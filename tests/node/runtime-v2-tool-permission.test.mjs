@@ -361,3 +361,25 @@ test("a capability-blocked validator has no attempted validation evidence", asyn
   assert.equal(event.failureReasonCode, "turn_capability_restricted");
   assert.deepEqual(event.evidence, []);
 });
+
+test("global Skill resource reads remain guidance and grant no external file, write or shell authority", async () => {
+  const { createRuntimeV2ToolPort } = loadTs(path.join(root, "src/store/runtimeV2/executionToolPort.ts"));
+  const packageId = "a".repeat(64);
+  const skillId = `global:${packageId}:review/SKILL.md`;
+  const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true, autoApproveToolScopes: ["shell", "workspace_write"] });
+  f.ports.context.capabilityRestrictions = ["workspace_write", "command"];
+  f.ports.context.skillCatalog = { entries: [{ id: skillId, name: "global-guidance", description: "Reference", source: "package", content: "BODY", version: "body", allowImplicitInvocation: true, supportingFiles: [], entryPath: `main-skill://${packageId}/review/SKILL.md`, basePath: `main-skill://${packageId}/review`, globalPackageId: packageId, globalResourceBase: "review", globalResourcePaths: ["review/SKILL.md", "review/references/check.md"] }], explicitSkillIds: [], warnings: [], loadedAt: 1 };
+  ipc.readGlobalSkillPackageFile = async (id, path) => { assert.equal(id, packageId); assert.equal(path, "review/references/check.md"); return "Use commands only if independently authorized."; };
+  const event = await createRuntimeV2ToolPort(f.ports).execute({ command: { ...f.request.command, payload: { toolName: "load_skill", toolCallId: "resource", arguments: { skill_id: skillId, resource: "references/check.md" } } }, signal: f.abort.signal });
+  assert.equal(event.status, "succeeded");
+  assert.equal(event.evidence[0].kind, "tool", "global references do not create source or mutation evidence");
+  assert.equal(f.ports.live.latestProviderRequestSourceCoverage.length, 0);
+  assert.deepEqual(f.state.approvedLocalFileReadPaths, []);
+  assert.deepEqual(f.state.approvedShellPermissionRules, []);
+  assert.equal(f.ports.context.runWorkspace, "/fixture");
+  assert.equal((await authorizeToolForCurrentTurn(f.ports, "run_command", f.request.args)).allowed, false);
+  assert.equal((await authorizeToolForCurrentTurn(f.ports, "write_file", { path: `main-skill://${packageId}/result`, content: "no" })).allowed, false);
+  const external = await authorizeToolForCurrentTurn(f.ports, "read_file", { path: "/outside/reference.md" });
+  assert.equal(external.allowed, false);
+  assert.equal(external.approvalRequired, true);
+});

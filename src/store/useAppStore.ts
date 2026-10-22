@@ -56,6 +56,8 @@ import {
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
 import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool, type MCPServerStatusSnapshot } from "../lib/mcpClient";
 import { normalizeGeminiExtensionInstallations, type GeminiExtensionInstallation } from "../lib/geminiExtensions";
+import { inspectGlobalSkillPackage, promoteLegacySkillPackage } from "../lib/ipc";
+import { globalSkillPackageId, migrateLegacySkillRegistrations, upsertGlobalSkillRegistration } from "../lib/globalSkillPackages";
 import { extensionMcpDiscoveryKey, extensionMcpServers, normalizeExtensionWorkspace, resolveWorkspaceMcpView, workspaceExtensionSkills, workspaceHasUnfinishedTurns, type ExtensionMcpDiscovery } from "../lib/workspaceMcp";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import { stripVisualObservationProtocolComments } from "../lib/sanitize";
@@ -1430,6 +1432,7 @@ export interface AppState {
   deleteSkill: (id: string) => void;
   addSkill: (skill: Omit<Skill, "id" | "active" | "isBuiltIn">) => void;
   updateSkill: (id: string, patch: Partial<Omit<Skill, "id" | "isBuiltIn">>) => void;
+  migrateLegacySkillPackages: () => Promise<void>;
 
   // Knowledge bases
   knowledgeBases: KnowledgeBase[];
@@ -1887,6 +1890,7 @@ export function normalizeProviderCompatibilityByRuntimeKey(
 const defaultSkills: Skill[] = [];
 const defaultKnowledgeBases: KnowledgeBase[] = [];
 const extensionRemovalLocks = new Set<string>();
+let legacySkillPackageMigration: Promise<void> | null = null;
 
 async function assertExtensionWorkspaceMutable(getState: () => any, workspace: string): Promise<void> {
   const state = getState();
@@ -10421,7 +10425,12 @@ export const useAppStore = create<AppState>()(
     const removeRecord = () => set((state) => ({
       skills: state.skills.filter((candidate) => candidate.id !== id),
     }));
-    if (skill.type === "package" && skill.packagePath) {
+    if (skill.type === "package" && !skill.packageStorage && skill.packagePath) {
+      if (get().skills.some((other) => other.id !== id && other.type === "package" &&
+        !other.packageStorage && other.packagePath === skill.packagePath && other.workspaceScope === skill.workspaceScope)) {
+        removeRecord();
+        return;
+      }
       void invoke("delete_protocol_package", {
         localPath: skill.packagePath,
         workspace: skill.workspaceScope || null,
@@ -10432,20 +10441,53 @@ export const useAppStore = create<AppState>()(
     }
     removeRecord();
   },
-  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, entryPoints, workspaceScope, allowImplicitInvocation }) =>
+  addSkill: ({ name, desc, content, type, toolParameters, packagePath, packageStorage, entryPoint, entryPoints, workspaceScope, allowImplicitInvocation }) =>
     set((s) => ({
-      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, entryPoints, workspaceScope, allowImplicitInvocation }],
+      skills: upsertGlobalSkillRegistration(s.skills, {
+        id: packageStorage?.kind === "global" ? `global-skill:${packageStorage.packageId}` : Date.now().toString(),
+        name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false,
+        type: type || "instruction", toolParameters, entryPoint, entryPoints, allowImplicitInvocation,
+        ...(packageStorage ? { packageStorage } : { packagePath, workspaceScope }),
+      }),
     })),
   updateSkill: (id, patch) =>
-    set((s) => ({
-      skills: s.skills.map((sk) => (sk.id === id ? {
+    set((s) => {
+      const packageId = globalSkillPackageId(patch);
+      if (packageId && s.skills.some((skill) => skill.id !== id && globalSkillPackageId(skill) === packageId)) {
+        return { skills: s.skills.filter((skill) => skill.id !== id) };
+      }
+      return { skills: s.skills.map((sk) => {
+        if (sk.id !== id) return sk;
+        const updated = {
         ...sk,
         ...patch,
         content: Object.prototype.hasOwnProperty.call(patch, "content")
           ? normalizeSkillContent(patch.content || "")
           : sk.content,
-      } : sk)),
-    })),
+        };
+        if (globalSkillPackageId(updated)) {
+          delete updated.packagePath;
+          delete updated.workspaceScope;
+        }
+        return updated;
+      }) };
+    }),
+  migrateLegacySkillPackages: () => {
+    if (legacySkillPackageMigration) return legacySkillPackageMigration;
+    legacySkillPackageMigration = migrateLegacySkillRegistrations({
+      getSkills: () => get().skills,
+      updateSkills: (apply) => set((state) => ({ skills: apply(state.skills) })),
+      promote: promoteLegacySkillPackage,
+      inspect: inspectGlobalSkillPackage,
+    }).then((result) => {
+      logStoreEvent("skill_package_migration_completed", result);
+    }).catch((error) => {
+      logStoreEvent("skill_package_migration_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }).finally(() => { legacySkillPackageMigration = null; });
+    return legacySkillPackageMigration;
+  },
 
   knowledgeBases: defaultKnowledgeBases,
   setKnowledgeBases: (v) => set({ knowledgeBases: Array.isArray(v) ? v : [] }),

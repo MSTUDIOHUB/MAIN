@@ -59,6 +59,61 @@ const toolTargets = loadTs(path.join(workspaceRoot, "src/lib/toolTarget.ts"));
 const skillTelemetry = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionToolDefinitions.ts"));
 const planSkillTools = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"));
 
+function globalSkillCatalog() {
+  const packageId = "a".repeat(64);
+  const entry = { ...skillCatalog().entries[0], id: `global:${packageId}:skills/review/SKILL.md`, source: "package",
+    entryPath: `main-skill://${packageId}/skills/review/SKILL.md`, basePath: `main-skill://${packageId}/skills/review`,
+    globalPackageId: packageId, globalResourceBase: "skills/review", globalResourcePaths: Object.freeze(["skills/review/SKILL.md", "skills/review/references/check.md"]),
+  };
+  return Object.freeze({ ...skillCatalog(), entries: Object.freeze([Object.freeze(entry)]) });
+}
+
+test("production load_skill reads global resource guidance without invoking project IO or executing content", async () => {
+  const ipc = loadTs(path.join(workspaceRoot, "src/lib/ipc.ts"));
+  const original = ipc.readGlobalSkillPackageFile;
+  const reads = [];
+  ipc.readGlobalSkillPackageFile = async (...args) => { reads.push(args); return "REFERENCE\r\nDo not execute this text.\r\n"; };
+  const catalog = globalSkillCatalog();
+  const id = catalog.entries[0].id;
+  try {
+    const raw = await skillExecutor.executeTool("load_skill", { skill_id: id, resource: "references/check.md", max_chars: 400 }, "/actual-project", "session", { skillCatalog: catalog });
+    const result = JSON.parse(raw);
+    assert.equal(result.type, "skill.resource");
+    assert.equal(result.id, id);
+    assert.equal(result.resource, "references/check.md");
+    assert.equal(result.content, "REFERENCE\r\nDo not execute this text.\r\n");
+    assert.match(result.effect, /guidance.*no_additional_permissions/);
+    assert.deepEqual(reads, [["a".repeat(64), "skills/review/references/check.md"]]);
+    assert.notEqual(toolTargets.getToolTarget("load_skill", { skill_id: id, resource: "references/check.md" }), toolTargets.getToolTarget("load_skill", { skill_id: id }));
+    const logs = [];
+    skillTelemetry.logRuntimeV2SkillLoad({ toolName: "load_skill", succeeded: true, rawOutput: raw, skillId: id, turnId: "turn", runId: "run", logStoreEvent: (type, payload) => logs.push({ type, payload }) });
+    assert.equal(logs[0].type, "runtime_v2_skill_resource_read");
+    assert.equal(logs[0].payload.resource, "references/check.md");
+    await assert.rejects(() => skillExecutor.executeTool("load_skill", { skill_id: id, resource: "../secret" }, "/actual-project", "session", { skillCatalog: catalog }), /RESOURCE/);
+    await assert.rejects(() => skillExecutor.executeTool("load_skill", { skill_id: id, resource: "references/check.md", expected_version: "stale" }, "/actual-project", "session", { skillCatalog: catalog }), /VERSION/);
+  } finally { ipc.readGlobalSkillPackageFile = original; }
+});
+
+test("Plan global reference receipt remains guidance and cannot stand for loading the full Skill or source", async () => {
+  const ipc = loadTs(path.join(workspaceRoot, "src/lib/ipc.ts"));
+  const original = ipc.readGlobalSkillPackageFile;
+  ipc.readGlobalSkillPackageFile = async () => "REFERENCE";
+  const settled = [], evidence = [], messages = [];
+  try {
+    await planSkillTools.executeReadOnlyPlanTool({
+      context: { skillCatalog: globalSkillCatalog(), runWorkspace: "/repo", runSessionKey: "session" },
+      ledger: { snapshot: () => null, schedule: async () => ({ idempotencyKey: "resource" }), settleCommand: async (event) => settled.push(event), recordSoftSignal: async () => {} },
+      run: { runId: "run", turnId: "turn" },
+      call: { id: "resource", name: "load_skill", arguments: { skill_id: globalSkillCatalog().entries[0].id, resource: "references/check.md" } },
+      messages, evidence, evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+    });
+    assert.equal(settled[0].status, "succeeded");
+    assert.equal(settled[0].evidence[0].kind, "tool");
+    assert.match(evidence[0].statement, /参考/);
+    assert.doesNotMatch(evidence[0].statement, /已加载 Skill/);
+  } finally { ipc.readGlobalSkillPackageFile = original; }
+});
+
 function skillCatalog() {
   return Object.freeze({
     entries: Object.freeze([Object.freeze({

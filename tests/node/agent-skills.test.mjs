@@ -41,6 +41,112 @@ async function loadAgentSkillsModule(ipcStubs) {
   return module.exports;
 }
 
+const GLOBAL_PACKAGE_ID = "a".repeat(64);
+function globalPackageRecord(overrides = {}) {
+  return { id: "global-record", name: "Global bundle", desc: "Reusable workflow", content: "", active: true, type: "package",
+    packageStorage: { kind: "global", packageId: GLOBAL_PACKAGE_ID }, ...overrides };
+}
+function globalPackageIpc(overrides = {}) {
+  return {
+    globSearch: async () => [], readFile: async () => { throw new Error("Global package must not use project IO"); },
+    inspectGlobalSkillPackage: async (id) => ({ packageId: id, name: "bundle", entryPoint: "skills/workflow/SKILL.md", entryPoints: ["skills/workflow/SKILL.md"], files: ["skills/workflow/SKILL.md", "skills/workflow/references/check.md"], reused: true }),
+    readGlobalSkillPackageFile: async (_id, file) => file.endsWith("SKILL.md") ? "---\nname: global-workflow\ndescription: Read the shared reference\n---\nBODY_ONLY_ON_LOAD\n" : "# Reference\r\nEXACT_RESOURCE\r\n",
+    ...overrides,
+  };
+}
+
+test("registered global packages load once across project and global Turns without project IO", async () => {
+  const inspections = [];
+  const ipc = globalPackageIpc();
+  const inspect = ipc.inspectGlobalSkillPackage;
+  ipc.inspectGlobalSkillPackage = async (id) => { inspections.push(id); return inspect(id); };
+  const api = await loadAgentSkillsModule(ipc);
+  const records = [globalPackageRecord(), globalPackageRecord({ id: "duplicate-record" }), globalPackageRecord({ id: "disabled", active: false, packageStorage: { kind: "global", packageId: "b".repeat(64) } })];
+  for (const workspace of ["/project/A", "/project/B", ""]) {
+    const snapshot = await api.loadSkillCatalog({ workspace, skills: records });
+    assert.equal(snapshot.entries.length, 1);
+    const entry = snapshot.entries[0];
+    assert.equal(entry.id, `global:${GLOBAL_PACKAGE_ID}:skills/workflow/SKILL.md`);
+    assert.equal(entry.entryPath, `main-skill://${GLOBAL_PACKAGE_ID}/skills/workflow/SKILL.md`);
+    assert.equal(entry.basePath, `main-skill://${GLOBAL_PACKAGE_ID}/skills/workflow`);
+    assert.doesNotMatch(api.renderSkillCatalogContext(snapshot), /BODY_ONLY_ON_LOAD/);
+    assert.match(api.loadSkillContent(snapshot, entry.id).content, /BODY_ONLY_ON_LOAD/);
+    assert.match(api.loadSkillContent(snapshot, entry.id).hostGuidance, /resource/);
+    assert.ok(Object.isFrozen(entry.globalResourcePaths));
+  }
+  assert.deepEqual(inspections, [GLOBAL_PACKAGE_ID, GLOBAL_PACKAGE_ID, GLOBAL_PACKAGE_ID], "same payload UI rows cannot duplicate discovery");
+});
+
+test("global resources use captured package identity, exact lossless windows and no root escapes", async () => {
+  const reads = [];
+  let resource = "# Reference\r\n" + "x".repeat(130) + "\r\nEND\r\n";
+  const ipc = globalPackageIpc({ readGlobalSkillPackageFile: async (id, file) => {
+    reads.push([id, file]);
+    return file.endsWith("SKILL.md") ? "---\nname: global-workflow\n---\nBODY" : resource;
+  } });
+  const api = await loadAgentSkillsModule(ipc);
+  const record = globalPackageRecord();
+  const snapshot = await api.loadSkillCatalog({ workspace: "/project", skills: [record] });
+  const entry = snapshot.entries[0];
+  record.packageStorage.packageId = "b".repeat(64);
+  const first = await api.loadSkillResourceContent(snapshot, entry.id, "references/check.md", { maxChars: 19 });
+  assert.equal(first.resource, "references/check.md");
+  assert.equal(first.complete, false);
+  assert.equal(first.id, entry.id);
+  assert.ok(first.entryPath.startsWith(`main-skill://${GLOBAL_PACKAGE_ID}/`));
+  let source = first.content;
+  let page = first;
+  while (page.nextStartLine !== null) {
+    page = await api.loadSkillResourceContent(snapshot, entry.id, "references/check.md", { maxChars: 19, startLine: page.nextStartLine, startChar: page.nextStartChar, expectedVersion: first.version });
+    source += page.content;
+  }
+  assert.equal(source, resource);
+  assert.ok(reads.every(([id, file]) => id === GLOBAL_PACKAGE_ID && file.startsWith("skills/workflow/")));
+  const before = reads.length;
+  for (const path of ["../outside", "/outside", "file:///outside", "C:\\outside", "references/../../outside", "references//check.md", "references/check.md\0", "missing.md"]) {
+    await assert.rejects(() => api.loadSkillResourceContent(snapshot, entry.id, path), /RESOURCE|PATH/);
+  }
+  await assert.rejects(() => api.loadSkillResourceContent(snapshot, "global:" + "b".repeat(64), "references/check.md"), /ADMITTED|AUTHORIZED/);
+  for (const patch of [{ globalPackageId: "../outside" }, { globalResourceBase: undefined }, { globalResourceBase: "../other" }, { entryPath: "/outside" }]) {
+    await assert.rejects(() => api.loadSkillResourceContent({ ...snapshot, entries: [{ ...entry, ...patch }] }, entry.id, "references/check.md"), /RESOURCE/);
+  }
+  assert.equal(reads.length, before, "unknown IDs and paths cannot reach native IO");
+  resource = "CHANGED";
+  await assert.rejects(() => api.loadSkillResourceContent(snapshot, entry.id, "references/check.md", { expectedVersion: first.version }), /VERSION/);
+  resource = "";
+  const empty = await api.loadSkillResourceContent(snapshot, entry.id, "references/check.md");
+  assert.equal(empty.content, "");
+  assert.equal(empty.complete, true);
+  assert.equal(empty.totalLines, 0);
+  assert.deepEqual(empty.returnedRange, { startLine: 0, endLine: 0, startChar: 0, endChar: 0 });
+});
+
+test("global package identity never aliases a new payload, malformed record or same-name workflow", async () => {
+  const ipc = globalPackageIpc();
+  let inspections = 0;
+  const inspect = ipc.inspectGlobalSkillPackage;
+  ipc.inspectGlobalSkillPackage = async (id) => { inspections++; return inspect(id); };
+  const api = await loadAgentSkillsModule(ipc);
+  const first = await api.loadSkillCatalog({ workspace: "/A", skills: [globalPackageRecord()] });
+  const old = api.listSkillCatalog(first).entries[0];
+  const secondId = "b".repeat(64);
+  const second = await api.loadSkillCatalog({ workspace: "/B", skills: [globalPackageRecord({ packageStorage: { kind: "global", packageId: secondId } })] });
+  assert.equal(api.resolveSkillId(second, old.id), null);
+  assert.equal(api.resolveSkillId(second, old.ref), null);
+  await assert.rejects(() => api.loadSkillResourceContent(second, old.id, "references/check.md"), /ADMITTED/);
+  const both = await api.loadSkillCatalog({ workspace: "", userPrompt: "Use $global-workflow", skills: [globalPackageRecord(), globalPackageRecord({ id: "different-payload", packageStorage: { kind: "global", packageId: secondId } })] });
+  assert.equal(both.entries.length, 2);
+  assert.deepEqual(both.explicitSkillIds, [], "same display name does not merge different resources or guess which workflow was selected");
+  const before = inspections;
+  const malformed = await api.loadSkillCatalog({ workspace: "/A", skills: [globalPackageRecord({ packagePath: ".protocols/legacy", workspaceScope: "/A", packageStorage: { kind: "global", packageId: "../outside" } })] });
+  assert.equal(malformed.entries.length, 0);
+  assert.equal(inspections, before);
+  ipc.inspectGlobalSkillPackage = async () => ({ ...(await inspect(GLOBAL_PACKAGE_ID)), packageId: secondId });
+  const mismatched = await api.loadSkillCatalog({ workspace: "", skills: [globalPackageRecord()] });
+  assert.equal(mismatched.entries.length, 0);
+  assert.match(mismatched.warnings.join(" "), /ID_MISMATCH/);
+});
+
 test("Skill admission exposes metadata first and loads exact content on demand", async () => {
   const files = {
     ".agents/skills/release/SKILL.md": [

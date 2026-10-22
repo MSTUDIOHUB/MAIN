@@ -70,11 +70,9 @@ import {
 import { runGitDiffTool, runGitStatusTool } from "./gitTools";
 import {
   LOAD_SKILL_TOOL_NAME,
-  isSkillVisibleToModel,
-  listSkillCatalog,
-  loadSkillContent,
   type SkillCatalogSnapshot,
 } from "./agentSkills";
+import { executeAgentSkillTool } from "./agentSkillExecutor";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -377,40 +375,7 @@ export async function executeTool(
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
   if (executionName === LOAD_SKILL_TOOL_NAME) {
-    if (!options.skillCatalog) {
-      throw new Error("SKILL_CATALOG_UNAVAILABLE: no Skill catalog was admitted for this Turn.");
-    }
-    const operation = String(args.operation || "load").trim();
-    if (operation === "list") {
-      return JSON.stringify(listSkillCatalog(options.skillCatalog, {
-        query: parseOptionalString(args.query),
-        cursor: parseOptionalString(args.cursor),
-        limit: parseOptionalNumber(args.limit),
-      }));
-    }
-    if (operation !== "load") {
-      throw new Error(`SKILL_OPERATION_INVALID: ${operation}`);
-    }
-    const skillId = String(args.skill_id || "").trim();
-    if (!isSkillVisibleToModel(options.skillCatalog, skillId)) {
-      throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
-    }
-    const loaded = loadSkillContent(options.skillCatalog, skillId, {
-      maxChars: parseOptionalNumber(args.max_chars),
-      section: parseOptionalString(args.section),
-      startLine: parseOptionalNumber(args.start_line),
-      maxLines: parseOptionalNumber(args.max_lines),
-      startChar: parseOptionalNumber(args.start_char),
-      expectedVersion: parseOptionalString(args.expected_version),
-      sectionCursor: parseOptionalString(args.section_cursor),
-    });
-    return JSON.stringify({
-      type: "skill.loaded",
-      ...loaded,
-      effect: loaded.complete === false
-        ? "instructions_partially_read_no_additional_permissions"
-        : "instructions_loaded_no_additional_permissions",
-    });
+    return executeAgentSkillTool(options.skillCatalog, args);
   }
 
   // ── MCP tool routing ────────────────────────────────────────

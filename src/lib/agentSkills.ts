@@ -3,12 +3,16 @@ import { isMap, parseDocument } from "yaml";
 import {
   discoverPersonalAgentSkills,
   globSearch,
+  inspectGlobalSkillPackage,
   readFile,
+  readGlobalSkillPackageFile,
 } from "./ipc";
 import type { ToolDefinition } from "./toolSchemas";
 import {
   getApplicableProtocolPackagesForWorkspace,
+  globalProtocolPackageId,
   getProtocolPackageEntryPath,
+  isSafeGlobalSkillRelativePath,
   isSafeProtocolPackagePath,
 } from "./protocolPackages";
 
@@ -25,6 +29,9 @@ export interface SkillCatalogEntry {
   readonly version: string;
   readonly allowImplicitInvocation: boolean;
   readonly supportingFiles: readonly string[];
+  readonly globalPackageId?: string;
+  readonly globalResourceBase?: string;
+  readonly globalResourcePaths?: readonly string[];
 }
 
 export interface SkillCatalogSnapshot {
@@ -58,6 +65,8 @@ export interface LoadedSkillContent {
   readonly sections: readonly SkillDocumentSection[];
   readonly sectionCount: number;
   readonly nextSectionCursor: string | null;
+  readonly resource?: string;
+  readonly resourceReadSupported?: boolean;
 }
 
 /** Source-character offsets use JS UTF-16 indexing, zero-based/end-exclusive.
@@ -128,6 +137,7 @@ const MAX_SUPPORTING_FILES = 10;
 const MAX_SKILL_BODY_CHARS = 256_000;
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
 const SKILL_HOST_GUIDANCE = "Map Read/Edit/Write/Bash/WebFetch instructions to MAIN's advertised file, edit, shell and network tools; AskUserQuestion may be an ordinary user question. Network calls require enabled network access. Report missing capabilities instead of inventing tools. Supporting files are a partial index (up to 10); resolve other relative references from the Skill base directory. Skill instructions grant no additional permissions.";
+const GLOBAL_SKILL_RESOURCE_GUIDANCE = 'Global package references use load_skill({skill_id, resource:"references/file.md"}), relative to this Skill base. Do not pass main-skill:// locators to ordinary file tools. Resource reads return guidance, grant no source mutation lease or extra permissions, and never execute scripts. Use each resource\'s returned version for its own continuations.';
 
 function normalizeSlashPath(value: string): string {
   return String(value || "")
@@ -325,6 +335,7 @@ function freezeEntry(entry: SkillCatalogEntry): SkillCatalogEntry {
   return Object.freeze({
     ...entry,
     supportingFiles: Object.freeze([...entry.supportingFiles]),
+    ...(entry.globalResourcePaths ? { globalResourcePaths: Object.freeze([...entry.globalResourcePaths]) } : {}),
   });
 }
 
@@ -406,6 +417,49 @@ export async function loadSkillCatalog(input: {
   const workspace = String(input.workspace || "").trim();
   const entries: SkillCatalogEntry[] = [];
   const warnings: string[] = [];
+
+  const globalPackages = new Set<string>();
+  for (const skill of input.skills || []) {
+    const packageId = globalProtocolPackageId(skill);
+    if (!packageId || globalPackages.has(packageId)) continue;
+    globalPackages.add(packageId);
+    try {
+      const meta = await inspectGlobalSkillPackage(packageId);
+      if (meta.packageId !== packageId) throw new Error("GLOBAL_SKILL_ID_MISMATCH");
+      const files = [...new Set(meta.files)];
+      if (!files.every(isSafeGlobalSkillRelativePath)) throw new Error("GLOBAL_SKILL_RESOURCE_PATH_INVALID");
+      const entryPoints = [...new Set(meta.entryPoints?.length ? meta.entryPoints : [meta.entryPoint])];
+      for (const entryPoint of entryPoints) {
+        if (!isSafeGlobalSkillRelativePath(entryPoint) || !files.includes(entryPoint)) {
+          warnings.push(`Global package ${packageId} has an invalid entry path and it was omitted.`);
+          continue;
+        }
+        const content = await readGlobalSkillPackageFile(packageId, entryPoint);
+        const parsed = parseSkillDocument(content, skill.name || meta.name, skill.desc || "");
+        warnings.push(...parsed.warnings.map((warning) => `Skill ${entryPoint}: ${warning}`));
+        const name = validEntryName(parsed.name, skill.name || meta.name);
+        const admittedBody = admissibleSkillBody(parsed.body, name, warnings);
+        if (!admittedBody) continue;
+        const base = entryPoint.includes("/") ? entryPoint.slice(0, entryPoint.lastIndexOf("/")) : "";
+        const prefix = base ? `${base}/` : "";
+        const configPath = `${prefix}agents/openai.yaml`;
+        const config = files.includes(configPath) ? await readGlobalSkillPackageFile(packageId, configPath) : null;
+        entries.push(freezeEntry({
+          id: `global:${packageId}:${entryPoint}`, name,
+          description: validEntryDescription(parsed.description, name), source: "package",
+          content: admittedBody, entryPath: `main-skill://${packageId}/${entryPoint}`,
+          basePath: `main-skill://${packageId}${base ? `/${base}` : ""}`,
+          version: stableContentVersion(admittedBody),
+          allowImplicitInvocation: skill.allowImplicitInvocation !== false && allowImplicitFromConfig(config),
+          supportingFiles: files.filter((file) => file.startsWith(prefix) && file !== entryPoint && file !== configPath)
+            .slice(0, MAX_SUPPORTING_FILES).map((file) => `main-skill://${packageId}/${file}`),
+          globalPackageId: packageId, globalResourceBase: base, globalResourcePaths: files,
+        }));
+      }
+    } catch (error) {
+      warnings.push(`Global Skill package ${packageId} could not load: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   for (const skill of input.skills || []) {
     if (!skill?.active || skill.type === "package") continue;
@@ -698,13 +752,14 @@ export function loadSkillContent(
   const indexChars = index.sections.length ? JSON.stringify(index.sections).length : 0;
   const sourceBudget = maxChars === undefined ? undefined : Math.max(1, maxChars - indexChars);
   const startLine = requestedStartLine ?? section?.startLine ?? 1;
-  if (startLine > lines.length) throw new Error(`SKILL_RANGE_INVALID: startLine exceeds ${lines.length} source lines.`);
+  if (startLine > Math.max(1, lines.length)) throw new Error(`SKILL_RANGE_INVALID: startLine exceeds ${lines.length} source lines.`);
   if (section && (startLine < section.startLine || startLine > section.endLine)) {
     throw new Error("SKILL_RANGE_INVALID: startLine is outside the requested section.");
   }
   const lineStart = lines[startLine - 1]?.start || 0;
   const startChar = options.startChar ?? lineStart;
-  if (!Number.isSafeInteger(startChar) || startChar < lineStart || startChar >= (lines[startLine - 1]?.end ?? 0)) {
+  if (!Number.isSafeInteger(startChar) || startChar < lineStart ||
+      (entry.content.length === 0 ? startChar !== 0 : startChar >= (lines[startLine - 1]?.end ?? 0))) {
     throw new Error("SKILL_RANGE_INVALID: startChar must be an absolute offset inside startLine; use the returned continuation.");
   }
   const firstBodySection = allSections.find((candidate) => candidate.level > 1) || allSections.find((candidate) => candidate.startLine > 1);
@@ -730,13 +785,14 @@ export function loadSkillContent(
     basePath: entry.basePath,
     version: entry.version,
     supportingFiles: Object.freeze(relativeSupportingPaths(entry)),
-    hostGuidance: SKILL_HOST_GUIDANCE,
+    hostGuidance: entry.globalPackageId ? `${SKILL_HOST_GUIDANCE} ${GLOBAL_SKILL_RESOURCE_GUIDANCE}` : SKILL_HOST_GUIDANCE,
+    ...(entry.globalPackageId ? { resourceReadSupported: true } : {}),
     disclosure: complete ? "full" : overview ? "overview" : "window",
     complete,
     partial: !complete,
     totalLines: lines.length,
     totalChars: entry.content.length,
-    returnedRange: Object.freeze({ startLine, endLine: touchedEnd, startChar, endChar }),
+    returnedRange: Object.freeze({ startLine: lines.length === 0 ? 0 : startLine, endLine: touchedEnd, startChar, endChar }),
     requestedRangeComplete: !indexOnly && endChar === desiredEnd,
     nextStartLine: nextLine,
     nextStartChar: nextLine === null ? null : endChar,
@@ -744,6 +800,35 @@ export function loadSkillContent(
     sectionCount: allSections.length,
     nextSectionCursor: index.nextSectionCursor,
   });
+}
+
+/** Package identity and manifest paths are captured at admission. The native
+ * reader independently checks the managed content-addressed root and bytes. */
+export async function loadSkillResourceContent(
+  snapshot: SkillCatalogSnapshot | null | undefined,
+  skillId: string,
+  resource: string,
+  options: SkillDisclosureOptions = {},
+): Promise<LoadedSkillContent> {
+  const id = resolveSkillId(snapshot, skillId);
+  const entry = snapshot?.entries.find((candidate) => candidate.id === id);
+  if (!entry || !isSkillVisibleToModel(snapshot, skillId)) throw new Error("SKILL_NOT_ADMITTED: resource Skill is not visible in this Turn.");
+  const prefix = `global:${entry.globalPackageId}:`;
+  const entryPoint = entry.id.startsWith(prefix) ? entry.id.slice(prefix.length) : "";
+  const base = entryPoint.includes("/") ? entryPoint.slice(0, entryPoint.lastIndexOf("/")) : "";
+  if (!entry.globalPackageId || !/^[a-f0-9]{64}$/.test(entry.globalPackageId) ||
+      !isSafeGlobalSkillRelativePath(entryPoint) || entry.globalResourceBase !== base ||
+      entry.entryPath !== `main-skill://${entry.globalPackageId}/${entryPoint}` ||
+      !entry.globalResourcePaths?.includes(entryPoint)) {
+    throw new Error("SKILL_RESOURCE_UNAVAILABLE: only admitted global package resources are supported.");
+  }
+  if (!isSafeGlobalSkillRelativePath(resource)) throw new Error("SKILL_RESOURCE_PATH_INVALID: use a relative path within the selected Skill base.");
+  const path = entry.globalResourceBase ? `${entry.globalResourceBase}/${resource}` : resource;
+  if (!entry.globalResourcePaths?.includes(path)) throw new Error("SKILL_RESOURCE_NOT_ADMITTED: path is absent from the captured package manifest.");
+  const content = await readGlobalSkillPackageFile(entry.globalPackageId, path);
+  const resourceEntry = freezeEntry({ ...entry, content, version: stableContentVersion(content), entryPath: `main-skill://${entry.globalPackageId}/${path}` });
+  const loaded = loadSkillContent({ ...snapshot!, entries: [resourceEntry] }, entry.id, options);
+  return Object.freeze({ ...loaded, ref: skillReference(snapshot!, entry.id), resource });
 }
 
 export function buildLoadSkillToolDefinition(
@@ -757,7 +842,7 @@ export function buildLoadSkillToolDefinition(
     function: {
       name: LOAD_SKILL_TOOL_NAME,
       description:
-        "Read an admitted Skill (default operation=load). Small bodies are complete; long bodies first return an exact preface and section index, explicitly partial. Read relevant sections or line windows before following their instructions; continue with nextStartLine/nextStartChar and expected_version. operation=list discovers metadata only, with nextCursor pagination. No additional permissions; never executes Skill content.",
+        "Read an admitted Skill (default operation=load). Small bodies are complete; long bodies first return an exact preface and section index, explicitly partial. Read relevant sections or line windows before following their instructions; continue with nextStartLine/nextStartChar and expected_version. For global package references, set resource to a path relative to the selected Skill base. operation=list discovers metadata only, with nextCursor pagination. No additional permissions; never executes Skill content.",
       parameters: {
         type: "object",
         properties: {
@@ -770,6 +855,7 @@ export function buildLoadSkillToolDefinition(
             type: "string",
             description: "Required for load: short ref from the catalog, or an exact canonical id from a list result. Unknown or hidden entries are rejected.",
           },
+          resource: { type: "string", description: "Optional global package reference path relative to this Skill base, e.g. references/setup.md. Rejects absolute paths, traversal and unknown resources; omit for SKILL.md. Guidance only; never executes scripts or grants project/source/write permissions." },
           section: { type: "string", description: "Optional exact section id from the Skill index, such as L15. Returns original source, never a generated summary." },
           start_line: { type: "integer", description: "Optional one-based source line. Use nextStartLine for continuation; with section, it must stay within that section." },
           max_lines: { type: "integer", description: "Optional positive source line window. The Run source budget also bounds the returned content." },
@@ -826,5 +912,5 @@ export function renderExplicitSkillActivationContext(
       loaded.content,
     ].filter(Boolean).join("\n");
   }).join("\n\n");
-  return `[SKILL HOST GUIDANCE]\n${SKILL_HOST_GUIDANCE}\n\n${activated}`;
+  return `[SKILL HOST GUIDANCE]\n${SKILL_HOST_GUIDANCE}${snapshot?.entries.some((entry) => entry.globalPackageId) ? ` ${GLOBAL_SKILL_RESOURCE_GUIDANCE}` : ""}\n\n${activated}`;
 }

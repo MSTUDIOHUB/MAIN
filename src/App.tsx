@@ -1395,6 +1395,9 @@ export default function App() {
   const updateSkill = useAppStore((s) => s.updateSkill);
 
   useEffect(() => initializeE2EScenarios(), []);
+  useEffect(() => {
+    void useAppStore.getState().migrateLegacySkillPackages();
+  }, []);
   useEffect(() => () => {
     if (sessionSaveTimerRef.current !== null) {
       window.clearTimeout(sessionSaveTimerRef.current);

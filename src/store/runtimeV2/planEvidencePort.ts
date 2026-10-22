@@ -152,6 +152,8 @@ export async function executeReadOnlyPlanTool(input: {
       statement: input.call.name === "load_skill"
         ? args.operation === "list"
           ? `已查看 Skill 目录 ${target} 的元数据；未加载正文，不构成项目源码证据。`
+          : args.resource !== undefined
+          ? `已读取 Skill ${target} 的${partialSkill ? "部分" : ""}参考说明；不代表完整 Skill 已加载，不构成项目源码证据。`
           : partialSkill
           ? `已读取 Skill ${target} 的目录或部分说明；完整内容仍可继续读取，不构成项目源码证据。`
           : `已加载 Skill ${target} 的冻结工作流说明；它不构成项目源码证据。`

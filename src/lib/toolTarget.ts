@@ -17,7 +17,9 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
       (args.collaboration_task_id as string) || "subagent";
     case "load_skill": return args.operation === "list"
       ? `Skills: ${(args.query as string) || (args.cursor as string) || "catalog"}`
-      : (args.skill_id as string) || "Skill";
+      : args.resource
+        ? `${(args.skill_id as string) || "Skill"} / ${args.resource}`
+        : (args.skill_id as string) || "Skill";
     case "list_directory": return (args.path as string) || ".";
     case "read_file": return (args.path as string) || "";
     case "read_document": return (args.path as string) || "";

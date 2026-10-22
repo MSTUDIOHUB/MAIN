@@ -166,6 +166,15 @@ export function logRuntimeV2SkillLoad(input: {
       });
       return;
     }
+    if (result.type === "skill.resource") {
+      input.logStoreEvent("runtime_v2_skill_resource_read", {
+        turnId: input.turnId, runId: input.runId, skillId: String(result.id || input.skillId),
+        resource: result.resource, revision: result.version, complete: result.complete !== false,
+        disclosure: result.disclosure, returnedRange: result.returnedRange,
+        effect: "resource_guidance_only",
+      });
+      return;
+    }
     revision = String(result.version || "") || null;
     skillId = String(result.id || skillId);
     complete = result.complete !== false;

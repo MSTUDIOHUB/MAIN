@@ -50,6 +50,7 @@ pub mod network_guard;
 pub mod planner;
 pub mod runtime;
 pub mod session_store;
+mod skill_packages;
 pub mod task_graph;
 pub mod trusted_execution;
 pub mod web_search;
@@ -13532,6 +13533,10 @@ pub fn run() {
             knowledge_search,
             knowledge_get_excerpt,
             discover_personal_agent_skills,
+            skill_packages::extract_global_skill_package,
+            skill_packages::promote_legacy_skill_package,
+            skill_packages::inspect_global_skill_package,
+            skill_packages::read_global_skill_package_file,
             extract_protocol_package,
             extract_gemini_extension,
             delete_protocol_package,

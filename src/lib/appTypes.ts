@@ -33,6 +33,8 @@ export interface Skill {
   type?: "instruction" | "tool" | "package";
   toolParameters?: string;
   packagePath?: string;
+  /** Immutable app-managed payload; never an arbitrary file-system root. */
+  packageStorage?: { kind: "global"; packageId: string };
   entryPoint?: string;
   /** All Skill entries owned by one imported archive. */
   entryPoints?: string[];

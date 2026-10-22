@@ -7,6 +7,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/useAppStore";
 import { parseSkillDocument } from "../lib/agentSkills";
 import { isSafeProtocolPackagePath } from "../lib/protocolPackages";
+import { extractGlobalSkillPackage, readGlobalSkillPackageFile } from "../lib/ipc";
+import type { Skill } from "../lib/appTypes";
 import GeminiExtensionsPanel from "./GeminiExtensionsPanel";
 
 /** Convert skill name to a preview of the tool function name (snake_case). */
@@ -20,6 +22,8 @@ function nameToToolName(name: string): string {
 
 function cleanupProtocolPackage(localPath: string | null, workspace: string | null) {
   if (!localPath) return;
+  if (useAppStore.getState().skills.some((skill) => skill.type === "package" &&
+    !skill.packageStorage && skill.packagePath === localPath && skill.workspaceScope === workspace)) return;
   void invoke("delete_protocol_package", {
     localPath,
     workspace,
@@ -39,12 +43,15 @@ async function readPackagePreviews(
   entryPoints: string[],
   workspace: string,
   fallbackName: string,
+  storage?: Skill["packageStorage"],
 ): Promise<PackageSkillPreview[]> {
   return Promise.all(entryPoints.map(async (entry) => {
     const fallback = entry.replace(/\\/g, "/").split("/").slice(-2, -1)[0] || fallbackName;
     try {
-      if (!isSafeProtocolPackagePath(packagePath, entry)) throw new Error("Invalid Skill entry path");
-      const content = await invoke<string>("read_file", { path: `${packagePath}/${entry}`, workspace });
+      if (!storage && !isSafeProtocolPackagePath(packagePath, entry)) throw new Error("Invalid Skill entry path");
+      const content = storage
+        ? await readGlobalSkillPackageFile(storage.packageId, entry)
+        : await invoke<string>("read_file", { path: `${packagePath}/${entry}`, workspace });
       const parsed = parseSkillDocument(content, fallback, "");
       return { name: parsed.name, description: parsed.description, unavailable: !content.trim() || parsed.warnings.length > 0 };
     } catch {
@@ -70,6 +77,11 @@ const SKILLS_COPY = {
     package: "协议包",
     prompt: "Agent Skill",
     installedAt: "安装位置：",
+    globalScope: "全局 · 所有项目",
+    globalLocation: "全局技能库（只读）",
+    projectScope: "项目：",
+    unknownScope: "旧安装 · 需重新导入",
+    globalImport: "全局安装，一次导入后可在所有项目中使用。",
     editSkill: "编辑技能",
     deleteSkill: "删除技能",
     createSkill: "创建新技能",
@@ -86,7 +98,6 @@ const SKILLS_COPY = {
     uploadFailed: "上传失败",
     packageUploadHint: "支持含 SKILL.md 的单技能 ZIP 和完整技能仓库 ZIP；会保留 references、scripts 等支持文件。旧版 program.md 包仍可导入。",
     unityImportHint: "Unity 官方技能：在 GitHub 仓库选择 Code → Download ZIP，直接导入下载的 ZIP。保存后发送 $unity-cli 检查 CLI 与 Editor 连接，并按指引完成首次环境配置。",
-    workspaceRequired: "请先打开项目文件夹，再导入技能包。",
     foundSkills: (count: number) => `发现 ${count} 个技能`,
     containsSkills: (count: number) => `包含 ${count} 个技能`,
     previewUnavailable: "部分技能说明无法完整解析或读取；请检查 SKILL.md 格式和文件访问权限后重试导入。",
@@ -120,6 +131,11 @@ const SKILLS_COPY = {
     package: "Package",
     prompt: "Agent Skill",
     installedAt: "Installed at:",
+    globalScope: "Global · All projects",
+    globalLocation: "Global Skill library (read-only)",
+    projectScope: "Project:",
+    unknownScope: "Legacy installation · Reimport required",
+    globalImport: "Install once and use in every project.",
     editSkill: "Edit Skill",
     deleteSkill: "Delete Skill",
     createSkill: "Create New Skill",
@@ -136,7 +152,6 @@ const SKILLS_COPY = {
     uploadFailed: "Upload failed",
     packageUploadHint: "Supports single-Skill ZIPs and complete Skill repository ZIPs containing SKILL.md. All references, scripts, and other files are preserved. Legacy program.md packages are supported.",
     unityImportHint: "Official Unity Skills: choose Code → Download ZIP on GitHub and import the downloaded ZIP directly. After saving, send $unity-cli to check the CLI and Editor connection and follow the first-use setup instructions.",
-    workspaceRequired: "Open a project folder before importing a Skill package.",
     foundSkills: (count: number) => `Found ${count} Skills`,
     containsSkills: (count: number) => `Contains ${count} Skills`,
     previewUnavailable: "Some Skill documents could not be fully parsed or read. Check the SKILL.md format and file access, then import again.",
@@ -188,6 +203,7 @@ export default function SkillsModal({
   const [formToolParams, setFormToolParams] = useState(DEFAULT_TOOL_PARAMS);
   const [contentTab, setContentTab] = useState<"edit" | "preview">("edit");
   const [formPackagePath, setFormPackagePath] = useState<string | null>(null);
+  const [formPackageStorage, setFormPackageStorage] = useState<Skill["packageStorage"]>();
   const [formEntryPoint, setFormEntryPoint] = useState<string | null>(null);
   const [formEntryPoints, setFormEntryPoints] = useState<string[]>([]);
   const [formPackageWorkspace, setFormPackageWorkspace] = useState<string | null>(null);
@@ -208,6 +224,7 @@ export default function SkillsModal({
     setEditingId(null);
     setContentTab("edit");
     setFormPackagePath(null);
+    setFormPackageStorage(undefined);
     setFormEntryPoint(null);
     setFormEntryPoints([]);
     setFormPackageWorkspace(null);
@@ -222,7 +239,7 @@ export default function SkillsModal({
 
   const handleSaveSkill = () => {
     if (!formName.trim()) return;
-    if (formType === "package" && (!formPackagePath || !formPackageWorkspace || uploadStatus === "uploading")) return;
+    if (formType === "package" && (!(formPackageStorage || (formPackagePath && formPackageWorkspace)) || uploadStatus === "uploading")) return;
     if (formType !== "package" && !formContent.trim()) return;
     uploadGeneration.current += 1;
     const patch = {
@@ -233,13 +250,21 @@ export default function SkillsModal({
       allowImplicitInvocation: formAllowImplicit,
       ...(formType === "tool" ? { toolParameters: formToolParams } : {}),
       ...(formType === "package"
-        ? {
+        ? formPackageStorage ? {
+            packageStorage: formPackageStorage,
+            packagePath: undefined,
+            workspaceScope: undefined,
+            entryPoint: formEntryPoint,
+            entryPoints: formEntryPoints,
+          } : {
+            packageStorage: undefined,
             packagePath: formPackagePath,
             entryPoint: formEntryPoint,
             entryPoints: formEntryPoints,
             workspaceScope: formPackageWorkspace,
           }
         : {
+            packageStorage: undefined,
             packagePath: undefined,
             entryPoint: undefined,
             entryPoints: undefined,
@@ -287,33 +312,27 @@ export default function SkillsModal({
     setFormAllowImplicit(skill.allowImplicitInvocation !== false);
     setFormToolParams(skill.toolParameters || DEFAULT_TOOL_PARAMS);
     setFormPackagePath(skill.packagePath || null);
+    setFormPackageStorage(skill.packageStorage);
     setFormEntryPoint(skill.entryPoint || null);
     const entries = skill.entryPoints?.length ? skill.entryPoints : skill.entryPoint ? [skill.entryPoint] : [];
     setFormEntryPoints(entries);
     setFormPackageWorkspace(skill.workspaceScope || null);
     setPackagePreviews([]);
-    if (skill.type === "package" && skill.packagePath && skill.workspaceScope) {
-      void readPackagePreviews(skill.packagePath, entries, skill.workspaceScope, skill.name).then((previews) => {
+    if (skill.type === "package" && (skill.packageStorage || (skill.packagePath && skill.workspaceScope))) {
+      void readPackagePreviews(skill.packagePath || "", entries, skill.workspaceScope || "", skill.name, skill.packageStorage).then((previews) => {
         if (generation === uploadGeneration.current) setPackagePreviews(previews);
       });
     }
     setUploadError("");
     setOriginalPackagePath(skill.packagePath || null);
     setOriginalPackageWorkspace(skill.workspaceScope || null);
-    setUploadStatus(skill.packagePath ? "done" : "idle");
+    setUploadStatus(skill.packageStorage || skill.packagePath ? "done" : "idle");
     setContentTab("edit");
     setIsAddingSkill(true);
   };
 
   const handleUploadPackage = async () => {
-    if (!currentWorkspace) {
-      setUploadError(copy.workspaceRequired);
-      setUploadStatus("error");
-      return;
-    }
     const generation = ++uploadGeneration.current;
-    const workspace = currentWorkspace;
-    let extractedPath: string | null = null;
     setUploadError("");
     setUploadStatus("uploading");
     try {
@@ -323,37 +342,31 @@ export default function SkillsModal({
       });
       if (generation !== uploadGeneration.current) return;
       if (!selected) {
-        setUploadStatus(formPackagePath ? "done" : "idle");
+        setUploadStatus(formPackageStorage || formPackagePath ? "done" : "idle");
         return;
       }
       const zipPath = typeof selected === "string" ? selected : selected[0];
-      const result = await invoke<{ name: string; entry_point: string; entry_points?: string[]; local_path: string }>("extract_protocol_package", { zipPath, workspace });
-      extractedPath = result.local_path;
-      if (generation !== uploadGeneration.current) {
-        cleanupProtocolPackage(extractedPath, workspace);
-        return;
-      }
-      const entries = [...new Set(result.entry_points?.length ? result.entry_points : [result.entry_point])];
-      if (!entries.length || entries.some((entry) => !isSafeProtocolPackagePath(result.local_path, entry))) {
+      const result = await extractGlobalSkillPackage(zipPath);
+      if (generation !== uploadGeneration.current) return;
+      const storage = { kind: "global" as const, packageId: result.packageId };
+      const entries = [...new Set(result.entryPoints)];
+      if (!entries.length || !/^[a-f0-9]{64}$/.test(result.packageId)) {
         throw new Error(copy.importRetry);
       }
-      const previews = await readPackagePreviews(result.local_path, entries, workspace, result.name);
-      if (generation !== uploadGeneration.current) {
-        cleanupProtocolPackage(extractedPath, workspace);
-        return;
-      }
-      if (formPackagePath && formPackagePath !== originalPackagePath && formPackagePath !== result.local_path) {
+      const previews = await readPackagePreviews("", entries, "", result.name, storage);
+      if (generation !== uploadGeneration.current) return;
+      if (formPackagePath && formPackagePath !== originalPackagePath) {
         cleanupProtocolPackage(formPackagePath, formPackageWorkspace);
       }
-      setFormPackagePath(result.local_path);
-      setFormPackageWorkspace(workspace);
-      setFormEntryPoint(result.entry_point);
+      setFormPackagePath(null);
+      setFormPackageWorkspace(null);
+      setFormPackageStorage(storage);
+      setFormEntryPoint(result.entryPoint);
       setFormEntryPoints(entries);
       setPackagePreviews(previews);
       if (!formName.trim()) setFormName(result.name);
       setUploadStatus("done");
     } catch (error) {
-      if (extractedPath) cleanupProtocolPackage(extractedPath, workspace);
       if (generation !== uploadGeneration.current) return;
       console.error("Package upload failed:", error);
       setUploadError(error instanceof Error ? error.message : String(error));
@@ -409,9 +422,18 @@ export default function SkillsModal({
                         )}
                         {skill.desc}
                       </div>
-                      {skill.type === "package" && skill.packagePath && (
-                        <div className="text-[10px] text-[#60a5fa] mt-1 font-mono">
-                          {copy.installedAt} {skill.packagePath}
+                      {skill.type === "package" && (
+                        <div className="text-[10px] mt-1" style={{ color: "var(--surface-text-muted)" }}>
+                          <span className="block" title={skill.workspaceScope || undefined}>
+                            {skill.packageStorage?.kind === "global"
+                              ? copy.globalScope
+                              : skill.workspaceScope ? `${copy.projectScope} ${skill.workspaceScope}` : copy.unknownScope}
+                          </span>
+                          <span className="block mt-1 font-mono break-all">
+                            {copy.installedAt} {skill.packageStorage?.kind === "global"
+                              ? `${copy.globalLocation} · ${skill.packageStorage.packageId.slice(0, 12)}`
+                              : skill.packagePath}
+                          </span>
                           <span className="block mt-1">{copy.containsSkills(skill.entryPoints?.length || 1)}</span>
                         </div>
                       )}
@@ -477,20 +499,20 @@ export default function SkillsModal({
                   <div className="flex items-center gap-3">
                     <button
                       onClick={handleUploadPackage}
-                      disabled={uploadStatus === "uploading" || !currentWorkspace}
+                      disabled={uploadStatus === "uploading"}
                       className="flex items-center gap-2 px-4 py-2 text-[12px] font-bold bg-[#0f1f2e] border border-[#3b82f6] text-[#60a5fa] rounded-md hover:bg-[#1e3a5f] transition-colors disabled:opacity-50"
                     >
                       <IconPackage className="w-3.5 h-3.5" />
                       {uploadStatus === "uploading" ? copy.extracting : copy.uploadZip}
                     </button>
-                    {uploadStatus === "done" && formPackagePath && (
-                      <span className="text-[11px] text-[#22c55e] font-mono">✓ {formPackagePath}</span>
+                    {uploadStatus === "done" && (formPackageStorage || formPackagePath) && (
+                      <span className="text-[11px] font-mono" style={{ color: "var(--surface-text)" }}>✓ {formPackageStorage ? copy.globalScope : formPackagePath}</span>
                     )}
                     {uploadStatus === "error" && (
                       <span role="alert" className="text-[11px] text-red-400">{copy.uploadFailed}: {uploadError} {copy.importRetry}</span>
                     )}
                   </div>
-                  {!currentWorkspace && <p role="status" className="text-[11px] text-[#a1a1aa] mt-2">{copy.workspaceRequired}</p>}
+                  <p role="status" className="text-[11px] mt-2" style={{ color: "var(--surface-text-muted)" }}>{copy.globalImport}</p>
                   <p className="text-[10px] text-[#71717a] mt-1.5">{copy.packageUploadHint}</p>
                   <p className="text-[11px] text-[#a1a1aa] mt-2 leading-relaxed">{copy.unityImportHint}</p>
                   {formEntryPoints.length > 0 && (
@@ -575,7 +597,7 @@ export default function SkillsModal({
 
               <div className="flex gap-3 pt-2">
                 <button onClick={handleCancel} className="flex-1 py-2 text-[12px] font-medium text-[#a1a1aa] border border-[#27272a] bg-[#000000] rounded-md hover:bg-[#18181b] transition-colors">{copy.cancel}</button>
-                <button onClick={handleSaveSkill} disabled={!formName.trim() || (formType === "package" ? !formPackagePath || !formPackageWorkspace || uploadStatus === "uploading" : !formContent.trim())} className="flex-1 py-2 text-[12px] theme-bg theme-bg-hover font-bold rounded-md transition-colors disabled:opacity-50">{isFormEditing ? copy.updateSkill : copy.saveSkill}</button>
+                <button onClick={handleSaveSkill} disabled={!formName.trim() || (formType === "package" ? !(formPackageStorage || (formPackagePath && formPackageWorkspace)) || uploadStatus === "uploading" : !formContent.trim())} className="flex-1 py-2 text-[12px] theme-bg theme-bg-hover font-bold rounded-md transition-colors disabled:opacity-50">{isFormEditing ? copy.updateSkill : copy.saveSkill}</button>
               </div>
             </div>
           )}

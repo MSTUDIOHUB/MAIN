@@ -1013,6 +1013,32 @@ export function readFile(path: string, workspace?: string): Promise<string> {
   return invoke<string>("read_file", { path, workspace });
 }
 
+export interface GlobalSkillPackageMeta {
+  packageId: string;
+  name: string;
+  entryPoint: string;
+  entryPoints: string[];
+  files: string[];
+  reused: boolean;
+}
+
+export function extractGlobalSkillPackage(zipPath: string): Promise<GlobalSkillPackageMeta> {
+  return invoke<GlobalSkillPackageMeta>("extract_global_skill_package", { zipPath });
+}
+
+export function promoteLegacySkillPackage(workspace: string, localPath: string): Promise<GlobalSkillPackageMeta> {
+  return invoke<GlobalSkillPackageMeta>("promote_legacy_skill_package", { workspace, localPath });
+}
+
+export function inspectGlobalSkillPackage(packageId: string): Promise<GlobalSkillPackageMeta> {
+  return invoke<GlobalSkillPackageMeta>("inspect_global_skill_package", { packageId });
+}
+
+/** Read verified UTF-8 guidance from an immutable package, never a workspace. */
+export function readGlobalSkillPackageFile(packageId: string, relativePath: string): Promise<string> {
+  return invoke<string>("read_global_skill_package_file", { packageId, relativePath });
+}
+
 export interface DiscoveredPersonalAgentSkill {
   entryPath: string;
   basePath: string;

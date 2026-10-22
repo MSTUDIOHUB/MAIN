@@ -5,6 +5,21 @@ export interface ProtocolPackageLike {
   entryPoint?: string | null;
   workspaceScope?: string | null;
   name?: string;
+  packageStorage?: { kind: string; packageId?: string } | null;
+}
+
+export function globalProtocolPackageId(pkg: ProtocolPackageLike): string | null {
+  const storage = pkg.packageStorage;
+  return pkg.active && pkg.type === "package" && storage?.kind === "global" &&
+    typeof storage.packageId === "string" && /^[a-f0-9]{64}$/.test(storage.packageId)
+    ? storage.packageId : null;
+}
+
+/** No roots, schemes, traversal or fuzzy basename resolution for resources. */
+export function isSafeGlobalSkillRelativePath(value: string): boolean {
+  return !!value && !/^[\\/]|^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) &&
+    !value.includes("\\") && !value.includes("\0") &&
+    value.split("/").every((part) => !!part && part !== "." && part !== "..");
 }
 
 function normalizeSlashPath(value: string): string {
@@ -49,10 +64,11 @@ function normalizeWorkspaceScope(value: string | null | undefined): string {
 }
 
 export function isProtocolPackageApplicableToWorkspace(
-  pkg: Pick<ProtocolPackageLike, "active" | "type" | "packagePath" | "entryPoint" | "workspaceScope">,
+  pkg: Pick<ProtocolPackageLike, "active" | "type" | "packagePath" | "entryPoint" | "workspaceScope" | "packageStorage">,
   workspace: string,
 ): boolean {
   if (!pkg.active || pkg.type !== "package" || !pkg.packagePath) return false;
+  if (pkg.packageStorage != null) return false;
 
   const workspaceScope = normalizeWorkspaceScope(pkg.workspaceScope);
   if (workspaceScope) {

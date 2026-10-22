@@ -17,6 +17,7 @@ test.beforeEach(async ({ page }) => {
     const requests: Array<{ body: string }> = [];
     const deletedPackages: Array<{ localPath: string; workspace: string }> = [];
     const extractedPackages: string[] = [];
+    const globalPackageId = "a".repeat(64);
     const entryPoints = [
       "skills-main/skills/unity-cli/SKILL.md",
       "skills-main/skills/zzz-folder/SKILL.md",
@@ -26,6 +27,10 @@ test.beforeEach(async ({ page }) => {
       `${packageRoot}/${entry}`,
       ["---", `name: ${index ? "zzz-sprite-tool" : "unity-cli"}`, "description: Unity fixture workflow.", "---", index ? "UNITY_LAST_SKILL_SENTINEL" : "UNITY_CLI_SKILL_SENTINEL"].join("\n"),
     ]));
+    const globalMeta = {
+      packageId: globalPackageId, name: "Unity Skills", entryPoint: entryPoints[0],
+      entryPoints, files: entryPoints, reused: false,
+    };
     (window as any).__SKILLS_RUNTIME_E2E__ = { requests, deletedPackages, extractedPackages };
 
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= {
@@ -57,6 +62,27 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? "");
       if (cmd === "get_workspace_root") return "/tmp/e2e-cloud-tool-fallback";
       if (cmd === "plugin:dialog|open") return "/tmp/unity-skills.zip";
+      if (cmd === "extract_global_skill_package") {
+        const state = (window as any).__SKILLS_RUNTIME_E2E__;
+        // Global imports have no workspace argument, including in project chat.
+        if (args?.workspace !== undefined) throw new Error("Global import must not bind a workspace");
+        extractedPackages.push("global");
+        if (state.extractError) throw new Error(state.extractError);
+        if (state.holdExtraction) await new Promise<void>((resolve) => { state.releaseExtraction = resolve; });
+        state.extractionSettled = true;
+        return { ...globalMeta, reused: extractedPackages.length > 1 };
+      }
+      if (cmd === "inspect_global_skill_package") {
+        if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
+        return globalMeta;
+      }
+      if (cmd === "read_global_skill_package_file") {
+        if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
+        const source = packageFiles[`${packageRoot}/${String(args?.relativePath ?? "")}`];
+        if (source === undefined) throw new Error("ENOENT");
+        return (window as any).__SKILLS_RUNTIME_E2E__.invalidMetadata
+          ? "---\nname: [broken\n---\nInvalid metadata fixture" : source;
+      }
       if (cmd === "extract_protocol_package") {
         extractedPackages.push(String(args?.workspace ?? ""));
         const state = (window as any).__SKILLS_RUNTIME_E2E__;
@@ -137,6 +163,15 @@ test.beforeEach(async ({ page }) => {
         await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         const body = String(args?.body ?? "{}");
         requests.push({ body });
+        if (body.includes("Interpret MAIN's current user request.")) {
+          return JSON.stringify({ output_text: JSON.stringify({
+            semantic: {
+              objective: "提供技能工作流建议",
+              workType: (window as any).__SKILLS_RUNTIME_E2E__.providerFlow === "list-load" ? "investigate" : "answer",
+              answerFormat: "answer", requiredCapabilities: [], forbiddenCapabilities: [],
+            }, confidence: 0.99, needsUserChoice: false,
+          }) });
+        }
         if ((window as any).__SKILLS_RUNTIME_E2E__.providerFlow === "list-load") {
           const receipts: any[] = [];
           const collectReceipts = (value: any) => {
@@ -191,6 +226,13 @@ async function createRuntimeSession(page: import("@playwright/test").Page, works
     const scope = state.currentWorkspace || "__MAIN_GLOBAL_CHAT__";
     return state.sessionsByWorkspace?.[scope]?.find((session: any) => session.id === state.currentSessionId)?.planLifecycleEpoch;
   })).toMatch(/^plan-session-/);
+}
+
+async function submitSkillRequest(page: import("@playwright/test").Page, text: string) {
+  // Exercise Composer -> semantic preflight -> Turn admission -> provider loop.
+  // The legacy scenario bridge deliberately bypasses intent routing.
+  await page.getByTestId("composer-textarea").fill(text);
+  await page.getByTestId("composer-send-button").click();
 }
 
 test("panel Agent Skill persists manual-only admission into the next Turns", async ({
@@ -270,12 +312,7 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
   await page.evaluate(() => {
     (window as any).__SKILLS_RUNTIME_E2E__.requests.length = 0;
   });
-  const ordinarySent = await page.evaluate(() =>
-    (window as any).__CODELY_E2E__?.sendCloudMessage?.(
-      "请直接回答一个普通问题。",
-    ),
-  );
-  expect(ordinarySent).toBe(true);
+  await submitSkillRequest(page, "请直接回答一个普通问题。");
   await expect
     .poll(async () =>
       page.evaluate(
@@ -308,12 +345,7 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
   await page.evaluate(() => {
     (window as any).__SKILLS_RUNTIME_E2E__.requests.length = 0;
   });
-  const explicitSent = await page.evaluate((name) =>
-    (window as any).__CODELY_E2E__?.sendCloudMessage?.(
-      `请使用 @${name} 给出一句建议。`,
-    ), SKILL_NAME,
-  );
-  expect(explicitSent).toBe(true);
+  await submitSkillRequest(page, `请使用 @${SKILL_NAME} 给出一句建议。`);
   await expect
     .poll(async () =>
       page.evaluate((previousTurnId) => {
@@ -381,36 +413,77 @@ test("a Unity skill collection imports all entries and activates the final skill
   await page.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "完成", exact: true }).click();
   await createRuntimeSession(page, true);
-  expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.sendCloudMessage?.("请使用 $zzz-sprite-tool 给出一句建议。"))).toBe(true);
+  await submitSkillRequest(page, "请使用 $zzz-sprite-tool 给出一句建议。");
   await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
   const requests = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
   expect(requests.some((body: string) => body.includes("[EXPLICITLY ACTIVATED SKILL") && body.includes("UNITY_LAST_SKILL_SENTINEL"))).toBe(true);
 });
 
-test("canceling a skill collection import removes the extracted package", async ({ page }) => {
+test("canceling a global import leaves shared cache unregistered", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-tool-fallback");
   const modal = await openPackageForm(page);
   await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
   await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
   await modal.getByRole("button", { name: "取消", exact: true }).click();
-  await expect.poll(() => page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages)).toEqual([
-    { localPath: ".protocols/unity-skills-fixture", workspace: "/tmp/e2e-cloud-tool-fallback" },
-  ]);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages)).toEqual([]);
   expect(await page.evaluate(() => {
     const data = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}");
     return (data?.state?.skills || []).some((skill: any) => skill.name === "Unity Skills");
   })).toBe(false);
 });
 
-test("package import explains that a workspace must be opened first", async ({ page }) => {
+test("a global collection installs without a workspace and survives reload", async ({ page }) => {
   await page.goto("/?e2eScenario=global-chat-tool-scope");
   const modal = await openPackageForm(page);
-  await expect(modal.getByText("请先打开项目文件夹，再导入技能包。", { exact: true })).toBeVisible();
-  await expect(modal.getByRole("button", { name: "上传 ZIP", exact: true })).toBeDisabled();
+  await expect(modal.getByText("全局安装，一次导入后可在所有项目中使用。", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  await expect(modal.getByText("全局 · 所有项目", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state;
+    const skill = state.skills.find((candidate: any) => candidate.name === "Unity Skills");
+    return { storage: skill?.packageStorage, scope: skill?.workspaceScope ?? null, workspace: state.currentWorkspace || null };
+  })).toEqual({ storage: { kind: "global", packageId: "a".repeat(64) }, scope: null, workspace: null });
+  await page.reload();
+  await createRuntimeSession(page, false);
+  await submitSkillRequest(page, "请使用 $zzz-sprite-tool 给出一句建议。");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
+  const bodies: string[] = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
+  expect(bodies.some((body) => body.includes("[EXPLICITLY ACTIVATED SKILL") && body.includes("UNITY_LAST_SKILL_SENTINEL"))).toBe(true);
+  // Reopen a project through the scenario's normal startup and create a real
+  // Session. The same registration works without another ZIP extraction.
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await createRuntimeSession(page, true);
+  await submitSkillRequest(page, "请使用 $zzz-sprite-tool 给出一句建议。");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
+  const projectBodies: string[] = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
+  expect(projectBodies.some((body) => body.includes("[EXPLICITLY ACTIVATED SKILL") && body.includes("UNITY_LAST_SKILL_SENTINEL"))).toBe(true);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.extractedPackages)).toEqual([]);
+});
+
+test("reimporting identical content preserves the existing registration and manual policy", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.locator('input[type="text"]').first().fill("My Unity Skills");
+  await modal.locator('input[type="checkbox"]').uncheck();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  const before = await page.evaluate(() => JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state.skills.find((skill: any) => skill.name === "My Unity Skills"));
+  await modal.getByRole("button", { name: "添加技能", exact: true }).click();
+  await modal.getByRole("button", { name: "协议包", exact: true }).click();
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  const registrations = await page.evaluate(() => JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state.skills.filter((skill: any) => skill.packageStorage?.kind === "global"));
+  expect(registrations).toEqual([before]);
+  expect(registrations[0].allowImplicitInvocation).toBe(false);
+  await expect(modal.getByText("仅手动", { exact: true })).toBeVisible();
 });
 
 
-test("closing during extraction cleans up the late package without saving it", async ({ page }) => {
+test("closing during extraction cannot register a late global package", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-tool-fallback");
   const modal = await openPackageForm(page);
   await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.holdExtraction = true; });
@@ -418,7 +491,8 @@ test("closing during extraction cleans up the late package without saving it", a
   await expect.poll(() => page.evaluate(() => typeof (window as any).__SKILLS_RUNTIME_E2E__.releaseExtraction)).toBe("function");
   await modal.getByRole("button", { name: "关闭", exact: true }).click();
   await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.releaseExtraction());
-  await expect.poll(() => page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.extractionSettled)).toBe(true);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages)).toEqual([]);
   await page.getByRole("button", { name: "技能与提示词" }).click();
   await expect(page.getByText("Unity Skills", { exact: true })).toHaveCount(0);
 });
@@ -442,7 +516,7 @@ test("load_skill lists every collection page then loads a discovered Skill throu
   await modal.getByRole("button", { name: "完成", exact: true }).click();
   await createRuntimeSession(page, true);
   await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.providerFlow = "list-load"; });
-  expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.sendCloudMessage?.("请从已安装技能中找到精灵工作流并给出建议。"))).toBe(true);
+  await submitSkillRequest(page, "请从已安装技能中找到精灵工作流并给出建议。");
   await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
   const runtimeBodies: string[] = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests
     .map((request: any) => request.body).filter((body: string) => body.includes("[MAIN RUNTIME V2]")));
