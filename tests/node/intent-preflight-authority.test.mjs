@@ -74,6 +74,23 @@ test("semantic preflight drops model authority, commands, and completion claims"
   assert.deepEqual(result.semantic.forbiddenCapabilities, ["workspace_write", "command"]);
 });
 
+test("valid semantic objectives supply missing display titles without changing semantics", async () => {
+  for (const title of [undefined, "", " \n "]) {
+    const wire = candidate();
+    if (title !== undefined) wire.title = title;
+    const result = await loadPreflight(wire)(params);
+    assert.equal(result.title, wire.semantic.objective);
+    assert.deepEqual(result.semantic, wire.semantic);
+    assert.equal(result.intent, "respond");
+    assert.equal(result.commandDirective.kind, "none");
+    assert.equal(result.requiresApproval, false);
+  }
+  const explicit = await loadPreflight({ ...candidate(), title: "## Result provenance" })(params);
+  assert.equal(explicit.title, "Result provenance");
+  assert.equal(explicit.summary, candidate().semantic.objective);
+  assert.equal(await loadPreflight({ title: "A title alone is not a semantic result" })(params), null);
+});
+
 test("work and capabilities determine execution independently of response format", async () => {
   for (const [workType, requiredCapabilities, answerFormat, intent, kind] of [
     ["implement", ["workspace_read", "workspace_write", "command"], "analysis", "execute", "file_modify"],

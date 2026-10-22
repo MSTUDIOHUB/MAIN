@@ -7,7 +7,7 @@ import ts from "typescript";
 
 // Use the same real-store loader as session-runtime-restore. Provider
 // transport, background title generation, and the final workflow are replaced.
-function createHarness(suffix, { deferBootstrap = false, deferCancellation = false } = {}) {
+function createHarness(suffix, { deferBootstrap = false, deferCancellation = false, observeSemanticTitles = false } = {}) {
   const moduleCache = new Map();
   const requests = [];
   const workflows = [];
@@ -15,6 +15,8 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
   const pendingRejections = [];
   const pendingBootstraps = [];
   const pendingCancellationWrites = [];
+  const metadataDecisions = [];
+  const titleRequests = [];
   function load(sourcePath) {
     const normalizedPath = path.resolve(sourcePath);
     if (moduleCache.has(normalizedPath)) return moduleCache.get(normalizedPath);
@@ -51,7 +53,17 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
           },
         };
         if (base === path.resolve("src/store/submitTitleEffects")) return {
-          ...load(`${base}.ts`), startSubmitSemanticMetadataEffect: async () => {},
+          ...load(`${base}.ts`), startSubmitSemanticMetadataEffect: (input) => {
+            if (!observeSemanticTitles) return Promise.resolve();
+            metadataDecisions.push(input.decision);
+            return load(`${base}.ts`).startSubmitSemanticMetadataEffect({
+              ...input,
+              requestSemanticTurnMetadata: async (request) => {
+                titleRequests.push(request);
+                return { title: "Separate title request", summary: "This auxiliary request should be unnecessary" };
+              },
+            });
+          },
         };
         if (base === path.resolve("src/store/commitCanceledTurn") && deferCancellation) {
           const actual = load(`${base}.ts`);
@@ -102,7 +114,7 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
     saveCurrentRuntimeToSession() {},
   }, true);
   return {
-    store, requests, workflows, pending, pendingBootstraps, pendingCancellationWrites, sessionKey, sessionEpoch, queueModule, buildEmptySessionRuntimeSnapshot,
+    store, requests, workflows, pending, pendingBootstraps, pendingCancellationWrites, metadataDecisions, titleRequests, sessionKey, sessionEpoch, queueModule, buildEmptySessionRuntimeSnapshot,
     getCancellation: () => getPendingSessionCancellation(sessionKey),
     makeGlobal() {
       const { GLOBAL_CHAT_KEY, resolveGlobalChatSessionKey } = load("src/lib/sessionTypes.ts");
@@ -843,3 +855,34 @@ test("a global mode-choice recovery reclassifies the original restricted body wi
     assert.equal(harness.store.getState().currentWorkspace, null);
   } finally { harness.cleanup(); }
 });
+
+for (const title of [undefined, "", " \n "]) {
+  test(`validated semantic objective supplies the existing title gate without another request (${title === undefined ? "omitted" : title === "" ? "empty" : "whitespace"})`, async () => {
+    const harness = createHarness(`reused-semantic-title-${title === undefined ? "omitted" : title === "" ? "empty" : "whitespace"}`, { observeSemanticTitles: true });
+    try {
+      const originalRequest = "Fix src/save.ts so the save button works, preserve its public interface, and run the relevant tests.";
+      const receipt = await harness.accept(originalRequest);
+      const result = semanticResult("implement", ["workspace_read", "workspace_write", "command"], "analysis", ["network"]);
+      result.semantic.objective = "Repair the save button";
+      if (title === undefined) delete result.title;
+      else result.title = title;
+      harness.resolve(0, result);
+      await waitFor(() => harness.workflows.length === 1);
+      assert.equal(harness.workflows.length, 1);
+      assert.equal(harness.metadataDecisions.length, 1, "the real submission must evaluate the existing title request gate");
+      assert.equal(harness.titleRequests.length, 0, "valid preflight semantics must not trigger the background title model");
+      assert.equal(harness.metadataDecisions[0], null);
+      const workflow = harness.workflows[0];
+      assert.equal(workflow.options.turnTitle, result.semantic.objective);
+      assert.equal(workflow.text, originalRequest, "a UI title never replaces the original task");
+      assert.equal(workflow.turnId, receipt.turnId);
+      assert.equal(workflow.options.admittedUserBlockId, receipt.userBlockId);
+      assert.deepEqual(workflow.options.semanticIntent, result.semantic);
+      assert.equal(workflow.effectiveRunIntent, "execute");
+      assert.equal(workflow.options.executionConsentGranted, undefined, "title reuse carries no tool approval");
+      assert.equal(harness.requests.length, 1);
+      assert.equal(harness.store.getState().conversationTurns.find((turn) => turn.id === receipt.turnId).userPrompt, originalRequest);
+      assert.equal(harness.store.getState().taskFlow.filter((block) => block.type === "user" && block.turnId === receipt.turnId).length, 1);
+    } finally { harness.cleanup(); }
+  });
+}

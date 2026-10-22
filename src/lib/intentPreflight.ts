@@ -126,9 +126,11 @@ function normalizePreflightResult(
     semantic,
     intent,
     confidence: candidate.confidence,
-    title: typeof candidate.title === "string"
-      ? normalizeConversationDisplayTitle(candidate.title, language === "en" ? 48 : 32, language === "en" ? "New task" : "新的任务")
-      : undefined,
+    title: normalizeConversationDisplayTitle(
+      typeof candidate.title === "string" && candidate.title.trim() ? candidate.title : semantic.objective,
+      language === "en" ? 48 : 32,
+      language === "en" ? "New task" : "新的任务",
+    ),
     summary: semantic.objective,
     needsUserChoice,
     question: question ?? (conflicts
