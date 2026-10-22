@@ -54,6 +54,17 @@ Skills remain supported for actual project-specific instructions.
 - Receiving instructions, discovering commands, compiling code, advancing
   frames, and passing game interactions are distinct facts. A development run
   cannot use discovery receipts as proof that the requested game exists.
+- Pressure selection must retain actually read Skill guidance separately from
+  editable source evidence. Deduplicate exact document/version windows instead
+  of expanding catalog bodies. If the shared input budget evicts guidance,
+  disclose that its text is absent and preserve exact document-local reread
+  targets and ranges. An evicted read must remain recoverable through the normal
+  authorized tool path; a duplicate-read guard must not make that pointer unusable.
+- Same-Run recovery uses the exact bounded Skill receipt in the canonical
+  checkpoint, including its document revision and source range. A display prefix
+  cannot reconstruct missing instructions. Restoring guidance does not restore
+  a source lease, approval, or an old mutation request; pending Skill reads still
+  pass through the ordinary tool execution and authorization path.
 
 R21 demonstrated excessive up-front discovery and four document-target/version
 mistakes before cancellation, with no game mutation. A separate production
@@ -61,3 +72,13 @@ function regression demonstrated fixed 12,000-character clipping of JSON that
 fit the Run's 64,000-character window. Those are separate evidence classes:
 the saved R21 UI projections do not reconstruct its complete raw CLI stdout,
 so the clipping regression does not prove the cause of every R21 query.
+
+R26 loaded both CLI and Pipeline guidance successfully. At its first pressure
+boundary, the production decision selector retained one source read and the
+latest four shell results but dropped all ten Skill receipts, including the
+bulk-builder section. This was confirmed by call-identity selection replay and
+matching 30-to-10 message telemetry, not a reconstruction of the missing full
+outbound HTTP body. The operator canceled at a pending discovery approval;
+no game was implemented or accepted. Loss of guidance is a confirmed harness
+defect, but it does not establish that every preceding discovery call was caused
+by compression.

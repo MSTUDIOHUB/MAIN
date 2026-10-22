@@ -1,4 +1,5 @@
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
 import {
   providerActionEpochExhausted,
@@ -291,6 +292,24 @@ export function createRuntimeV2ProviderPort(
             completedIdentities.delete(
               runtimeV2ProviderToolCallIdentity(call),
             );
+          }
+          const skillWindows = runtimeV2TranscriptSkillGuidanceWindows(input.live.messages);
+          for (const call of schedulingCalls.filter(call => call.name === "load_skill")) {
+            const identity = runtimeV2ProviderToolCallIdentity(call);
+            const prior = skillWindows.filter(window => runtimeV2ProviderToolCallIdentity({
+              name: window.call.function.name, arguments: JSON.parse(window.call.function.arguments),
+            }) === identity);
+            const latest = prior[prior.length - 1];
+            if (!latest) continue;
+            const missing = prior.filter(window => window.documentKey === latest.documentKey && window.version === latest.version).some(window => {
+              const coveredEnd = (input.live.latestProviderRequestSkillGuidanceWindows || [])
+                .filter(visible => visible.documentKey === window.documentKey && visible.version === window.version)
+                .sort((a, b) => a.returnedRange.startChar - b.returnedRange.startChar)
+                .reduce((end, visible) => visible.returnedRange.startChar <= end
+                  ? Math.max(end, visible.returnedRange.endChar) : end, window.returnedRange.startChar);
+              return coveredEnd < window.returnedRange.endChar;
+            });
+            if (missing) completedIdentities.delete(identity);
           }
           const rejectedIdentities = new Set(
             providerEffectFacts.rejectedActionIdentities,

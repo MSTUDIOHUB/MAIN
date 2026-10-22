@@ -59,6 +59,7 @@ import {
   runtimeV2TerminalOutcomeToLegacy,
 } from "./executionRunnerIdentity";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
+import { restoreRuntimeV2SkillHistory } from "./executionSkillHistory";
 import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import {
   resolveRuntimeV2ObjectiveAdmission,
@@ -258,6 +259,7 @@ export async function runSubmitRuntimeV2Execute(
       );
       await controller.reobserveAfterLegacyMigration();
     } else {
+      restoreRuntimeV2SkillHistory(live, existing.aggregate, identity.run);
       input.logStoreEvent("runtime_v2_execute_resuming_scheduled", {
         turnId: identity.turn.turnId,
         runId: identity.run.runId,

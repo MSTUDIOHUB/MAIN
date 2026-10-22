@@ -71,6 +71,13 @@ export interface RuntimeV2MaterializedSourceCoverage {
   readonly complete: boolean;
 }
 
+/** Derived visibility only: exact guidance windows in the latest outbound
+ * request. No body, checkpoint memory, source lease or tool authority. */
+export type RuntimeV2MaterializedSkillGuidanceWindow = Pick<
+  import("./executionProviderSkillTranscript").RuntimeV2TranscriptSkillGuidanceWindow,
+  "documentKey" | "version" | "returnedRange" | "readTarget"
+>;
+
 export type RuntimeV2ProviderActionWindow =
   | "corrective_source"
   | "corrective_mutation"
@@ -92,6 +99,8 @@ export interface RuntimeV2LiveExecutionState {
    * provider attempt. It is process-local and is never checkpoint authority. */
   latestProviderRequestSourceCoverage:
     readonly RuntimeV2MaterializedSourceCoverage[];
+  latestProviderRequestSkillGuidanceWindows:
+    readonly RuntimeV2MaterializedSkillGuidanceWindow[];
   /** Process-local decoding pressure for the next provider request. This
    * narrows only the advertised next-action catalog after a causally closed
    * no-effect loop; durable authorization and the full post-mutation surface
@@ -158,6 +167,7 @@ export function createRuntimeV2LiveExecutionState(): RuntimeV2LiveExecutionState
     coveredReadToolResults: new Map(),
     parallelReadCountByToolCallId: new Map(),
     latestProviderRequestSourceCoverage: [],
+    latestProviderRequestSkillGuidanceWindows: [],
     latestProviderActionWindow: null,
     correctiveValidationCommand: null,
     mutationSourceCoverageByToolCallId: new Map(),

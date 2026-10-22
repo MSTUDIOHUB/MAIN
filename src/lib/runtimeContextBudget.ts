@@ -360,6 +360,7 @@ export function boundRuntimeMessagesToContext(
 export function boundRuntimeMessageGroupsToInputBudget(
   messages: readonly AgentMessage[],
   inputBudget: number,
+  options: { readonly priorityToolCallIds?: ReadonlySet<string> } = {},
 ): AgentMessage[] {
   const budget = Math.max(0, Math.floor(inputBudget));
   const receiptIndices = new Map<string, number[]>();
@@ -390,7 +391,13 @@ export function boundRuntimeMessageGroupsToInputBudget(
   const latestContentGroup = [...groups].reverse().find((group) => group[0]?.role !== "system");
   if (latestContentGroup) protectedGroups.add(latestContentGroup);
   let result = [...messages];
-  for (const group of groups) {
+  // Read guidance remains useful across ordinary tool observations. Prefer
+  // evicting other historical groups first; the same hard token bound still
+  // applies, and callers must disclose any guidance that cannot fit.
+  const evictionOrder = [...groups].sort((left, right) =>
+    Number(left[0]?.tool_calls?.some((call) => options.priorityToolCallIds?.has(call.id)) || false) -
+    Number(right[0]?.tool_calls?.some((call) => options.priorityToolCallIds?.has(call.id)) || false));
+  for (const group of evictionOrder) {
     if (estimateMessagesTokens(result as TrimMessage[]) <= budget) return result;
     if (protectedGroups.has(group)) continue;
     const removed = new Set(group);

@@ -1,4 +1,5 @@
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
   deriveBudgetedStreamSettings,
@@ -83,6 +84,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     settings,
   );
   input.live.latestProviderAssistantReasoning = null;
+  input.live.latestProviderRequestSkillGuidanceWindows = [];
   const requestMode = String(input.command.payload.mode || "").trim();
   let streamedText = "";
   recordApprovedPlanContext(input.ports);
@@ -314,6 +316,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
   input.live.latestProviderRequestSourceCoverage = executeRequest?.coverage || materializedRuntimeV2SourceCoverage(
       messages, input.ports.context.runWorkspace || "", providerEffectFacts,
     );
+  input.live.latestProviderRequestSkillGuidanceWindows = runtimeV2TranscriptSkillGuidanceWindows(messages)
+    .map(({ documentKey, version, returnedRange, readTarget }) => ({ documentKey, version, returnedRange, readTarget }));
   sourceOnlyFrontier = effectPressure?.reason === "source_only_frontier" && input.live.latestProviderRequestSourceCoverage.length > 0;
   const estimatedInputTokens = estimateMessagesTokens(messages as TrimMessage[]) + toolSchemaTokens;
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
@@ -388,6 +392,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     decisionViewApplied: !readOnly && (standardConversation.length !== canonicalDecisionConversation.length || standardConversation.some((message, index) => message !== canonicalDecisionConversation[index])),
     contextPolicy: readOnly ? "read_only_budget" : "execute_decision",
     canonicalConversationMessages: history.messages.length,
+    visibleSkillGuidanceWindows: input.live.latestProviderRequestSkillGuidanceWindows.length,
+    visibleSkillGuidanceDocuments: new Set(input.live.latestProviderRequestSkillGuidanceWindows.map(window => window.documentKey)).size,
     removedDecisionMessages: Math.max(
       0,
       readOnly ? unboundedMessages.length - messages.length : history.messages.length - boundedConversation.length,
@@ -529,6 +535,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
           input.ports.context.runWorkspace || "",
           providerEffectFacts,
         );
+      input.live.latestProviderRequestSkillGuidanceWindows = runtimeV2TranscriptSkillGuidanceWindows(recoveryMessages)
+        .map(({ documentKey, version, returnedRange, readTarget }) => ({ documentKey, version, returnedRange, readTarget }));
       result = await streamChatCompletion(
         recoveryMessages,
         adapterCapabilities.reasoningToggle

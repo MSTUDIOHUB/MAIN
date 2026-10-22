@@ -17,6 +17,10 @@ import {
   minimumSourceWindowCover,
   sourceWindowsExtendContinuousCoverage,
 } from "./executionProviderSourceCover";
+import {
+  activeRuntimeV2SkillGuidanceWindows,
+  runtimeV2EvictedSkillGuidanceNotice,
+} from "./executionProviderSkillTranscript";
 
 const RUNTIME_V2_PROVIDER_FEEDBACK_PREFIX =
   "[runtime-v2 provider feedback:";
@@ -594,6 +598,7 @@ export function buildRuntimeV2DecisionView(
   })();
   const selectedCallIds = new Set([
     ...activeSourceCallIds,
+    ...activeRuntimeV2SkillGuidanceWindows(messages).map((window) => window.callId),
     ...[...latestCommittedCallIdByTarget.values()]
       .map((entry) => entry.callId),
     ...(latestFailedValidation
@@ -670,5 +675,21 @@ export function boundRuntimeV2ProviderConversation(
     options.contextLimit, options.reservedOutputTokens,
   ).inputBudget;
   if (estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
-  return boundRuntimeMessageGroupsToInputBudget(buildRuntimeV2DecisionView(messages, effects), inputBudget);
+  const decision = buildRuntimeV2DecisionView(messages, effects);
+  const guidance = activeRuntimeV2SkillGuidanceWindows(decision);
+  const priorityToolCallIds = new Set(guidance.map((window) => window.callId));
+  const evictedIds = new Set<string>();
+  // A notice consumes input tokens too. Recompute from the same canonical
+  // projection until every newly evicted window is represented. The set grows
+  // monotonically and contains only the finite actually-read guidance set.
+  while (true) {
+    const evicted = guidance.filter((window) => evictedIds.has(window.callId));
+    const candidates = evicted.length
+      ? [...decision, runtimeV2EvictedSkillGuidanceNotice(evicted)] : decision;
+    const bounded = boundRuntimeMessageGroupsToInputBudget(candidates, inputBudget, { priorityToolCallIds });
+    const visibleIds = new Set(bounded.flatMap((message) => message.tool_calls?.map((call) => call.id) || []));
+    const newlyEvicted = guidance.filter((window) => !visibleIds.has(window.callId) && !evictedIds.has(window.callId));
+    if (!newlyEvicted.length) return bounded;
+    for (const window of newlyEvicted) evictedIds.add(window.callId);
+  }
 }
