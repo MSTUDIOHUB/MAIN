@@ -40,9 +40,6 @@ import {
 } from "./executionContract";
 import { deriveRuntimeV2ExecutionContractAdvance } from "./executionContractAdvance";
 import {
-  runtimeV2EvidenceOnlyDecisionConversation,
-} from "./executionContractFormation";
-import {
   deriveRuntimeV2ValidationCorrectionWindow,
 } from "./executionValidationCorrection";
 import {
@@ -164,30 +161,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
     ));
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
   const forceStructuredAction = structuredActionRequired;
-  const presentConversation = (conversation: typeof canonicalDecisionConversation) => {
-    const latestFeedbackIndex = conversation.map((message) =>
-      message.role === "system" && typeof message.content === "string" &&
-      message.content.startsWith("[runtime-v2 provider feedback:")
-    ).lastIndexOf(true);
-    const feedbackDraft = conversation[latestFeedbackIndex - 1];
-    const preserveFeedbackPair = latestFeedbackIndex > 0 &&
-      feedbackDraft?.role === "assistant" && !feedbackDraft.tool_calls?.length;
-    return structuredActionRequired ? [
-        ...runtimeV2EvidenceOnlyDecisionConversation(
-          preserveFeedbackPair
-            ? conversation.filter((_, index) =>
-                index !== latestFeedbackIndex - 1 && index !== latestFeedbackIndex
-              )
-            : conversation,
-        ),
-        // Old executable action templates are omitted from forced decoding,
-        // but the latest failed no-tool draft and its feedback remain causal.
-        ...(preserveFeedbackPair
-          ? conversation.slice(latestFeedbackIndex - 1, latestFeedbackIndex + 1)
-          : []),
-      ]
-    : conversation;
-  };
   const effectiveToolChoice = runtimeV2ExecutionEffectiveToolChoice({
     requested: input.toolChoice,
     tools: providerTools,
@@ -300,33 +273,29 @@ export async function requestRuntimeV2ProviderOnce(input: {
     const fixedTokens = Math.max(...[sourceCoverage, []].map((coverage) =>
       estimateMessagesTokens([decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions] as TrimMessage[])
     ));
-    const presentationOverhead = Math.max(0,
-      estimateMessagesTokens(presentConversation(conversation) as TrimMessage[]) -
-      estimateMessagesTokens(conversation as TrimMessage[]),
-    );
     const standard = budget && inputBudget !== null
       ? boundRuntimeV2ProviderConversation(conversation, {
           contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens,
-          inputBudget: inputBudget - toolSchemaTokens - fixedTokens - presentationOverhead,
+          inputBudget: inputBudget - toolSchemaTokens - fixedTokens,
         }, providerEffectFacts)
       : conversation;
     const coverage = materializedRuntimeV2SourceCoverage(
       standard, input.ports.context.runWorkspace || "", providerEffectFacts,
     );
-    // All eviction precedes the existing exact-source snapshot presentation.
-    // No later Execute layer crops source bytes or revives omitted coverage.
-    const presented = presentConversation(standard);
-    const assembled = [...presented, decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions];
+    // Recovery changes the frontier guidance, never the roles or bytes of
+    // surviving canonical assistant/tool groups. Source authority derives
+    // only from those exact receipts in the request being sent.
+    const assembled = [...standard, decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions];
     const tokens = estimateMessagesTokens(assembled as TrimMessage[]) + toolSchemaTokens;
     if (inputBudget !== null && tokens > inputBudget) {
       input.live.latestProviderRequestSourceCoverage = [];
       throw new Error("RUNTIME_CONTEXT_BUDGET_EXCEEDED: complete provider request exceeds the Run input budget");
     }
-    return { standard, presented, messages: assembled, coverage, tokens };
+    return { standard, messages: assembled, coverage, tokens };
   };
   const executeRequest = readOnly ? null : assembleExecuteRequest(canonicalDecisionConversation);
   const standardConversation = executeRequest?.standard || canonicalDecisionConversation;
-  const boundedConversation = executeRequest?.presented || canonicalDecisionConversation;
+  const boundedConversation = executeRequest?.standard || canonicalDecisionConversation;
   const decisionInstruction = decisionInstructionFor(initialCoverage);
   const unboundedMessages = [
     // Keep stable instructions, objectives and receipt pairs as the cacheable

@@ -232,13 +232,14 @@ test("Execute action recovery still submits an advertised tool after a reasoning
   });
 });
 
-test("Execute outbound decision retains only the assistant draft adjacent to its latest feedback", async () => {
+test("Execute outbound recovery preserves canonical history and the adjacent latest draft/feedback pair", async () => {
   await withStreamFixture("ollama", truncatedStream, async (fixture, calls) => {
     fixture.context.runtimeRunIntent = "execute";
     fixture.live.messages.push({ role: "assistant", content: "OLD_DRAFT_WITHOUT_CURRENT_FEEDBACK" });
     const input = { live: fixture.live, ports: fixture, command: command("execute"), tools: [], textEnvelope: false, toolChoice: null, signal: new AbortController().signal };
     const failed = await request.requestRuntimeV2ProviderOnce(input);
     history.rememberRuntimeV2ProviderResult(fixture, failed, input.command, []);
+    const canonical = structuredClone(fixture.live.messages);
     await request.requestRuntimeV2ProviderOnce({ ...input, command: command("execute", { recoveryPressure: { reason: "output_truncated" } }) });
     assert.equal(calls.length, 2);
     const next = calls[1].messages;
@@ -246,7 +247,8 @@ test("Execute outbound decision retains only the assistant draft adjacent to its
     assert.ok(feedbackIndex > 0);
     assert.equal(next[feedbackIndex - 1].role, "assistant");
     assert.equal(next[feedbackIndex - 1].content, "##");
-    assert.doesNotMatch(JSON.stringify(next), /OLD_DRAFT_WITHOUT_CURRENT_FEEDBACK/);
+    assert.deepEqual(next.slice(0, canonical.length), canonical, "a roomy recovery request preserves the original transcript");
+    assert.equal(next.filter((message) => message.content === "OLD_DRAFT_WITHOUT_CURRENT_FEEDBACK").length, 1, "older history is retained once, without rebinding the latest feedback");
   });
 });
 
@@ -435,12 +437,14 @@ test("empty protocol feedback cannot bind an older unrelated assistant draft on 
     const size = fixture.live.messages.length;
     history.rememberRuntimeV2ProviderResult(fixture, rejected, command("execute"), tools);
     assert.equal(fixture.live.messages.length, size);
+    const canonical = structuredClone(fixture.live.messages);
     await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "provider_response_rejected", occurrence: 1, stage: "reconsider" } }), tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
     assert.equal(calls[0].options.toolChoice, "required");
     const index = calls[0].messages.findIndex((message) => message.role === "system" && message.content.startsWith("[runtime-v2 provider feedback: native_tool_calls_invalid]"));
     assert.ok(index > 0);
     assert.equal(calls[0].messages[index - 1].content, "");
-    assert.doesNotMatch(JSON.stringify(calls[0].messages), /OLDER_UNRELATED_REPLY/);
+    assert.deepEqual(calls[0].messages.slice(0, canonical.length), canonical);
+    assert.equal(calls[0].messages.filter((message) => message.content === "OLDER_UNRELATED_REPLY").length, 1, "retain earlier history once while the empty newest response owns its feedback");
   });
 });
 
