@@ -138,6 +138,22 @@ enum QuoteState {
 pub fn inspect_shell_command(
     command: &str,
 ) -> Result<TrustedShellInspection, ShellValidationError> {
+    inspect_shell_command_with_workspace(command, None)
+}
+
+/// Absolute argv paths require a concrete workspace and canonical containment.
+/// The context-free inspector deliberately keeps its stricter lexical policy.
+pub fn inspect_shell_command_in_workspace(
+    command: &str,
+    workspace_root: impl AsRef<Path>,
+) -> Result<TrustedShellInspection, ShellValidationError> {
+    inspect_shell_command_with_workspace(command, Some(workspace_root.as_ref()))
+}
+
+fn inspect_shell_command_with_workspace(
+    command: &str,
+    workspace_root: Option<&Path>,
+) -> Result<TrustedShellInspection, ShellValidationError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err(ShellValidationError::critical(
@@ -166,7 +182,7 @@ pub fn inspect_shell_command(
     let mut overall_risk = TrustedExecutionRisk::Low;
     for (raw, connector_after) in raw_segments {
         let (words, redirections) = parse_segment_words_and_redirections(&raw)?;
-        validate_segment_semantics(&raw, &words)?;
+        validate_segment_semantics(&raw, &words, workspace_root)?;
         let risk = if !redirections.is_empty() {
             TrustedExecutionRisk::High
         } else if connector_after.is_some() {
@@ -506,7 +522,7 @@ fn parse_segment_words_and_redirections(
                     "redirection target is missing",
                 ));
             }
-            validate_relative_workspace_token(&target, segment, true)?;
+            validate_workspace_path_token(&target, segment, true, None)?;
             words.push(target.clone());
             redirections.push(ShellRedirection { kind, target });
             index = next_index;
@@ -590,7 +606,11 @@ fn push_word(words: &mut Vec<String>, current: &mut String) {
     }
 }
 
-fn validate_segment_semantics(segment: &str, words: &[String]) -> Result<(), ShellValidationError> {
+fn validate_segment_semantics(
+    segment: &str,
+    words: &[String],
+    workspace_root: Option<&Path>,
+) -> Result<(), ShellValidationError> {
     let executable_index = words
         .iter()
         .position(|word| !is_environment_assignment(word))
@@ -642,7 +662,7 @@ fn validate_segment_semantics(segment: &str, words: &[String]) -> Result<(), She
     }
 
     for word in words {
-        validate_relative_workspace_token(word, segment, false)?;
+        validate_workspace_path_token(word, segment, false, workspace_root)?;
     }
     Ok(())
 }
@@ -689,10 +709,11 @@ fn is_shell_command_flag(word: &str) -> bool {
             && lower[1..].chars().any(|flag| flag == 'c'))
 }
 
-fn validate_relative_workspace_token(
+fn validate_workspace_path_token(
     word: &str,
     segment: &str,
     redirection: bool,
+    workspace_root: Option<&Path>,
 ) -> Result<(), ShellValidationError> {
     let Some(candidate) = normalized_workspace_path_candidate(word) else {
         return Ok(());
@@ -705,18 +726,24 @@ fn validate_relative_workspace_token(
         return Ok(());
     }
     let path = Path::new(&candidate);
-    let escapes = path.is_absolute()
+    let trusted_absolute = !redirection
+        && path.is_absolute()
+        && workspace_root.is_some_and(|root| {
+            resolve_workspace_path(root, path, WorkspacePathMode::AllowMissing).is_ok()
+        });
+    let escapes = ((path.is_absolute() || is_windows_absolute_path(&candidate))
+        && !trusted_absolute)
         || candidate.starts_with('~')
-        || is_windows_absolute_path(&candidate)
         || candidate
             .split(['/', '\\'])
             .any(|component| component == "..")
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        });
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || (!trusted_absolute
+            && path
+                .components()
+                .any(|component| matches!(component, Component::RootDir | Component::Prefix(_))));
     if escapes {
         return Err(ShellValidationError::critical(
             if redirection {
@@ -728,7 +755,11 @@ fn validate_relative_workspace_token(
             if redirection {
                 "redirection target must be a workspace-relative path"
             } else {
-                "shell path must remain workspace-relative"
+                if workspace_root.is_some() {
+                    "shell path must remain within the canonical workspace"
+                } else {
+                    "shell path must remain workspace-relative"
+                }
             },
         ));
     }
@@ -740,8 +771,7 @@ fn normalized_workspace_path_candidate(word: &str) -> Option<String> {
         .strip_prefix("--")
         .and_then(|value| value.split_once('=').map(|(_, path)| path))
         .or_else(|| word.split_once('=').map(|(_, value)| value))
-        .unwrap_or(word)
-        .trim();
+        .unwrap_or(word);
     if candidate.starts_with('-') {
         // For compact short options such as `-Cpath` or `-Ipath`, remove only
         // the option letter. Stripping every leading alphabetic character
@@ -1057,7 +1087,7 @@ pub fn prepare_trusted_shell_execution(
     working_directory: impl AsRef<Path>,
     command: &str,
 ) -> Result<PreparedTrustedShellExecution, TrustedExecutionError> {
-    let inspection = inspect_shell_command(command)?;
+    let inspection = inspect_shell_command_in_workspace(command, workspace_root.as_ref())?;
     let trusted_working_directory =
         resolve_workspace_working_directory(workspace_root.as_ref(), working_directory)?;
     for segment in &inspection.segments {
@@ -1088,7 +1118,7 @@ pub fn prepare_trusted_shell_execution(
             let existing_path = fs::symlink_metadata(&candidate_path).is_ok();
             if obvious_path || existing_path {
                 resolve_workspace_path(
-                    trusted_working_directory.root(),
+                    workspace_root.as_ref(),
                     candidate_path,
                     WorkspacePathMode::AllowMissing,
                 )?;
@@ -1349,6 +1379,79 @@ mod tests {
         }
         inspect_shell_command("printf ok > reports/out.txt")
             .expect("workspace-relative redirection should remain inspectable");
+    }
+
+    #[test]
+    fn workspace_bound_shell_accepts_absolute_argv_inside_the_canonical_root() {
+        let temp = workspace();
+        let root = temp.path().join("Workspace With Spaces");
+        fs::create_dir_all(root.join("Assets")).unwrap();
+        fs::write(root.join("Assets/input.txt"), "input").unwrap();
+        let canonical = canonical_workspace_root(&root).unwrap();
+        let canonical_text = canonical.display().to_string();
+        for command in [
+            format!(
+                "tool inspect --project-path '{}' --format json",
+                canonical_text
+            ),
+            format!(
+                "tool inspect --project-path '{}' --format json",
+                root.display()
+            ),
+            format!("tool inspect --project-path='{}'", canonical_text),
+            format!("tool inspect -C'{}'", canonical_text),
+            format!("PROJECT_PATH='{}' tool inspect", canonical_text),
+            format!("cat '{}/Assets/input.txt'", canonical_text),
+            format!("tool inspect --output='{}/Assets/new.txt'", canonical_text),
+        ] {
+            inspect_shell_command(&command).expect_err("unbound inspection remains strict");
+            let prepared = prepare_trusted_shell_execution(&root, &root, &command)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(prepared.inspection().command, command);
+            assert_eq!(prepared.working_directory(), canonical);
+        }
+    }
+
+    #[test]
+    fn workspace_bound_shell_rejects_absolute_escapes_and_redirections() {
+        let temp = workspace();
+        let root = temp.path().join("project");
+        let sibling = temp.path().join("project-other");
+        fs::create_dir_all(root.join("safe")).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let canonical = canonical_workspace_root(&root).unwrap();
+        let sibling = fs::canonicalize(sibling).unwrap();
+        for command in [
+            format!("tool inspect --project-path '{}'", sibling.display()),
+            format!("tool inspect --project-path='{}'", sibling.display()),
+            format!("tool inspect -C'{}'", sibling.display()),
+            format!("tool inspect '{}/safe/../safe'", canonical.display()),
+            format!("printf ok > '{}/out.txt'", canonical.display()),
+            "tool inspect ../outside".to_string(),
+        ] {
+            prepare_trusted_shell_execution(&root, &root, &command).expect_err(&command);
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&sibling, root.join("escape")).unwrap();
+            fs::write(sibling.join("secret.txt"), "secret").unwrap();
+            std::os::unix::fs::symlink(sibling.join("secret.txt"), root.join("escape-file "))
+                .unwrap();
+            for command in [
+                format!("cat '{}/escape-file '", canonical.display()),
+                "cat 'escape-file '".to_string(),
+            ] {
+                prepare_trusted_shell_execution(&root, &root, &command).expect_err(&command);
+            }
+            for suffix in ["escape", "escape/missing.txt"] {
+                let command = format!(
+                    "tool inspect --project-path='{}/{}'",
+                    canonical.display(),
+                    suffix
+                );
+                prepare_trusted_shell_execution(&root, &root, &command).expect_err(&command);
+            }
+        }
     }
 
     #[test]

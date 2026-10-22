@@ -1,4 +1,7 @@
-use crate::trusted_execution::{inspect_shell_command, TrustedExecutionRisk};
+use crate::trusted_execution::{
+    canonical_workspace_root, inspect_shell_command, inspect_shell_command_in_workspace,
+    TrustedExecutionRisk,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -132,6 +135,7 @@ pub struct PermissionGuard {
     config: PermissionConfig,
     source: String,
     source_path: Option<PathBuf>,
+    workspace_root: Option<PathBuf>,
 }
 
 impl PermissionConfig {
@@ -283,6 +287,7 @@ impl PermissionGuard {
             config,
             source: "builtin_default".to_string(),
             source_path: None,
+            workspace_root: None,
         }
     }
 
@@ -295,13 +300,21 @@ impl PermissionGuard {
             config,
             source: source.into(),
             source_path,
+            workspace_root: None,
         }
     }
 
     pub fn from_workspace(workspace: impl AsRef<Path>) -> Result<Self, PermissionError> {
-        let permissions_path = workspace.as_ref().join(".MAIN").join("permissions.yaml");
+        let workspace = workspace.as_ref();
+        canonical_workspace_root(workspace).map_err(|error| PermissionError::InvalidConfig {
+            path: workspace.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let permissions_path = workspace.join(".MAIN").join("permissions.yaml");
         if !permissions_path.exists() {
-            return Ok(Self::new(PermissionConfig::default_runtime_foundation()));
+            let mut guard = Self::new(PermissionConfig::default_runtime_foundation());
+            guard.workspace_root = Some(workspace.to_path_buf());
+            return Ok(guard);
         }
 
         let content = fs::read_to_string(&permissions_path).map_err(|error| {
@@ -311,16 +324,18 @@ impl PermissionGuard {
             }
         })?;
         let config = PermissionConfig::from_yaml(&content, permissions_path.clone())?;
-        Ok(Self::with_source(
-            config,
-            "workspace_file",
-            Some(permissions_path),
-        ))
+        let mut guard = Self::with_source(config, "workspace_file", Some(permissions_path));
+        guard.workspace_root = Some(workspace.to_path_buf());
+        Ok(guard)
     }
 
     pub fn inspect(&self, command: &str) -> PermissionDecision {
         let trimmed = command.trim();
-        let trusted_inspection = match inspect_shell_command(trimmed) {
+        let inspection = match &self.workspace_root {
+            Some(root) => inspect_shell_command_in_workspace(trimmed, root),
+            None => inspect_shell_command(trimmed),
+        };
+        let trusted_inspection = match inspection {
             Ok(inspection) => inspection,
             Err(error) => {
                 let rejected_segment = error
@@ -981,6 +996,59 @@ mod tests {
         assert_eq!(decision.source, "builtin_default");
         assert_eq!(decision.source_path, None);
         assert_eq!(decision.decision, super::PermissionDecisionKind::Allow);
+    }
+
+    #[test]
+    fn workspace_permission_inspection_preserves_absolute_in_root_command_authority() {
+        let workspace = make_temp_workspace("absolute-project-argument");
+        let canonical = fs::canonicalize(&workspace).unwrap();
+        let command = format!(
+            "tool inspect --project-path '{}' --format json",
+            canonical.display()
+        );
+        let guard = PermissionGuard::from_workspace(&workspace).unwrap();
+        let decision = guard.inspect(&command);
+        assert_eq!(decision.command, command);
+        assert_eq!(decision.decision, super::PermissionDecisionKind::Ask);
+        let raw_root_command = format!(
+            "tool inspect --project-path '{}' --format json",
+            workspace.display()
+        );
+        assert_eq!(
+            guard.inspect(&raw_root_command).decision,
+            super::PermissionDecisionKind::Ask
+        );
+        assert!(
+            decision.requires_approval,
+            "an in-root argument does not approve an unknown tool"
+        );
+        assert_eq!(
+            PermissionGuard::new(PermissionConfig::default_runtime_foundation())
+                .inspect(&command)
+                .decision,
+            super::PermissionDecisionKind::Deny,
+            "an unbound guard remains strict"
+        );
+
+        fs::create_dir_all(workspace.join(".MAIN")).unwrap();
+        fs::write(
+            workspace.join(".MAIN/permissions.yaml"),
+            "shell:\n  allow:\n    - tool inspect\n  deny: []\n",
+        )
+        .unwrap();
+        let configured = PermissionGuard::from_workspace(&workspace).unwrap();
+        assert_eq!(
+            configured.inspect(&command).decision,
+            super::PermissionDecisionKind::Allow
+        );
+        let outside = format!(
+            "tool inspect --project-path '{}'",
+            canonical.parent().unwrap().display()
+        );
+        assert_eq!(
+            configured.inspect(&outside).decision,
+            super::PermissionDecisionKind::Deny
+        );
     }
 
     #[test]
