@@ -162,14 +162,28 @@ test("uncertain workspace calibration stays inside the original safe Turn instea
 
 for (const text of [
   "Hello!", "Explain how docker ps works.", "请解释这个命令的含义。", "npm test",
+]) {
+  test(`clear workspace requests avoid semantic preflight: ${text}`, () => {
+    const harness = createHarness(operation);
+    assert.equal(harness.route(text).handled, false);
+    assert.equal(harness.effects.length, 0);
+  });
+}
+
+for (const text of [
   "Inspect README.md. Do not modify files or run commands.",
   "检查当前环境，不要执行命令或修改文件。",
   "Read-only audit of the current environment.", "请只读检查当前环境。",
 ]) {
-  test(`clear or explicitly constrained workspace requests avoid semantic preflight: ${text}`, () => {
-    const harness = createHarness(operation);
-    assert.equal(harness.route(text).handled, false);
-    assert.equal(harness.effects.length, 0);
+  test(`natural read-only restrictions remain semantic input and retain the calibrated read-only intent: ${text}`, async () => {
+    const harness = createHarness({ ...operation, intent: "analyze" });
+    assert.equal(harness.route(text).handled, true);
+    await harness.complete();
+    assert.equal(harness.requests.length, 1);
+    assert.ok(harness.requests[0][0][1].content.includes(text));
+    assert.equal(harness.resumes[0].options.resolvedIntent, "analyze");
+    assert.equal(harness.resumes[0].options.commandDirective.requiresApproval, false);
+    assert.equal(harness.resumes[0].options.executionConsentGranted, undefined);
   });
 }
 

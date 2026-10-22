@@ -75,7 +75,9 @@ timeout 错误，只是一次请求失败；它保留原始错误并回到共享
 
 普通 Execute 的时间语义是“进展驱动”，不是“从接纳开始倒计时”：模型推理、持续流式输出、真实工具动作、证据收集、修改和验证无论总耗时多久，都不能因为 Turn 年龄被取消。10 分钟只用于 `provider recovery stall lease`：它从第一次没有形成可执行结果的 provider 决策开始，在模型持续重复已拒绝动作、返回空动作或请求持续失败且没有新进展时累计；任一可执行决策或新的工具/证据边界立即清零。该 lease 只在两次动作之间检查，不中断正在进行的慢模型请求或工具。读取和有限验证仍可有单操作 watchdog；单操作超时是可恢复失败，不是整轮终态。
 
-Chat 与 analyze 复用 `readOnlyRunner` 的公共 provider/tool adapter，但保持不同权限策略。Web 开关不参与路由：无本地来源的对话始终为 Chat；工作区或附件进入 analyze。`networkRead` 在可见 Turn/队列 receipt 接纳时冻结，并写入 `turn.admitted`；恢复以该 ledger 事实为准，旧 checkpoint 缺失时关闭网络。Chat 仅允许 `load_skill` 与快照允许的 `web_search/web_fetch`；模型参数和 Rust 自动 fallback 均不能切换选定的搜索 provider。
+自然自动模式中，工作区的低置信 `analyze/report` 候选必须把完整请求交给现有语义 preflight；局部词语、引文或历史说明不能作为跳过校准的整轮只读权限。真正只读的自然请求仍应由语义结果保持只读，不能因执行词语或工具元数据自动升级。显式 slash、锁定模式及其他结构化路由边界保持原样；语义预检不替代后续逐工具审批。
+
+Chat 与 analyze 复用 `readOnlyRunner` 的公共 provider/tool adapter，但保持不同权限策略。Web 开关不参与路由：已解析为只读的自然回复中，无本地来源的对话进入 Chat，工作区或附件进入 analyze。`networkRead` 在可见 Turn/队列 receipt 接纳时冻结，并写入 `turn.admitted`；恢复以该 ledger 事实为准，旧 checkpoint 缺失时关闭网络。Chat 仅允许 `load_skill` 与快照允许的 `web_search/web_fetch`；模型参数和 Rust 自动 fallback 均不能切换选定的搜索 provider。
 
 只读策略没有 4/8 分钟默认整轮 deadline。10 分钟恢复租约只在无语义进展后、请求之间检查；必须先接受有效回答或新证据，再考虑租约。成功工具回执并不自动代表进展：Web 版本忽略 query、顺序、追踪参数，按实际来源内容比较；文件读取按相同版本的新增覆盖计算。缓存回放、空结果和已覆盖事实不重置租约。按已结算的模型请求批次派生 `recoveryPressure`，指导指出信息缺口、重构查询或给出证据化回答；次数与历史 `iteration_limit` 不得切到强制总结或撤掉安全读取工具。回答未完成时保留正文与协议反馈，在同一恢复租约内修正，不按总结尝试次数终止；租约耗尽仍无回答时为 `error`，不能把工具证据投影为生命周期 `partial`。搜索结果只提供待核对来源：第一批新候选打开取证分支，持续改写查询不能代替读取来源并无限续租；实际新来源回执重新打开该分支。实际策略由 [readOnly.ts](../src/lib/runtime-v2/readOnly.ts)、[readOnlyProgress.ts](../src/lib/runtime-v2/readOnlyProgress.ts) 与 [decision.ts](../src/lib/runtime-v2/decision.ts) 共享。
 

@@ -1478,9 +1478,10 @@ export function shouldUseBlockingIntentPreflight(
   if (hasWorkspace) {
     // A natural analysis/report cue describes the reply format, but cannot
     // establish whether live command or external application tools are needed.
-    // Calibrate that ambiguity without widening explicit read-only authority.
-    return (resolution.intent === "analyze" || resolution.intent === "report") &&
-      !hasReadOnlyWorkspaceConstraint(input);
+    // Calibrate the complete request, including the scope of restrictions and
+    // historical references. Text fragments are not a typed whole-Turn lock;
+    // explicit composer/shortcut/resolved choices bypass this at submission.
+    return resolution.intent === "analyze" || resolution.intent === "report";
   }
   if (getIntentPolicy(resolution.intent).uiCategory === "output_style") return false;
 

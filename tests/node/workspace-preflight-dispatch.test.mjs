@@ -95,9 +95,9 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
   return {
     store, requests, workflows, pending, pendingBootstraps, pendingCancellationWrites, sessionKey, sessionEpoch, queueModule, buildEmptySessionRuntimeSnapshot,
     getCancellation: () => getPendingSessionCancellation(sessionKey),
-    async accept() {
+    async accept(text = "Inspect the current local service and report its live state.") {
       const accepted = await store.getState().acceptWorkspaceInstruction({
-        text: "Inspect the current local service and report its live state.",
+        text,
         clientSubmissionId: `submission-${suffix}`,
       });
       assert.equal(accepted.accepted, true, accepted.reason);
@@ -461,3 +461,39 @@ test("an inactive workspace preflight releases only its origin claim and retries
     assert.equal(harness.workflows[0].turnId, receipt.turnId);
   } finally { harness.cleanup(); }
 });
+
+for (const [suffix, text, intent] of [
+  ["scoped-reference", "请直接实现 src/Feature.cs。先检查编译错误。可把运行时控制器和编辑器构建器分成两份文件分别生成。历史上下文：只读 baseline 回执仅证明工具可用，本轮完成实现与验证。", "execute"],
+  ["current-readonly", "Inspect README.md. Do not modify files or run commands.", "analyze"],
+]) {
+  test(`natural scoped constraints reach semantic calibration without becoming typed whole-Turn authority: ${suffix}`, async () => {
+    const harness = createHarness(suffix);
+    try {
+      const receipt = await harness.accept(text);
+      assert.equal(harness.workflows.length, 0, "the heuristic alone cannot freeze the tool authority before semantic calibration");
+      const request = harness.requests[0];
+      assert.equal(request[0].length, 2);
+      assert.ok(request[0][1].content.includes(text), "preflight receives the full current request, including historical context and current restrictions");
+      assert.match(request[0][0].content, /explicit user restrictions take priority/);
+      assert.deepEqual(request[4], [], "semantic calibration has no tools");
+      assert.equal(request[5], 512);
+      harness.resolve(0, { intent, confidence: 0.98, requiresApproval: true,
+        commandDirective: { kind: "shell", source: "preflight", requiresApproval: true } });
+      await waitFor(() => harness.workflows.length === 1);
+      assert.equal(harness.workflows.length, 1);
+      const workflow = harness.workflows[0];
+      assert.equal(workflow.turnId, receipt.turnId);
+      assert.equal(workflow.effectiveRunIntent, intent);
+      assert.equal(workflow.options.resolvedIntent, intent);
+      assert.equal(workflow.options.executionConsentGranted, undefined, "intent routing is not a per-tool permission grant");
+      assert.equal(workflow.options.workspaceInstructionClaim.turnId, receipt.turnId);
+      const turn = harness.store.getState().conversationTurns.find((item) => item.id === receipt.turnId);
+      assert.equal(turn.intent, intent);
+      if (intent === "analyze") {
+        assert.equal(turn.commandDirective.kind, "none");
+        assert.equal(turn.commandDirective.requiresApproval, false, "operation metadata cannot elevate a semantic read-only result");
+      }
+      assert.equal(harness.requests.length, 1);
+    } finally { harness.cleanup(); }
+  });
+}
