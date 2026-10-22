@@ -77,6 +77,20 @@ Skill 的命令示例可能针对其他 Pipeline 版本。以当前安装包文�
 
 可选的 `agents/openai.yaml` 支持 `allow_implicit_invocation: false`，用于只允许手动启用的 Skill。支持文件仍需通过普通受权工具按需读取或执行。
 
+### 从 Git 来源安装和手动更新
+
+MAIN 面板目前导入 ZIP 快照。也可以使用 Unity 仓库推荐的 Skills CLI，从 Git 来源安装到 MAIN 已支持的个人目录：
+
+```sh
+npx skills add Unity-Technologies/skills --global --agent codex --skill '*'
+npx skills check
+npx skills update --global
+```
+
+这里的 `--agent codex` 选择 `~/.agents/skills` 安装目录，执行任务的宿主仍由用户选择。该个人目录也可能被其他兼容宿主发现。安装位置和命令选项以 [Skills CLI 安装目录说明](https://github.com/vercel-labs/skills/blob/main/docs/agents.md) 和 [命令说明](https://github.com/vercel-labs/skills/blob/main/docs/commands.md) 为准。
+
+`check` 和 `update` 需要手动运行，Git 地址本身不会触发后台自动更新。这些命令管理 CLI 安装的技能，不更新 MAIN 已导入的 ZIP 快照。选择一种来源管理同一集合，避免与启用的同名 ZIP 技能产生歧义；在进行中的任务结束后更新，再用新 Turn 检查版本。
+
 ### 导入 Gemini CLI 扩展
 
 在项目中打开“技能与提示词”，找到“Gemini CLI 扩展”，点击“导入 Gemini ZIP”。选择包含 `gemini-extension.json` 的 ZIP，查看预览并勾选需要的组件，然后点击“安装所选组件”。可以导入仅 Skills、仅 HTTP MCP 或两者兼有的扩展。
