@@ -1033,6 +1033,17 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       </div>
                     </div>
                     <div className="mt-3 flex flex-wrap items-stretch justify-end gap-2 text-center [&>button]:min-w-0 [&>button]:max-w-full">
+                      {onCancelTurn && (
+                        <button
+                          type="button"
+                          data-testid="execution-capsule-tool-cancel-turn"
+                          onClick={onCancelTurn}
+                          className={`${neutralActionButtonClass} mr-auto px-4 py-2 text-[12px] font-medium`}
+                          title={copy.cancelTurnInfo}
+                        >
+                          {copy.cancelTurn}
+                        </button>
+                      )}
                       {hasActiveDiffPreview && (
                         <button
                           onClick={onOpenDiff}

@@ -103,6 +103,7 @@ import {
 } from "../lib/pendingToolReview";
 import {
   getToolPermissionResolutionIdentity,
+  isExactToolPermissionResolutionIdentity,
   shouldRenderPermissionCapsule,
 } from "../lib/actionRequest";
 import {
@@ -3247,6 +3248,25 @@ export default function ChatArea({
     requestId: permissionResolutionIdentity?.requestId,
     taskId: pendingReviewTaskId,
   });
+  const handleCancelPendingToolReview = useCallback(() => {
+    const current = useAppStore.getState();
+    const marker = current.harnessRunMarker;
+    if (
+      !permissionResolutionIdentity ||
+      !isExactToolPermissionResolutionIdentity(current.activeActionRequest, permissionResolutionIdentity) ||
+      current.currentTurnId !== permissionResolutionIdentity.turnId ||
+      marker?.sessionKey !== permissionResolutionIdentity.sessionKey ||
+      !shouldRenderPermissionCapsule({
+        request: current.activeActionRequest,
+        sessionKey: current.getCurrentSessionKey() || "",
+        turnId: marker?.status === "running" ? marker.turnId : null,
+        runId: marker?.status === "running" ? getHarnessActionRunId(marker) : null,
+        requestId: permissionResolutionIdentity.requestId,
+        taskId: current.pendingReviewTaskId,
+      })
+    ) return;
+    onStopGeneration();
+  }, [onStopGeneration, permissionResolutionIdentity]);
   const capsuleControlTurnStatusKey = capsuleControlTurnVisibleStatus || capsuleControlTurn?.status || null;
   const capsuleControlIsRunActive =
     agentStatus === "running" &&
@@ -4610,7 +4630,7 @@ export default function ChatArea({
       pendingToolReview={pendingToolReviewForExecutionCapsule}
       canApprovePlan={false}
       autoApproveTools={autoApproveTools}
-      onCancelTurn={onStopGeneration}
+      onCancelTurn={pendingToolReviewForExecutionCapsule ? handleCancelPendingToolReview : onStopGeneration}
       onApprovePlan={approvePlan}
       onRejectPlan={rejectPlan}
       onRejectDiff={(identity) => rejectToolAction?.(identity.taskId, identity)}

@@ -427,6 +427,7 @@ for (const width of [1440, 640]) {
       };
       await captureReview("content");
       for (const button of [
+        page.getByTestId("execution-capsule-tool-cancel-turn"),
         review.getByRole("button", { name: "拒绝", exact: true }),
         page.getByTestId("execution-capsule-tool-approve-session"),
         page.getByTestId("execution-capsule-tool-approve-once"),
@@ -443,6 +444,115 @@ for (const width of [1440, 640]) {
       await captureReview("actions");
     });
   }
+}
+
+for (const review of ["shell", "file", "restored shell"] as const) {
+  test(`pending ${review} review can cancel the real App Turn without executing its tool`, async ({ page }) => {
+    await installTauriSessionPersistenceMock(page);
+    await page.addInitScript(() => {
+      const internals = (window as any).__TAURI_INTERNALS__;
+      const invoke = internals.invoke;
+      const calls: string[] = [];
+      (window as any).__REVIEW_CANCEL_NATIVE_EXECUTIONS__ = calls;
+      internals.invoke = async (command: string, args: unknown) => {
+        if (["run_command", "exec_command", "execute_command", "write_file", "write_file_create_new", "write_file_atomic", "apply_patch", "delete_workspace_path"].includes(command)) {
+          calls.push(command);
+          throw new Error("Pending tool must never execute during cancellation");
+        }
+        return invoke(command, args);
+      };
+    });
+    await page.goto(`/?e2eScenario=${review !== "file" ? "execution-capsule-pending-tool-review" : "execution-capsule-orphan-pending-review"}`);
+    const identity = await page.evaluate(async (kind) => {
+      const bridge = (window as any).__CODELY_E2E__;
+      if (kind !== "file") bridge?.showPendingToolReviewPrompt?.();
+      else bridge?.showOrphanPendingReviewPrompt?.();
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      if (kind === "restored shell") useAppStore.setState({ pendingReviewResolve: null });
+      const state = useAppStore.getState();
+      return { turnId: state.currentTurnId, requestId: state.activeActionRequest?.requestId };
+    }, review);
+    const card = page.getByTestId("execution-capsule-tool-review");
+    await expect(card).toBeVisible();
+    await expect(page.getByTestId("composer-stop-button")).toHaveCount(0);
+    const cancel = card.getByRole("button", { name: "结束本轮", exact: true });
+    await expect(cancel).toBeVisible();
+    await cancel.click();
+
+    await expect.poll(async () => page.evaluate(async (turnId) => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const state = useAppStore.getState();
+      const turn = state.conversationTurns.find((item: any) => item.id === turnId);
+      return {
+        outcome: turn?.runtimeOutcome?.resultKind,
+        status: turn?.status,
+        agentStatus: state.agentStatus,
+        generating: state.isGenerating,
+        pendingRequest: state.activeActionRequest,
+        pendingTask: state.pendingReviewTaskId,
+        pendingCall: state.pendingToolCall,
+        pendingResolver: state.pendingReviewResolve !== null,
+        nativeExecutions: (window as any).__REVIEW_CANCEL_NATIVE_EXECUTIONS__,
+        finalCount: state.taskFlow.filter((item: any) => item.turnId === turnId && item.visibility === "assistant_final").length,
+        conclusionCount: state.runtimeEvents.filter((item: any) => item.turnId === turnId && item.type === "turn.completed" && item.resultKind === "canceled").length,
+      };
+    }, identity.turnId)).toEqual({
+      outcome: "canceled", status: "done", agentStatus: "idle", generating: false,
+      pendingRequest: null, pendingTask: null, pendingCall: null, pendingResolver: false,
+      nativeExecutions: [], finalCount: 1, conclusionCount: 1,
+    });
+    await expect(card).toHaveCount(0);
+  });
+}
+
+for (const replacement of ["request", "session"] as const) {
+  test(`a stale review cancel click cannot stop a replacement ${replacement}`, async ({ page }) => {
+    await installTauriSessionPersistenceMock(page);
+    await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+    await page.evaluate(() => (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.());
+    await expect(page.getByTestId("execution-capsule-tool-cancel-turn")).toBeVisible();
+    const result = await page.evaluate(async (drift) => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const state = useAppStore.getState();
+      const originalStop = state.stopGeneration;
+      let stopCalls = 0;
+      let captureClicks = 0;
+      useAppStore.setState({ stopGeneration: () => { stopCalls++; originalStop(); } });
+      const button = document.querySelector<HTMLElement>("[data-testid='execution-capsule-tool-cancel-turn']")!;
+      button.addEventListener("click", () => {
+        captureClicks++;
+        if (drift === "request") {
+          (window as any).__CODELY_E2E__?.rotatePendingToolReviewIdentity?.();
+        } else {
+          // Exercise the transition where the Session changed while the old
+          // ActionRequest is still present, before the next UI projection.
+          useAppStore.setState({ currentSessionId: Number(state.currentSessionId) + 1 });
+        }
+      }, { capture: true, once: true });
+      button.click();
+      const after = useAppStore.getState();
+      return {
+        captureClicks, stopCalls,
+        originalRequestId: state.activeActionRequest?.requestId,
+        currentRequestId: after.activeActionRequest?.requestId,
+        pendingTask: after.pendingReviewTaskId,
+        originalPendingTask: state.pendingReviewTaskId,
+        pendingCall: !!after.pendingToolCall,
+        pendingResolver: !!after.pendingReviewResolve,
+        status: after.conversationTurns.find((turn: any) => turn.id === state.currentTurnId)?.status,
+        terminalCount: after.runtimeEvents.filter((event: any) => event.turnId === state.currentTurnId && event.type === "turn.completed").length,
+      };
+    }, replacement);
+    expect(result.captureClicks).toBe(1);
+    expect(result.stopCalls).toBe(0);
+    expect(result.pendingTask).toBe(result.originalPendingTask);
+    expect(result.pendingCall).toBe(true);
+    expect(result.pendingResolver).toBe(true);
+    expect(result.status).toBe("awaiting_approval");
+    expect(result.terminalCount).toBe(0);
+    if (replacement === "request") expect(result.currentRequestId).not.toBe(result.originalRequestId);
+    else expect(result.currentRequestId).toBe(result.originalRequestId);
+  });
 }
 
 test("destructive approval shows exact risk and target and cannot enable session approval", async ({ page }) => {
