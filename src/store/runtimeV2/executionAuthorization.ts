@@ -7,6 +7,7 @@ import {
 import { shellPermissionPreflight } from "../../lib/ipc";
 import {
   canApplyShellAutoReview,
+  getShellPermissionCommandForTool,
   resolveShellAutoApproval,
 } from "../../lib/shellAutoApproval";
 import {
@@ -451,38 +452,51 @@ export async function authorizeToolForCurrentTurn(
         };
   }
   const consent = state.currentTurnExecutionConsent;
-  if (consent?.turnId !== input.context.turnId || consent.granted !== true) {
-    return {
-      allowed: false,
-      reason: `执行 ${risk} 工具前需要本轮执行授权。`,
-      allowExternalLocalRead: false,
-    };
-  }
-  if (risk === "workspace_write") {
-    return { allowed: true, reason: null, allowExternalLocalRead: false };
-  }
-  if (risk === "shell") {
+  const hasConsent = consent?.turnId === input.context.turnId && consent.granted === true;
+  // A dangerous shell command is classified as destructive, but still needs
+  // the shell guard's exact decision/approval packet at the execution boundary.
+  if (risk === "shell" || getShellPermissionCommandForTool(exposedName, args)) {
     const shell = await resolveShellAutoApproval({
       toolName: exposedName,
       args,
       workspace: input.context.runWorkspace || "",
       preflight: shellPermissionPreflight,
     });
-    if (!canApplyShellAutoReview(shell)) {
+    if (shell.error || shell.decision?.decision === "deny") {
       return {
         allowed: false,
-        reason: shell.error || "该 Shell 命令需要单独审批，未执行。",
+        reason: shell.error || shell.decision?.reviewReason || "该 Shell 命令已被权限策略拒绝。",
         allowExternalLocalRead: false,
+      };
+    }
+    if (!hasConsent || !canApplyShellAutoReview(shell)) {
+      return {
+        allowed: false,
+        reason: "该 Shell 命令需要单独审批，未执行。",
+        allowExternalLocalRead: false,
+        approvalRequired: true,
+        risk,
+        ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}),
       };
     }
     return {
       allowed: true,
       reason: null,
       allowExternalLocalRead: false,
-      ...(shell.approval
-        ? { shellPermissionApproval: shell.approval }
-        : {}),
+      ...(shell.approval ? { shellPermissionApproval: shell.approval } : {}),
     };
+  }
+  if (!hasConsent) {
+    return {
+      allowed: false,
+      reason: `执行 ${risk} 工具前需要本轮执行授权。`,
+      allowExternalLocalRead: false,
+      approvalRequired: true,
+      risk,
+    };
+  }
+  if (risk === "workspace_write") {
+    return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (isPerCallOnlyToolRisk(risk)) {
     return {

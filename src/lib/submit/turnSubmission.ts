@@ -1618,6 +1618,10 @@ export function resolveSubmitRuntimeDecision(params: {
     effectiveDisplayIntent,
     shouldGrantExecutionConsentForTurn:
       params.requiresPlanExecutionAdmission !== true && (
+        // The admitted user request authorizes this Execute Turn. Individual
+        // shell, external and destructive actions still pass tool approval;
+        // auto-approval controls those reviews, not whether Execute can act.
+        (params.effectiveRunIntent === "execute" && runtimeRunIntent === "execute") ||
         params.executionConsentGranted === true ||
         params.shouldExecuteOnceFromReplyOption ||
         params.autoApproveTools === true

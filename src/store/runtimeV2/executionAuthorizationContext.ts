@@ -50,6 +50,7 @@ export interface RuntimeV2ToolAuthorizationResult {
   readonly reason: string | null;
   readonly allowExternalLocalRead: boolean;
   readonly shellPermissionApproval?: import("../../lib/ipc").ShellPermissionApproval;
+  readonly shellPermissionDecision?: import("../../lib/ipc").ShellPermissionDecision;
   readonly approvalRequired?: boolean;
   readonly risk?: ToolRiskLevel;
   readonly localFileReadPath?: string;

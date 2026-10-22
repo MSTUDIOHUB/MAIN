@@ -13,6 +13,7 @@ import { withEventSchema } from "../../lib/turnEvents";
 import type { TaskBlock } from "../../lib/taskTypes";
 import type { RuntimeV2Command } from "../../lib/runtime-v2";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import type { ShellPermissionDecision } from "../../lib/ipc";
 
 function ownsRuntimeV2PermissionRun(
   state: any,
@@ -30,6 +31,7 @@ function exactTimelineToolBlock(
   taskFlow: readonly TaskBlock[],
   command: RuntimeV2Command,
   target: string,
+  externalRead: boolean,
 ): Extract<TaskBlock, { type: "tool" }> | null {
   for (let index = taskFlow.length - 1; index >= 0; index -= 1) {
     const block = taskFlow[index]!;
@@ -38,7 +40,7 @@ function exactTimelineToolBlock(
       block.turnId === command.run.turnId &&
       block.runId === command.run.runId &&
       String(block.toolCallId || "") === command.idempotencyKey &&
-      normalizeLocalFileReadPath(block.target) === target
+      (externalRead ? normalizeLocalFileReadPath(block.target) : String(block.target || "").trim()) === target
     ) {
       return block;
     }
@@ -65,12 +67,14 @@ export async function requestRuntimeV2ToolPermission(input: {
   readonly target: string;
   readonly risk: ToolRiskLevel;
   readonly permissionTarget: string;
+  readonly shellPermissionDecision?: ShellPermissionDecision;
   readonly signal?: AbortSignal;
 }): Promise<ToolReviewDecision> {
   const set = input.ports.set;
-  const normalizedTarget = normalizeLocalFileReadPath(
-    input.permissionTarget,
-  );
+  const externalRead = input.risk === "local_file_read";
+  const normalizedTarget = externalRead
+    ? normalizeLocalFileReadPath(input.permissionTarget)
+    : String(input.permissionTarget || "").trim();
   if (!set || !normalizedTarget) {
     return {
       action: "error",
@@ -89,6 +93,7 @@ export async function requestRuntimeV2ToolPermission(input: {
     initial.taskFlow || [],
     input.command,
     normalizedTarget,
+    externalRead,
   );
   const taskId = existingBlock?.id ?? initial._nextTaskId();
   const turn = (initial.conversationTurns || []).find(
@@ -110,10 +115,14 @@ export async function requestRuntimeV2ToolPermission(input: {
   const permissionToolCall = {
     toolCallId: input.command.idempotencyKey,
     name: input.toolName,
-    arguments: { ...input.args, path: normalizedTarget },
+    arguments: { ...input.args },
     risk: input.risk,
-    localFileReadPath: normalizedTarget,
+    ...(externalRead ? { localFileReadPath: normalizedTarget } : {}),
+    ...(input.shellPermissionDecision
+      ? { shellPermissionDecision: input.shellPermissionDecision }
+      : {}),
   };
+  const argumentIdentity = JSON.stringify(input.args);
   const request = buildToolPermissionActionRequest({
     sessionKey: input.command.run.sessionKey,
     turnId: input.command.run.turnId,
@@ -151,6 +160,7 @@ export async function requestRuntimeV2ToolPermission(input: {
       state.taskFlow || [],
       input.command,
       normalizedTarget,
+      externalRead,
     );
     if (existingBlock && currentBlock?.id !== taskId) return {};
 
@@ -266,7 +276,14 @@ export async function requestRuntimeV2ToolPermission(input: {
 
   const resolved = await decision;
   input.signal?.removeEventListener("abort", abort);
-  if (resolved.action === "accept") {
+  if (resolved.action === "accept" && (
+    input.signal?.aborted ||
+    !ownsRuntimeV2PermissionRun(input.ports.get(), input.command) ||
+    JSON.stringify(input.args) !== argumentIdentity
+  )) {
+    return { action: "error", error: "RUNTIME_V2_PERMISSION_OWNER_MISMATCH" };
+  }
+  if (resolved.action === "accept" && externalRead) {
     const grantedPath = normalizeLocalFileReadPath(
       resolved.grantLocalFileReadPath,
     );

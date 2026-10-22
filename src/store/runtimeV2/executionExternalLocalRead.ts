@@ -12,6 +12,7 @@ import {
 } from "./executionEvidence";
 import { requestRuntimeV2ToolPermission } from "./executionToolPermission";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import { getShellPermissionCommandForTool } from "../../lib/shellAutoApproval";
 
 export type RuntimeV2ToolAuthorizationResolution =
   | {
@@ -24,9 +25,9 @@ export type RuntimeV2ToolAuthorizationResolution =
     };
 
 /**
- * Resolve authorization at the effect boundary. External reads and explicit
- * per-call destructive operations may pause on the existing ActionRequest UI;
- * all other denials remain ordinary blocked tool completions.
+ * Resolve authorization at the effect boundary. Missing Turn consent and
+ * concrete per-call review requirements await the existing ActionRequest UI.
+ * Policy denials remain ordinary blocked tool completions.
  */
 export async function resolveRuntimeV2ToolAuthorization(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -71,6 +72,7 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
       target: input.target,
       risk: authorization.risk,
       permissionTarget: requestedPath,
+      shellPermissionDecision: authorization.shellPermissionDecision,
       signal: input.signal,
     });
     if (review.action === "reject") {
@@ -128,6 +130,20 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
           input.toolName,
           input.args,
         );
+      } else if (authorization.shellPermissionDecision) {
+        const decision = authorization.shellPermissionDecision;
+        const command = getShellPermissionCommandForTool(input.toolName, input.args);
+        const packet = review.shellPermissionApproval;
+        const approved = !!command && decision.command === command &&
+          decision.decision !== "deny" &&
+          (!decision.requiresApproval || packet?.command === command);
+        authorization = {
+          ...authorization,
+          allowed: approved,
+          reason: approved ? null : "The shell approval did not match the pending command.",
+          approvalRequired: false,
+          ...(approved && packet ? { shellPermissionApproval: packet } : {}),
+        };
       } else {
         // Per-call risks are intentionally not persisted in policy. The
         // accepted ActionRequest authorizes this exact invocation only.

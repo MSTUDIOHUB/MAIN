@@ -1066,6 +1066,52 @@ test("effective intent decision downgrades untrusted Goal intents but preserves 
   assert.equal(explicit.effectiveRunIntent, "goal");
 });
 
+test("admitted direct Execute binds execution consent to this Turn without enabling auto approval", () => {
+  const decision = resolveSubmitRuntimeDecision({
+    effectiveRunIntent: "execute",
+    currentMainModeKey: "main_mode",
+    isPlanApproved: false,
+    autoApproveTools: false,
+    executionConsentGranted: false,
+    shouldExecuteOnceFromReplyOption: false,
+    preservePlanState: false,
+  });
+  const patch = buildSubmitRunStatePatch({
+    turnId: "turn-direct-command",
+    isHidden: false,
+    currentInput: "Run the project's CLI and return its actual output",
+    preferredLanguage: "en",
+    shouldArchiveChoiceFeedback: false,
+    currentNormalizedStreamState: {},
+    effectiveWorkflowMode: decision.effectiveWorkflowMode,
+    preservePlanState: false,
+    shouldGrantExecutionConsentForTurn: decision.shouldGrantExecutionConsentForTurn,
+    currentConfig: { workflowMode: "chat" },
+  });
+
+  assert.equal(decision.runtimeRunIntent, "execute");
+  assert.deepEqual(patch.currentTurnExecutionConsent, {
+    turnId: "turn-direct-command",
+    granted: true,
+  });
+  assert.equal(Object.hasOwn(patch, "autoApproveTools"), false);
+  assert.equal(Object.hasOwn(patch, "approvedShellPermissionRules"), false);
+
+  for (const effectiveRunIntent of ["respond", "analyze", "plan"]) {
+    const readDecision = resolveSubmitRuntimeDecision({
+      effectiveRunIntent,
+      currentMainModeKey: "main_mode",
+      isPlanApproved: false,
+      autoApproveTools: false,
+      executionConsentGranted: false,
+      shouldExecuteOnceFromReplyOption: false,
+      preservePlanState: false,
+    });
+    assert.equal(readDecision.shouldGrantExecutionConsentForTurn, false,
+      `${effectiveRunIntent} must not gain execution authority`);
+  }
+});
+
 test("approved-plan child run cannot inherit generic consent before Harness admission", () => {
   const decision = resolveSubmitRuntimeDecision({
     effectiveRunIntent: "execute",
