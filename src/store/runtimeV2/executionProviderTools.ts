@@ -2,6 +2,7 @@ import { isChatContext } from "./readOnlyPolicy";
 import {
   RUNTIME_V2_SUBAGENT_ACCESS_MODES,
   RUNTIME_V2_SUBAGENT_TASK_KINDS,
+  RUN_COMMAND_SHELL_CONTRACT,
   type ToolDefinition,
 } from "../../lib/toolSchemas";
 import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
@@ -162,6 +163,7 @@ function runtimeV2ToolDefinition(
         ...definition.function,
         description: [
           "Run an authorized shell command and wait for its actual result; ordinary external actions remain available while validation is pending.",
+          RUN_COMMAND_SHELL_CONTRACT,
           "The workspace root is already the execution directory; use cwd for a relative subdirectory and never prepend cd.",
           "Only a finite build, test, lint, typecheck, check, or bounded inline assertion can provide acceptance validation. Ordinary actions and source inspections do not discharge file mutation validation debt.",
           exactValidationCommand

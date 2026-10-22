@@ -45,6 +45,12 @@ export interface ToolDefinition {
 
 export const SUBMIT_PLAN_CANDIDATE_TOOL_NAME = "submit_plan_candidate";
 
+export const RUN_COMMAND_SHELL_CONTRACT = [
+  "This tool uses a restricted shell parser. Use literal arguments and the cwd field instead of cd.",
+  "Shell variable expansion, command substitution, nested shells, and unquoted line breaks are rejected; quoted multiline code or data may be passed as one literal argument.",
+  "For batches, submit separate tool calls with literal paths and arguments.",
+].join(" ");
+
 const PLAN_EXPECTED_SCALAR_SCHEMA = {
   anyOf: [
     { type: "string" },
@@ -1017,7 +1023,11 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "run_command",
-      description: "同步执行一个有限时 shell 命令并等待结束，返回 stdout、stderr、exitCode、timedOut、durationMs。适合测试、构建和一次性诊断；比 execute_command 更适合需要明确成功/失败的步骤。文件修改回合不得用 Python、重定向、sed 或临时脚本写工作区源码，必须改用 apply_patch、replace_in_file 或 write_file 以保留结构化 diff 与 changedPaths。",
+      description: [
+        "同步执行一个有限时 shell 命令并等待结束，返回 stdout、stderr、exitCode、timedOut、durationMs。适合测试、构建和一次性诊断；比 execute_command 更适合需要明确成功/失败的步骤。",
+        RUN_COMMAND_SHELL_CONTRACT,
+        "文件修改回合不得用 Python、重定向、sed 或临时脚本写工作区源码，必须改用 apply_patch、replace_in_file 或 write_file 以保留结构化 diff 与 changedPaths。",
+      ].join(" "),
       parameters: {
         type: "object",
         properties: {
