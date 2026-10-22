@@ -159,14 +159,11 @@ export function runtimeV2ExecutionProviderOutputTokenLimit(
 }
 
 /**
- * Once exact source is visible but no workspace effect exists, a documented
- * reasoning toggle can switch the next request into action decoding. This is
- * capability- and state-based; model/provider names never enter the policy.
+ * Preserve configured reasoning outside a real action/recovery boundary.
+ * Visible source alone does not require action decoding or a workspace effect.
  */
 export function runtimeV2ExecutionReasoningRequest(input: {
   readonly configured: StreamSettings["reasoningRequest"];
-  readonly sourceOnlyFrontier: boolean;
-  readonly hasMutationTool: boolean;
   readonly providerSupportsReasoningToggle: boolean;
   readonly structuredActionRequired?: boolean;
   readonly recoveringFromRejectedAction?: boolean;
@@ -198,13 +195,7 @@ export function runtimeV2ExecutionReasoningRequest(input: {
   ) {
     return "explicit";
   }
-  return !input.recoveringFromRejectedAction &&
-      input.sourceOnlyFrontier &&
-      input.hasMutationTool &&
-      input.providerSupportsReasoningToggle &&
-      input.configured !== "off"
-    ? "off"
-    : input.configured;
+  return input.configured;
 }
 
 export function runtimeV2ProviderProtocolError(input: {

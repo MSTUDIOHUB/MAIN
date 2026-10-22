@@ -637,12 +637,10 @@ test("native and compatibility tool protocols share a bounded decision output bu
   );
 });
 
-test("source-only effect pressure uses capability-gated action decoding", () => {
+test("only real action or recovery boundaries override configured reasoning", () => {
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "explicit",
-      sourceOnlyFrontier: true,
-      hasMutationTool: false,
       providerSupportsReasoningToggle: true,
       structuredActionRequired: true,
     }),
@@ -652,8 +650,6 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "explicit",
-      sourceOnlyFrontier: true,
-      hasMutationTool: false,
       providerSupportsReasoningToggle: false,
       structuredActionRequired: true,
     }),
@@ -663,28 +659,25 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: false,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       structuredActionRequired: true,
     }),
     "off",
     "a closed state-machine action boundary decodes a tool immediately instead of opening another hidden essay",
   );
+  for (const configured of ["auto", "explicit", "off"]) {
+    assert.equal(
+      providerRequest.runtimeV2ExecutionReasoningRequest({
+        configured,
+        providerSupportsReasoningToggle: true,
+      }),
+      configured,
+      "visible source and an available mutation tool do not create an action boundary",
+    );
+  }
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
-      providerSupportsReasoningToggle: true,
-    }),
-    "off",
-  );
-  assert.equal(
-    providerRequest.runtimeV2ExecutionReasoningRequest({
-      configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: false,
     }),
     "auto",
@@ -693,17 +686,6 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: false,
-      hasMutationTool: true,
-      providerSupportsReasoningToggle: true,
-    }),
-    "auto",
-  );
-  assert.equal(
-    providerRequest.runtimeV2ExecutionReasoningRequest({
-      configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       recoveringFromRejectedAction: true,
       recoveryStage: "reconsider",
@@ -714,8 +696,6 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       recoveringFromRejectedAction: true,
       recoveryStage: "reframe",
@@ -726,8 +706,6 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "off",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       recoveringFromRejectedAction: true,
       recoveryStage: "alternative",

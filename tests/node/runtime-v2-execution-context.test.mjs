@@ -6800,6 +6800,30 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
   assert.doesNotMatch(prompt, /round|attempt|Gemma|Qwen/i);
 });
 
+test("ordinary reasoning preserves its configuration without a recovery boundary", () => {
+  for (const configured of ["auto", "explicit", "off", undefined]) {
+    for (const providerSupportsReasoningToggle of [false, true]) {
+      assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+        configured,
+        providerSupportsReasoningToggle,
+        structuredActionRequired: false,
+      }), configured);
+    }
+  }
+  assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+    configured: "auto", providerSupportsReasoningToggle: true,
+    structuredActionRequired: true,
+  }), "off", "a real required-action boundary retains its existing capability policy");
+  assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+    configured: "explicit", providerSupportsReasoningToggle: true,
+    recoveringFromRejectedAction: true,
+  }), "off", "a rejected action retains its existing recovery policy");
+  assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+    configured: "auto", providerSupportsReasoningToggle: false,
+    structuredActionRequired: true,
+  }), "auto", "an adapter without a toggle cannot override the configuration");
+});
+
 test("corrective action window closes observation but not the Run", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {
@@ -6835,8 +6859,6 @@ test("corrective action window closes observation but not the Run", () => {
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       actionWindow: "corrective_mutation",
     }),
@@ -10505,6 +10527,85 @@ test("Execute request budgets the full wire shape before compacting canonical co
       assert.equal(message.content, canonical.content, "recovery pressure never crops retained receipts");
     }
   } finally { streaming.streamChatCompletion = originalStream; }
+});
+
+test("ordinary reference requests retain reasoning across source windows and input pressure", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const laneSettings = loadTs(path.join(workspaceRoot, "src/lib/providerLaneSettings.ts"));
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalSettings = laneSettings.deriveBudgetedStreamSettings;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  const target = "references/verification-loop.md";
+  const facts = { ...originalFacts(null), sourceReadVersionsByToolCallId: new Map([["reference", { target, version: "reference-v1" }]]) };
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => facts;
+  let configured = "auto";
+  laneSettings.deriveBudgetedStreamSettings = (...args) => ({ ...originalSettings(...args), reasoningRequest: configured });
+  let wire;
+  streaming.streamChatCompletion = async (messages, settings, _callbacks, _signal, tools, _maxOutput, options) => {
+    wire = { messages, settings, tools, options };
+    return { content: "Continue from the verified reference.", semanticContent: "Continue from the verified reference.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  const tools = ["read_file", "run_command", "replace_in_file"].map((name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {} } } }));
+  const source = "# Verification\nUse real observations before reporting success.\n";
+  try {
+    const invoke = async (windowKind, inputBudget, recovery = false) => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = [
+        { role: "system", content: "[MAIN RUNTIME V2] workspace authority" },
+        { role: "user", runtimeTurnId: "t1", content: "Use the reference to perform the requested external operation." },
+        { role: "assistant", content: "Earlier planning context. ".repeat(1_000) },
+        ...(windowKind === "none" ? [] : [
+          { role: "assistant", content: "Read the workflow reference.", tool_calls: [{ id: "reference", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: target }) } }] },
+          { role: "tool", tool_call_id: "reference", content: loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts")).formatReadFileWindowPayloadForModel(target, {
+            content: source, contentVersion: "reference-v1", startLine: 1, endLine: 2,
+            totalLines: windowKind === "partial" ? 8 : 2,
+            totalChars: windowKind === "partial" ? source.length * 4 : source.length,
+            returnedChars: source.length, truncated: windowKind === "partial",
+            ...(windowKind === "partial" ? { nextStartLine: 3 } : {}),
+          }) },
+        ]),
+      ];
+      const canonical = structuredClone(live.messages);
+      const events = [];
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid", apiKey: "", model: "fixture", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live,
+        logStoreEvent: (name, data) => events.push({ name, data }),
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "observing", run: { turnId: "t1", runId: "r1" }, payload: {
+        mode: "execute", effectPressure: { reason: "source_only_frontier" },
+        ...(recovery ? { recoveryPressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason: "tool_execution_failed", occurrence: 1, stage: "reconsider" } } : {}),
+      } }, tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages, canonical);
+      return { ...wire, coverage: live.latestProviderRequestSourceCoverage, event: events.find((entry) => entry.name === "runtime_v2_context_prepared")?.data };
+    };
+    for (configured of ["auto", "explicit", "off"]) {
+      for (const windowKind of ["none", "complete", "partial"]) {
+        const roomy = await invoke(windowKind, 111_412);
+        const fullTokens = trim.estimateMessagesTokens(roomy.messages) + trim.estimateTokens(JSON.stringify(roomy.tools));
+        const pressured = await invoke(windowKind, fullTokens - 100);
+        for (const result of [roomy, pressured]) {
+          assert.equal(result.settings.reasoningRequest, configured, `${windowKind}: source visibility is not a decoding boundary`);
+          assert.equal(result.event.structuredActionRequired, false);
+          assert.equal(result.event.effectPressureActionDecoding, false);
+          assert.equal(result.options.toolChoice, undefined);
+          assert.equal(result.coverage.length > 0, windowKind !== "none");
+        }
+        assert.equal(roomy.event.decisionViewApplied, false);
+        assert.equal(pressured.event.decisionViewApplied, true, "the fixture must exercise real full-request pressure");
+      }
+    }
+    configured = "auto";
+    const recovery = await invoke("complete", 111_412, true);
+    assert.equal(recovery.settings.reasoningRequest, "off");
+    assert.equal(recovery.event.structuredActionRequired, true);
+    assert.equal(recovery.options.toolChoice, "required");
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    laneSettings.deriveBudgetedStreamSettings = originalSettings;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
 });
 
 test("recovery requests preserve canonical command and source receipts before real budget pressure", async () => {

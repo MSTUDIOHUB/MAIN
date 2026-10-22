@@ -197,6 +197,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - 设备内存估算是容量保护而非精确 KV 分配器；provider 仍可在请求时返回真实容量错误，后续应把它作为新的资源事实处理，不能静默截断正文。
 - 单次模型可见读取仍有绝对窗口上限。需要全文件语义时必须沿同一版本连续取窗，而不是提高常量或把文件偷偷裁成摘要。
 - reasoning 的专有请求字段只属于 adapter。OMLX 的 `auto` 不发送正向 reasoning 覆盖，保持所选模型声明的默认行为；只有 `explicit` 才依据该次请求的真实输出上限派生 hidden-thinking budget，`off` 用于关闭 thinking 的有界恢复。Execute、Plan 和 child 共用这一 adapter 规则，未知 endpoint 不接收这些字段；Runtime 只消费规范化后的 reasoning-toggle 能力来处理 reasoning-only 的长度截断。
+- 普通来源读取（包括 Skill 的引用文档）只增加证据与可见源码范围，不得单凭 `source_only_frontier` 覆盖已配置的 reasoning。没有真实动作窗口或恢复边界时，请求保留配置值；来源可见也不产生写入义务。
 - 任务总时长与单次决策输出必须分离：[executionProviderRequestPolicy.ts](../src/store/runtimeV2/executionProviderRequestPolicy.ts) 将普通 `execute` 动作解码封顶 4096 tokens，action window、`validate`／动作恢复封顶 2048；Chat/analyze 与结论请求使用同一 Run 的 `outputBudget`，受父请求 8192 上限约束，缺少 Run 预算的结论才回退 2048。动作流在 4000 reasoning 字符内仍未产生可见语义或工具调用时，runtime 只结束该次 stream并保留失败正文与反馈；[executionProviderRequest.ts](../src/store/runtimeV2/executionProviderRequest.ts) 仅依据 adapter 的 reasoning-toggle 能力关闭思考做有界恢复，无工具结论同样适用。无工具恢复要求完整回答，有工具只读恢复保留读取与回答选择；不得要求不存在的工具动作、重复同一失败上下文，或把单步输出边界投影成 Turn 超时或任务失败。
 
 ## 5. 项目基线不是会话记忆

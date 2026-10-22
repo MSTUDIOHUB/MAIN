@@ -175,8 +175,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
       : undefined;
   const derivedReasoningRequest = runtimeV2ExecutionReasoningRequest({
     configured: settings.reasoningRequest,
-    sourceOnlyFrontier,
-    hasMutationTool,
     providerSupportsReasoningToggle:
       adapterCapabilities.reasoningToggle,
     structuredActionRequired,
