@@ -993,9 +993,9 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
             {activeReviewTask && (
               <div className="mt-3 grid gap-3">
                 {activeReviewTask && (
-                  <div data-testid="execution-capsule-tool-review" className={`rounded-2xl border p-3 ${surface}`}>
+                  <div data-testid="execution-capsule-tool-review" className={`mx-auto w-full min-w-0 max-w-2xl rounded-2xl border p-3 text-left ${surface}`}>
                     <div className="flex min-w-0 items-start justify-between gap-3">
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <div className={`text-[12px] font-medium ${primaryText}`}>{copy.pendingReview}</div>
                         <div className={`mt-1 text-[11px] ${secondaryText}`}>{copy.chooseApproval}</div>
                         <div className="mt-2 grid gap-1 text-[11px]">
@@ -1032,7 +1032,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         </div>
                       </div>
                     </div>
-                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                    <div className="mt-3 flex flex-wrap items-stretch justify-end gap-2 text-center [&>button]:min-w-0 [&>button]:max-w-full">
                       {hasActiveDiffPreview && (
                         <button
                           onClick={onOpenDiff}

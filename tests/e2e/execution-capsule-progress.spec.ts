@@ -368,6 +368,83 @@ test("ExecutionCapsule keeps approval buttons visible for a long command with pl
   await expect(page.getByTestId("execution-capsule-current-plan-task")).toHaveCount(0);
 });
 
+for (const width of [1440, 640]) {
+  for (const appearance of ["light", "dark", "black"] as const) {
+    test(`tool approval review layout is centered and left aligned: ${appearance} ${width}`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width, height: 960 });
+      await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+      await page.evaluate(async (mode) => {
+        const bridge = (window as any).__CODELY_E2E__;
+        bridge?.showPendingToolReviewPrompt?.();
+        bridge?.setThemeMode?.(mode);
+        // Keep the real, identity-matched pending review; a short command exposes
+        // the intrinsic-width body that long command text previously concealed.
+        const { useAppStore } = await import("/src/store/useAppStore.ts");
+        const command = "printf --help";
+        useAppStore.setState((state: any) => ({
+          activeActionRequest: { ...state.activeActionRequest, target: command },
+          pendingToolCall: {
+            ...state.pendingToolCall,
+            arguments: { ...state.pendingToolCall.arguments, command },
+            shellPermissionDecision: { ...state.pendingToolCall.shellPermissionDecision, command },
+          },
+          taskFlow: state.taskFlow.map((block: any) => block.id === state.pendingReviewTaskId
+            ? { ...block, target: command }
+            : block),
+        }));
+      }, appearance);
+
+      const review = page.getByTestId("execution-capsule-tool-review");
+      await expect(review).toBeVisible();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", appearance);
+      await expect.poll(async () => review.evaluate((element) => {
+        const card = element.getBoundingClientRect();
+        const shell = element.closest("[data-testid='execution-capsule-shell']")!.getBoundingClientRect();
+        const target = element.querySelector("[data-testid='execution-capsule-tool-review-target']")!.getBoundingClientRect();
+        return {
+          readableWidth: card.width <= 672,
+          centered: Math.abs((card.left + card.right) / 2 - (shell.left + shell.right) / 2) < 1,
+          fullBody: target.width >= card.width - 28,
+          withinViewport: card.left >= 0 && card.right <= window.innerWidth,
+          noHorizontalOverflow: element.scrollWidth <= element.clientWidth,
+        };
+      })).toEqual({ readableWidth: true, centered: true, fullBody: true, withinViewport: true, noHorizontalOverflow: true });
+      for (const field of [
+        review.getByText("待审批", { exact: true }),
+        review.getByText("请选择审批方式", { exact: true }),
+        page.getByTestId("execution-capsule-tool-review-risk"),
+        page.getByTestId("execution-capsule-tool-review-name"),
+        page.getByTestId("execution-capsule-tool-review-target"),
+        page.getByTestId("execution-capsule-tool-review-argument"),
+      ]) {
+        await expect(field).toHaveCSS("text-align", "left");
+      }
+      await expect(page.getByTestId("execution-capsule-tool-review-argument")).toHaveText("printf --help");
+      const captureReview = async (section: string) => {
+        const screenshotPath = testInfo.outputPath(`approval-review-${appearance}-${width}-${section}.png`);
+        await page.getByTestId("agent-explanation-capsule").screenshot({ path: screenshotPath });
+        await testInfo.attach(`approval-review-${appearance}-${width}-${section}`, { path: screenshotPath, contentType: "image/png" });
+      };
+      await captureReview("content");
+      for (const button of [
+        review.getByRole("button", { name: "拒绝", exact: true }),
+        page.getByTestId("execution-capsule-tool-approve-session"),
+        page.getByTestId("execution-capsule-tool-approve-once"),
+      ]) {
+        // The existing Capsule owns a vertical scroll area on small windows.
+        // Review actions must remain reachable inside that area after wrapping.
+        await button.scrollIntoViewIfNeeded();
+        await expect(button).toBeInViewport();
+        const bounds = await button.boundingBox();
+        const card = await review.boundingBox();
+        expect(bounds!.x).toBeGreaterThanOrEqual(card!.x);
+        expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(card!.x + card!.width);
+      }
+      await captureReview("actions");
+    });
+  }
+}
+
 test("destructive approval shows exact risk and target and cannot enable session approval", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
   await page.evaluate(() => {
