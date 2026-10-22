@@ -159,7 +159,7 @@ Markdown 只负责审核显示。批准后任务和验证从 sealed typed graph 
 
 ## Execute 的稳定工具面
 
-普通工作区 Execute 使用一个稳定且有界的读／改／验核心授权面，安全读取不因 observing/acting/validating 切换消失。成功 mutation 之后会产生验证债务：`validate` provider 目录保留有限验证，也保留由当前 exact source 和实施契约支持的后续 mutation，避免多文件修复被阶段切换截断；任何新 mutation 都把验证债务移动到最新工作区边界，只有该边界之后的有限/行为验收才能完成。这样阶段表达当前重点而不是互斥权限振荡，同时不会靠固定轮数或总耗时强制结束。路径授权、修改前源码版本绑定、批准 WorkPlan scope、命令权限和完成证据仍由 runtime 硬门控制。
+普通工作区 Execute 使用一个稳定且有界的读／改／验核心授权面，安全读取不因 observing/acting/validating 切换消失。成功 mutation 之后会产生验证债务：`validate` provider 目录保留有限验证和普通工具动作，也保留由当前 exact source 和实施契约支持的后续 mutation，避免多文件修复被阶段切换截断；任何新 mutation 都把验证债务移动到最新工作区边界，只有该边界之后的有限/行为验收才能完成。没有显式实施契约的普通 Execute 不因中途一次验证通过自动撤掉工具；模型提交自然最终报告时才检查当前证据。这样阶段表达当前重点而不是互斥权限振荡，同时不会靠固定轮数或总耗时强制结束。路径授权、修改前源码版本绑定、批准 WorkPlan scope、命令权限和完成证据仍由 runtime 硬门控制。
 
 任务总时长与单次模型决策预算分离。普通 Execute 可以持续任意多步；但一次普通 `execute` 动作解码最多 4096 tokens，action window、`validate`、恢复动作与执行结论最多 2048。动作请求若只生成隐藏 reasoning，达到 4000 字符且仍没有可见语义或工具调用时，只取消该次 stream，关闭 reasoning，并带 `ACTION_OUTPUT_BUDGET_EXHAUSTED` 反馈立即重试一个结构化动作。纯 prose 无论长短都不能清偿 Execute/Validate 的 effect debt。最终恢复请求不再广告工具，只允许模型简短交接已改内容、证据缺口和人工验证步骤；已有真实修改时以 `partial` 正常收口，不能误报 `success`。上述边界只防止单次响应独占本地 lane，不是 Turn、Run 或复杂任务的时间／token 上限。
 

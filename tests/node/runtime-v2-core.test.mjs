@@ -682,7 +682,7 @@ test("minimal Execute loops through inspect, edit, behavioral validation, and co
 
   next = runtime.decideNextCommands(state)[0];
   assert.equal(next.kind, "request_model");
-  assert.equal(next.payload.mode, "conclude");
+  assert.equal(next.payload.mode, "validate");
   assert.equal(next.payload.toolExpectation, undefined);
   state = schedule(state, next);
   state = runtime.transition(state, event(state, "provider.responded", {
@@ -697,7 +697,7 @@ test("minimal Execute loops through inspect, edit, behavioral validation, and co
   assert.equal(
     runtime.latestRuntimeV2ProviderConclusionText(state),
     "Updated src/main.js and verified the repaired behavior.",
-    "only the evidence-ready conclude request may supply terminal provider text",
+    "a clean natural final may conclude once the latest mutation has matching validation",
   );
   const evidence = runtime.summarizeRuntimeV2ExecuteEvidence(state, {
     isMutationToolName: (name) => name === "apply_patch",
@@ -1363,17 +1363,83 @@ test("command-only completion accepts a real external operation without manufact
   assert.equal(commandOnlyOutcome(state)?.resultKind, "success");
 });
 
-test("command-only completion rejects failed, blocked, and skipped actions until that exact action succeeds", () => {
+test("ordinary Execute keeps actions after an intermediate validation and requires a fresh pass after the next mutation", () => {
+  let state = aggregateWithValidation("npm test");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
+  const next = runtime.decideNextCommands(state)[0];
+  assert.equal(next.payload.mode, "validate", "an intermediate pass cannot force a report-only request");
+  const providerTools = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderTools.ts"));
+  const available = ["read_file", "write_file", "apply_patch", "run_command"].map((name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {}, required: [] } } }));
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({ ports: { get: () => ({}), live: {}, context: { turnId: baseTurn.turnId } }, command: next, available });
+  assert.deepEqual(selected.map((tool) => tool.function.name), available.map((tool) => tool.function.name));
+
+  state = commitMutation(state, "next-game-step", "src/main.js");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false, "a later mutation makes the intermediate pass stale");
+  state = providerResult(state, { visibleText: "The remaining game work is complete." });
+  assert.equal(commandOnlyOutcome(state), null, "natural final cannot replace a fresh validation");
+  state = providerResult(state, { toolCalls: [{ id: "validate-last-game-step", name: "run_command", arguments: { command: "npm test" } }] });
+  state = executePendingTool(state, { type: "validation.completed", passed: true, evidence: [{ id: "last-game-step-pass", kind: "validation", target: "npm test", version: "passed" }], presentation: { toolName: "run_command", target: "npm test" } });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
+  assert.equal(runtime.decideNextCommands(state)[0].payload.mode, "validate");
+  state = providerResult(state, { visibleText: "All requested steps are complete and the latest change passed its check." });
+  assert.equal(commandOnlyOutcome(state)?.resultKind, "success");
+});
+
+test("ordinary Execute cannot let an earlier pass hide a later real failure or treat a skipped optional action as attempted", () => {
+  let state = aggregateWithValidation("npm test");
+  state = operationReceipt(state, "editor-tool inspect", { status: "failed", evidence: [] });
+  state = operationReceipt(state, "editor-tool optional-query", { status: "blocked", failureReasonCode: "provider_batch_predecessor_failed", evidence: [] });
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null, "the real predecessor failure remains unresolved");
+  state = operationReceipt(state, "editor-tool inspect");
+  state = providerResult(state, { visibleText: "The failed check now succeeded; the optional query was not needed." });
+  assert.equal(commandOnlyOutcome(state)?.resultKind, "success", "an unexecuted optional sibling creates no independent failure debt");
+});
+
+test("a final current-mutation validation supersedes earlier corrected CLI failures but not failures after that pass", () => {
+  let state = aggregateWithValidation("npm test");
+  state = operationReceipt(state, "editor-tool inspect --obsolete", { status: "failed", evidence: [] });
+  state = operationReceipt(state, "editor-tool inspect --format json");
+  state = providerResult(state, { toolCalls: [{ id: "final-acceptance-after-cli-repair", name: "run_command", arguments: { command: "npm test" } }] });
+  state = executePendingTool(state, { type: "validation.completed", passed: true, evidence: [{ id: "final-current-mutation-pass", kind: "validation", target: "npm test", version: "passed" }], presentation: { toolName: "run_command", target: "npm test" } });
+  state = providerResult(state, { visibleText: "The corrected command and the final current-workspace validation succeeded." });
+  assert.equal(commandOnlyOutcome(state)?.resultKind, "success", "a rejected earlier command spelling is not permanent failure debt after final validation");
+  state = operationReceipt(state, "editor-tool inspect --new-bad-option", { status: "failed", evidence: [] });
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null, "a new real failure after the current validation remains unresolved");
+});
+
+test("a later validation cannot conceal a scheduled action whose actual effect receipt is missing", () => {
+  let state = aggregateWithValidation("npm test");
+  const unfinished = commandFor(state, "execute_tool", "missing-actual-effect", { toolName: "run_command", arguments: { command: "editor-tool prepare" } });
+  state = schedule(state, unfinished);
+  state = runtime.transition(state, event(state, "command.completed", { run: baseRun, idempotencyKey: unfinished.idempotencyKey, status: "succeeded" }));
+  state = providerResult(state, { toolCalls: [{ id: "validation-after-missing-effect", name: "run_command", arguments: { command: "npm test" } }] });
+  state = executePendingTool(state, { type: "validation.completed", passed: true, evidence: [{ id: "pass-after-missing-effect", kind: "validation", target: "npm test", version: "passed" }], presentation: { toolName: "run_command", target: "npm test" } });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null, "an actual effect receipt is required even if its control-plane command settled before the latest pass");
+});
+
+test("an explicit implementation contract retains its declared coverage and conclusion behavior", () => {
+  const contract = { summary: "Implement the requested change", root_causes: ["fixture"], changes: [{ operation: "modify", targets: ["src/main.js"], change: "Repair behavior", expected_outcome: "Works" }], validations: [{ kind: "finite_command", command: "npm test", expected_outcome: "Passes" }] };
+  const state = aggregateWithValidation("npm test", true, ["behavioral"], contract);
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
+  assert.equal(runtime.decideNextCommands(state)[0].payload.mode, "conclude");
+  const missingTarget = aggregateWithValidation("npm test", true, ["behavioral"], { ...contract, changes: [{ ...contract.changes[0], targets: ["src/main.js", "src/scene.js"] }] });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(missingTarget), false);
+  assert.notEqual(runtime.decideNextCommands(missingTarget)[0].payload.mode, "conclude");
+});
+
+test("command-only completion rejects real failures until that exact action succeeds", () => {
   for (const status of ["failed", "blocked"]) {
-    for (const failureReasonCode of [undefined, "provider_batch_predecessor_failed", "provider_batch_predecessor_unsettled"]) {
-      let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool inspect", { status, evidence: [], failureReasonCode });
+      let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool inspect", { status, evidence: [] });
       state = operationReceipt(state, "editor-tool status");
       state = providerResult(state, { visibleText: "Done." });
-      assert.equal(commandOnlyOutcome(state), null, `${status}:${failureReasonCode}`);
+      assert.equal(commandOnlyOutcome(state), null, status);
       state = operationReceipt(state, "editor-tool inspect", { arguments: { cwd: ".", command: "editor-tool inspect" } });
       state = providerResult(state, { visibleText: "Both commands now succeeded." });
-      assert.equal(commandOnlyOutcome(state)?.resultKind, "success", `${status}:${failureReasonCode}`);
-    }
+      assert.equal(commandOnlyOutcome(state)?.resultKind, "success", status);
   }
 });
 
@@ -1397,9 +1463,8 @@ test("command-only completion requires an executed validation even if a skipped 
     failureReasonCode: "provider_batch_predecessor_failed",
     evidence: [{ id: "invalid-validation-proof", kind: "validation", target: "npm test", version: "passed" }],
   });
-  state = operationReceipt(state, "editor-tool status");
   state = providerResult(state, { visibleText: "Done." });
-  assert.equal(commandOnlyOutcome(state), null, "a skipped action cannot be resolved by an unrelated success");
+  assert.equal(commandOnlyOutcome(state), null, "a skipped fake pass is not execution proof");
 
   state = providerResult(state, {
     toolCalls: [{ id: "executed-validation", name: "run_command", arguments: { cwd: ".", command: "npm test" } }],

@@ -13,6 +13,7 @@ import type {
 import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
+import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 import {
   resolveRuntimeV2SubagentReferences,
   runtimeV2SubagentModelHandle,
@@ -236,6 +237,10 @@ function executeReadyForConclusion(state: TurnAggregateV1): boolean {
     return planCoverage.allMutationTargetsCovered &&
       planCoverage.allRequiredValidationsPassed;
   }
+  // A passing intermediate check does not say that the provider has finished
+  // the complete objective. Ordinary Execute keeps its action surface until
+  // a natural final; explicit implementation contracts retain their boundary.
+  if (state.strategy === "execute" && !deriveRuntimeV2ExecutionContract(state)) return false;
   return runtimeV2DirectExecuteReadyForConclusion(state);
 }
 

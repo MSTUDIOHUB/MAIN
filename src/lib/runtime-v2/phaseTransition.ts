@@ -309,6 +309,12 @@ export function runtimeV2DirectExecuteContractCoverage(state: TurnAggregateV1) {
   return deriveRuntimeV2ExecutionContractCoverage(state, currentDirectExecuteValidationPasses(state));
 }
 
+/** The latest admitted real pass at the current mutation boundary. Earlier
+ * failed attempts may be superseded by this final workspace validation. */
+export function latestRuntimeV2DirectExecuteValidationSequence(state: TurnAggregateV1): number {
+  return latestSequence(currentDirectExecuteValidationPasses(state).map((event) => event.sequence));
+}
+
 export function runtimeV2DirectExecuteReadyForConclusion(state: TurnAggregateV1): boolean {
   const validPasses = currentDirectExecuteValidationPasses(state);
   if (!validPasses.length) return false;

@@ -6,7 +6,7 @@ import {
   deriveRuntimeV2ExecutionContract,
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
 } from "./executionContract";
-import { summarizeRuntimeV2ExecuteEvidence } from "./phaseTransition";
+import { latestRuntimeV2DirectExecuteValidationSequence, runtimeV2DirectExecuteReadyForConclusion, summarizeRuntimeV2ExecuteEvidence } from "./phaseTransition";
 import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
 import { isRuntimeV2ReadOnlyToolName } from "./workspaceReadPolicy";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
@@ -29,6 +29,68 @@ export interface RuntimeV2CompletionDecision {
   readonly resultReason: string;
 }
 
+/** One canonical action frontier shared by command and mutation completion.
+ * No control-plane receipt or skipped sibling can manufacture an effect. */
+function completedRuntimeV2ActionFacts(
+  aggregate: TurnAggregateV1,
+  afterSequence = -1,
+): { hasOperation: boolean; allSettled: boolean } {
+  if (!aggregate.run) return { hasOperation: false, allSettled: false };
+
+  // Unlike recovery fingerprints, this key preserves every normalized tool
+  // argument. Only the same action can resolve its earlier failed receipt.
+  const actionKey = (toolName: string, args: unknown): string => JSON.stringify(
+    [toolName, args],
+    (_key, value) => value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)))
+      : value,
+  );
+  const commands = new Map<string, { key: string; operation: boolean; readOnly: boolean }>();
+  const completedKeys = new Set<string>();
+  const results = new Map<string, { settled: boolean; operation: boolean }>();
+  for (const event of aggregate.events) {
+    if (!("run" in event) || event.run.runId !== aggregate.run.identity.runId) continue;
+    if (event.type === "command.scheduled") {
+      const command = event.command;
+      if (command.kind !== "execute_tool" && command.kind !== "execute_validation") continue;
+      const name = String(command.payload.toolName || "");
+      const key = actionKey(name, command.payload.arguments || {});
+      const readOnly = isRuntimeV2ReadOnlyToolName(name);
+      const operation = !!name && !readOnly &&
+        name !== RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
+        !isWorkspaceMutationToolName(name);
+      commands.set(command.idempotencyKey, { key, operation, readOnly });
+      continue;
+    }
+    if (event.type !== "tool.completed" && event.type !== "validation.completed") continue;
+    const command = commands.get(event.idempotencyKey);
+    if (!command) continue;
+    completedKeys.add(event.idempotencyKey);
+    if (event.sequence <= afterSequence) continue;
+    const skipped = event.type === "validation.completed"
+      ? !isRuntimeV2ValidationAttempt(event)
+      : event.failureReasonCode === "provider_batch_predecessor_failed" ||
+        event.failureReasonCode === "provider_batch_predecessor_unsettled";
+    // A skipped sibling was not attempted. Its real predecessor failure
+    // remains in this frontier until that same action actually succeeds.
+    if (skipped) continue;
+    const succeeded = event.type === "validation.completed" ? event.passed : event.status === "succeeded";
+    const executed = event.type === "validation.completed" || event.receiptOrigin !== "replayed";
+    const hasEffect = executed && event.evidence.some((evidence) =>
+      evidence.kind === "tool" || evidence.kind === "mutation" || evidence.kind === "validation",
+    );
+    results.set(command.key, {
+      settled: succeeded && (command.readOnly || hasEffect),
+      operation: succeeded && command.operation && hasEffect,
+    });
+  }
+  return {
+    hasOperation: [...results.values()].some((result) => result.operation),
+    allSettled: [...commands.keys()].every((key) => completedKeys.has(key)) &&
+      [...results.values()].every((result) => result.settled),
+  };
+}
+
 /** Ordinary command tasks have no file artifact to mutate or validate. Their
  * real effect receipts may support a later natural final, without switching
  * the next request to `conclude` or withdrawing Execute tools. */
@@ -44,59 +106,25 @@ export function runtimeV2CommandTaskReadyForConclusion(
       isMutationToolName: isWorkspaceMutationToolName,
     }).mutationCount > 0
   ) return false;
-
-  // Unlike recovery fingerprints, this key preserves every normalized tool
-  // argument. Only the same action can resolve its earlier failed receipt.
-  const actionKey = (toolName: string, args: unknown): string => JSON.stringify(
-    [toolName, args],
-    (_key, value) => value && typeof value === "object" && !Array.isArray(value)
-      ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)))
-      : value,
-  );
-  const commands = new Map<string, { key: string; operation: boolean; readOnly: boolean }>();
-  const results = new Map<string, { settled: boolean; operation: boolean }>();
-  for (const event of aggregate.events) {
-    if (!("run" in event) || event.run.runId !== aggregate.run.identity.runId) continue;
-    if (event.type === "command.scheduled") {
-      const command = event.command;
-      if (command.kind !== "execute_tool" && command.kind !== "execute_validation") continue;
-      const name = String(command.payload.toolName || "");
-      const key = actionKey(name, command.payload.arguments || {});
-      const readOnly = isRuntimeV2ReadOnlyToolName(name);
-      const operation = !!name && !readOnly &&
-        name !== RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
-        !isWorkspaceMutationToolName(name);
-      commands.set(command.idempotencyKey, { key, operation, readOnly });
-      results.set(key, { settled: false, operation: false });
-      continue;
-    }
-    if (event.type !== "tool.completed" && event.type !== "validation.completed") continue;
-    const command = commands.get(event.idempotencyKey);
-    if (!command) continue;
-    const attempted = event.type !== "validation.completed" || isRuntimeV2ValidationAttempt(event);
-    const succeeded = attempted && (event.type === "validation.completed" ? event.passed : event.status === "succeeded");
-    const executed = event.type === "validation.completed" || event.receiptOrigin !== "replayed";
-    const hasEffect = executed && event.evidence.some((evidence) =>
-      evidence.kind === "tool" || evidence.kind === "mutation" || evidence.kind === "validation",
-    );
-    results.set(command.key, {
-      settled: succeeded && (command.readOnly || hasEffect),
-      operation: succeeded && command.operation && hasEffect,
-    });
-  }
-  return [...results.values()].some((result) => result.operation) &&
-    [...results.values()].every((result) => result.settled);
+  const facts = completedRuntimeV2ActionFacts(aggregate);
+  return facts.hasOperation && facts.allSettled;
 }
 
-/** Mutation tasks retain the evidence-ready `conclude` gate. A command task
- * may instead finish through a clean, tool-free natural response after its
- * real receipts; source reads and provider prose alone never grant success. */
+/** Ordinary Execute may finish through a clean natural response after real
+ * command results or current mutation validation. Neither receipts nor an
+ * intermediate pass forces the model to stop its remaining authorized work. */
 export function latestRuntimeV2ProviderConclusionText(
   aggregate: TurnAggregateV1,
 ): string {
+  const naturalFinalReady = runtimeV2CommandTaskReadyForConclusion(aggregate) || (
+    aggregate.strategy === "execute" && !aggregate.workPlan && !aggregate.sealedWorkPlan &&
+    !deriveRuntimeV2ExecutionContract(aggregate) &&
+    runtimeV2DirectExecuteReadyForConclusion(aggregate) &&
+    completedRuntimeV2ActionFacts(aggregate, latestRuntimeV2DirectExecuteValidationSequence(aggregate)).allSettled
+  );
   return (
     latestRuntimeV2Answer(aggregate, true) ||
-    (runtimeV2CommandTaskReadyForConclusion(aggregate)
+    (naturalFinalReady
       ? latestRuntimeV2Answer(aggregate)
       : "")
   ).slice(0, 24_000);
