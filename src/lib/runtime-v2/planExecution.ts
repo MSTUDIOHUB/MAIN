@@ -7,6 +7,7 @@ import type {
 } from "./workPlan";
 import type { RuntimeV2ExecutionValidationAuthority } from "./contracts";
 import { runtimeV2ValidationBoundaryMatchesCurrent } from "./validationReceipt";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import {
   normalizeWorkspacePathIdentity,
   workspacePathsReferToSameFile,
@@ -551,7 +552,7 @@ export function deriveRuntimeV2PlanValidationCorrectionScope(
   const passedAfterFailure = new Set<string>();
   for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
     const event = aggregate.events[index]!;
-    if (event.type !== "validation.completed") continue;
+    if (!isRuntimeV2ValidationAttempt(event)) continue;
     const authorityId = event.authority?.kind === "work_plan"
       ? event.authority.validationId
       : "";
@@ -709,7 +710,7 @@ export function deriveRuntimeV2PlanExecutionCoverage(
   const mutationBoundary = latestMutationIndex(aggregate);
   const passedValidations = aggregate.events.filter(
     (event): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
-      event.type === "validation.completed" &&
+      isRuntimeV2ValidationAttempt(event) &&
       event.passed &&
       eventIndex(aggregate, event) > mutationBoundary &&
       !!event.authority &&

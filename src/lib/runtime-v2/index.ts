@@ -26,5 +26,6 @@ export * from "./subagentReport";
 export * from "./subagentHandoff";
 export * from "./terminal";
 export * from "./validationReceipt";
+export * from "./validationAttempt";
 export * from "./workPlan";
 export * from "./workspaceReadPolicy";

@@ -1,4 +1,5 @@
 import type { RuntimeV2Command, TurnAggregateV1 } from "../../lib/runtime-v2";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 
 export interface RuntimeV2ShellBatchInterruption {
   readonly predecessorToolCallId: string;
@@ -41,7 +42,9 @@ export function runtimeV2SequentialShellBatchInterruption(
       if (predecessorIds.has(id)) commandCalls.set(event.command.idempotencyKey, id);
     } else if (event.type === "tool.completed" || event.type === "validation.completed") {
       const id = commandCalls.get(event.idempotencyKey);
-      if (id) succeeded.set(id, event.type === "validation.completed" ? event.passed : event.status === "succeeded");
+      if (id) succeeded.set(id, event.type === "validation.completed"
+        ? isRuntimeV2ValidationAttempt(event) && event.passed
+        : event.status === "succeeded");
     }
   }
   for (const id of predecessors) {

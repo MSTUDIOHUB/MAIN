@@ -3,6 +3,7 @@ import type { RuntimeV2Event } from "./events";
 import { deriveRuntimeV2ExecutionContract, runtimeV2ExecutionContractMutationTargets, scheduledCommandsByKey } from "./executionContract";
 import { workspacePathsReferToSameFile } from "../workspacePaths";
 import { analyzeValidationCommand } from "../validationContract";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 
 /** Uses only already-admitted, passing validators at the current mutation
  * boundary. Declared checks are obligations, not optional report decoration. */
@@ -19,7 +20,7 @@ export function deriveRuntimeV2ExecutionContractCoverage(
     !mutations.some((item) => workspacePathsReferToSameFile(item.target, target)));
   const missingValidationIndexes = contract.validations.flatMap((check, index) => {
     const latest = [...state.events].reverse().find((event) => {
-      if (event.type !== "validation.completed") return false;
+      if (!isRuntimeV2ValidationAttempt(event)) return false;
       if (event.sequence <= contract.recordedAtSequence) return false;
       const request = commands.get(event.idempotencyKey);
       const args = request?.payload.arguments as Record<string, unknown> | undefined;
@@ -32,7 +33,7 @@ export function deriveRuntimeV2ExecutionContractCoverage(
     });
     // A later failure of this exact obligation invalidates its earlier pass,
     // even if an unrelated validator subsequently succeeds.
-    const covered = latest?.type === "validation.completed" && currentPasses.some((event) => event.sequence === latest.sequence);
+    const covered = latest?.type === "validation.completed" && currentPasses.some((event) => isRuntimeV2ValidationAttempt(event) && event.passed && event.sequence === latest.sequence);
     return covered ? [] : [index];
   });
   return { complete: !pendingTargets.length && !missingValidationIndexes.length, pendingTargets, missingValidationIndexes };

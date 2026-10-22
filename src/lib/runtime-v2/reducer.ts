@@ -7,6 +7,7 @@ import {
   type RuntimeV2TurnIdentity, type RuntimeV2WorkPlanReference,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import {
   canRecordRuntimeV2Recovery,
   emptyRuntimeV2RecoveryBudget, exhaustRuntimeV2Recovery,
@@ -477,7 +478,9 @@ export function tryTransition(
             // that could not be executed or authorized.
             commandReceipt(completion.command, "succeeded", event.at),
           ),
-          evidence: appendNovelRuntimeV2Evidence(state.evidence, event.evidence),
+          evidence: isRuntimeV2ValidationAttempt(event)
+            ? appendNovelRuntimeV2Evidence(state.evidence, event.evidence)
+            : state.evidence,
           pendingToolCalls: toolCallId
             ? state.pendingToolCalls.filter((call) => call.id !== toolCallId)
             : state.pendingToolCalls,

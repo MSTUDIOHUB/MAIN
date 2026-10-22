@@ -47,7 +47,7 @@ import {
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
 import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
-import { runtimeV2SequentialShellBatchInterruption } from "./executionSequentialShellBatch";
+import { interruptedRuntimeV2ShellBatchReceipt } from "./executionSequentialShellBatchReceipt";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -181,27 +181,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         toolName,
         target: target || null,
       });
-      const batchInterruption = runtimeV2SequentialShellBatchInterruption(
-        aggregateForCurrentTurn(input),
-        command,
-      );
-      if (batchInterruption) {
-        const content = `TOOL_NOT_EXECUTED: ${toolName} was not executed because predecessor ${batchInterruption.predecessorToolCallId} in the same shell batch did not succeed. Reassess the remaining commands from the actual receipts.`;
-        recordToolResultHistory({ ports: input, command, toolName, target, status: "blocked", content });
-        input.logStoreEvent("runtime_v2_tool_execution_blocked", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          reason: batchInterruption.reasonCode,
-          predecessorToolCallId: batchInterruption.predecessorToolCallId,
-        });
-        const receipt = toolCompletionFor(input, command, toolName, args, target, content, "blocked", "execution_failed", undefined, undefined, batchInterruption.reasonCode);
-        return receipt.type === "validation.completed"
-          ? { ...receipt, evidence: [] }
-          : receipt;
-      }
+      const skippedBatchReceipt = interruptedRuntimeV2ShellBatchReceipt({
+        ports: input, command, toolName, args, target,
+      });
+      if (skippedBatchReceipt) return skippedBatchReceipt;
       const hasCoveredSourceReceipt =
         !!toolCallId &&
         input.live.coveredReadToolResults.has(toolCallId);

@@ -12,6 +12,7 @@ import type {
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import {
   resolveRuntimeV2SubagentReferences,
   runtimeV2SubagentModelHandle,
@@ -291,10 +292,10 @@ function providerToolCallProgress(
     const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
     if (!toolCallId) continue;
     if (
-      event.passed ||
+      isRuntimeV2ValidationAttempt(event) && (event.passed ||
       event.failureKind === "assertion_failed" ||
       event.failureKind === "execution_failed" ||
-      !event.failureKind
+      !event.failureKind)
     ) {
       progressed.add(toolCallId);
     } else {
@@ -374,10 +375,10 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
     }
     if (event.type === "validation.completed") {
       if (
-        event.passed ||
+        isRuntimeV2ValidationAttempt(event) && (event.passed ||
         event.failureKind === "assertion_failed" ||
         event.failureKind === "execution_failed" ||
-        !event.failureKind
+        !event.failureKind)
       ) {
         break;
       }

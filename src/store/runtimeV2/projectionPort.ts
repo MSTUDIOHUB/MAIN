@@ -12,6 +12,7 @@ import {
   withTurnRuntimePhaseStatus,
 } from "../../lib/turnPhase";
 import { runtimeV2StructuredActionMarkdown } from "../../lib/runtime-v2";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import type {
   ProjectionPort,
   RuntimeV2Command,
@@ -285,7 +286,7 @@ function reconcileRuntimeV2TimelineBlocks(
   const validationOutcomes = new Map(
     aggregate.events
       .filter((event) => event.type === "validation.completed")
-      .map((event) => [event.idempotencyKey, event.passed] as const),
+      .map((event) => [event.idempotencyKey, isRuntimeV2ValidationAttempt(event) && event.passed] as const),
   );
   const completions = new Map(
     aggregate.events
@@ -326,7 +327,10 @@ function reconcileRuntimeV2TimelineBlocks(
         completion.status !== "succeeded";
       const terminalFailed = failed || toolFailed;
       const presentation = completion?.presentation;
-      const fallbackMessage = terminalFailed
+      const notExecuted = completion?.type === "validation.completed" && !isRuntimeV2ValidationAttempt(completion);
+      const fallbackMessage = notExecuted
+        ? language === "zh" ? "该验证未执行，没有产生通过或失败结果。" : "This validator was not executed and produced no pass or failure result."
+        : terminalFailed
         ? validationPassed === false
           ? language === "zh"
             ? "有限验证未通过；运行时已保留真实失败输出供后续修复。"
@@ -341,7 +345,7 @@ function reconcileRuntimeV2TimelineBlocks(
         executionName: presentation?.toolName || block.executionName,
         target: presentation?.target || block.target,
         status: terminalFailed ? "error" : "done",
-        toolStatus: terminalFailed ? "failed" : "executed",
+        toolStatus: notExecuted ? "rejected" : terminalFailed ? "failed" : "executed",
         turnPhase: withTurnRuntimePhaseStatus(
           block.turnPhase,
           terminalFailed ? "failed" : "done",

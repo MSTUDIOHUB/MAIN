@@ -148,6 +148,30 @@ test("a control-plane completion without an actual tool receipt cannot release t
   assert.deepEqual(sideEffects, []);
 });
 
+test("a malformed passed not-executed validator cannot release later shell effects", async () => {
+  sideEffects.length = 0;
+  const calls = [{ id: "unexecuted-validator", name: "run_command", arguments: { command: "npm test" } }, shellCalls()[1]];
+  const f = ledger(calls);
+  const [first] = runtime.decideNextCommands(f.aggregate);
+  assert.equal(first.kind, "execute_validation");
+  f.apply("command.scheduled", { run: f.run, command: first });
+  f.apply("validation.completed", { run: f.run, idempotencyKey: first.idempotencyKey, passed: true, failureKind: "not_executed", evidence: [] });
+  const [command] = runtime.decideNextCommands(f.aggregate);
+  f.apply("command.scheduled", { run: f.run, command });
+  const live = createRuntimeV2LiveExecutionState();
+  live.messages.push({ role: "assistant", content: "", tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+  const port = createRuntimeV2ToolPort({
+    get: () => ({ runtimeV2Checkpoints: { turn: runtime.createRuntimeV2Checkpoint({ revision: f.aggregate.nextSequence, aggregate: f.aggregate, updatedAt: f.aggregate.updatedAt }) } }),
+    context: { turnId: "turn", runtimeRunIntent: "execute", runWorkspace: "/fixture", runSessionKey: "/fixture:1", phaseLanguage: "en" },
+    live, nextId: (scope) => `${scope}-1`, now: () => 100, logStoreEvent() {},
+  });
+  const receipt = await port.execute({ run: f.run, command, signal: new AbortController().signal });
+  assert.equal(receipt.type, "tool.completed");
+  assert.equal(receipt.status, "blocked");
+  assert.equal(receipt.failureReasonCode, "provider_batch_predecessor_failed");
+  assert.deepEqual(sideEffects, []);
+});
+
 for (const status of ["failed", "blocked"]) {
   test(`a ${status} predecessor closes the remaining shell pairs without approvals or execution`, async () => {
     sideEffects.length = 0;
@@ -207,6 +231,8 @@ test("a skipped validator creates no validation evidence or failed-validator fro
   const receipt = await port.execute({ run: f.run, command, signal: new AbortController().signal });
   assert.equal(receipt.type, "validation.completed");
   assert.equal(receipt.passed, false);
+  assert.equal(receipt.failureKind, "not_executed");
+  assert.equal(receipt.failureReasonCode, "provider_batch_predecessor_failed");
   assert.deepEqual(receipt.evidence, []);
   f.apply(receipt.type, receipt);
   const effects = deriveRuntimeV2ProviderEffectFacts(f.aggregate);

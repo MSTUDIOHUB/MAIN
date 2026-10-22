@@ -136,8 +136,12 @@ export type RuntimeV2Event =
       readonly failureKind?:
         | "assertion_failed"
         | "execution_failed"
+        | "not_executed"
         | "not_authorized"
         | "protocol_invalid";
+      /** Durable boundary cause; not_executed closes a tool pair without
+       * creating validation evidence, a pass, or a failed-check frontier. */
+      readonly failureReasonCode?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "work_plan.sealed";

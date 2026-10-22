@@ -14,6 +14,7 @@ import {
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
   isRuntimeV2TurnTerminallyClosed,
+  isRuntimeV2ValidationAttempt,
   runtimeV2DirectExecuteReadyForConclusion,
   runtimeV2ProviderRecoveryStallExpired,
   RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT,
@@ -350,7 +351,7 @@ export async function runSubmitRuntimeV2Execute(
           (event): event is Extract<
             (typeof before.events)[number],
             { type: "validation.completed" }
-          > => event.type === "validation.completed" && !event.passed,
+          > => isRuntimeV2ValidationAttempt(event) && !event.passed,
         );
         const latestDetail = String(
           latestFailure?.presentation?.message || "",

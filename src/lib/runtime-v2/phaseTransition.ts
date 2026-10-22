@@ -6,6 +6,7 @@ import type {
 import type { RuntimeV2Event } from "./events";
 import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 import { analyzeValidationCommand } from "../validationContract";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
 import { workspacePathsReferToSameFile } from "../workspacePaths";
 import {
@@ -262,7 +263,7 @@ function currentDirectExecuteValidationPasses(
   const validations = state.events.filter((
     event,
   ): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
-    event.type === "validation.completed" &&
+    isRuntimeV2ValidationAttempt(event) &&
     event.sequence > latestMutationSequence
   );
   const validPasses = validations.filter((event) => {
@@ -354,7 +355,7 @@ function failedValidationSummarySinceLastPass(
   let countingStalled = true;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
-    if (event.type !== "validation.completed") continue;
+    if (!isRuntimeV2ValidationAttempt(event)) continue;
     if (event.passed) break;
     count += 1;
     const fingerprint = validationFailureFingerprint(event);
@@ -428,7 +429,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
     mutationCount:
       committedMutationSequences(state.events, input.isMutationToolName).length,
     passedValidationCount: state.events.filter((event) =>
-      event.type === "validation.completed" &&
+      isRuntimeV2ValidationAttempt(event) &&
       event.passed &&
       event.sequence > latestMutationSequence
     ).length,
@@ -436,7 +437,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
     stalledValidationCount: failedValidations.stalled,
     failedOperationCount: state.events.filter((event) =>
       (event.type === "tool.completed" && event.status !== "succeeded") ||
-      (event.type === "validation.completed" && !event.passed)
+      (isRuntimeV2ValidationAttempt(event) && !event.passed)
     ).length,
     failedProviderRequestCount: failedProviderDecisionKeys.size,
   };
@@ -447,7 +448,7 @@ function latestValidation(
 ): Extract<RuntimeV2Event, { type: "validation.completed" }> | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
-    if (event.type === "validation.completed") return event;
+    if (isRuntimeV2ValidationAttempt(event)) return event;
   }
   return null;
 }
@@ -538,7 +539,7 @@ export function decideRuntimeV2ExecutePhaseTransition(
     );
     const latestValidationSequence = latestSequence(
       state.events
-        .filter((event) => event.type === "validation.completed")
+        .filter(isRuntimeV2ValidationAttempt)
         .map((event) => event.sequence),
     );
     if (

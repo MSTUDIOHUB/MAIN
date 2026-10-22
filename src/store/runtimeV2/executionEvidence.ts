@@ -498,7 +498,7 @@ export function toolCompletionFor(
                 : null,
           }))
         : [],
-      failureKind === "assertion_failed"
+      failureKind === "assertion_failed" || failureKind === "not_executed"
         ? "protocol_invalid"
         : failureKind,
       presentation,

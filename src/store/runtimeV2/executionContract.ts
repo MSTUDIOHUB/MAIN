@@ -2,6 +2,7 @@ import type { ToolDefinition } from "../../lib/toolSchemas";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import { analyzeValidationCommand } from "../../lib/validationContract";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { finiteValidationCommandRejection } from "./executionValidationCommand";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
@@ -246,7 +247,7 @@ export function validateRuntimeV2ExecutionContractSubmission(input: {
             )
           )
         ) ||
-        (event.type === "validation.completed" && !event.passed) ||
+        (isRuntimeV2ValidationAttempt(event) && !event.passed) ||
         (
           event.type === "subagent.completed" &&
           event.evidence.length > 0
