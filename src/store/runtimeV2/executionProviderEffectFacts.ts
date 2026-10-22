@@ -9,8 +9,12 @@ import {
 import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerReadReceipts";
+import { runtimeV2SequentialShellBatchInterruption } from "./executionSequentialShellBatch";
 
 export interface RuntimeV2ProviderEffectFacts {
+  /** Standard tool pairs closed without executing a canceled dependency.
+   * These are transport completions, never attempted semantic effects. */
+  readonly unexecutedToolCallIds?: ReadonlySet<string>;
   /** Runtime-scoped provider tool-call id -> committed mutation targets.
    *
    * This projection is derived from the durable command/effect ledger. The
@@ -140,13 +144,28 @@ export function deriveRuntimeV2ProviderEffectFacts(
     }
   >();
   const rejectedActionIdentities = new Set<string>();
+  const unexecutedToolCallIds = new Set<string>();
   const observationActionsByFingerprint =
     new Map<string, Set<string>>();
   const repeatedObservationToolNames = new Set<string>();
   for (const event of aggregate?.events || []) {
+    const command = "idempotencyKey" in event
+      ? commandsByIdempotencyKey.get(event.idempotencyKey)
+      : undefined;
+    const skippedTool = event.type === "tool.completed" &&
+      (event.failureReasonCode === "provider_batch_predecessor_failed" ||
+        event.failureReasonCode === "provider_batch_predecessor_unsettled");
+    const skippedValidation = event.type === "validation.completed" &&
+      !event.passed && event.evidence.length === 0 &&
+      event.failureKind === "execution_failed" && !!command &&
+      !!runtimeV2SequentialShellBatchInterruption(aggregate, command);
+    if (skippedTool || skippedValidation) {
+      const toolCallId = toolCallIdsByCommand.get(event.idempotencyKey);
+      if (toolCallId) unexecutedToolCallIds.add(toolCallId);
+    }
     if (event.type !== "validation.completed" || event.passed) continue;
     const toolCallId = toolCallIdsByCommand.get(event.idempotencyKey);
-    if (toolCallId) failedValidationToolCallIds.add(toolCallId);
+    if (toolCallId && !unexecutedToolCallIds.has(toolCallId)) failedValidationToolCallIds.add(toolCallId);
   }
   for (const event of aggregate?.events || []) {
     if (
@@ -303,6 +322,7 @@ export function deriveRuntimeV2ProviderEffectFacts(
     }
   }
   return {
+    unexecutedToolCallIds,
     committedMutationTargetsByToolCallId,
     replayedToolCallIds,
     replayedSourceReceiptCountSinceMutation,

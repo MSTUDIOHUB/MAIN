@@ -66,9 +66,10 @@ export function unexpectedRuntimeV2ProviderToolNames(
   )];
 }
 
-/** Independent reads and child scheduling may share a provider decision;
- * each selected command still passes its own durable Runtime fence. Workspace
- * effects (including joins that may commit staged work) remain isolated. */
+/** Independent reads and child scheduling may share a provider decision.
+ * Homogeneous shell decisions are consumed in order, with their own durable
+ * fences and approvals; they are never classified as safe parallel reads.
+ * Other workspace effects (including joins) remain isolated. */
 export function boundRuntimeV2ProviderToolCalls(
   calls: readonly RuntimeV2NormalizedToolCall[],
   attemptedIdentities: ReadonlySet<string> = new Set(),
@@ -83,6 +84,7 @@ export function boundRuntimeV2ProviderToolCalls(
     | "empty"
     | "first"
     | "safe_batch"
+    | "sequential_shell_batch"
     | "collaboration_batch"
     | "first_novel_after_attempt"
     | "first_novel_after_rejection"
@@ -106,6 +108,32 @@ export function boundRuntimeV2ProviderToolCalls(
       accepted: [],
       discarded: [...calls],
       selection: "all_rejected",
+    };
+  }
+  if (calls.every((call) => call.name === "run_command")) {
+    const seen = new Set<string>();
+    const acceptedIndices = eligibleIndices.filter((index) => {
+      const identity = runtimeV2ProviderToolCallIdentity(calls[index]!);
+      if (attemptedIdentities.has(identity) || seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    });
+    if (acceptedIndices.length === 0) {
+      return { accepted: [], discarded: [...calls], selection: "all_attempted" };
+    }
+    const selected = new Set(acceptedIndices);
+    const firstIndex = acceptedIndices[0]!;
+    return {
+      accepted: calls.filter((_, index) => selected.has(index)),
+      discarded: calls.filter((_, index) => !selected.has(index)),
+      selection: acceptedIndices.length > 1
+        ? "sequential_shell_batch"
+        : firstIndex === 0
+          ? "first"
+          : calls.slice(0, firstIndex).some((call) =>
+              rejectedIdentities.has(runtimeV2ProviderToolCallIdentity(call)))
+            ? "first_novel_after_rejection"
+            : "first_novel_after_attempt",
     };
   }
   if (calls.every((call) => isRuntimeV2ReadOnlyToolName(call.name))) {
