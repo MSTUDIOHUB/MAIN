@@ -31,6 +31,7 @@ function createHarness(suffix, { deferBootstrap = false, deferCancellation = fal
       if (specifier.startsWith(".")) {
         const base = path.resolve(path.dirname(normalizedPath), specifier);
         if (base === path.resolve("src/lib/streaming")) return {
+          resolveJsonObjectOutputOptions: () => ({ responseFormat: { type: "json_object" } }),
           buildOpenAiCompatibleReasoningRequestExtras: () => ({}),
           streamChatCompletion: (...args) => {
             assert.equal(args[0].length, 2);

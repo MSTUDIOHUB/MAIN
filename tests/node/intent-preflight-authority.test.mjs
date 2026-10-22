@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -15,7 +16,7 @@ function loadPreflight(candidate, transport) {
     const localRequire = createRequire(resolved);
     const requireModule = (name) => {
       if (name === "./streaming") {
-        return { streamChatCompletion: async (...args) => transport
+        return { resolveJsonObjectOutputOptions: () => ({ responseFormat: { type: "json_object" } }), streamChatCompletion: async (...args) => transport
           ? transport(...args)
           : ({ content: JSON.stringify(candidate), finishReason: "stop", toolCalls: [] }) };
       }
@@ -183,4 +184,67 @@ test("truncated, canceled, erroneous, or non-strict JSON streams never yield sem
     controller.abort();
     return { content, finishReason: "stop" };
   })({ ...params, signal: controller.signal }), null);
+});
+
+// Exact completed content from the controlled replay, not the historical native response.
+const capturedCompleteAnalysisProse = "I need to interpret the user's request. The user is asking to run `pwd` in the terminal in the current workspace, and explicitly states to wait for separate approval before executing.\n\nLet me analyze:\n- Objective: Run `pwd` command in the current workspace terminal\n- Work type: operate (executing a command)\n- Answer format: answer (the output of the command)\n- Required capabilities: command (to run pwd), workspace_read (pwd reads current directory)\n- Forbidden capabilities: None explicitly stated as forbidden in the current request. The user is asking to run a command, so command is needed.\n- The user explicitly says to wait for approval before executing - this is a procedural note, not a capability restriction. It means the system should not auto-execute but wait for approval. This doesn't forbid the command capability itself.\n\nThe request is clear and unambiguous.";
+
+
+test("preflight requests adapter-owned JSON output without changing the bounded semantic request", async () => {
+  let captured;
+  const input = "Run pwd once in the workspace after separate command approval.\n" + "CURRENT_REQUEST_SOURCE ".repeat(300);
+  const result = await loadPreflight(null, async (messages, settings, callbacks, signal, tools, maxTokens, options) => {
+    captured = { messages, settings, tools, maxTokens, options };
+    return { content: JSON.stringify(candidate({ workType: "operate", requiredCapabilities: ["command"], forbiddenCapabilities: [] })), finishReason: "stop", toolCalls: [] };
+  })({ ...params, input, hasWorkspace: true });
+  assert.deepEqual(captured.options, { responseFormat: { type: "json_object" }, contextOwnership: "caller" });
+  assert.equal(captured.settings.reasoningRequest, "off");
+  assert.equal(captured.maxTokens, 512);
+  assert.deepEqual(captured.tools, []);
+  assert.equal(JSON.parse(captured.messages[1].content).currentRequest, input);
+  assert.equal(result.intent, "execute");
+  assert.equal(result.requiresApproval, true);
+  assert.equal(result.commandDirective.exactCommand, undefined);
+});
+
+test("completed analysis prose is rejected with a safe JSON diagnostic rather than semantic authority", async () => {
+  assert.equal(capturedCompleteAnalysisProse.length, 878);
+  assert.equal(createHash("sha256").update(capturedCompleteAnalysisProse).digest("hex"), "99befa663c7cc3a343490b39d704515ca588c18c3e097e4058baba55dae34dee");
+  const diagnostics = [];
+  const result = await loadPreflight(null, async () => ({ content: capturedCompleteAnalysisProse, finishReason: "stop", toolCalls: [] }))({
+    ...params, onDiagnostic: (item) => diagnostics.push(item),
+  });
+  assert.equal(result, null);
+  assert.deepEqual(diagnostics, [{ code: "invalid_json", finishReason: "stop", contentChars: 878 }]);
+  assert.doesNotMatch(JSON.stringify(diagnostics), /pwd|interpret|separate approval/);
+});
+
+test("preflight failure diagnostics name invalid fields and preserve stream rejection boundaries", async () => {
+  for (const [wire, expected] of [
+    [{ content: JSON.stringify(candidate({ workType: "execute" })), finishReason: "stop" }, { code: "invalid_result", field: "semantic.workType" }],
+    [{ content: JSON.stringify(candidate()), finishReason: "length" }, { code: "incomplete_output" }],
+    [{ content: JSON.stringify(candidate()), finishReason: "PRIVATE_FINISH_MARKER" }, { code: "incomplete_output" }],
+    [{ content: JSON.stringify(candidate()), finishReason: "stop", clientStopReason: "reasoning_char_limit" }, { code: "client_output_limited" }],
+    [{ content: JSON.stringify(candidate()), finishReason: "stop", protocolViolation: "PRIVATE_PROTOCOL_MARKER" }, { code: "protocol_violation" }],
+    [{ content: JSON.stringify(candidate()), finishReason: "stop", toolCalls: [{ id: "PRIVATE_TOOL_MARKER" }] }, { code: "unexpected_tool_calls" }],
+  ]) {
+    const diagnostics = [];
+    assert.equal(await loadPreflight(null, async () => wire)({ ...params, onDiagnostic: (item) => diagnostics.push(item) }), null);
+    assert.equal(diagnostics.length, 1);
+    assert.deepEqual({ code: diagnostics[0].code, ...(diagnostics[0].field ? { field: diagnostics[0].field } : {}) }, expected);
+    assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE_/);
+    if (wire.finishReason === "PRIVATE_FINISH_MARKER") assert.equal(diagnostics[0].finishReason, "unknown");
+  }
+  const diagnostics = [];
+  assert.equal(await loadPreflight(null, async () => { throw new Error("PRIVATE_TRANSPORT_MARKER"); })({ ...params, onDiagnostic: (item) => diagnostics.push(item) }), null);
+  assert.deepEqual(diagnostics, [{ code: "transport_error" }]);
+  const streamDiagnostics = [];
+  assert.equal(await loadPreflight(null, async (_messages, _settings, callbacks) => {
+    callbacks.onError(new Error("PRIVATE_STREAM_MARKER"));
+    return { content: "PRIVATE_RESPONSE_MARKER", finishReason: "stop", toolCalls: [] };
+  })({ ...params, onDiagnostic: (item) => streamDiagnostics.push(item) }), null);
+  assert.deepEqual(streamDiagnostics, [{ code: "stream_error", finishReason: "stop", contentChars: 23 }]);
+  const aborted = new AbortController();
+  aborted.abort();
+  assert.equal(await loadPreflight(null, async () => { throw new Error("must not call transport"); })({ ...params, signal: aborted.signal, onDiagnostic: () => { throw new Error("Diagnostics cannot alter authority"); } }), null);
 });

@@ -37,6 +37,7 @@ import {
   type ProtocolChatMessage,
   type ReasoningRequestMode,
 } from "./cloudProtocol";
+import { applyStreamResponseFormat, isUnsupportedStreamResponseFormat } from "./streamResponseFormat";
 import { computeContextBudgets } from "./contextTrim";
 import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
@@ -1403,9 +1404,15 @@ async function requestOpenAiNonStreaming(
             reasoningEffort: settings.reasoningEffort ?? "none",
             nativeTools: candidateTools.length,
           });
+          const explicitOutputCap = Math.floor(Number(maxTokensOverride));
+          const formattedBody = applyStreamResponseFormat({
+            ...candidate.body,
+            ...(Number.isFinite(explicitOutputCap) && explicitOutputCap > 0
+              ? { max_output_tokens: explicitOutputCap } : {}),
+          }, "openai_responses", options.responseFormat);
           const candidateBody = settings.authMode === "openai_chatgpt_oauth"
-            ? ensureOpenAiChatGptCodexRequestBody(candidate.body)
-            : candidate.body;
+            ? ensureOpenAiChatGptCodexRequestBody(formattedBody)
+            : formattedBody;
           const candidatePayload = await postJsonRequest(
             apiUrl,
             headers,
@@ -1446,6 +1453,7 @@ async function requestOpenAiNonStreaming(
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           lastCompatibilityError = err instanceof Error ? err : new Error(errMsg);
+          if (options.responseFormat && /response_format|text\.format|json_schema|schema/i.test(errMsg)) throw lastCompatibilityError;
           if (responseTools.length > 0 && candidate.mode !== "transcript_text" && isNativeToolCompatibilityErrorMessage(errMsg)) {
             throw lastCompatibilityError;
           }
@@ -1512,7 +1520,7 @@ async function requestOpenAiNonStreaming(
         throw lastCompatibilityError ?? new Error("Responses request failed without a compatibility fallback result.");
       }
     } else {
-      const chatBody: Record<string, unknown> = {
+      let chatBody: Record<string, unknown> = {
         model: settings.model,
         messages: messages.map((message) => {
           const mapped = mapMessageForApi(message, false, {
@@ -1535,6 +1543,7 @@ async function requestOpenAiNonStreaming(
             )
           : {}),
       };
+      chatBody = applyStreamResponseFormat(chatBody, "openai_chat", options.responseFormat);
       applyOpenAiToolChoice(chatBody, settings, tools, options.toolChoice, minimalCompatibilityMode);
       payload = await postJsonRequest(
         apiUrl,
@@ -1683,7 +1692,7 @@ async function streamViaRustProxy(
 
   // Build the request body (same logic as streamChatCompletion)
   const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
-  const body: Record<string, unknown> = isOllama
+  let body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
         messages: messages.map((m) => mapMessageForApi(m, true, {
@@ -1718,6 +1727,8 @@ async function streamViaRustProxy(
             maxTokens,
           ),
         };
+
+  body = applyStreamResponseFormat(body, isOllama ? "ollama" : isAnthropic || isGemini ? "unsupported" : "openai_chat", options.responseFormat);
 
   if (tools && tools.length > 0 && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
@@ -2410,8 +2421,53 @@ async function streamViaRustProxy(
   return resultPromise;
 }
 
+/** JSON mode support belongs to the adapter, not semantic routing. */
+export function resolveJsonObjectOutputOptions(settings: StreamSettings): Pick<StreamRequestOptions, "responseFormat"> {
+  return isAnthropicProvider(settings) || isGeminiProvider(settings)
+    ? {} : { responseFormat: { type: "json_object" } };
+}
+
 // ── Main streaming function ─────────────────────────────────────────
 export async function streamChatCompletion(
+  messages: ChatMessage[], settings: StreamSettings, callbacks: StreamCallbacks,
+  signal?: AbortSignal, tools?: ToolDefinition[], maxTokensOverride?: number,
+  options: StreamRequestOptions = {},
+): Promise<StreamResult> {
+  if (!options.responseFormat || isAnthropicProvider(settings) || isGeminiProvider(settings)) {
+    return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, options);
+  }
+  let outputStarted = false;
+  const terminalLifecycle: Parameters<NonNullable<StreamCallbacks["onLifecycle"]>>[0][] = [];
+  const guarded: StreamCallbacks = {
+    ...callbacks,
+    onToken(token) { if (token) outputStarted = true; callbacks.onToken(token); },
+    onDone() {},
+    onError() {},
+    onLifecycle(event) {
+      if (["first_chunk", "chunk_progress", "model_progress"].includes(event.phase)) outputStarted = true;
+      if (["stream_error", "stream_done", "stream_cancelled"].includes(event.phase)) terminalLifecycle.push(event);
+      else callbacks.onLifecycle?.(event);
+    },
+  };
+  let result: StreamResult;
+  try {
+    result = await streamChatCompletionAttempt(messages, settings, guarded, signal, tools, maxTokensOverride, options);
+  } catch (error) {
+    if (!signal?.aborted && !outputStarted && isUnsupportedStreamResponseFormat(error instanceof Error ? error.message : String(error))) {
+      emitStreamingConsole("streaming", "info", "optional response format unsupported; retrying the same request without that field");
+      const { responseFormat: _format, ...remaining } = options;
+      return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, remaining);
+    }
+    terminalLifecycle.forEach((event) => callbacks.onLifecycle?.(event));
+    callbacks.onError(toError(error, "Structured output request failed."));
+    throw error;
+  }
+  terminalLifecycle.forEach((event) => callbacks.onLifecycle?.(event));
+  callbacks.onDone(result);
+  return result;
+}
+
+async function streamChatCompletionAttempt(
   messages: ChatMessage[],
   settings: StreamSettings,
   callbacks: StreamCallbacks,
@@ -2457,7 +2513,7 @@ export async function streamChatCompletion(
 
   // Build the request body based on provider
   const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
-  const body: Record<string, unknown> = isOllama
+  let body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
         messages: messages.map((m) => mapMessageForApi(m, true, {
@@ -2466,7 +2522,6 @@ export async function streamChatCompletion(
         })),
         stream: true,
         options: buildOllamaOptions(settings, maxTokens),
-        ...(options.responseFormat ? { format: options.responseFormat } : {}),
       }
     : isAnthropic
       ? buildAnthropicRequestBody({
@@ -2488,7 +2543,6 @@ export async function streamChatCompletion(
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
-          ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
           ...buildOpenAiCompatibleReasoningRequestExtras(
             settings,
             maxTokens,
@@ -2497,6 +2551,8 @@ export async function streamChatCompletion(
 
   // Native tool catalogs share one OpenAI-compatible function schema,
   // including Ollama's /api/chat transport.
+  body = applyStreamResponseFormat(body, isOllama ? "ollama" : isAnthropic || isGemini ? "unsupported" : "openai_chat", options.responseFormat);
+
   if (tools && tools.length > 0 && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }

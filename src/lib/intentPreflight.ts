@@ -1,5 +1,5 @@
 import { normalizeCloudProtocol, normalizeLocalToolProtocol, resolveEffectiveCloudApiFormat } from "./cloudProtocol";
-import { streamChatCompletion, type StreamSettings } from "./streaming";
+import { resolveJsonObjectOutputOptions, streamChatCompletion, type StreamResult, type StreamSettings } from "./streaming";
 import {
   getIntentPolicy,
   type IntentPreflightResult,
@@ -14,6 +14,18 @@ import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 import { TURN_CAPABILITIES, type SemanticCapability } from "./turnCapabilities";
 
 type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud" | "cloudExperimentalLoginEnabled">;
+type DiagnosticField = "result" | "semantic" | "semantic.objective" | "semantic.workType" | "semantic.answerFormat" |
+  "semantic.requiredCapabilities" | "semantic.forbiddenCapabilities" | "confidence" | "needsUserChoice" | "question" |
+  "settings.baseUrl" | "settings.model";
+const DIAGNOSTIC_FINISH_REASONS = ["stop", "length", "tool_calls", "function_call", "content_filter"] as const;
+
+export interface IntentPreflightDiagnostic {
+  readonly code: "unavailable" | "cancelled" | "transport_error" | "stream_error" | "incomplete_output" |
+    "client_output_limited" | "protocol_violation" | "unexpected_tool_calls" | "invalid_json" | "invalid_result";
+  readonly field?: DiagnosticField;
+  readonly finishReason?: typeof DIAGNOSTIC_FINISH_REASONS[number] | "unknown" | null;
+  readonly contentChars?: number;
+}
 
 function deriveStreamSettings(config: PreflightConfig): StreamSettings {
   if (config.activeProfile === "local") {
@@ -62,15 +74,17 @@ function normalizeCapabilities(value: unknown): SemanticCapability[] | null {
   return [...new Set(value)] as SemanticCapability[];
 }
 
-function normalizeSemanticIntent(raw: unknown): SemanticTaskIntent | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+function normalizeSemanticIntent(raw: unknown, onInvalid?: (field: DiagnosticField) => void): SemanticTaskIntent | null {
+  const invalid = (field: DiagnosticField) => { onInvalid?.(field); return null; };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid("semantic");
   const value = raw as Record<string, unknown>;
-  if (typeof value.objective !== "string" || !value.objective.trim()) return null;
-  if (!["answer", "investigate", "implement", "operate", "plan"].includes(value.workType as string)) return null;
-  if (!["answer", "analysis", "summary", "report", "plan"].includes(value.answerFormat as string)) return null;
+  if (typeof value.objective !== "string" || !value.objective.trim()) return invalid("semantic.objective");
+  if (!["answer", "investigate", "implement", "operate", "plan"].includes(value.workType as string)) return invalid("semantic.workType");
+  if (!["answer", "analysis", "summary", "report", "plan"].includes(value.answerFormat as string)) return invalid("semantic.answerFormat");
   const requiredCapabilities = normalizeCapabilities(value.requiredCapabilities);
   const forbiddenCapabilities = normalizeCapabilities(value.forbiddenCapabilities);
-  if (!requiredCapabilities || !forbiddenCapabilities) return null;
+  if (!requiredCapabilities) return invalid("semantic.requiredCapabilities");
+  if (!forbiddenCapabilities) return invalid("semantic.forbiddenCapabilities");
   return {
     objective: value.objective.trim(),
     workType: value.workType as SemanticTaskIntent["workType"],
@@ -94,14 +108,18 @@ function normalizePreflightResult(
   raw: unknown,
   language: "zh" | "en",
   explicitIntent?: ResolvedUserIntent,
+  onInvalid?: (field: DiagnosticField) => void,
 ): IntentPreflightResult | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const invalid = (field: DiagnosticField) => { onInvalid?.(field); return null; };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid("result");
   const candidate = raw as Record<string, unknown>;
-  const semantic = normalizeSemanticIntent(candidate.semantic);
-  if (!semantic || typeof candidate.confidence !== "number" || !Number.isFinite(candidate.confidence) ||
-    candidate.confidence < 0 || candidate.confidence > 1 || typeof candidate.needsUserChoice !== "boolean") return null;
+  const semantic = normalizeSemanticIntent(candidate.semantic, onInvalid);
+  if (!semantic) return null;
+  if (typeof candidate.confidence !== "number" || !Number.isFinite(candidate.confidence) ||
+    candidate.confidence < 0 || candidate.confidence > 1) return invalid("confidence");
+  if (typeof candidate.needsUserChoice !== "boolean") return invalid("needsUserChoice");
   const question = typeof candidate.question === "string" ? candidate.question.trim() : undefined;
-  if (candidate.needsUserChoice && !question) return null;
+  if (candidate.needsUserChoice && !question) return invalid("question");
   const required = semantic.requiredCapabilities;
   const implementation = semantic.workType === "implement" || required.includes("workspace_write");
   const forbidden = semantic.forbiddenCapabilities;
@@ -160,9 +178,25 @@ export async function runIntentPreflight(params: {
   previousRequest?: string;
   signal?: AbortSignal;
   config: PreflightConfig;
+  onDiagnostic?: (diagnostic: IntentPreflightDiagnostic) => void;
 }): Promise<IntentPreflightResult | null> {
+  const reject = (code: IntentPreflightDiagnostic["code"], field?: DiagnosticField, result?: Pick<StreamResult, "content" | "finishReason">): null => {
+    const finish = result?.finishReason;
+    try {
+      params.onDiagnostic?.({
+        code, ...(field ? { field } : {}),
+        ...(result ? {
+          finishReason: finish == null ? null : (DIAGNOSTIC_FINISH_REASONS as readonly string[]).includes(finish)
+            ? finish as typeof DIAGNOSTIC_FINISH_REASONS[number] : "unknown",
+          contentChars: typeof result.content === "string" ? result.content.length : 0,
+        } : {}),
+      });
+    } catch { /* Diagnostics must not change semantic authority or cancellation. */ }
+    return null;
+  };
   const settings = deriveStreamSettings(params.config);
-  if (!settings.baseUrl || !settings.model || params.signal?.aborted) return null;
+  if (params.signal?.aborted) return reject("cancelled");
+  if (!settings.baseUrl || !settings.model) return reject("unavailable", !settings.baseUrl ? "settings.baseUrl" : "settings.model");
 
   const systemPrompt = [
     "Interpret MAIN's current user request. Return one complete JSON object only; no prose, markdown or tools.",
@@ -189,11 +223,20 @@ export async function runIntentPreflight(params: {
       params.signal,
       [],
       512,
+      { ...resolveJsonObjectOutputOptions(settings), contextOwnership: "caller" },
     );
-    if (streamFailed || params.signal?.aborted || result.finishReason !== "stop" ||
-      result.clientStopReason || result.protocolViolation || result.toolCalls?.length) return null;
-    return normalizePreflightResult(JSON.parse(result.content.trim()), params.language, params.explicitIntent);
+    if (params.signal?.aborted) return reject("cancelled", undefined, result);
+    if (streamFailed) return reject("stream_error", undefined, result);
+    if (result.finishReason !== "stop") return reject("incomplete_output", undefined, result);
+    if (result.clientStopReason) return reject("client_output_limited", undefined, result);
+    if (result.protocolViolation) return reject("protocol_violation", undefined, result);
+    if (result.toolCalls?.length) return reject("unexpected_tool_calls", undefined, result);
+    let candidate: unknown;
+    try { candidate = JSON.parse(result.content.trim()); }
+    catch { return reject("invalid_json", undefined, result); }
+    return normalizePreflightResult(candidate, params.language, params.explicitIntent,
+      (field) => { reject("invalid_result", field, result); });
   } catch {
-    return null;
+    return reject(params.signal?.aborted ? "cancelled" : "transport_error");
   }
 }

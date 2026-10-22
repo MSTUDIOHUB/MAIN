@@ -18108,7 +18108,14 @@ export const useAppStore = create<AppState>()(
       startBlockingPreflight: (blockingPreflightEffect) => {
         void startSubmitBlockingPreflightEffect({
           effect: blockingPreflightEffect,
-          runIntentPreflight,
+          runIntentPreflight: (request) => runIntentPreflight({
+            ...request,
+            onDiagnostic: (diagnostic) => logStoreEvent("intent_preflight_rejected", {
+              sessionKey: blockingPreflightEffect.sendOriginSessionKey,
+              turnId: blockingPreflightEffect.originalOptions?.workspaceInstructionClaim?.turnId ?? null,
+              ...diagnostic,
+            }),
+          }),
           getState: get,
           setState: set,
           isSessionRuntimeActive,

@@ -24,6 +24,7 @@ function createHarness(candidate) {
     const localRequire = createRequire(resolved);
     function requireModule(name) {
       if (name === "./streaming") return {
+        resolveJsonObjectOutputOptions: () => ({ responseFormat: { type: "json_object" } }),
         streamChatCompletion: async (...args) => {
           requests.push(args);
           return { content: JSON.stringify(semanticResponse), finishReason: "stop", toolCalls: [] };
