@@ -67,8 +67,8 @@ export function unexpectedRuntimeV2ProviderToolNames(
 }
 
 /** Independent reads and child scheduling may share a provider decision.
- * Homogeneous shell decisions are consumed in order, with their own durable
- * fences and approvals; they are never classified as safe parallel reads.
+ * Opted-in reads mixed with shell decisions are consumed in order, with their
+ * own durable fences and approvals; they are never parallel reads.
  * Other workspace effects (including joins) remain isolated. */
 export function boundRuntimeV2ProviderToolCalls(
   calls: readonly RuntimeV2NormalizedToolCall[],
@@ -76,10 +76,15 @@ export function boundRuntimeV2ProviderToolCalls(
   rejectedIdentities: ReadonlySet<string> = new Set(),
   options: {
     readonly maxSpawnSubagents?: number;
+    /** The caller owns ordered execution, per-call fences and fresh reads. */
+    readonly allowMixedObservationShellBatch?: boolean;
   } = {},
 ): {
   readonly accepted: RuntimeV2NormalizedToolCall[];
   readonly discarded: RuntimeV2NormalizedToolCall[];
+  /** Batch-local call references, not durable source authority. A retained
+   * shell may change external state, so later reads must execute afresh. */
+  readonly freshReadCalls?: readonly RuntimeV2NormalizedToolCall[];
   readonly selection:
     | "empty"
     | "first"
@@ -110,15 +115,40 @@ export function boundRuntimeV2ProviderToolCalls(
       selection: "all_rejected",
     };
   }
-  if (calls.every((call) => call.name === "run_command")) {
-    const seen = new Set<string>();
-    const acceptedIndices = eligibleIndices.filter((index) => {
-      const identity = runtimeV2ProviderToolCallIdentity(calls[index]!);
-      if (attemptedIdentities.has(identity) || seen.has(identity)) return false;
-      seen.add(identity);
-      return true;
+  if (
+    calls.every((call) => call.name === "run_command") ||
+    (options.allowMixedObservationShellBatch === true &&
+      calls.some((call) => call.name === "run_command") &&
+      calls.every((call) =>
+        call.name === "run_command" || isRuntimeV2ReadOnlyToolName(call.name)
+      ))
+  ) {
+    const seenShells = new Set<string>();
+    const acceptedIndices: number[] = [];
+    const freshReadCalls: RuntimeV2NormalizedToolCall[] = [];
+    let retainedShell = false;
+    let hasNovelAction = false;
+    calls.forEach((call, index) => {
+      const identity = runtimeV2ProviderToolCallIdentity(call);
+      if (call.name === "run_command") {
+        if (
+          rejectedIdentities.has(identity) ||
+          attemptedIdentities.has(identity) || seenShells.has(identity)
+        ) return;
+        seenShells.add(identity);
+        retainedShell = true;
+        hasNovelAction = true;
+      } else if (retainedShell) {
+        // Do not collapse same-path reads across a command or reuse the
+        // pre-command attempted/closed frontier for this new observation.
+        freshReadCalls.push(call);
+      } else {
+        if (rejectedIdentities.has(identity)) return;
+        hasNovelAction ||= !attemptedIdentities.has(identity);
+      }
+      acceptedIndices.push(index);
     });
-    if (acceptedIndices.length === 0) {
+    if (!hasNovelAction) {
       return { accepted: [], discarded: [...calls], selection: "all_attempted" };
     }
     const selected = new Set(acceptedIndices);
@@ -126,6 +156,7 @@ export function boundRuntimeV2ProviderToolCalls(
     return {
       accepted: calls.filter((_, index) => selected.has(index)),
       discarded: calls.filter((_, index) => !selected.has(index)),
+      freshReadCalls,
       selection: acceptedIndices.length > 1
         ? "sequential_shell_batch"
         : firstIndex === 0

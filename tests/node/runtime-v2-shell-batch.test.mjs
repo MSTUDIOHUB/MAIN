@@ -71,10 +71,21 @@ test("a homogeneous shell decision retains every novel command for sequential Ru
   assert.equal(batch.selection, "sequential_shell_batch");
 });
 
-test("shell batching does not widen mixed file mutation or observation decisions", () => {
-  for (const name of ["read_file", "replace_in_file", "spawn_subagent"]) {
+test("shell batching preserves read companions while isolating file mutations and child scheduling", () => {
+  for (const name of ["read_file", "load_skill"]) {
+    const calls = [shellCalls()[0], { id: "observation", name, arguments: {} }];
+    const batch = surface.boundRuntimeV2ProviderToolCalls(
+      calls, new Set(), new Set(), { allowMixedObservationShellBatch: true },
+    );
+    assert.deepEqual(batch.accepted, calls);
+    assert.deepEqual(batch.discarded, []);
+    assert.equal(batch.selection, "sequential_shell_batch");
+  }
+  for (const name of ["replace_in_file", "spawn_subagent"]) {
     const calls = [shellCalls()[0], { id: "other", name, arguments: {} }];
-    const batch = surface.boundRuntimeV2ProviderToolCalls(calls);
+    const batch = surface.boundRuntimeV2ProviderToolCalls(
+      calls, new Set(), new Set(), { allowMixedObservationShellBatch: true },
+    );
     assert.deepEqual(batch.accepted, [calls[0]]);
     assert.deepEqual(batch.discarded, [calls[1]]);
   }
@@ -254,4 +265,133 @@ test("a new provider decision is not poisoned by a prior batch's failed predeces
   const [command] = runtime.decideNextCommands(f.aggregate);
   const { runtimeV2SequentialShellBatchInterruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
   assert.equal(runtimeV2SequentialShellBatchInterruption(f.aggregate, command), null);
+});
+
+
+const observationCalls = () => [
+  { id: "skill", name: "load_skill", arguments: { skill_id: "fixture-guidance" } },
+  { id: "shell", name: "run_command", arguments: { command: "tool status" } },
+  { id: "source", name: "read_file", arguments: { path: "src/current.ts" } },
+  { id: "check", name: "run_command", arguments: { command: "npm test" } },
+];
+
+for (const failureIndex of [0, 1, 2]) {
+  for (const failureStatus of ["failed", "blocked", "canceled"]) {
+    test(`a mixed observation batch skips every sibling after ${failureStatus} member ${failureIndex} without authorization or execution`, async () => {
+      sideEffects.length = 0;
+      const calls = observationCalls();
+      const f = ledger(calls);
+      for (let index = 0; index <= failureIndex; index += 1) {
+        const [command] = runtime.decideNextCommands(f.aggregate);
+        assert.equal(command.payload.toolCallId, calls[index].id);
+        f.apply("command.scheduled", { run: f.run, command });
+        if (index === failureIndex && failureStatus === "canceled") {
+          f.apply("command.completed", { run: f.run, idempotencyKey: command.idempotencyKey, status: "canceled" });
+        } else {
+          f.apply("tool.completed", {
+            run: f.run, idempotencyKey: command.idempotencyKey,
+            status: index === failureIndex ? failureStatus : "succeeded", evidence: [],
+          });
+        }
+      }
+      const live = createRuntimeV2LiveExecutionState();
+      live.messages.push({ role: "assistant", content: "", tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+      live.coveredReadToolResults.set("source", "A cached read must not bypass the predecessor gate.");
+      const port = createRuntimeV2ToolPort({
+        get: () => ({ runtimeV2Checkpoints: { turn: JSON.parse(JSON.stringify(runtime.createRuntimeV2Checkpoint({ revision: f.aggregate.nextSequence, aggregate: f.aggregate, updatedAt: f.aggregate.updatedAt }))) } }),
+        context: { turnId: "turn", runtimeRunIntent: "execute", runWorkspace: "/fixture", runSessionKey: "/fixture:1", phaseLanguage: "en" },
+        live, nextId: (scope) => `${scope}-${f.aggregate.nextSequence}`, now: () => 100, logStoreEvent() {},
+      });
+      for (const call of calls.slice(failureIndex + 1)) {
+        const [command] = runtime.decideNextCommands(f.aggregate);
+        assert.equal(command.payload.toolCallId, call.id);
+        f.apply("command.scheduled", { run: f.run, command });
+        const receipt = await port.execute({ run: f.run, command, signal: new AbortController().signal });
+        assert.equal(receipt.failureReasonCode, failureStatus === "canceled" ? "provider_batch_predecessor_unsettled" : "provider_batch_predecessor_failed");
+        assert.deepEqual(receipt.evidence, []);
+        if (receipt.type === "validation.completed") {
+          assert.equal(receipt.passed, false);
+          assert.equal(receipt.failureKind, "not_executed");
+        } else {
+          assert.equal(receipt.type, "tool.completed");
+          assert.equal(receipt.status, "blocked");
+        }
+        assert.equal(live.messages.at(-1).tool_call_id, call.id);
+        assert.match(live.messages.at(-1).content, /not executed/i);
+        f.apply(receipt.type, receipt);
+      }
+      assert.deepEqual(sideEffects, [], "blocked siblings cross neither permission preflight nor tool IPC");
+      assert.deepEqual(f.aggregate.pendingToolCalls, []);
+      const effects = deriveRuntimeV2ProviderEffectFacts(f.aggregate);
+      const attempted = surface.completedRuntimeV2ProviderToolCallIdentities(live.messages, effects);
+      for (const call of calls.slice(failureIndex + 1)) {
+        assert.ok(effects.unexecutedToolCallIds.has(call.id));
+        assert.ok(!attempted.has(surface.runtimeV2ProviderToolCallIdentity(call)), "a fresh provider decision may retry a skipped call");
+      }
+      assert.ok(!effects.failedValidationToolCallIds.has("check"));
+    });
+  }
+}
+
+test("mixed observation sequencing accepts only actual predecessor tool receipts", () => {
+  const { runtimeV2SequentialShellBatchInterruption: interruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
+  for (const status of ["succeeded", "canceled"]) {
+    const f = ledger(observationCalls());
+    const [first] = runtime.decideNextCommands(f.aggregate);
+    f.apply("command.scheduled", { run: f.run, command: first });
+    f.apply("command.completed", { run: f.run, idempotencyKey: first.idempotencyKey, status });
+    const [second] = runtime.decideNextCommands(f.aggregate);
+    assert.equal(interruption(f.aggregate, second)?.reasonCode, "provider_batch_predecessor_unsettled", `${status} control completion is not an actual successful read receipt`);
+  }
+
+  const succeeded = ledger(observationCalls());
+  for (let index = 0; index < observationCalls().length; index += 1) {
+    const [command] = runtime.decideNextCommands(succeeded.aggregate);
+    assert.equal(interruption(succeeded.aggregate, command), null);
+    succeeded.apply("command.scheduled", { run: succeeded.run, command });
+    succeeded.apply(command.kind === "execute_validation" ? "validation.completed" : "tool.completed", {
+      run: succeeded.run, idempotencyKey: command.idempotencyKey,
+      ...(command.kind === "execute_validation" ? { passed: true } : { status: "succeeded" }), evidence: [],
+    });
+    const duplicate = runtime.tryTransition(succeeded.aggregate, {
+      ...succeeded.aggregate.events.at(-1),
+      eventId: `duplicate-${index}`, sequence: succeeded.aggregate.nextSequence,
+      ...(command.kind === "execute_validation" ? { passed: false } : { status: "failed" }),
+    });
+    assert.equal(duplicate.disposition, "rejected", "a second receipt cannot rewrite the settled predecessor or dispatch a sibling twice");
+  }
+  assert.deepEqual(succeeded.aggregate.pendingToolCalls, []);
+});
+
+
+test("canceling a queued mixed observation batch stops before any remaining command is scheduled", async () => {
+  const f = ledger(observationCalls());
+  const abort = new AbortController();
+  abort.abort();
+  const invoked = [];
+  let id = 0;
+  const controller = new runtime.RuntimeV2Controller({
+    checkpoint: { append: async ({ expectedRevision }) => ({ disposition: "committed", checkpoint: { revision: expectedRevision + 1 } }) },
+    provider: { request: async () => { invoked.push("provider"); throw new Error("Canceled batch requested inference"); } },
+    tool: { execute: async () => { invoked.push("tool"); throw new Error("Canceled batch ran a command"); } },
+    scheduler: { execute: async () => { invoked.push("scheduler"); throw new Error("Canceled batch scheduled work"); } },
+    projection: { publish: async () => {} },
+    clockId: { now: () => 100, nextId: (scope) => `${scope}-${++id}` },
+  }, { aggregate: f.aggregate, revision: 1 }, { abortSignal: abort.signal });
+  assert.equal(await controller.driveOnce(), false);
+  assert.deepEqual(invoked, []);
+  const after = controller.snapshot().aggregate;
+  assert.equal(after.terminalOutcome.resultKind, "canceled");
+  assert.equal(after.events.filter((event) => event.type === "command.scheduled" && event.command.kind === "execute_tool").length, 0);
+});
+
+
+test("pure independent reads retain their existing failure semantics", () => {
+  const { runtimeV2SequentialShellBatchInterruption: interruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
+  const f = ledger(observationCalls().filter((call) => call.name !== "run_command"));
+  const [first] = runtime.decideNextCommands(f.aggregate);
+  f.apply("command.scheduled", { run: f.run, command: first });
+  f.apply("tool.completed", { run: f.run, idempotencyKey: first.idempotencyKey, status: "failed", evidence: [] });
+  const [next] = runtime.decideNextCommands(f.aggregate);
+  assert.equal(interruption(f.aggregate, next), null);
 });

@@ -10805,3 +10805,103 @@ test("successful command receipts with equal output cannot turn prior source rea
   }
 });
 
+
+test("mixed observation shell batches retain every ordered proposal", () => {
+  const calls = [
+    { id: "skill", name: "load_skill", arguments: { skill_id: "s:fixture" } },
+    { id: "shell", name: "run_command", arguments: { command: "example --version" } },
+    { id: "project", name: "read_file", arguments: { path: "ProjectSettings/ProjectVersion.txt" } },
+    { id: "reference", name: "read_file", arguments: { path: "references/workflow.md" } },
+  ];
+  const selected = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set(), new Set(), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(selected.accepted, calls);
+  assert.deepEqual(selected.discarded, []);
+  assert.equal(selected.selection, "sequential_shell_batch");
+  assert.deepEqual(selected.freshReadCalls, calls.slice(2));
+});
+
+test("mixed observation shell freshness follows retained shell positions, not whole batch identities", () => {
+  const before = { id: "before", name: "read_file", arguments: { path: "state.json" } };
+  const shell = { id: "shell", name: "run_command", arguments: { command: "example refresh" } };
+  const after = { ...before, id: "after" };
+  const readIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity(before);
+  const shellIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity(shell);
+  const calls = [before, shell, after];
+  const cached = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set([readIdentity]), new Set(), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(cached.accepted, calls, "the pre-command cached companion and fresh later read are distinct observations");
+  assert.deepEqual(cached.freshReadCalls, [after]);
+  const closed = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set([readIdentity]), new Set([readIdentity]), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(closed.accepted, [shell, after], "a closed pre-command read cannot suppress the post-command observation");
+  assert.deepEqual(closed.freshReadCalls, [after]);
+  const repeatedShell = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set([readIdentity, shellIdentity]), new Set([readIdentity]), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(repeatedShell.accepted, [], "a discarded old shell cannot reopen a closed read");
+  assert.deepEqual(repeatedShell.freshReadCalls || [], []);
+  const write = { id: "write", name: "replace_in_file", arguments: { path: "state.json", search_text: "old", replace_text: "new" } };
+  assert.deepEqual(providerToolSurface.boundRuntimeV2ProviderToolCalls([before, shell, write], new Set(), new Set(), { allowMixedObservationShellBatch: true }).accepted, [before], "same-batch source reads never authorize a proposed source edit");
+});
+
+test("mixed observation shell provider admission replays only the pre-command read and executes the later read fresh", async () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.providerLaneProfile = { schemaVersion: "provider-lane.v1", nativeTools: true, requiredToolChoice: false, streaming: true, textToolEnvelope: true, reasoning: false, imageInput: false, toolResultRole: "tool" };
+  const oldContent = "{\"value\":\"old\"}\n";
+  const newContent = "{\"value\":\"fresh\"}\n";
+  live.messages = [
+    { role: "system", content: "[MAIN RUNTIME V2] fixture" },
+    { role: "user", content: "Inspect, refresh and inspect the current state." },
+    { role: "assistant", content: "Prior inspection.", tool_calls: [{ id: "old-read", type: "function", function: { name: "read_file", arguments: '{"path":"state.json"}' } }] },
+    { role: "tool", tool_call_id: "old-read", content: oldContent },
+  ];
+  const calls = [
+    { id: "wire-repeat", name: "read_file", arguments: { path: "state.json" } },
+    { id: "wire-shell", name: "run_command", arguments: { command: "example refresh", description: "Refresh state" } },
+    { id: "wire-after", name: "read_file", arguments: { path: "state.json" } },
+  ];
+  const definitions = [
+    { ...definition("read_file"), function: { ...definition("read_file").function, parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } },
+    { ...definition("run_command"), function: { ...definition("run_command").function, parameters: { type: "object", properties: { command: { type: "string" }, description: { type: "string" } }, required: ["command"] } } },
+  ];
+  const originalSurface = Object.getOwnPropertyDescriptor(executionContext, "providerToolDefinitionsForCommand");
+  const originalRequest = providerRequest.requestRuntimeV2ProviderOnce;
+  const toolExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+  const originalExecute = toolExecutor.executeTool;
+  const originalAuthorize = authorization.authorizeToolForCurrentTurn;
+  let counter = 0;
+  let refreshed = false;
+  const executions = [];
+  Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", { configurable: true, enumerable: true, value: () => definitions });
+  providerRequest.requestRuntimeV2ProviderOnce = async () => runtime.normalizeProviderResponseV1({ tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+  authorization.authorizeToolForCurrentTurn = async () => ({ allowed: true, reason: null });
+  toolExecutor.executeTool = async (name) => {
+    executions.push(name);
+    if (name === "run_command") { refreshed = true; return "exitCode: 0\nrefreshed"; }
+    assert.equal(refreshed, true, "the post-command observation executes after the command");
+    return newContent;
+  };
+  const ports = { get: () => ({}), context: { turnId: "turn", runWorkspace: "/tmp/mixed-observation-fixture", runSessionKey: "session", phaseLanguage: "en" }, live, nextId: (scope) => `${scope}-${++counter}`, now: () => 100, logStoreEvent() {} };
+  try {
+    const selected = await providerPort.createRuntimeV2ProviderPort(ports).request({ command: command("acting"), signal: new AbortController().signal });
+    assert.deepEqual(selected.toolCalls.map((call) => call.name), ["read_file", "run_command", "read_file"]);
+    assert.equal(new Set(selected.toolCalls.map((call) => call.id)).size, 3, "each admitted proposal retains a unique Runtime-scoped correlation id");
+    assert.deepEqual(selected.toolCalls.map((call) => call.arguments), calls.map((call) => call.arguments));
+    assert.deepEqual(live.messages.at(-1).tool_calls.map((call) => call.id), selected.toolCalls.map((call) => call.id));
+    assert.equal(live.coveredReadToolResults.get(selected.toolCalls[0].id), oldContent);
+    assert.equal(live.coveredReadToolResults.has(selected.toolCalls[2].id), false, "pre-command cache is not installed for a later observation of the same path");
+    const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+    const receipts = [];
+    for (const [index, call] of selected.toolCalls.entries()) {
+      receipts.push(await toolPort.execute({ command: { ...command("acting"), idempotencyKey: `mixed-${index}`, kind: "execute_tool", payload: { toolCallId: call.id, toolName: call.name, arguments: call.arguments } }, signal: new AbortController().signal }));
+    }
+    assert.equal(receipts[0].receiptOrigin, "replayed");
+    assert.equal(receipts[1].status, "succeeded");
+    assert.equal(receipts[2].status, "succeeded");
+    assert.notEqual(receipts[2].receiptOrigin, "replayed");
+    assert.match(live.messages.at(-1).content, /fresh/);
+    assert.doesNotMatch(live.messages.at(-1).content, /"old"/);
+    assert.deepEqual(executions, ["run_command", "read_file", "read_file"], "source versioning rereads fresh bytes, while the first cached read does not cross IPC");
+  } finally {
+    providerRequest.requestRuntimeV2ProviderOnce = originalRequest;
+    Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", originalSurface);
+    toolExecutor.executeTool = originalExecute;
+    authorization.authorizeToolForCurrentTurn = originalAuthorize;
+  }
+});

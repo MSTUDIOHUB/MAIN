@@ -1,5 +1,6 @@
 import type { RuntimeV2Command, TurnAggregateV1 } from "../../lib/runtime-v2";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
+import { isRuntimeV2ReadOnlyToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
 
 export interface RuntimeV2ShellBatchInterruption {
   readonly predecessorToolCallId: string;
@@ -9,7 +10,8 @@ export interface RuntimeV2ShellBatchInterruption {
 }
 
 /** Reconstruct sequencing from the canonical provider/command/receipt ledger.
- * A failed command invalidates the assumptions behind its pending siblings;
+ * Reads may accompany shell actions in one ordered observation batch.
+ * A failed member invalidates the assumptions behind its pending siblings;
  * each sibling still receives an ordinary tool result, without running it or
  * inventing another process-local queue. */
 export function runtimeV2SequentialShellBatchInterruption(
@@ -17,7 +19,7 @@ export function runtimeV2SequentialShellBatchInterruption(
   command: RuntimeV2Command,
 ): RuntimeV2ShellBatchInterruption | null {
   const callId = String(command.payload.toolCallId || "");
-  if (!aggregate || !callId || command.payload.toolName !== "run_command") return null;
+  if (!aggregate || !callId) return null;
   let batchIndex = -1;
   let predecessors: readonly string[] = [];
   for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
@@ -26,7 +28,9 @@ export function runtimeV2SequentialShellBatchInterruption(
     const calls = event.result.toolCalls;
     const currentIndex = calls.findIndex((call) => call.id === callId);
     if (currentIndex < 0) continue;
-    if (currentIndex === 0 || !calls.every((call) => call.name === "run_command")) return null;
+    const sequentialObservation = calls.some((call) => call.name === "run_command") &&
+      calls.every((call) => call.name === "run_command" || isRuntimeV2ReadOnlyToolName(call.name));
+    if (currentIndex === 0 || !sequentialObservation) return null;
     batchIndex = index;
     predecessors = calls.slice(0, currentIndex).map((call) => call.id);
     break;

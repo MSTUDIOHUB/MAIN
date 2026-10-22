@@ -320,6 +320,7 @@ export function createRuntimeV2ProviderPort(
             completedIdentities,
             rejectedIdentities,
             {
+              allowMixedObservationShellBatch: true,
               maxSpawnSubagents: Math.max(
                 0,
                 Math.floor(
@@ -408,8 +409,9 @@ export function createRuntimeV2ProviderPort(
               batchSelection: batch.selection,
             });
           }
+          const freshReadCalls = new Set(batch.freshReadCalls);
           const coveredReads = selectedCalls.map((call) => ({
-            receipt: coveredReadReceipts.get(
+            receipt: freshReadCalls.has(call) ? null : coveredReadReceipts.get(
               runtimeV2ProviderToolCallIdentity(call),
             ) || null,
           }));
