@@ -1311,7 +1311,7 @@ shell:
             "printf secret > /tmp/outside.txt",
             "printf secret >> ../outside.txt",
             "cat <<EOF",
-            "printf secret 2>&1",
+            "printf secret 2>&3",
         ];
 
         for command in commands {
@@ -1334,5 +1334,40 @@ shell:
                 Err(PermissionError::Denied { .. }) | Err(PermissionError::NotAllowed { .. })
             ));
         }
+    }
+
+    #[test]
+    fn stdio_duplication_preserves_existing_allow_and_exact_approval_policy() {
+        let guard = PermissionGuard::new(PermissionConfig::default_runtime_foundation());
+        assert_eq!(
+            guard.validate("printf ok 2>&1").unwrap().decision,
+            super::PermissionDecisionKind::Allow
+        );
+        let command = "example --version 2>&1";
+        let decision = guard.inspect(command);
+        assert_eq!(decision.decision, super::PermissionDecisionKind::Ask);
+        assert!(decision.requires_approval);
+        assert!(matches!(
+            guard.validate(command),
+            Err(PermissionError::ApprovalRequired { .. })
+        ));
+        let approval = super::ShellPermissionApproval {
+            command: command.to_string(),
+            approved_at_ms: Some(1),
+            scope: Some("once".to_string()),
+            rules: Vec::new(),
+            risk_level: Some(decision.risk_level),
+        };
+        assert_eq!(
+            guard
+                .validate_with_approval(command, Some(&approval))
+                .unwrap()
+                .command,
+            command
+        );
+        assert!(matches!(
+            guard.validate_with_approval("other --version 2>&1", Some(&approval)),
+            Err(PermissionError::ApprovalRequired { .. })
+        ));
     }
 }

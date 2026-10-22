@@ -43,6 +43,8 @@ pub enum ShellRedirectionKind {
     Input,
     Output,
     Append,
+    /// Duplicate only the existing stdout/stderr streams; target is an fd.
+    StdioDuplication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,8 @@ pub enum ShellRedirectionKind {
 pub struct ShellRedirection {
     pub kind: ShellRedirectionKind,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fd: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +344,16 @@ fn split_structured_segments(
             ));
         }
 
+        // The ampersand in an unquoted output-descriptor operator belongs to
+        // that operator, not to shell background execution. The word parser
+        // below still validates both descriptor numbers and rejects all other
+        // descriptor forms before policy matching or execution.
+        if ch == '>' && chars.get(index + 1) == Some(&'&') {
+            current.push_str(">&");
+            index += 2;
+            continue;
+        }
+
         let connector = match ch {
             ';' => {
                 if matches!(chars.get(index + 1), Some(';' | '&')) {
@@ -452,6 +466,7 @@ fn parse_segment_words_and_redirections(
     let mut words = Vec::new();
     let mut redirections = Vec::new();
     let mut current = String::new();
+    let mut word_has_quoting = false;
     let mut quote = None;
     let mut escaped = false;
     let mut index = 0;
@@ -465,6 +480,7 @@ fn parse_segment_words_and_redirections(
             continue;
         }
         if ch == '\\' && quote != Some(QuoteState::Single) {
+            word_has_quoting = true;
             escaped = true;
             index += 1;
             continue;
@@ -481,29 +497,57 @@ fn parse_segment_words_and_redirections(
             continue;
         }
         if ch == '\'' {
+            word_has_quoting = true;
             quote = Some(QuoteState::Single);
             index += 1;
             continue;
         }
         if ch == '"' {
+            word_has_quoting = true;
             quote = Some(QuoteState::Double);
             index += 1;
             continue;
         }
         if ch.is_whitespace() {
             push_word(&mut words, &mut current);
+            word_has_quoting = false;
             index += 1;
             continue;
         }
         if matches!(ch, '<' | '>') {
-            push_word(&mut words, &mut current);
+            // An IO number is unquoted digits immediately before the operator.
+            // Quoted/escaped digits are ordinary argv, as is a spaced `2 >`.
+            let source_fd = if !word_has_quoting
+                && !current.is_empty()
+                && current.chars().all(|value| value.is_ascii_digit())
+            {
+                let source = match current.as_str() {
+                    "0" if ch == '<' => 0,
+                    "1" if ch == '>' => 1,
+                    "2" if ch == '>' => 2,
+                    _ => {
+                        return Err(ShellValidationError::critical(
+                            ShellViolationKind::DangerousRedirection,
+                            Some(segment),
+                            "only standard input, stdout and stderr redirections are permitted",
+                        ))
+                    }
+                };
+                current.clear();
+                Some(source)
+            } else {
+                push_word(&mut words, &mut current);
+                None
+            };
+            word_has_quoting = false;
             let (kind, consumed) = match (ch, chars.get(index + 1)) {
                 ('>', Some('>')) => (ShellRedirectionKind::Append, 2),
-                ('>', Some('&' | '|' | '(')) | ('<', Some('<' | '>' | '&' | '(')) => {
+                ('>', Some('&')) => (ShellRedirectionKind::StdioDuplication, 2),
+                ('>', Some('|' | '(')) | ('<', Some('<' | '>' | '&' | '(')) => {
                     return Err(ShellValidationError::critical(
                         ShellViolationKind::DangerousRedirection,
                         Some(segment),
-                        "descriptor, heredoc, process, and clobber redirections are not permitted",
+                        "input-descriptor, heredoc, process, and clobber redirections are not permitted",
                     ));
                 }
                 ('>', _) => (ShellRedirectionKind::Output, 1),
@@ -522,9 +566,25 @@ fn parse_segment_words_and_redirections(
                     "redirection target is missing",
                 ));
             }
-            validate_workspace_path_token(&target, segment, true, None)?;
-            words.push(target.clone());
-            redirections.push(ShellRedirection { kind, target });
+            let source_fd = if kind == ShellRedirectionKind::StdioDuplication {
+                if !matches!(target.as_str(), "1" | "2") {
+                    return Err(ShellValidationError::critical(
+                        ShellViolationKind::DangerousRedirection,
+                        Some(segment),
+                        "only stdout/stderr duplication is permitted; descriptor close, move and arbitrary targets are not",
+                    ));
+                }
+                Some(source_fd.unwrap_or(1))
+            } else {
+                validate_workspace_path_token(&target, segment, true, None)?;
+                words.push(target.clone());
+                source_fd
+            };
+            redirections.push(ShellRedirection {
+                kind,
+                target,
+                source_fd,
+            });
             index = next_index;
             continue;
         }
@@ -1125,6 +1185,9 @@ pub fn prepare_trusted_shell_execution(
             }
         }
         for redirection in &segment.redirections {
+            if redirection.kind == ShellRedirectionKind::StdioDuplication {
+                continue;
+            }
             resolve_workspace_path(
                 trusted_working_directory.root(),
                 trusted_working_directory.path().join(&redirection.target),
@@ -1373,12 +1436,174 @@ mod tests {
             "printf ok >> ../out",
             "cat < ~/.ssh/id_rsa",
             "cat <<EOF",
-            "printf ok 2>&1",
+            "printf ok 2>&3",
         ] {
             inspect_shell_command(command).expect_err(command);
         }
         inspect_shell_command("printf ok > reports/out.txt")
             .expect("workspace-relative redirection should remain inspectable");
+    }
+
+    #[test]
+    fn stdio_duplication_preserves_shell_connectors_and_argv() {
+        let command = "which example && example --version 2>&1 || echo \"EXAMPLE_CLI_NOT_FOUND\"";
+        let inspection =
+            inspect_shell_command(command).expect("stderr-to-stdout is not background execution");
+        assert_eq!(inspection.command, command);
+        assert_eq!(inspection.segments.len(), 3);
+        assert_eq!(
+            inspection.segments[0].connector_after,
+            Some(ShellConnector::And)
+        );
+        assert_eq!(
+            inspection.segments[1].connector_after,
+            Some(ShellConnector::Or)
+        );
+        assert_eq!(inspection.segments[1].words, ["example", "--version"]);
+        assert_eq!(inspection.risk, TrustedExecutionRisk::High);
+        for command in [
+            "printf ok 2>&1",
+            "printf ok 1>&2",
+            "printf ok >&2",
+            "printf ok 2>& 1",
+        ] {
+            let segment = &inspect_shell_command(command).expect(command).segments[0];
+            assert_eq!(segment.words, ["printf", "ok"], "{command}");
+            assert_eq!(segment.redirections.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&segment.redirections[0]).unwrap()["kind"],
+                "stdio_duplication"
+            );
+        }
+        for command in ["printf '%s' '2>&1'", "printf '%s' 2\\>\\&1"] {
+            let inspection = inspect_shell_command(command).expect(command);
+            assert!(inspection.segments[0].redirections.is_empty());
+            assert_eq!(inspection.segments[0].words.last().unwrap(), "2>&1");
+        }
+        for command in [
+            "printf '%s' '2'>&1",
+            "printf '%s' \\2>&1",
+            "printf '%s' 2 >&1",
+        ] {
+            let inspection = inspect_shell_command(command).expect(command);
+            assert_eq!(inspection.segments[0].words, ["printf", "%s", "2"]);
+            assert_eq!(inspection.segments[0].redirections[0].source_fd, Some(1));
+        }
+    }
+
+    #[test]
+    fn stdio_duplication_keeps_background_and_descriptor_escapes_closed() {
+        for command in [
+            "printf ok 2>&1 &",
+            "printf ok 2>&1& echo no",
+            "printf ok 2> &1",
+            "printf ok 3>&1",
+            "printf ok 2>&3",
+            "printf ok 2>&0",
+            "printf ok 0>&1",
+            "printf ok 3>captured.txt",
+            "printf ok 9>>captured.txt",
+            "cat 9<captured.txt",
+            "printf ok 2>&-",
+            "printf ok 2>&1-",
+            "printf ok 2>&file",
+            "printf ok 2<&1",
+            "printf ok 2>>&1",
+            "printf ok 2>&1$(pwd)",
+            "printf ok 2>&1; sh -c pwd",
+            "printf ok 2>&1 > ../outside",
+            "printf ok 2>&1 > /tmp/outside",
+        ] {
+            inspect_shell_command(command).expect_err(command);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_duplication_is_not_a_workspace_file_but_file_redirects_still_are() {
+        let root = workspace();
+        let outside = workspace();
+        fs::write(outside.path().join("secret"), "untouched").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("1")).unwrap();
+        prepare_trusted_shell_execution(root.path(), root.path(), "printf ok 2>&1")
+            .expect("descriptor 1 is not the symlink named 1");
+        prepare_trusted_shell_execution(root.path(), root.path(), "printf ok 2>1")
+            .expect_err("a file redirect through the same symlink still escapes");
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_duplication_executes_original_stderr_routing_and_file_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = workspace();
+        runtime.block_on(async {
+            let result = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "ls definitely-missing-stdio-duplication 2>&1 || printf FALLBACK",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("execute merged stderr");
+            assert!(result.success);
+            assert!(result
+                .stdout
+                .contains("definitely-missing-stdio-duplication"));
+            assert!(result.stdout.ends_with("FALLBACK"));
+            assert!(result.stderr.is_empty());
+            let reversed = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "printf stdout 1>&2",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("execute stdout-to-stderr");
+            assert!(reversed.success);
+            assert_eq!(reversed.stdout, "");
+            assert_eq!(reversed.stderr, "stdout");
+            let to_file = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "ls definitely-missing-stdio-duplication > captured.txt 2>&1 || printf FALLBACK",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("file target remains workspace-bound");
+            assert_eq!(to_file.stdout, "FALLBACK");
+            assert!(to_file.stderr.is_empty());
+            assert!(fs::read_to_string(root.path().join("captured.txt"))
+                .unwrap()
+                .contains("definitely-missing-stdio-duplication"));
+            let from_original_stdout = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "ls definitely-missing-stdio-duplication 2>&1 > captured.txt || printf FALLBACK",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("descriptor duplication keeps its original position");
+            assert!(from_original_stdout
+                .stdout
+                .contains("definitely-missing-stdio-duplication"));
+            assert!(from_original_stdout.stdout.ends_with("FALLBACK"));
+            assert!(from_original_stdout.stderr.is_empty());
+            assert_eq!(
+                fs::read_to_string(root.path().join("captured.txt")).unwrap(),
+                ""
+            );
+        });
     }
 
     #[test]
