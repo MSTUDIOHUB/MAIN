@@ -33,15 +33,17 @@ export function reconcileRuntimeV2TimelineBlocks(
     if (
       (block.type !== "progress" && block.type !== "tool") ||
       block.turnId !== run.turnId ||
-      block.runId !== run.runId ||
-      !String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")
+      block.runId !== run.runId
     ) {
       return [block];
     }
     const receipt = block.toolCallId ? receipts.get(block.toolCallId) : undefined;
     const blockRunning = block.type === "progress"
       ? block.status === "running"
-      : block.toolStatus === "running";
+      : block.toolStatus === "running" || block.toolStatus === "pending";
+    // Permission-created and timeline-created rows share the exact command
+    // receipt owner. Their presentation dedupe keys do not change execution
+    // truth, including a canceled row that was still awaiting approval.
     if (!receipt || !blockRunning) return [block];
     // A canceled command remains canonical in the runtime ledger and final
     // projection. Remove only its provisional UI row instead of relabeling it

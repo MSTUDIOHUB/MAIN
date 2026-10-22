@@ -36,6 +36,10 @@ function loadTs(sourcePath) {
 const {
   createRuntimeV2ProjectionPort,
 } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/projectionPort.ts"));
+const runtime = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
+const { requestRuntimeV2ToolPermission } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionToolPermission.ts"));
+const { isExactPendingToolReviewOwner } = loadTs(path.join(workspaceRoot, "src/lib/pendingToolReview.ts"));
+const { reconcileRuntimeV2TimelineBlocks } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/projectionTimeline.ts"));
 const {
   buildLiveTurnProcessTimelineModel,
 } = loadTs(path.join(workspaceRoot, "src/lib/turnProcessArchive.ts"));
@@ -153,8 +157,102 @@ function createHarness(language = "zh", markerOverrides = {}) {
       logs.push({ event, data });
     },
   });
-  return { port, getState: () => state, logs };
+  return { port, getState: () => state, setState: (patch) => { state = { ...state, ...patch }; }, logs };
 }
+
+test("canonical receipts settle approved permission rows and preserve success through a later failure and cancellation", async () => {
+  const harness = createHarness("en");
+  let taskId = 100;
+  let timestamp = 1;
+  harness.setState({ _nextTaskId: () => ++taskId });
+  const permissionPorts = {
+    get: harness.getState,
+    set: (updater) => harness.setState(typeof updater === "function" ? updater(harness.getState()) : updater),
+    context: { phaseLanguage: "en", turnId: runIdentity.turnId },
+    now: () => ++timestamp,
+    logStoreEvent() {},
+  };
+  const append = (state, type, fields) => runtime.transition(state, {
+    schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+    sequence: state?.nextSequence || 0,
+    eventId: `permission-projection-${++timestamp}`,
+    at: timestamp,
+    type,
+    ...fields,
+  });
+  let ledger = append(null, "turn.admitted", {
+    turn: aggregate().turn, strategy: "execute", objective: "Inspect the external tool", constraints: [], acceptanceCriteria: [],
+  });
+  ledger = append(ledger, "run.started", { run: runIdentity, phase: "acting" });
+  const successful = command({ idempotencyKey: "approved-shell", payload: { toolName: "run_command", arguments: { command: "editor-tool status" } } });
+  ledger = append(ledger, "command.scheduled", { run: runIdentity, command: successful });
+  const review = requestRuntimeV2ToolPermission({ ports: permissionPorts, command: successful, toolName: "run_command", args: successful.payload.arguments, target: "editor-tool status", permissionTarget: "editor-tool status", risk: "shell" });
+  const pending = harness.getState();
+  const request = pending.activeActionRequest;
+  assert.equal(request.status, "pending");
+  const owner = { taskId: request.taskId, turnIds: [request.turnId], toolCallId: request.toolCallId, toolName: request.toolName, target: request.target };
+  const resolve = pending.pendingReviewResolve;
+  harness.setState({
+    activeActionRequest: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    taskFlow: pending.taskFlow.map((block) => isExactPendingToolReviewOwner(block, owner) ? { ...block, status: "running", toolStatus: "running" } : block),
+  });
+  resolve({ action: "accept" });
+  assert.equal((await review).action, "accept");
+  ledger = append(ledger, "tool.completed", {
+    run: runIdentity, idempotencyKey: successful.idempotencyKey, status: "succeeded",
+    evidence: [{ id: "actual-cli-status", kind: "tool", target: "editor-tool status", version: "exit-0" }],
+    presentation: { toolName: "run_command", target: "editor-tool status", message: "Actual command succeeded." },
+  });
+  await harness.port.publish({ aggregate: ledger, audience: "capsule_live", projection: projection("live_action", "Continue the requested checks.", "after-approval-success") });
+  const successRow = harness.getState().taskFlow.find((block) => block.toolCallId === successful.idempotencyKey);
+  assert.equal(successRow.status, "done", "a real success settles its permission-created row immediately");
+  assert.equal(successRow.toolStatus, "executed");
+
+  const failed = command({ idempotencyKey: "later-blocked-shell", payload: { toolName: "run_command", arguments: { command: "editor-tool inspect" } } });
+  ledger = append(ledger, "command.scheduled", { run: runIdentity, command: failed });
+  await harness.port.publish({ aggregate: ledger, audience: "timeline", projection: projection("timeline", "Inspect external state.", "later-blocked-shell") });
+  ledger = append(ledger, "tool.completed", { run: runIdentity, idempotencyKey: failed.idempotencyKey, status: "blocked", failureKind: "not_authorized", evidence: [] });
+
+  const canceled = command({ idempotencyKey: "cancel-pending-shell", payload: { toolName: "run_command", arguments: { command: "editor-tool query" } } });
+  ledger = append(ledger, "command.scheduled", { run: runIdentity, command: canceled });
+  const abort = new AbortController();
+  const canceledReview = requestRuntimeV2ToolPermission({ ports: permissionPorts, command: canceled, toolName: "run_command", args: canceled.payload.arguments, target: "editor-tool query", permissionTarget: "editor-tool query", risk: "shell", signal: abort.signal });
+  assert.equal(harness.getState().activeActionRequest.status, "pending");
+  abort.abort();
+  assert.equal((await canceledReview).action, "error");
+  ledger = append(ledger, "command.completed", { run: runIdentity, idempotencyKey: canceled.idempotencyKey, status: "canceled" });
+  const outcome = { resultKind: "canceled", reason: "user_cancelled", completedAt: ++timestamp, finalProjectionId: "permission-cancel-final" };
+  ledger = append(ledger, "run.aborted", { run: runIdentity, reason: "user_cancelled" });
+  ledger = append(ledger, "run.completed", { run: runIdentity, outcome });
+  const final = { id: outcome.finalProjectionId, audience: "final", kind: "final", markdown: "Canceled after preserving the completed command.", dedupeKey: "permission-cancel-final" };
+  ledger = append(ledger, "projection.published", { run: runIdentity, audience: "final", projectionId: final.id, projection: final });
+  ledger = append(ledger, "turn.completed", { turn: ledger.turn, runId: runIdentity.runId, outcome });
+  await harness.port.publish({ aggregate: ledger, audience: "final", projection: final });
+
+  const rows = harness.getState().taskFlow.filter((block) => block.type === "tool");
+  assert.equal(rows.some((block) => block.status === "running" || block.toolStatus === "running" || block.toolStatus === "pending"), false);
+  assert.equal(rows.find((block) => block.toolCallId === successful.idempotencyKey)?.toolStatus, "executed");
+  assert.equal(rows.find((block) => block.toolCallId === failed.idempotencyKey)?.toolStatus, "failed");
+  assert.equal(rows.some((block) => block.toolCallId === canceled.idempotencyKey), false, "a canceled unexecuted permission row is removed instead of marked successful");
+});
+
+test("receipt reconciliation requires the exact Turn, Run, and command identity independently of presentation keys", () => {
+  const base = { id: 1, type: "tool", turnId: "turn-a", runId: "run-a", toolName: "run_command", target: "editor-tool status", toolCallId: "exact-command", status: "running", toolStatus: "running", dedupeKey: "runtime-v2-permission:exact-command" };
+  const rows = [base,
+    { ...base, id: 2, turnId: "turn-other" },
+    { ...base, id: 3, runId: "run-other" },
+    { ...base, id: 4, toolCallId: "no-receipt" },
+  ];
+  const settled = reconcileRuntimeV2TimelineBlocks(rows, aggregate({
+    completedCommands: [{ idempotencyKey: "exact-command", kind: "execute_tool", status: "succeeded", actionFingerprint: "status", completedAt: 2 }],
+    events: [{ type: "tool.completed", run: runIdentity, idempotencyKey: "exact-command", status: "succeeded", evidence: [{ id: "status-result", kind: "tool", target: base.target, version: "exit-0" }] }],
+  }), 3, "en");
+  assert.equal(settled[0].toolStatus, "executed");
+  assert.deepEqual(settled.slice(1), rows.slice(1), "unrelated owners and unexecuted commands retain their own state");
+});
 
 async function publishCompletedReadOnly(harness) {
   const terminalOutcome = {
