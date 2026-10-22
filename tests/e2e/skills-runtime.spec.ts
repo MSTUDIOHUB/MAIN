@@ -8,6 +8,7 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
       window.localStorage.clear();
+      window.sessionStorage.removeItem("__SKILLS_RUNTIME_SESSIONS__");
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
 
@@ -82,14 +83,54 @@ test.beforeEach(async ({ page }) => {
         }
         throw new Error("ENOENT");
       }
-      if (
-        cmd === "list_project_sessions" ||
-        cmd === "rebuild_project_sessions_index"
-      ) {
-        return [];
+      if (["list_project_sessions", "rebuild_project_sessions_index", "save_project_session", "load_project_session", "load_project_session_meta", "load_project_session_page"].includes(cmd)) {
+        const records = JSON.parse(window.sessionStorage.getItem("__SKILLS_RUNTIME_SESSIONS__") || "{}");
+        const workspace = String(args?.workspace ?? "");
+        const sessions = records[workspace] || {};
+        if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") {
+          return Object.values(sessions).map((record: any) => {
+            const { messages: _messages, runtimeSnapshot: _runtime, ...meta } = record;
+            return meta;
+          });
+        }
+        const candidate = (args?.session || {}) as Record<string, any>;
+        const id = String(cmd === "save_project_session" ? candidate.id : args?.sessionId);
+        if (cmd === "save_project_session") {
+          const previousRevision = sessions[id]?.storageRevision || 0;
+          if ((candidate.storageRevision || 0) !== previousRevision) throw new Error("Session storage revision conflict");
+          const saved = {
+            ...candidate, workspaceRoot: workspace, storageVersion: 3,
+            storageRevision: previousRevision + 1, storageStatus: "ok",
+            updatedAtMs: candidate.updatedAtMs || Date.now(),
+          };
+          records[workspace] = { ...sessions, [id]: saved };
+          window.sessionStorage.setItem("__SKILLS_RUNTIME_SESSIONS__", JSON.stringify(records));
+          return saved;
+        }
+        const record = sessions[id] || {
+          id, title: "Missing Session", date: "", active: false, messages: [],
+          messageCount: 0, turnCount: 0, workspaceRoot: workspace,
+          storageVersion: 3, storageRevision: 0, storageStatus: "missing",
+        };
+        if (cmd === "load_project_session_meta") {
+          const { messages: _messages, ...meta } = record;
+          return meta;
+        }
+        if (cmd === "load_project_session_page") {
+          const turns = record.runtimeSnapshot?.conversationTurns || [];
+          const endTurnIndex = Math.min(turns.length, Number(args?.beforeTurnIndex ?? turns.length));
+          const startTurnIndex = Math.max(0, endTurnIndex - Number(args?.limit || 40));
+          const pageTurns = turns.slice(startTurnIndex, endTurnIndex);
+          const turnIds = new Set(pageTurns.map((turn: any) => turn.id));
+          return {
+            sessionId: id, turns: pageTurns,
+            messages: (record.messages || []).filter((message: any) => turnIds.has(message.turnId)),
+            startTurnIndex, endTurnIndex, totalTurns: turns.length,
+            hasMore: startTurnIndex > 0, nextBeforeTurnIndex: startTurnIndex || null,
+          };
+        }
+        return record;
       }
-      if (cmd === "save_project_session") return args?.session ?? {};
-      if (cmd === "load_project_session") return {};
       if (cmd === "proxy_request") {
         // Yield once so the test exercises the same async React/runtime
         // scheduling boundary as the other cloud provider E2E fixtures.
@@ -136,6 +177,20 @@ function runtimeRequestSummary(body: string) {
     body,
     toolNames,
   };
+}
+
+async function createRuntimeSession(page: import("@playwright/test").Page, workspace: boolean) {
+  // The shared legacy cloud fixture seeds a Session without its admission
+  // epoch. Create one through the real UI, which owns Session identity; the
+  // storage adapter above preserves it instead of inventing an epoch per Turn.
+  await (workspace
+    ? page.getByTestId("workspace-new-session")
+    : page.getByTitle("新建聊天", { exact: true })).click();
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state;
+    const scope = state.currentWorkspace || "__MAIN_GLOBAL_CHAT__";
+    return state.sessionsByWorkspace?.[scope]?.find((session: any) => session.id === state.currentSessionId)?.planLifecycleEpoch;
+  })).toMatch(/^plan-session-/);
 }
 
 test("panel Agent Skill persists manual-only admission into the next Turns", async ({
@@ -210,6 +265,7 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
     rehydratedModal.getByText("仅手动", { exact: true }),
   ).toBeVisible();
   await rehydratedHeading.locator("xpath=following-sibling::button").click();
+  await createRuntimeSession(page, false);
 
   await page.evaluate(() => {
     (window as any).__SKILLS_RUNTIME_E2E__.requests.length = 0;
@@ -324,6 +380,7 @@ test("a Unity skill collection imports all entries and activates the final skill
   await expect(page.getByText("zzz-folder", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "完成", exact: true }).click();
+  await createRuntimeSession(page, true);
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.sendCloudMessage?.("请使用 $zzz-sprite-tool 给出一句建议。"))).toBe(true);
   await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
   const requests = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
@@ -383,6 +440,7 @@ test("load_skill lists every collection page then loads a discovered Skill throu
   await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
   await modal.getByRole("button", { name: "保存技能", exact: true }).click();
   await modal.getByRole("button", { name: "完成", exact: true }).click();
+  await createRuntimeSession(page, true);
   await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.providerFlow = "list-load"; });
   expect(await page.evaluate(() => (window as any).__CODELY_E2E__?.sendCloudMessage?.("请从已安装技能中找到精灵工作流并给出建议。"))).toBe(true);
   await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
