@@ -9,13 +9,12 @@ import {
 } from "../../lib/workspacePaths";
 import {
   appendRuntimeV2ProviderFeedbackHistory,
-  appendRuntimeV2RejectedToolCallHistory,
+  appendRuntimeV2RejectedToolCallBatchHistory,
   rememberRuntimeV2ProviderResult,
 } from "./executionProviderHistory";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import {
   runtimeV2ProviderToolCallIdentity,
-  scopeRuntimeV2ProviderToolCallIds,
   unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
 import {
@@ -41,15 +40,6 @@ function rejectedProviderResult(input: {
 }): RuntimeV2NormalizedProviderResult {
   const actionIdentity = input.actionIdentity ||
     runtimeV2ProviderToolCallIdentity(input.rejectedCall);
-  const [historyCall] = scopeRuntimeV2ProviderToolCallIds(
-    [input.rejectedCall],
-    () => input.ports.nextId("provider-rejected-tool-call"),
-  );
-  appendRuntimeV2RejectedToolCallHistory(input.ports.live, {
-    call: historyCall!,
-    actionIdentity,
-    feedback: input.feedback,
-  });
   appendRuntimeV2ProviderFeedbackHistory(input.ports.live, {
     code: input.feedbackCode,
     feedback: input.feedback,
@@ -58,6 +48,17 @@ function rejectedProviderResult(input: {
     ...input.result,
     visibleText: "",
     toolCalls: [],
+    actionReceipts: input.result.toolCalls.map((call) => {
+      const rejected = call.id === input.rejectedCall.id || (input.reason === "tool_surface_rejected" && call.name === input.rejectedCall.name);
+      const identity = input.actionIdentity && call.id === input.rejectedCall.id ? input.actionIdentity
+        : input.reason === "tool_surface_rejected" ? runtimeV2UnavailableToolSemanticIdentity(call) : runtimeV2ProviderToolCallIdentity(call);
+      const safeCall = { ...call, id: input.ports.nextId("provider-settled-tool-call"), arguments: ["write_file", "replace_in_file", "apply_patch"].includes(call.name)
+        ? { runtime_v2_rejected_action: identity, effect: "none" } : call.arguments };
+      const feedback = rejected ? input.feedback : "ACTION_NOT_EXECUTED: provider_batch_predecessor_failed. No effect ran; propose this action again after correcting the rejected batch.";
+      return { call: safeCall, actionIdentity: identity, status: rejected ? "rejected" as const : "not_executed" as const,
+        reasonCode: rejected ? input.reason : "provider_batch_predecessor_failed", feedback,
+        priorFeedbackObserved: rejected && input.ports.live.latestProviderRequestRejectedIdentities?.has(identity) === true };
+    }),
     diagnostics: [
       ...input.result.diagnostics,
       {
@@ -68,6 +69,7 @@ function rejectedProviderResult(input: {
       },
     ],
   };
+  appendRuntimeV2RejectedToolCallBatchHistory(input.ports.live, rejectedResult.actionReceipts!);
   rememberRuntimeV2ProviderResult(input.ports, rejectedResult, input.command);
   input.ports.logStoreEvent("runtime_v2_provider_action_rejected", {
     turnId: input.command.run.turnId,
@@ -136,7 +138,7 @@ export function rejectRuntimeV2UnexpectedProviderTool(input: {
   const feedback = [
     `TOOL_SURFACE_REJECTED: ${unexpected.join(", ")} is not available in this decision.`,
     `Allowed tools: ${allowedToolNames.join(", ")}.`,
-    "The requested action was not executed and its branch is closed. Submit exactly one advertised structured action now; do not repeat, narrate, or request a hidden tool.",
+    "No action in this batch ran. Use an advertised tool with corrected arguments, or explain the exact missing prerequisite. Do not invent a tool or a filesystem location for a managed resource.",
   ].join("\n");
   return rejectedProviderResult({
     ...input,
@@ -151,6 +153,21 @@ export function rejectRuntimeV2UnexpectedProviderTool(input: {
       semanticActionIdentity: actionIdentity,
     },
   });
+}
+
+/** An earlier rejected shell cannot silently disappear and release its dependent tail. */
+export function rejectRuntimeV2FailedShellPredecessor(input: {
+  ports: RuntimeV2ExecutionPortsInput;
+  command: RuntimeV2Command;
+  result: RuntimeV2NormalizedProviderResult;
+  rejectedIdentities: ReadonlySet<string>;
+}): RuntimeV2NormalizedProviderResult | null {
+  const index = input.result.toolCalls.findIndex(call => call.name === "run_command" &&
+    input.rejectedIdentities.has(runtimeV2ProviderToolCallIdentity(call)));
+  if (index < 0 || !input.result.toolCalls.slice(index + 1).some(call => call.name === "run_command")) return null;
+  return rejectedProviderResult({ ...input, rejectedCall: input.result.toolCalls[index]!, reason: "already_rejected",
+    feedbackCode: "provider_batch_predecessor_failed",
+    feedback: "ACTION_NOT_EXECUTED: an earlier shell command in this batch was already blocked or failed. No command in this batch ran. Re-observe the missing prerequisite or propose independent work separately; downstream commands cannot assume predecessor success." });
 }
 
 /** OpenAI-compatible servers may return native tool arguments that violate

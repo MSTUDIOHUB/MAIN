@@ -107,6 +107,7 @@ export interface SubmitAsyncWorkflowRunState {
   taskFlow: TaskBlock[];
   runtimeEvents: ReturnType<typeof withEventSchema>[];
   activeActionRequest?: {
+    requestId?: string;
     sessionKey: string;
     turnId: string;
     runId: string;
@@ -1090,22 +1091,31 @@ export async function settleProjectedRuntimePause<
         ? "awaiting_input"
         : "awaiting_approval"
       : "paused";
+    const executionCheckpoint = normalizeRuntimeV2Checkpoint(
+      (state.runtimeV2Checkpoints as Record<string, unknown> | undefined)?.[request.turnId],
+    );
+    const pauseMessage = executionCheckpoint?.aggregate.run?.status === "paused" &&
+        executionCheckpoint.aggregate.run.identity.runId === settlement.identity.runId
+      ? executionCheckpoint.aggregate.run.blocker?.message || pauseOutcome.reason
+      : pauseOutcome.reason;
     let runtimeEvents = state.runtimeEvents || [];
     if (!runtimeEvents.some((event) =>
       event.type === "run.paused" &&
       event.threadId === request.runSessionKey &&
       event.turnId === request.turnId &&
-      event.runId === settlement.identity.runId
+      event.runId === settlement.identity.runId &&
+      event.requestId === actionRequest?.requestId
     )) {
       runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
         type: "run.paused",
+        ...(actionRequest?.requestId ? { requestId: actionRequest.requestId } : {}),
         threadId: request.runSessionKey,
         turnId: request.turnId,
         timestampMs,
         runId: settlement.identity.runId,
         parentRunId: settlement.identity.parentRunId,
         reason: pauseOutcome.reason,
-        message: pauseOutcome.reason,
+        message: pauseMessage,
       }));
     }
     nextMarker = {
@@ -2094,6 +2104,7 @@ export async function runSubmitAsyncWorkflowRun<
     capabilityRestrictions,
     approvalRequiredCapabilities,
     requiredCapabilities: input.semanticIntent?.requiredCapabilities,
+    intentClarification: input.semanticIntent?.clarification,
     goalCreationAuthorization: input.goalCreationAuthorization,
     goalContinuationAuthorization: input.goalContinuationAuthorization,
     effectiveCommandDirective: input.effectiveCommandDirective,

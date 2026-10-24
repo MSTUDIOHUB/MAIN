@@ -3,11 +3,14 @@ import { estimateMessagesTokens, estimateTokens } from "../../lib/contextTrim";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2/aggregate";
 import { appendRuntimeV2AssistantToolCallHistory, appendRuntimeV2ProviderFeedbackHistory, appendRuntimeV2ToolResultHistory, upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 import type { RuntimeV2LiveExecutionState } from "./executionTypes";
+import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 
 /** A replay adapter, not another history owner. No new evidence is minted. */
 export function restoreReadOnlyHistory(live: RuntimeV2LiveExecutionState, aggregate: TurnAggregateV1): void {
   const commands = new Map(aggregate.events.flatMap((event) => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
   for (const event of aggregate.events) {
+    const reply = runtimeV2ClarificationMessage(event);
+    if (reply) live.messages.push(reply);
     if (event.type === "provider.responded") {
       if (event.result.toolCalls.length) appendRuntimeV2AssistantToolCallHistory(live, event.result);
       else if (event.result.diagnostics.length) appendRuntimeV2ProviderFeedbackHistory(live, { visibleText: event.result.visibleText, code: event.result.diagnostics.map((item) => item.code).join(","), feedback: event.result.diagnostics.map((item) => item.message).join("\n") });

@@ -37,6 +37,39 @@ const streaming = loadTs("src/lib/streaming.ts");
 const lanes = loadTs("src/lib/modelLaneCoordinator.ts");
 const runtime = loadTs("src/lib/runtime-v2/index.ts");
 const actionWindows = loadTs("src/store/runtimeV2/executionProviderActionWindow.ts");
+const requestPolicy = loadTs("src/store/runtimeV2/executionProviderRequestPolicy.ts");
+const admission = loadTs("src/store/runtimeV2/executionProviderSurfaceRejection.ts");
+
+test("a failed shell predecessor cannot be filtered away to release a later command", () => {
+  const p = ports(); let id = 0; p.nextId = prefix => `${prefix}-${++id}`;
+  const calls = [{ id: "failed", name: "run_command", arguments: { command: "missing-generator" } }, { id: "dependent", name: "run_command", arguments: { command: "consume-generated-file" } }];
+  const { runtimeV2ProviderToolCallIdentity } = loadTs("src/store/runtimeV2/providerToolSurface.ts");
+  const rejected = admission.rejectRuntimeV2FailedShellPredecessor({ ports: p, command: command("execute"), result: { toolCalls: calls, diagnostics: [] },
+    rejectedIdentities: new Set([runtimeV2ProviderToolCallIdentity(calls[0])]) });
+  assert.equal(rejected.toolCalls.length, 0);
+  assert.deepEqual(rejected.actionReceipts.map(item => item.status), ["rejected", "not_executed"]);
+  assert.equal(rejected.actionReceipts[1].reasonCode, "provider_batch_predecessor_failed");
+});
+
+test("unknown-tool batches durably close every call without executing or poisoning skipped siblings", () => {
+  const p = ports(); let id = 0; p.nextId = prefix => `${prefix}-${++id}`;
+  const result = { toolCalls: [1, 2, 3].map(index => ({ id: `bad-${index}`, name: "read_skill", arguments: { section: `L${index}` } })).concat({ id: "shell", name: "run_command", arguments: { command: "unity status" } }), diagnostics: [] };
+  const rejected = admission.rejectRuntimeV2UnexpectedProviderTool({ ports: p, command: command("execute"), tools: [{ function: { name: "load_skill" } }, { function: { name: "run_command" } }], result });
+  assert.equal(rejected.toolCalls.length, 0);
+  assert.equal(rejected.actionReceipts.length, 4);
+  assert.deepEqual(rejected.actionReceipts.map(item => item.status), ["rejected", "rejected", "rejected", "not_executed"]);
+  const restored = types.createRuntimeV2LiveExecutionState();
+  history.restoreRuntimeV2ExecutionHistory(restored, { events: [{ type: "provider.responded", result: rejected }], evidence: [] });
+  assert.equal(restored.messages.filter(message => message.role === "tool").length, 4);
+  assert.match(restored.messages.at(-1).content, /provider_batch_predecessor_failed/);
+});
+
+test("semantic action failures leave ordinary reasoning and a no-tool blocker reply available", () => {
+  for (const reason of ["repeated_action_rejected", "tool_execution_failed", "non_actionable_response"]) {
+    assert.equal(requestPolicy.runtimeV2RecoveryRequiresStructuredAction({ reason }), false);
+    assert.equal(requestPolicy.runtimeV2ExecutionReasoningRequest({ configured: "auto", providerSupportsReasoningToggle: true, recoveringFromRejectedAction: true }), "auto");
+  }
+});
 
 function command(mode = "conclude", extra = {}) {
   return {
@@ -254,7 +287,7 @@ test("client action guards retain canonical recovery and accurately distinguish 
       const canonical = structuredClone(fixture.live.messages);
       const events = [];
       fixture.logStoreEvent = (name, data) => events.push({ name, data });
-      const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "tool_execution_failed" } }), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "empty_response" } }), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
       assert.equal(calls.length, 2);
       assert.equal(calls[1].settings.reasoningRequest, "off");
       assert.equal(calls[0].options.reasoningOnlyCharLimit, 4_000);

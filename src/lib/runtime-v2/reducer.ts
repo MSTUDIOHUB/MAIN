@@ -356,6 +356,26 @@ export function tryTransition(
   }
 
   switch (event.type) {
+    case "run.wait_started":
+    case "run.wait_ended":
+      return { disposition: "applied", state: append(state, event) };
+    case "run.paused": {
+      if (!state.run || state.run.status === "paused" || state.scheduledCommands.length || state.pendingToolCalls.length ||
+        !event.blocker.requestId || !event.blocker.options.includes("stop") ||
+        (event.blocker.options.includes("continue") && !event.blocker.independentWork?.length) ||
+        !state.events.some(item => item.sequence === event.blocker.evidenceSequence)) return rejection(state, "run_not_active");
+      return { disposition: "applied", state: append(state, event, { run: { ...state.run, status: "paused", blocker: event.blocker } }) };
+    }
+    case "run.decision_recorded": {
+      const blocker = state.run?.blocker;
+      if (state.run?.status !== "paused" || !blocker || blocker.requestId !== event.requestId || blocker.decision || !blocker.options.includes(event.choice)) return rejection(state, "run_not_active");
+      if (blocker.clarification && event.choice !== "stop" && !event.reply?.trim()) return rejection(state, "run_not_active");
+      return { disposition: "applied", state: append(state, event, { run: { ...state.run, blocker: { ...blocker, decision: event.choice, ...(event.reply ? { decisionReply: event.reply } : {}) } } }) };
+    }
+    case "run.resumed": {
+      if (state.run?.status !== "paused" || state.run.blocker?.requestId !== event.requestId || !state.run.blocker.decision || state.run.blocker.decision === "stop") return rejection(state, "run_not_active");
+      return { disposition: "applied", state: append(state, event, { run: { ...state.run, status: "running" } }) };
+    }
     case "run.started": {
       if (state.run) return rejection(state, "run_already_started");
       const run: RuntimeV2RunState = {
@@ -390,6 +410,7 @@ export function tryTransition(
         }),
       };
     case "command.scheduled": {
+      if (state.run?.status === "paused") return rejection(state, "run_not_active");
       if (!isSameRun(event.command.run, event.run) || event.command.phase !== state.phase) {
         return rejection(state, "command_identity_mismatch");
       }

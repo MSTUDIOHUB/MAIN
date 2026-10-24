@@ -637,15 +637,15 @@ test("native and compatibility tool protocols share a bounded decision output bu
   );
 });
 
-test("only real action or recovery boundaries override configured reasoning", () => {
+test("semantic action and recovery boundaries preserve configured reasoning", () => {
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "explicit",
       providerSupportsReasoningToggle: true,
       structuredActionRequired: true,
     }),
-    "off",
-    "a required action decodes committed evidence instead of opening a second hidden analysis phase",
+    "explicit",
+    "required action selection does not prove a reasoning decoder failure",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
@@ -662,8 +662,8 @@ test("only real action or recovery boundaries override configured reasoning", ()
       providerSupportsReasoningToggle: true,
       structuredActionRequired: true,
     }),
-    "off",
-    "a closed state-machine action boundary decodes a tool immediately instead of opening another hidden essay",
+    "auto",
+    "an action boundary preserves the model's configured reasoning",
   );
   for (const configured of ["auto", "explicit", "off"]) {
     assert.equal(
@@ -690,8 +690,8 @@ test("only real action or recovery boundaries override configured reasoning", ()
       recoveringFromRejectedAction: true,
       recoveryStage: "reconsider",
     }),
-    "off",
-    "a rejected structured action switches directly to bounded action decoding",
+    "auto",
+    "semantic rejection does not change reasoning capability",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
@@ -700,8 +700,8 @@ test("only real action or recovery boundaries override configured reasoning", ()
       recoveringFromRejectedAction: true,
       recoveryStage: "reframe",
     }),
-    "off",
-    "a sustained rejected-action loop cannot reopen long-form reasoning",
+    "auto",
+    "sustained semantic rejection remains an optional-action decision",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({

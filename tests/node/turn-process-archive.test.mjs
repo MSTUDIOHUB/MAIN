@@ -63,6 +63,12 @@ const {
   buildCodexActivityGroups,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnProcessArchive.ts"));
 
+test("concrete context actions are not overwritten by a generic scope phase", () => {
+  const blocks = [{ id: 1, type: "tool", toolName: "get_project_skeleton", target: "/fixture", status: "running", toolStatus: "running", intentSummary: "读取项目概览", turnPhase: { id: "scope", kind: "scope", title: "范围归纳" } }];
+  const live = buildLiveTurnProcessTimelineModel({ blocks, language: "zh" });
+  assert.equal(live.steps[0].intent, "读取项目概览");
+});
+
 test("tool intent helpers derive stable phases without model metadata", () => {
   assert.equal(deriveToolPhase({ toolName: "grep_search", target: "TurnProcessArchive" }), "discover");
   assert.equal(deriveToolPhase({ toolName: "read_file", target: "src/components/ChatArea.tsx" }), "inspect");

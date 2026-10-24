@@ -205,6 +205,18 @@ export class RuntimeV2Controller {
     }));
   }
 
+  async pauseRun(blocker: import("./contracts").RuntimeV2ExecutionBlocker): Promise<TurnAggregateV1> {
+    return this.apply(asEvent({ ...this.eventBase(), type: "run.paused", run: this.requireAggregate().run!.identity, blocker }));
+  }
+
+  async recordUserWait(commandKey: string, requestId: string, waiting: boolean): Promise<void> {
+    await this.apply(asEvent({ ...this.eventBase(), type: waiting ? "run.wait_started" : "run.wait_ended", run: this.requireAggregate().run!.identity, commandKey, requestId }));
+  }
+
+  async resumeRun(requestId: string): Promise<TurnAggregateV1> {
+    return this.apply(asEvent({ ...this.eventBase(), type: "run.resumed", run: this.requireAggregate().run!.identity, requestId }));
+  }
+
   async recordObservation(input: { id: string; kind: "source" | "tool" | "validation" | "subagent" | "user"; target: string; version?: string | null }): Promise<TurnAggregateV1> {
     const state = this.requireAggregate();
     if (!state.run) throw new Error("Runtime v2 Run is not active.");

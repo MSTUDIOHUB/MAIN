@@ -39,6 +39,29 @@ export interface RuntimeV2EventBase {
 
 export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
+      readonly type: "run.wait_started" | "run.wait_ended";
+      readonly run: RuntimeV2RunIdentity;
+      readonly requestId: string;
+      readonly commandKey: string;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "run.paused";
+      readonly run: RuntimeV2RunIdentity;
+      readonly blocker: import("./contracts").RuntimeV2ExecutionBlocker;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "run.decision_recorded";
+      readonly run: RuntimeV2RunIdentity;
+      readonly requestId: string;
+      readonly choice: "recheck" | "continue" | "stop";
+      readonly reply?: string;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "run.resumed";
+      readonly run: RuntimeV2RunIdentity;
+      readonly requestId: string;
+    })
+  | (RuntimeV2EventBase & {
       readonly type: "turn.admitted";
       readonly networkRead?: import("../networkRead").NetworkReadPolicy;
       readonly turn: RuntimeV2TurnIdentity;

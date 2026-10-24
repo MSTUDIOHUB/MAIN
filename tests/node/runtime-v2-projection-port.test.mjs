@@ -235,7 +235,8 @@ test("canonical receipts settle approved permission rows and preserve success th
   const rows = harness.getState().taskFlow.filter((block) => block.type === "tool");
   assert.equal(rows.some((block) => block.status === "running" || block.toolStatus === "running" || block.toolStatus === "pending"), false);
   assert.equal(rows.find((block) => block.toolCallId === successful.idempotencyKey)?.toolStatus, "executed");
-  assert.equal(rows.find((block) => block.toolCallId === failed.idempotencyKey)?.toolStatus, "failed");
+  assert.equal(rows.find((block) => block.toolCallId === failed.idempotencyKey)?.toolStatus, "rejected");
+  assert.equal(rows.find((block) => block.toolCallId === failed.idempotencyKey)?.toolOutcome, "blocked");
   assert.equal(rows.some((block) => block.toolCallId === canceled.idempotencyKey), false, "a canceled unexecuted permission row is removed instead of marked successful");
 });
 

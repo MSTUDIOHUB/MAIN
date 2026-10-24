@@ -21,7 +21,8 @@ import type {
 
 export interface RuntimeV2RunState {
   readonly identity: RuntimeV2RunIdentity;
-  readonly status: "running" | "reviewing" | "completed";
+  readonly status: "running" | "reviewing" | "paused" | "completed";
+  readonly blocker?: import("./contracts").RuntimeV2ExecutionBlocker;
   readonly phase: RuntimeV2Phase;
   readonly terminalOutcome: RuntimeV2TerminalOutcome | null;
 }

@@ -202,6 +202,19 @@ export interface RuntimeV2NormalizedToolCall {
   readonly arguments: Readonly<Record<string, unknown>>;
 }
 
+export interface RuntimeV2ExecutionBlocker {
+  readonly requestId: string;
+  readonly reasonCode: "rejected_action_cycle" | "recovery_stalled" | "external_state_required" | "intent_clarification";
+  readonly evidenceSequence: number;
+  readonly message: string;
+  readonly actionIdentity?: string;
+  readonly options: readonly ("recheck" | "continue" | "stop")[];
+  readonly independentWork?: readonly string[];
+  readonly decision?: "recheck" | "continue" | "stop";
+  readonly clarification?: import("../turnClarification").TurnClarification;
+  readonly decisionReply?: string;
+}
+
 export interface RuntimeV2ProviderDiagnostic {
   readonly code: string;
   readonly message: string;
@@ -213,6 +226,16 @@ export interface RuntimeV2NormalizedProviderResult {
   readonly commentary?: string;
   readonly toolCalls: readonly RuntimeV2NormalizedToolCall[];
   readonly diagnostics: readonly RuntimeV2ProviderDiagnostic[];
+  /** Settled without execution at admission. These close every original
+   * tool pair and survive restart without entering the effect scheduler. */
+  readonly actionReceipts?: readonly {
+    readonly call: RuntimeV2NormalizedToolCall;
+    readonly actionIdentity: string;
+    readonly status: "rejected" | "not_executed";
+    readonly reasonCode: string;
+    readonly feedback: string;
+    readonly priorFeedbackObserved?: boolean;
+  }[];
   readonly usage?: Readonly<Record<string, number>>;
 }
 

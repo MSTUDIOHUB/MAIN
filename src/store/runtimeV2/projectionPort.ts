@@ -667,6 +667,7 @@ export function createRuntimeV2ProjectionPort(
           runId: run.runId,
           storeDisposition,
           projectionKind: projection.kind,
+          ...(aggregate.terminalOutcome ? { resultKind: aggregate.terminalOutcome.resultKind, reason: aggregate.terminalOutcome.reason, finalProjectionId: aggregate.terminalOutcome.finalProjectionId } : {}),
           dedupeKey: projection.dedupeKey.slice(0, 240),
           dedupeKeyChars: projection.dedupeKey.length,
           markdownChars: projection.markdown.length,
@@ -676,7 +677,7 @@ export function createRuntimeV2ProjectionPort(
             .trim()
             .slice(0, 240) || "",
           timelineRecordCount: projectedTaskFlow.filter((block) =>
-            block.type === "progress" &&
+            (block.type === "progress" || block.type === "tool") &&
             block.turnId === run.turnId &&
             block.runId === run.runId &&
             String(block.dedupeKey || "").startsWith("runtime-v2-timeline:")

@@ -85,6 +85,7 @@ export type RuntimeV2ProviderActionWindow =
   | "closed_recovery";
 
 export interface RuntimeV2LiveExecutionState {
+  latestProviderRequestRejectedIdentities?: ReadonlySet<string>;
   readonly messages: AgentMessage[];
   readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
   readonly childAbortControllers: Map<string, AbortController>;
@@ -146,6 +147,7 @@ export interface RuntimeV2LiveExecutionState {
 }
 
 export interface RuntimeV2ExecutionPortsInput {
+  readonly recordUserWait?: (commandKey: string, requestId: string, waiting: boolean) => Promise<void>;
   readonly get: StoreGet;
   readonly set?: StoreSet;
   readonly context: RuntimeV2SubmissionContext;

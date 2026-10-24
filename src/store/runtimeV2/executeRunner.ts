@@ -51,7 +51,6 @@ import {
 import {
   runtimeV2ExecuteTerminalDecision,
   runtimeV2PhaseTransitionMessage,
-  truthfulRuntimeV2RecoveryStallDecision,
 } from "./executionOutcome";
 import {
   createRuntimeV2RunnerIdentity,
@@ -60,6 +59,10 @@ import {
 } from "./executionRunnerIdentity";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import { restoreRuntimeV2SkillHistory } from "./executionSkillHistory";
+import { restoreRuntimeV2ExecutionHistory } from "./executionProviderHistory";
+import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
+import { pausedAgentLoopOutcome } from "../../lib/runOutcome";
+import { deriveRuntimeV2ExecutionBlocker, projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
 import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import {
   resolveRuntimeV2ObjectiveAdmission,
@@ -124,6 +127,7 @@ export async function runSubmitRuntimeV2Execute(
     logStoreEvent: input.logStoreEvent,
   });
   const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
+  if (existing && !existing.aggregate.terminalOutcome) restoreRuntimeV2ExecutionHistory(live, existing.aggregate);
   const emergencyTerminal =
     getRuntimeV2EmergencyTerminalEnvelope(
       initialState,
@@ -161,7 +165,9 @@ export async function runSubmitRuntimeV2Execute(
     });
     throw new Error("RUNTIME_V2_STALE_RUN_CHECKPOINT: checkpoint belongs to a different harness run.");
   }
+  let recordUserWait: (commandKey: string, requestId: string, waiting: boolean) => Promise<void> = async () => {};
   const executionPorts = {
+    recordUserWait: (commandKey: string, requestId: string, waiting: boolean) => recordUserWait(commandKey, requestId, waiting),
     get: input.get,
     set: input.set,
     context: input.context,
@@ -191,6 +197,7 @@ export async function runSubmitRuntimeV2Execute(
     abortSignal: input.context.abortCtrl.signal,
   });
   let providerRecoveryLease: RuntimeV2ProviderRecoveryStallLease | null = null;
+  recordUserWait = (commandKey, requestId, waiting) => controller.recordUserWait(commandKey, requestId, waiting);
 
   try {
     if (!existing) {
@@ -222,7 +229,7 @@ export async function runSubmitRuntimeV2Execute(
           runtimeV2ExecuteAcceptanceEvidenceRequirements(
             admission.acceptanceCriteria,
           ),
-        initialPhase: admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
+        initialPhase: isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "") || admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
@@ -272,6 +279,18 @@ export async function runSubmitRuntimeV2Execute(
     while (true) {
       const before = controller.snapshot().aggregate;
       if (!before || before.terminalOutcome) break;
+      if (before.run?.status === "paused") {
+        if (before.run.blocker?.decision && before.run.blocker.decision !== "stop") {
+          await controller.resumeRun(before.run.blocker.requestId);
+          live.messages.push({ role: "system", content: "The user requested a recheck of the paused prerequisite. Re-observe the exact prerequisite before retrying; no extra permissions or acceptance were granted." });
+          input.set((state: any) => ({ activeActionRequest: null, conversationTurns: state.conversationTurns.map((turn: any) => turn.id === before.turn.turnId ? { ...turn, status: "executing", runtimeOutcome: undefined } : turn) }));
+          continue;
+        }
+        projectRuntimeV2ExecutionBlocker({ aggregate: before, get: input.get, set: input.set, language: input.context.phaseLanguage });
+        return createRuntimeV2RunnerSettlement(input.context, pausedAgentLoopOutcome(before.run.blocker?.reasonCode || "action_required", "action_required"));
+      }
+      const blocker = deriveRuntimeV2ExecutionBlocker(before, nextId("execution-choice"), input.context.phaseLanguage);
+      if (blocker) { await controller.pauseRun(blocker); continue; }
       const providerRecoveryWindow =
         deriveRuntimeV2ProviderRecoveryWindow(before);
       const providerRecoveryPressure =
@@ -457,11 +476,8 @@ export async function runSubmitRuntimeV2Execute(
             recoveryStartedAt: providerRecoveryLease?.startedAt || null,
           },
         );
-        await controller.driveOnce(truthfulRuntimeV2RecoveryStallDecision({
-          aggregate: before,
-          recoveryOccurrence: providerRecoveryPressure.occurrence,
-        }));
-        if (controller.snapshot().aggregate?.terminalOutcome) break;
+        await controller.pauseRun({ requestId: nextId("execution-choice"), reasonCode: "recovery_stalled", evidenceSequence: before.events[before.events.length - 1]!.sequence,
+          message: input.context.phaseLanguage === "zh" ? "恢复过程持续未产生新进展。请检查所需资源或权限后重新检查，或停止任务。" : "Recovery made no new progress. Check prerequisites and recheck, or stop.", options: ["recheck", "stop"] });
         continue;
       }
       const phaseTransition = decideRuntimeV2ExecutePhaseTransition(before, {

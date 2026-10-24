@@ -31,6 +31,7 @@ export interface RuntimeV2SubmissionContext {
   readonly effectiveRunIntent: ResolvedRunIntent;
   readonly runtimeRunIntent: ResolvedRunIntent;
   readonly requiredCapabilities?: readonly TurnCapability[];
+  readonly intentClarification?: import("../../lib/turnClarification").TurnClarification;
   readonly capabilityRestrictions?: readonly TurnCapability[];
   readonly approvalRequiredCapabilities?: readonly TurnCapability[];
   /** Exact live project rules captured at the Turn safe boundary. */

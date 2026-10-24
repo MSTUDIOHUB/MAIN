@@ -7,7 +7,6 @@ import {
 } from "../lib/streamDisplayPolicy";
 import type { TaskBlock } from "../lib/taskTypes";
 import {
-  makeTurnRuntimePhase,
   normalizeTurnRuntimePhase,
   type TurnRuntimePhase,
 } from "../lib/turnPhase";
@@ -83,7 +82,7 @@ export function startSubmitStreamingUi(
   context.thinkingInterceptor = thinkingInterceptor;
 
   const attachRuntimePhase = <T extends TaskBlock>(block: T, phase?: TurnRuntimePhase): T => {
-    const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase || makeTurnRuntimePhase("scope", phaseLanguage), phaseLanguage);
+    const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase, phaseLanguage);
     return normalized ? { ...block, turnPhase: normalized } : block;
   };
 

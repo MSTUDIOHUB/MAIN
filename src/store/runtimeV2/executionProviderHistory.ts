@@ -1,4 +1,5 @@
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 import type {
   AgentMessage,
   ContentPart,
@@ -27,6 +28,29 @@ import type {
 } from "./executionTypes";
 import { stripResidueToolMarkup } from "../../lib/runtime-v2/providerAnswer";
 export { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
+
+/** Restore actual receipts, never execute tools to reconstruct context. */
+export function restoreRuntimeV2ExecutionHistory(live: RuntimeV2LiveExecutionState, aggregate: TurnAggregateV1): void {
+  const commands = new Map(aggregate.events.flatMap(event => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
+  const results = new Map(aggregate.events.flatMap(event => {
+    if (event.type !== "tool.completed" && event.type !== "validation.completed") return [];
+    const id = String(commands.get(event.idempotencyKey)?.payload.toolCallId || "");
+    const content = event.type === "tool.completed" ? event.modelContent : undefined;
+    return id ? [[id, content || event.presentation?.message || "Tool completed without a model receipt."] as const] : [];
+  }));
+  for (const event of aggregate.events) {
+    const reply = runtimeV2ClarificationMessage(event);
+    if (reply) live.messages.push(reply);
+    if (event.type !== "provider.responded") continue;
+    const calls = event.result.toolCalls.filter(call => results.has(call.id));
+    if (calls.length) {
+      appendRuntimeV2AssistantToolCallHistory(live, { ...event.result, toolCalls: calls });
+      for (const call of calls) appendRuntimeV2ToolResultHistory(live, call.id, results.get(call.id)!);
+    }
+    appendRuntimeV2RejectedToolCallBatchHistory(live, event.result.actionReceipts || []);
+  }
+  live.evidenceCounter = Math.max(0, ...aggregate.evidence.map(evidence => Number(/^E(\d+)$/.exec(evidence.id)?.[1]) || 0));
+}
 
 /** Rehydrate only the latest same-Run failure, never an answer before new work. */
 export function restoreRuntimeV2ProviderRecoveryHistory(
@@ -242,6 +266,7 @@ export function appendRuntimeV2RejectedToolCallHistory(
     readonly call: RuntimeV2NormalizedToolCall;
     readonly actionIdentity: string;
     readonly feedback: string;
+    readonly batchToolCallIds?: ReadonlySet<string>;
   },
 ): void {
   const actionIdentity = String(input.actionIdentity || "")
@@ -256,7 +281,8 @@ export function appendRuntimeV2RejectedToolCallHistory(
     const message = live.messages[index];
     if (
       message?.role === "tool" &&
-      String(message.content || "").startsWith(marker)
+      String(message.content || "").startsWith(marker) &&
+      !input.batchToolCallIds?.has(String(message.tool_call_id || ""))
     ) {
       supersededToolCallIds.add(String(message.tool_call_id || ""));
       live.messages.splice(index, 1);
@@ -297,6 +323,15 @@ export function appendRuntimeV2RejectedToolCallHistory(
     content: `${marker}\n${feedback}`,
   });
   live.latestProviderAssistantReasoning = null;
+}
+
+/** Coalesce older attempts, while retaining every call in this settled batch. */
+export function appendRuntimeV2RejectedToolCallBatchHistory(
+  live: RuntimeV2LiveExecutionState,
+  receipts: NonNullable<RuntimeV2NormalizedProviderResult["actionReceipts"]>,
+): void {
+  const batchToolCallIds = new Set(receipts.map(receipt => receipt.call.id));
+  for (const receipt of receipts) appendRuntimeV2RejectedToolCallHistory(live, { ...receipt, batchToolCallIds });
 }
 
 /**

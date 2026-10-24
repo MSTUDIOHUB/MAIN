@@ -331,7 +331,7 @@ export function buildRuntimeV2FinalProjection(
       mutationLine,
       validationLine,
       evidenceLine,
-      `- ${reason}`,
+      /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
     ].filter(Boolean).join("\n\n"),
     "final",
     `final:${resultKind}:${reason}`,

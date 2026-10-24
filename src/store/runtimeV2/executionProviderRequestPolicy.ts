@@ -66,7 +66,7 @@ export function runtimeV2RecoveryRequiresStructuredAction(
   // A complete ordinary reply carries a strategy/acceptance gap, not a failed
   // structured decoding attempt. Keep prose and optional authorized actions
   // available so recovery can use its exact causal feedback.
-  return !!pressure && pressure.reason !== "non_actionable_response";
+  return !!pressure && ["empty_response", "provider_response_rejected", "output_truncated"].includes(pressure.reason);
 }
 
 export function shouldRetryRuntimeV2WithoutReasoning(input: {
@@ -172,24 +172,8 @@ export function runtimeV2ExecutionReasoningRequest(input: {
   readonly recoveryStage?: string;
   readonly actionWindow?: RuntimeV2ProviderActionWindow | null;
 }): StreamSettings["reasoningRequest"] {
-  // A state-machine-required action already has its causal boundary in the
-  // durable transcript. Opening another hidden analysis phase here lets a
-  // model reconsider a closed branch, repeat unavailable reads, or serialize
-  // a required tool schema as prose. Decode the next structured action
-  // directly when the adapter exposes a documented reasoning toggle.
-  if (
-    input.structuredActionRequired &&
-    input.providerSupportsReasoningToggle
-  ) {
-    return "off";
-  }
-  if (
-    input.recoveringFromRejectedAction &&
-    input.providerSupportsReasoningToggle &&
-    input.configured !== "off"
-  ) {
-    return "off";
-  }
+  // Semantic rejection is not evidence of a reasoning/decoder failure. Only
+  // the request-local, output-limited retry below may disable reasoning.
   if (
     input.actionWindow &&
     input.providerSupportsReasoningToggle &&

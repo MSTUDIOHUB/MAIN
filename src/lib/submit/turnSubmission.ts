@@ -2210,15 +2210,11 @@ export function resolveSubmitPreflightEffectAction<
     };
   }
 
-  if (params.effect.request.hasWorkspace && (!params.preflight || params.preflight.needsUserChoice)) {
+  if (params.effect.request.hasWorkspace && !params.preflight) {
     return {
       kind: "conclude_without_execution",
-      resultKind: params.preflight ? "blocked" : "error",
-      summary: params.preflight
-        ? params.preflight.question || (params.effect.preferredLanguage === "en"
-          ? "Please clarify the requested work and restrictions before MAIN uses tools."
-          : "请明确本轮目标与操作限制，MAIN 尚未执行工具。")
-        : params.effect.preferredLanguage === "en"
+      resultKind: "error",
+      summary: params.effect.preferredLanguage === "en"
           ? "MAIN could not interpret this request because semantic routing failed or returned an incomplete result. No tools ran. Please retry."
           : "语义解析请求失败或返回不完整结果，MAIN 未能确定本轮目标，尚未执行工具。请重试。",
     };
@@ -2228,7 +2224,10 @@ export function resolveSubmitPreflightEffectAction<
     images: params.effect.originalImages,
     preferredLanguage: params.effect.preferredLanguage,
     resolution: params.effect.resolution,
-    preflight: params.preflight,
+    // Workspace clarifications enter a durable Runtime pause on the admitted
+    // Turn. They are neither a new execution approval nor a blocked final.
+    preflight: params.effect.request.hasWorkspace && params.preflight
+      ? { ...params.preflight, needsUserChoice: false } : params.preflight,
   });
 
   if (

@@ -3246,14 +3246,14 @@ test("structured native recovery uses generic required without a named-tool lock
   );
 });
 
-test("provider request failure enters structured recovery while tools remain", () => {
+test("provider transport failure preserves optional tools and reasoning rather than requiring an action", () => {
   assert.equal(
     providerRequest.runtimeV2RecoveryRequiresStructuredAction({
       reason: "provider_request_failed",
       occurrence: 1,
       stage: "reconsider",
     }),
-    true,
+    false,
   );
   assert.equal(
     providerRequest.runtimeV2RecoveryRequiresStructuredAction(null),
@@ -6871,11 +6871,11 @@ test("ordinary reasoning preserves its configuration without a recovery boundary
   assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
     configured: "auto", providerSupportsReasoningToggle: true,
     structuredActionRequired: true,
-  }), "off", "a real required-action boundary retains its existing capability policy");
+  }), "auto", "action selection does not prove a reasoning decoder failure");
   assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
     configured: "explicit", providerSupportsReasoningToggle: true,
     recoveringFromRejectedAction: true,
-  }), "off", "a rejected action retains its existing recovery policy");
+  }), "explicit", "semantic rejection preserves configured reasoning");
   assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
     configured: "auto", providerSupportsReasoningToggle: false,
     structuredActionRequired: true,
@@ -10675,10 +10675,10 @@ test("ordinary reference requests retain reasoning across source windows and inp
     }
     configured = "auto";
     const recovery = await invoke("complete", 111_412, true);
-    assert.equal(recovery.settings.reasoningRequest, "off");
-    assert.equal(recovery.event.structuredActionRequired, true);
-    assert.equal(recovery.options.toolChoice, "required");
-    assert.equal(recovery.options.reasoningOnlyCharLimit, 4_000, "real required-action recovery retains its explicit client guard");
+    assert.equal(recovery.settings.reasoningRequest, "auto");
+    assert.equal(recovery.event.structuredActionRequired, false);
+    assert.equal(recovery.options.toolChoice, undefined);
+    assert.equal(recovery.options.reasoningOnlyCharLimit, null, "semantic recovery allows a blocker report with normal reasoning");
   } finally {
     streaming.streamChatCompletion = originalStream;
     laneSettings.deriveBudgetedStreamSettings = originalSettings;
@@ -10741,8 +10741,8 @@ test("recovery requests preserve canonical command and source receipts before re
         assert.equal(roomy.coverage[0]?.windows[0]?.content, source);
         assert.equal(roomy.coverage[0]?.version, "source-v1");
         assert.equal(roomy.options.contextOwnership, "caller");
-        assert.equal(roomy.options.actionOnlyCharLimit, 1_000, "this change does not alter structured recovery policy");
-        assert.equal(roomy.options.toolChoice, textEnvelope ? undefined : "required");
+        assert.equal(roomy.options.actionOnlyCharLimit, 3_000, "semantic recovery uses ordinary reply decoding");
+        assert.equal(roomy.options.toolChoice, undefined);
         assert.doesNotMatch(roomy.messages.map((message) => message.content).join("\n"), /committed_source_snapshot_v1|committed_observation_receipts_v1/);
       }
     }

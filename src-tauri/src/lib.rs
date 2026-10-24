@@ -50,7 +50,7 @@ pub mod network_guard;
 pub mod planner;
 pub mod runtime;
 pub mod session_store;
-mod skill_packages;
+pub mod skill_packages;
 pub mod task_graph;
 pub mod trusted_execution;
 pub mod web_search;
@@ -365,7 +365,7 @@ struct CapturedPipe {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerminalCommandOutput {
+pub struct TerminalCommandOutput {
     command: String,
     stdout: String,
     stderr: String,
@@ -2549,7 +2549,7 @@ fn resolve_command_working_directory(
         .map_err(|error| format!("WORKING_DIRECTORY_REJECTED: {error}"))
 }
 
-fn run_workspace_shell_command(
+pub fn run_workspace_shell_command(
     workspace: &Path,
     working_directory: &Path,
     command: String,

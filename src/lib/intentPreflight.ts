@@ -12,6 +12,7 @@ import type { AppConfig } from "./appTypes";
 import { normalizeConversationDisplayTitle } from "./workflowModels";
 import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 import { TURN_CAPABILITIES, type SemanticCapability } from "./turnCapabilities";
+import { normalizeTurnClarification } from "./turnClarification";
 
 type PreflightConfig = Pick<AppConfig, "activeProfile" | "local" | "cloud" | "cloudExperimentalLoginEnabled">;
 type DiagnosticField = "result" | "semantic" | "semantic.objective" | "semantic.workType" | "semantic.answerFormat" |
@@ -112,6 +113,7 @@ function normalizePreflightResult(
   language: "zh" | "en",
   explicitIntent?: ResolvedUserIntent,
   onInvalid?: (field: DiagnosticField) => void,
+  currentInput = "",
 ): IntentPreflightResult | null {
   const invalid = (field: DiagnosticField) => { onInvalid?.(field); return null; };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid("result");
@@ -133,7 +135,12 @@ function normalizePreflightResult(
     (semantic.workType === "implement" && forbidden.includes("workspace_write")) ||
     ((explicitPolicy === "none" || explicitPolicy === "read_only") && operationRequired) ||
     (explicitPolicy === "none" && required.includes("workspace_read"));
-  const needsUserChoice = candidate.needsUserChoice || conflicts;
+  const clarification = conflicts ? {
+    kind: "constraint_conflict" as const, field: "capabilities", evidence: currentInput,
+    question: language === "en" ? "The requested capabilities conflict with the current limits. Please clarify the permitted scope."
+      : "任务所需能力与本轮限制冲突，请明确允许的操作范围。",
+  } : normalizeTurnClarification(candidate.clarification, currentInput);
+  const needsUserChoice = !!clarification;
   const intent = explicitIntent && explicitIntent !== "execute"
     ? explicitIntent : deriveSemanticIntent(semantic);
   const operationPolicy = getIntentPolicy(intent).toolPolicy;
@@ -144,7 +151,7 @@ function normalizePreflightResult(
     : required.includes("external_interaction") ? "mcp" : "none";
   const requiresApproval = kind !== "none";
   return {
-    semantic,
+    semantic: { ...semantic, ...(clarification ? { clarification } : {}) },
     intent,
     confidence: candidate.confidence,
     title: normalizeConversationDisplayTitle(
@@ -154,10 +161,7 @@ function normalizePreflightResult(
     ),
     summary: semantic.objective,
     needsUserChoice,
-    question: question ?? (conflicts
-      ? language === "en" ? "The requested capabilities conflict with the current limits. Please clarify the permitted scope."
-        : "任务所需能力与本轮限制冲突，请明确允许的操作范围。"
-      : undefined),
+    question: clarification?.question,
     outputFormat: semantic.answerFormat,
     needsWorkspaceRead: required.includes("workspace_read"),
     riskLevel: requiresApproval ? "medium" : "low",
@@ -208,7 +212,8 @@ export async function runIntentPreflight(params: {
     "forbiddenCapabilities contain only explicit CURRENT operational restrictions. Read-only forbids workspace_write; no commands forbids command separately. Historical baselines, quotations and examples are reference context, not current restrictions.",
     "approvalRequiredCapabilities contain only capabilities for which the CURRENT request explicitly requires separate human approval before each invocation; otherwise use []. This adds a review requirement, never approval. Historical approvals, quotations and examples do not create this requirement.",
     "An explicit mode is a capability upper bound; still interpret restrictions in its natural-language body. Never approve tools, widen paths, invent exact commands or claim completion.",
-    "Use previousRequest only to understand an actual continuation; the current request always controls. If materially ambiguous, set needsUserChoice true and provide a brief question.",
+    "Use previousRequest only for an actual continuation; the current request controls. Never ask permission to start requested work; session scopes and per-action policy own approval. Task length, commands and interaction checks are not input gaps.",
+    "For a necessary missing input, provide clarification:{kind:'missing_input',field:'missing fact',evidence:'exact current-request excerpt',question:'specific question'}. For an unresolved target choice use kind:'target_ambiguity' and choices:[...] copied from that excerpt. needsUserChoice alone has no authority. Do not invent a gap for execution consent.",
     "Required shape: {\"semantic\":{\"objective\":\"short task goal\",\"workType\":\"answer|investigate|implement|operate|plan\",\"answerFormat\":\"answer|analysis|summary|report|plan\",\"requiredCapabilities\":[],\"forbiddenCapabilities\":[],\"approvalRequiredCapabilities\":[]},\"confidence\":0.0,\"needsUserChoice\":false}. Optional title and question are short strings; question is required when needsUserChoice is true.",
     `Capability values: ${TURN_CAPABILITIES.join(", ")}.`,
     `Mode: ${params.mainModeKey}; explicit intent: ${params.explicitIntent ?? "none"}; workspace: ${params.hasWorkspace === true}; language: ${params.language}.`,
@@ -239,7 +244,7 @@ export async function runIntentPreflight(params: {
     try { candidate = JSON.parse(result.content.trim()); }
     catch { return reject("invalid_json", undefined, result); }
     return normalizePreflightResult(candidate, params.language, params.explicitIntent,
-      (field) => { reject("invalid_result", field, result); });
+      (field) => { reject("invalid_result", field, result); }, params.input);
   } catch {
     return reject(params.signal?.aborted ? "cancelled" : "transport_error");
   }

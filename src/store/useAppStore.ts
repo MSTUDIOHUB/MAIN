@@ -1,4 +1,7 @@
 import { captureNetworkRead } from "../lib/networkRead";
+import { createRuntimeV2ExecutionBlockerView, resolveRuntimeV2ExecutionBlocker } from "./runtimeV2/executionBlocker";
+import { installRuntimeV2ExecutionDecisionReplay } from "./runtimeV2/executionDecisionReplay";
+import { reconcileRuntimeV2TimelineBlocks } from "./runtimeV2/projectionTimeline";
 import { deriveStreamSettings } from "../lib/providerLaneSettings";
 import { buildOpenAiCompatibleReasoningRequestExtras } from "../lib/streaming";
 // store/useAppStore.ts
@@ -1701,6 +1704,7 @@ export interface AppState {
       goalContinuationGuidance?: string;
       /** Reserved child run identity for an approved Plan handoff. */
       runIdOverride?: string;
+      executionResumeRequestId?: string;
       /** Exact one-shot Plan execution attempt consumed only after Run admission. */
       planExecutionLeaseId?: string;
       planExecutionInstructionHash?: string;
@@ -3744,7 +3748,7 @@ export function normalizeSessionRuntimeSnapshot(
     snapshot.autoApproveTools === true,
     snapshot.autoApproveToolScopes,
   );
-  const rawTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
+  let rawTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   const persistedWorkspaceQueueEntries = Array.isArray(
     snapshot.workspaceTurnQueue?.entries,
   )
@@ -3871,7 +3875,7 @@ export function normalizeSessionRuntimeSnapshot(
     restoredPlanArtifacts.artifacts,
   );
   const actionRequestCandidate = normalizeActionRequest(snapshot.activeActionRequest);
-  const originalActionRequest = actionRequestCandidate && (
+  let originalActionRequest = actionRequestCandidate && (
     !expectedContainerSessionKey ||
     actionRequestCandidate.sessionKey === expectedContainerSessionKey
   )
@@ -4069,6 +4073,22 @@ export function normalizeSessionRuntimeSnapshot(
         isPlanApproved: restoredIsPlanApproved,
       }
     : null;
+  const executionCheckpoint = restoredHarnessRunMarker?.turnId
+    ? restoredRuntimeV2Checkpoints[restoredHarnessRunMarker.turnId] : null;
+  const executionChoice = executionCheckpoint && suppliedLifecycleSessionEpoch &&
+      executionCheckpoint.owner.sessionEpoch === suppliedLifecycleSessionEpoch &&
+      executionCheckpoint.owner.sessionKey === restoredLifecycleSessionKey &&
+      executionCheckpoint.aggregate.run?.identity.runId === restoredHarnessRunMarker?.runId
+    ? createRuntimeV2ExecutionBlockerView(executionCheckpoint.aggregate, "zh", Math.max(0, ...rawTaskFlow.map(block => block.id)) + 1)
+    : null;
+  if (executionChoice) {
+    originalActionRequest = executionChoice.request;
+    if (!rawTaskFlow.some(block => block.type === "agent" && block.choiceRequest?.requestId === executionChoice.request.requestId)) {
+      rawTaskFlow = [...rawTaskFlow, executionChoice.block];
+    }
+  } else if (originalActionRequest?.kind === "user_choice" && originalActionRequest.executionBlocker) {
+    originalActionRequest = null;
+  }
   const deletionOwnedActionRequest = goalDeletionFenced &&
     isActionRequestOwnedByGoalForDeletion({
       request: originalActionRequest,
@@ -6545,7 +6565,16 @@ export function buildRestoredSessionRuntimePatch(input: {
     expectedSessionEpoch: input.expectedSessionEpoch,
   });
   if (!normalized) return {};
-  const taskFlow = normalized.taskFlow || [];
+  let taskFlow = normalized.taskFlow || [];
+  // Re-derive display outcomes from the owner-fenced canonical ledger,
+  // including rows persisted by older versions as attempted failures.
+  for (const persisted of Object.values(normalized.runtimeV2Checkpoints || {})) {
+    const checkpoint = normalizeRuntimeV2Checkpoint(persisted);
+    if (checkpoint) taskFlow = reconcileRuntimeV2TimelineBlocks(
+      taskFlow, checkpoint.aggregate, checkpoint.updatedAt,
+      input.fallbackState.config?.language === "en" ? "en" : "zh",
+    );
+  }
   const conversationTurns = normalized.conversationTurns || [];
   const restoredReviewTurnId = normalized.activeActionRequest?.kind === "plan_review"
     ? normalized.activeActionRequest.turnId
@@ -17126,6 +17155,7 @@ export const useAppStore = create<AppState>()(
     replyOptionIsCustom?: boolean;
     parentRunIdOverride?: string;
     runIdOverride?: string;
+    executionResumeRequestId?: string;
     planExecutionLeaseId?: string;
     planExecutionInstructionHash?: string;
     continueExistingGoal?: boolean;
@@ -17140,6 +17170,37 @@ export const useAppStore = create<AppState>()(
     subagentPreferenceOverride?: SubagentDelegationPreference;
   }) => {
     let state = get();
+    const executionChoice = options?.replyOptionRequestIdentity;
+    if (executionChoice && state.activeActionRequest?.kind === "user_choice" && state.activeActionRequest.executionBlocker) {
+      const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+      const sessionKey = resolveSessionRuntimeKey(scopeKey, state.currentSessionId);
+      if (sessionKey !== executionChoice.sessionKey) return false;
+      void resolveRuntimeV2ExecutionBlocker({ get, set, identity: executionChoice,
+        choice: options?.selectedReplyOptionText || text,
+        sessionEpoch: resolveActiveSessionPlanLifecycleEpoch(state, sessionKey) || "",
+        persist: (projected, isCurrent) => persistSubmitRuntimeProjection({ state: projected, scopeKey, sessionId: state.currentSessionId,
+          sanitizeTaskBlocksForPersist, buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState, persistSessionRecord: saveProjectSession, isCurrent }),
+        dispatch: (turn, requestId) => {
+          const resumedIntent = normalizeRuntimeV2Checkpoint(get().runtimeV2Checkpoints?.[turn.id])?.aggregate.strategy;
+          const intent = resumedIntent === "chat" ? "respond" : resumedIntent === "analyze" ? "analyze" : resumedIntent === "plan" ? "plan" : "execute";
+          get().sendMessage(turn.userPrompt, undefined, { hidden: true, reuseCurrentTurn: true, turnIdOverride: turn.id,
+            runIdOverride: executionChoice.runId, executionResumeRequestId: requestId, resolvedIntent: intent, runtimeIntentOverride: intent,
+            skipIntentResolution: true, submissionOriginSessionKey: executionChoice.sessionKey });
+        },
+        stop: turnId => { get().closeTurnAsCanceled(turnId, { reason: "user_cancelled", message: "用户停止了暂停的任务。" }); },
+      }).catch(error => logStoreEvent("runtime_v2_blocker_resolution_failed", { requestId: executionChoice.requestId, error: String(error) }));
+      return true;
+    }
+    if (options?.executionResumeRequestId) {
+      const checkpoint = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints?.[String(options.turnIdOverride)]);
+      if (!checkpoint || checkpoint.aggregate.run?.blocker?.requestId !== options.executionResumeRequestId ||
+        checkpoint.aggregate.run.status !== "paused" || state.harnessRunMarker?.status !== "paused" ||
+        !checkpoint.aggregate.run.blocker.decision || checkpoint.aggregate.run.identity.runId !== options.runIdOverride ||
+        checkpoint.owner.sessionKey !== resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId) ||
+        checkpoint.owner.sessionEpoch !== resolveActiveSessionPlanLifecycleEpoch(state, checkpoint.owner.sessionKey)) return false;
+      set({ activeActionRequest: null, agentStatus: "idle", isGenerating: false });
+      state = get();
+    }
     if (options?.adoptExistingTurn) {
       const claim = options.workspaceInstructionClaim;
       const head = state.workspaceTurnQueue?.entries[0];
@@ -19093,6 +19154,8 @@ export const useAppStore = create<AppState>()(
   }
   )
 );
+
+installRuntimeV2ExecutionDecisionReplay(useAppStore);
 
 async function requestSemanticTurnMetadata(params: {
   input: string;

@@ -153,7 +153,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
     executionContractAdvance.required ||
     validationCorrection.active ||
     validationCorrection.validationCommandUnavailable ||
-    recoveringFromRejectedAction ||
     runtimeV2RecoveryRequiresStructuredAction(
       recoveryPressure as RuntimeV2ProviderRecoveryPressure | null,
     ));
@@ -321,6 +320,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
     .map(({ documentKey, version, returnedRange, readTarget }) => ({ documentKey, version, returnedRange, readTarget }));
   sourceOnlyFrontier = effectPressure?.reason === "source_only_frontier" && input.live.latestProviderRequestSourceCoverage.length > 0;
   const estimatedInputTokens = estimateMessagesTokens(messages as TrimMessage[]) + toolSchemaTokens;
+  input.live.latestProviderRequestRejectedIdentities = new Set(
+    [...providerEffectFacts.rejectedActionIdentities].filter(identity => JSON.stringify(messages).includes(identity)),
+  );
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,

@@ -26,6 +26,7 @@ import {
   runtimeV2ToolEvidenceProjection,
   runtimeV2ToolHasStructuredValidatorContract,
 } from "./executionEffectEvidence";
+import { runtimeV2ProviderToolCallIdentity } from "./providerReadReceipts";
 
 type RuntimeV2ToolFailureKind = NonNullable<Extract<
   RuntimeV2EventDraft,
@@ -56,7 +57,7 @@ export function recordToolResultHistory(input: {
   appendRuntimeV2ToolResultHistory(
     input.ports.live,
     toolCallId,
-    input.content,
+    input.status === "succeeded" ? input.content : `[runtime-v2 failed action: ${runtimeV2ProviderToolCallIdentity({ name: input.toolName, arguments: input.command.payload.arguments as Record<string, unknown> || {} })}]\n${input.content}`,
   );
 }
 

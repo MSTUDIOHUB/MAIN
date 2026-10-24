@@ -182,7 +182,7 @@ export type MainThreadEvent =
       target?: string;
     } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.started"; threadId: string; turnId: string; timestampMs: number } & MainThreadRunIdentity)
-  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; requestId?: string; progress?: MainThreadProgressUpdate } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string; resultKind?: TerminalResultKind } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.aborted"; threadId: string; turnId: string; timestampMs: number; reason: string; message?: string } & MainThreadRunIdentity)
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.started"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
@@ -356,6 +356,7 @@ export function appendRuntimeEventWithResult(
     const existingBoundary = existing.find((candidate) =>
       isRunBoundaryEvent(candidate) &&
       candidate.type === event.type &&
+      (candidate.type !== "run.paused" || event.type !== "run.paused" || candidate.requestId === event.requestId) &&
       candidate.threadId === event.threadId &&
       candidate.turnId === event.turnId &&
       candidate.runId === event.runId

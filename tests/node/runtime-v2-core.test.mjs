@@ -492,6 +492,39 @@ function executeAggregate(
   return state;
 }
 
+test("execution blockers survive ledger replay and require an exact durable decision before same-Run resume", () => {
+  let state = executeAggregate();
+  const blocker = { requestId: "blocker-1", reasonCode: "rejected_action_cycle", evidenceSequence: 1, message: "The exact action was rejected after feedback.", options: ["recheck", "stop"] };
+  state = runtime.transition(state, event(state, "run.paused", { run: baseRun, blocker }));
+  assert.equal(state.run.status, "paused");
+  assert.deepEqual(runtime.decideNextCommands(state), [], "paused Run cannot issue another model request");
+  assert.equal(runtime.tryTransition(state, event(state, "run.resumed", { run: baseRun, requestId: "blocker-1" })).disposition, "rejected");
+  assert.equal(runtime.tryTransition(state, event(state, "run.decision_recorded", { run: baseRun, requestId: "stale", choice: "recheck" })).disposition, "rejected");
+  state = runtime.transition(state, event(state, "run.decision_recorded", { run: baseRun, requestId: "blocker-1", choice: "recheck" }));
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
+  const persisted = runtime.serializeRuntimeV2CheckpointMap({ [baseTurn.turnId]: checkpoint });
+  state = runtime.normalizeRuntimeV2Checkpoint(persisted[baseTurn.turnId]).aggregate;
+  assert.equal(state.run.blocker.decision, "recheck");
+  state = runtime.transition(state, event(state, "run.resumed", { run: baseRun, requestId: "blocker-1" }));
+  assert.equal(state.run.status, "running");
+  assert.equal(state.events.filter(e => e.type === "run.started").length, 1);
+  assert.equal(state.terminalOutcome, null);
+});
+
+test("the final Session IPC snapshot strips live checkpoint caches even after partial merging", () => {
+  const { prepareProjectSessionSnapshotForSave } = loadTs("src/lib/ipc.ts");
+  const state = executeAggregate();
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
+  for (const partial of [false, true]) {
+    const session = prepareProjectSessionSnapshotForSave({ id: 1, transcriptPartial: partial, runtimeSnapshot: { runtimeV2Checkpoints: { [baseTurn.turnId]: checkpoint } } }, { id: 1, messages: [{ id: 1, type: "user" }], runtimeSnapshot: { conversationTurns: [{ id: baseTurn.turnId }] } });
+    const persisted = session.runtimeSnapshot.runtimeV2Checkpoints[baseTurn.turnId];
+    assert.equal(persisted.aggregate, undefined);
+    assert.equal(persisted.scheduledCommands, undefined);
+    assert.deepEqual(runtime.normalizeRuntimeV2Checkpoint(persisted).aggregate, state);
+    assert.ok(checkpoint.aggregate, "the live checkpoint stays materialized");
+  }
+});
+
 function commandFor(state, kind, key, payload = {}) {
   return {
     idempotencyKey: key,
@@ -3318,6 +3351,37 @@ test("failed tool effects remain consecutive provider no-progress decisions", ()
     3,
     "the count remains a strategy signal but cannot conclude the parent Run",
   );
+});
+
+test("approval waiting is subtracted from recovery time and survives cold replay", () => {
+  let state = providerResult(executeAggregate(), { toolCalls: [], diagnostics: [] });
+  const original = runtime.deriveRuntimeV2ProviderRecoveryWindow(state).startedAt;
+  state = runtime.transition(state, event(state, "run.wait_started", { run: baseRun, commandKey: "effect", requestId: "approval", at: original + 100 }));
+  state = runtime.transition(state, event(state, "run.wait_ended", { run: baseRun, commandKey: "effect", requestId: "approval", at: original + 10_100 }));
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
+  const restored = runtime.normalizeRuntimeV2Checkpoint(runtime.serializeRuntimeV2CheckpointMap({ [baseTurn.turnId]: checkpoint })[baseTurn.turnId]).aggregate;
+  assert.equal(runtime.deriveRuntimeV2ProviderRecoveryWindow(restored).startedAt, original + 10_000);
+  const lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({ current: { startedAt: original },
+    pressure: runtime.deriveRuntimeV2ProviderRecoveryPressure(restored), startedAt: original + 10_000, now: original + 10_100 });
+  assert.equal(lease.startedAt, original + 10_000);
+});
+
+test("replayed and unchanged source results cannot renew a recovery lease", () => {
+  let state = providerResult(executeAggregate(), { toolCalls: [{ id: "read-1", name: "read_file", arguments: { path: "a.ts" } }] });
+  state = executePendingTool(state, { type: "tool.completed", status: "succeeded", modelContent: "same source",
+    evidence: [{ id: "E1", kind: "read", target: "a.ts", version: "v1", summary: "Source" }] });
+  state = providerResult(state, { toolCalls: [], diagnostics: [] });
+  const original = runtime.deriveRuntimeV2ProviderRecoveryWindow(state).startedAt;
+  for (const [index, origin] of [[2, "replayed"], [3, "executed"]]) {
+    state = providerResult(state, { toolCalls: [{ id: `read-${index}`, name: "read_file", arguments: { path: "a.ts" } }] });
+    state = executePendingTool(state, { type: "tool.completed", status: "succeeded", receiptOrigin: origin, modelContent: "same source",
+      evidence: [{ id: `E${index}`, kind: "read", target: "a.ts", version: "v1", summary: "Source" }] });
+    assert.equal(runtime.deriveRuntimeV2ProviderRecoveryWindow(state).startedAt, original);
+  }
+  state = providerResult(state, { toolCalls: [{ id: "new-source", name: "read_file", arguments: { path: "a.ts" } }] });
+  state = executePendingTool(state, { type: "tool.completed", status: "succeeded", modelContent: "changed source",
+    evidence: [{ id: "E4", kind: "read", target: "a.ts", version: "v2", summary: "New source" }] });
+  assert.equal(runtime.deriveRuntimeV2ProviderRecoveryWindow(state), null);
 });
 
 test("prose without a tool is non-actionable while execute or validate debt remains", () => {

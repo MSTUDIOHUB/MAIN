@@ -72,6 +72,7 @@ export interface SubmissionRuntimeContext {
   capabilityRestrictions?: readonly import("./turnCapabilities").TurnCapability[];
   approvalRequiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
+  intentClarification?: import("./turnClarification").TurnClarification;
   goalCreationAuthorization: GoalCreationAuthorization | null;
   goalContinuationAuthorization: GoalContinuationAuthorization | null;
   effectiveCommandDirective: CommandDirective | null;

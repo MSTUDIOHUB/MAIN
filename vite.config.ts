@@ -4,6 +4,10 @@ import tailwindcss from "@tailwindcss/vite";
 
 // process is provided by the Vite/Node config runtime.
 const host = process.env.TAURI_DEV_HOST;
+// Freeze the dev module graph for long headless production-chain validation.
+// The harness imports real /src modules; filesystem evidence must not reload
+// the page and replace a live Run with fixture startup state.
+const frozenRuntimeValidation = process.env.MAIN_FROZEN_RUNTIME_E2E === "1";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -18,14 +22,14 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
-    hmr: host
+    hmr: frozenRuntimeValidation ? false : host
       ? {
           protocol: "ws",
           host,
           port: 1421,
         }
       : undefined,
-    watch: {
+    watch: frozenRuntimeValidation ? null : {
       // 3. tell Vite to ignore watching `src-tauri`
       // Also ignore workspace directories that the agent writes to during
       // execution (e.g. .protocols/, tracks/, .codely-cli/) to prevent HMR

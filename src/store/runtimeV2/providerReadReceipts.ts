@@ -102,6 +102,7 @@ export function completedRuntimeV2ProviderToolCallIdentities(
     }
     if (message.role !== "tool" || !message.tool_call_id) continue;
     if (effects?.unexecutedToolCallIds?.has(message.tool_call_id)) continue;
+    if (effects?.failedToolCallIds?.has(message.tool_call_id)) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
     if (

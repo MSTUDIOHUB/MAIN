@@ -15,7 +15,7 @@ import {
   type RuntimeV2TransportVariant,
 } from "../../lib/runtime-v2";
 import {
-  appendRuntimeV2RejectedToolCallHistory,
+  appendRuntimeV2RejectedToolCallBatchHistory,
   appendRuntimeV2ProviderFeedbackHistory,
   aggregateForCurrentTurn,
   baseProviderProfile,
@@ -54,12 +54,14 @@ import {
   normalizeRuntimeV2ProviderToolCalls,
 } from "./executionProviderTools";
 import {
-  runtimeV2RepeatedActionFeedback,
+  buildRuntimeV2RepeatedActionReceipts,
+  runtimeV2DeferredToolReceipts,
 } from "./executionProviderFeedback";
 import {
   rejectRuntimeV2InvalidCorrectiveSourceRead,
   rejectRuntimeV2InvalidProviderToolArguments,
   rejectRuntimeV2UnexpectedProviderTool,
+  rejectRuntimeV2FailedShellPredecessor,
 } from "./executionProviderSurfaceRejection";
 
 export { runtimeV2RepeatedActionFeedback } from "./executionProviderFeedback";
@@ -280,6 +282,7 @@ export function createRuntimeV2ProviderPort(
               providerEffectFacts,
             ),
           );
+          for (const rejected of providerEffectFacts.rejectedActionIdentities) completedIdentities.delete(rejected);
           for (const call of schedulingCalls) {
             if (
               !coveredReadReceipts.has(
@@ -334,6 +337,8 @@ export function createRuntimeV2ProviderPort(
               );
             }
           }
+          const failedPredecessor = rejectRuntimeV2FailedShellPredecessor({ ports: input, command, result, rejectedIdentities });
+          if (failedPredecessor) return failedPredecessor;
           const batch = boundRuntimeV2ProviderToolCalls(
             schedulingCalls,
             completedIdentities,
@@ -358,25 +363,13 @@ export function createRuntimeV2ProviderPort(
             const rejectedCall = schedulingCalls[0]!;
             const actionIdentity =
               runtimeV2ProviderToolCallIdentity(rejectedCall);
-            const feedback = runtimeV2RepeatedActionFeedback({
-              call: rejectedCall,
-              reason: runtimeRejectedReason,
-              workspace: input.context.runWorkspace || "",
-              visibleSourceTargets:
-                input.live.latestProviderRequestSourceCoverage.map(
-                  (coverage) => coverage.target,
-                ),
+            const actionReceipts = buildRuntimeV2RepeatedActionReceipts({
+              calls: schedulingCalls, aggregate: aggregateForCurrentTurn(input), reason: runtimeRejectedReason,
+              workspace: input.context.runWorkspace || "", visibleSourceTargets: input.live.latestProviderRequestSourceCoverage.map(coverage => coverage.target),
+              observed: input.live.latestProviderRequestRejectedIdentities, nextId: () => input.nextId("provider-rejected-tool-call"),
             });
-            const [rejectedHistoryCall] =
-              scopeRuntimeV2ProviderToolCallIds(
-                [rejectedCall],
-                () => input.nextId("provider-rejected-tool-call"),
-              );
-            appendRuntimeV2RejectedToolCallHistory(input.live, {
-              call: rejectedHistoryCall!,
-              actionIdentity,
-              feedback,
-            });
+            const feedback = actionReceipts.map(receipt => receipt.feedback).join("\n");
+            appendRuntimeV2RejectedToolCallBatchHistory(input.live, actionReceipts);
             appendRuntimeV2ProviderFeedbackHistory(input.live, {
               code: "repeated_action_rejected",
               feedback,
@@ -386,6 +379,7 @@ export function createRuntimeV2ProviderPort(
               ...result,
               visibleText: "",
               toolCalls: [],
+              actionReceipts,
               diagnostics: [
                 ...result.diagnostics,
                 {
@@ -449,7 +443,9 @@ export function createRuntimeV2ProviderPort(
           result = {
             ...result,
             toolCalls: scopedCalls,
+            ...(discardedCalls.length ? { actionReceipts: runtimeV2DeferredToolReceipts(discardedCalls, () => input.nextId("provider-deferred-tool-call")) } : {}),
           };
+          if (result.actionReceipts?.length) appendRuntimeV2RejectedToolCallBatchHistory(input.live, result.actionReceipts);
           scopedCalls.forEach((call, index) => {
             const covered = coveredReads[index];
             if (!covered?.receipt) return;

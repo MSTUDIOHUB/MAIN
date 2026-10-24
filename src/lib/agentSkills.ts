@@ -68,6 +68,7 @@ export interface LoadedSkillContent {
   readonly nextSectionCursor: string | null;
   readonly resource?: string;
   readonly resourceReadSupported?: boolean;
+  readonly nextRead?: { readonly tool: "load_skill"; readonly arguments: SkillReadTarget & { readonly start_line: number; readonly start_char: number } };
 }
 
 /** Reusable identity for one admitted document, independent of read coordinates. */
@@ -816,6 +817,7 @@ function discloseSkillDocument(
     requestedRangeComplete: !indexOnly && endChar === desiredEnd,
     nextStartLine: nextLine,
     nextStartChar: nextLine === null ? null : endChar,
+    ...(nextLine === null ? {} : { nextRead: { tool: "load_skill" as const, arguments: { skill_id: ref, expected_version: entry.version, ...(resource === undefined ? {} : { resource }), start_line: nextLine, start_char: endChar } } }),
     sections: Object.freeze(index.sections.map((heading) => Object.freeze(heading))),
     sectionCount: allSections.length,
     nextSectionCursor: index.nextSectionCursor,

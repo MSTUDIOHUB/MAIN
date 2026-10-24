@@ -102,6 +102,7 @@ export interface RunIntentResolution {
 
 /** Task semantics describe the current request, never permission or completion. */
 export interface SemanticTaskIntent {
+  clarification?: import("./turnClarification").TurnClarification;
   objective: string;
   workType: "answer" | "investigate" | "implement" | "operate" | "plan";
   answerFormat: "answer" | "analysis" | "summary" | "report" | "plan";

@@ -278,7 +278,9 @@ export async function requestRuntimeV2ToolPermission(input: {
   if (input.signal?.aborted) abort();
   else input.signal?.addEventListener("abort", abort, { once: true });
 
+  await input.ports.recordUserWait?.(input.command.idempotencyKey, request.requestId, true);
   const resolved = await decision;
+  if (!input.signal?.aborted) await input.ports.recordUserWait?.(input.command.idempotencyKey, request.requestId, false);
   input.signal?.removeEventListener("abort", abort);
   if (resolved.action === "accept" && (
     input.signal?.aborted ||

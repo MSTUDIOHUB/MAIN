@@ -271,6 +271,7 @@ function providerRequestModesByCommandKey(
 
 function providerToolCallProgress(
   events: readonly RuntimeV2Event[],
+  novelSequences: ReadonlySet<number>,
 ): {
   readonly progressed: ReadonlySet<string>;
   readonly settledWithoutProgress: ReadonlySet<string>;
@@ -289,7 +290,7 @@ function providerToolCallProgress(
     if (event.type === "tool.completed") {
       const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
       if (!toolCallId) continue;
-      if (event.status === "succeeded") progressed.add(toolCallId);
+      if (novelSequences.has(event.sequence)) progressed.add(toolCallId);
       else settledWithoutProgress.add(toolCallId);
       continue;
     }
@@ -322,10 +323,21 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
   if (state.pendingToolCalls.length > 0) return null;
   const providerRequestKeys = providerRequestCommandKeys(state.events);
   const providerRequestModes = providerRequestModesByCommandKey(state.events);
-  const toolCallProgress = providerToolCallProgress(state.events);
   let occurrence = 0;
   let latestReason: RuntimeV2ProviderRecoveryPressure["reason"] | null = null;
   let startedAt = 0;
+  const novelSequences = new Set<number>();
+  const facts = new Set<string>();
+  for (const event of state.events) {
+    const evidence = event.type === "tool.completed" && event.status === "succeeded" && event.receiptOrigin !== "replayed" ? event.evidence
+      : event.type === "observation.recorded" ? [event.evidence]
+      : event.type === "subagent.completed" && event.status === "completed" ? event.evidence : [];
+    for (const item of evidence) {
+      const key = JSON.stringify([item.kind, item.target, item.version, event.type === "tool.completed" ? event.modelContent : undefined]);
+      if (!facts.has(key)) { facts.add(key); novelSequences.add(event.sequence); }
+    }
+  }
+  const toolCallProgress = providerToolCallProgress(state.events, novelSequences);
 
   for (let index = state.events.length - 1; index >= 0; index -= 1) {
     const event = state.events[index]!;
@@ -375,7 +387,7 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
       continue;
     }
     if (event.type === "tool.completed") {
-      if (event.status === "succeeded") break;
+      if (novelSequences.has(event.sequence)) break;
       continue;
     }
     if (event.type === "validation.completed") {
@@ -390,21 +402,29 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
       continue;
     }
     if (
-      event.type === "observation.recorded" ||
+      (event.type === "observation.recorded" && novelSequences.has(event.sequence)) ||
       event.type === "work_plan.sealed" ||
       event.type === "work_plan.approved" ||
       event.type === "work_plan.invalidated" ||
-      event.type === "subagent.completed" ||
+      (event.type === "subagent.completed" && novelSequences.has(event.sequence)) ||
       event.type === "subagent.handoff_applied" ||
-      event.type === "run.started"
+      event.type === "run.started" || event.type === "run.resumed"
     ) {
       break;
     }
   }
 
   if (!latestReason || occurrence === 0) return null;
+  let waitStart: number | null = null;
+  let waited = 0;
+  for (const event of state.events) {
+    if (event.at < startedAt) continue;
+    if (event.type === "run.wait_started") waitStart ??= event.at;
+    if (event.type === "run.wait_ended" && waitStart !== null) { waited += event.at - waitStart; waitStart = null; }
+  }
+  if (waitStart !== null) waited += state.updatedAt - waitStart;
   return {
-    startedAt,
+    startedAt: startedAt + waited,
     pressure: {
       schemaVersion: "runtime-v2-provider-recovery.v1",
       reason: latestReason,
@@ -527,6 +547,7 @@ export function decideNextCommands(
   state: TurnAggregateV1,
   input: RuntimeV2DecisionInput = {},
 ): readonly RuntimeV2Command[] {
+  if (state.run?.status === "paused") return [];
   if (!state.run || state.run.status === "completed" || state.terminalOutcome) return [];
   if (state.scheduledCommands.length > 0) return [];
   if (input.resultKind && input.resultReason) {

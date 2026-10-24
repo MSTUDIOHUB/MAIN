@@ -28,6 +28,7 @@ export interface CreateSubmitRuntimeContextInput {
   capabilityRestrictions?: readonly import("../lib/turnCapabilities").TurnCapability[];
   approvalRequiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
+  intentClarification?: import("../lib/turnClarification").TurnClarification;
   goalCreationAuthorization: GoalCreationAuthorization | null;
   goalContinuationAuthorization: GoalContinuationAuthorization | null;
   effectiveCommandDirective: CommandDirective | null;
@@ -72,6 +73,7 @@ export function createSubmitRuntimeContext(
     capabilityRestrictions: input.capabilityRestrictions,
     approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     requiredCapabilities: input.requiredCapabilities,
+    intentClarification: input.intentClarification,
     goalCreationAuthorization: input.goalCreationAuthorization,
     goalContinuationAuthorization: input.goalContinuationAuthorization,
     effectiveCommandDirective: input.effectiveCommandDirective,

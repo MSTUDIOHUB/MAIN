@@ -2,6 +2,7 @@ import type { TaskBlock } from "../../lib/taskTypes";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { withTurnRuntimePhaseStatus } from "../../lib/turnPhase";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
+import { runtimeV2ToolOutcomePresentation } from "./toolOutcomePresentation";
 
 /** Derive settled timeline rows from canonical command and effect receipts.
  * This projection has no store or lifecycle authority of its own. */
@@ -44,11 +45,11 @@ export function reconcileRuntimeV2TimelineBlocks(
     // Permission-created and timeline-created rows share the exact command
     // receipt owner. Their presentation dedupe keys do not change execution
     // truth, including a canceled row that was still awaiting approval.
-    if (!receipt || !blockRunning) return [block];
+    if (!receipt) return [block];
     // A canceled command remains canonical in the runtime ledger and final
     // projection. Remove only its provisional UI row instead of relabeling it
     // as either a successful or failed operation.
-    if (receipt === "canceled") return [];
+    if (receipt === "canceled") return blockRunning ? [] : [block];
     const validationPassed = block.toolCallId
       ? validationOutcomes.get(block.toolCallId)
       : undefined;
@@ -62,7 +63,9 @@ export function reconcileRuntimeV2TimelineBlocks(
         completion.status !== "succeeded";
       const terminalFailed = failed || toolFailed;
       const presentation = completion?.presentation;
-      const notExecuted = completion?.type === "validation.completed" && !isRuntimeV2ValidationAttempt(completion);
+      const outcome = completion ? runtimeV2ToolOutcomePresentation(completion, language) : undefined;
+      const notExecuted = outcome?.toolOutcome === "not_executed";
+      const blocked = outcome?.toolOutcome === "blocked";
       const fallbackMessage = notExecuted
         ? language === "zh" ? "该验证未执行，没有产生通过或失败结果。" : "This validator was not executed and produced no pass or failure result."
         : terminalFailed
@@ -78,18 +81,19 @@ export function reconcileRuntimeV2TimelineBlocks(
         ...block,
         toolName: presentation?.toolName || block.toolName,
         executionName: presentation?.toolName || block.executionName,
-        target: presentation?.target || block.target,
-        status: terminalFailed ? "error" : "done",
-        toolStatus: notExecuted ? "rejected" : terminalFailed ? "failed" : "executed",
+        target: outcome?.target || presentation?.target || block.target,
+        status: notExecuted ? "not_executed" : blocked ? "blocked" : terminalFailed ? "error" : "done",
+        toolStatus: notExecuted || blocked ? "rejected" : terminalFailed ? "failed" : "executed",
+        toolOutcome: outcome?.toolOutcome,
+        diagnosticDetails: outcome?.diagnosticDetails,
         turnPhase: withTurnRuntimePhaseStatus(
           block.turnPhase,
-          terminalFailed ? "failed" : "done",
+          terminalFailed && !notExecuted && !blocked ? "failed" : "done",
           language,
         ),
-        message: presentation?.message || fallbackMessage,
+        message: outcome?.message || fallbackMessage,
         observationSummary:
-          presentation?.observationSummary ||
-          presentation?.message ||
+          outcome?.observationSummary ||
           fallbackMessage,
         ...(presentation?.diff
           ? {
@@ -101,6 +105,7 @@ export function reconcileRuntimeV2TimelineBlocks(
           : {}),
       }];
     }
+    if (!blockRunning) return [block];
     return [{
       ...block,
       status: failed ? "failed" as const : "done" as const,

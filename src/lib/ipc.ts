@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
 import {
   createProjectSessionMutationCoordinator,
   isProjectSessionAdmissionProjectionOwned,
@@ -112,7 +113,7 @@ function projectSessionSaveNeedsTranscriptBase(session: unknown): boolean {
     projectSessionTranscriptRows(runtime?.conversationTurns).length === 0;
 }
 
-function prepareProjectSessionSnapshotForSave(session: any, existing: unknown): any {
+export function prepareProjectSessionSnapshotForSave(session: any, existing: unknown): any {
   const incoming = isProjectSessionObject(session) ? session : {};
   const current = isProjectSessionObject(existing) ? existing : {};
   const incomingRuntime = isProjectSessionObject(incoming.runtimeSnapshot)
@@ -146,6 +147,9 @@ function prepareProjectSessionSnapshotForSave(session: any, existing: unknown): 
     taskFlow: messages,
     conversationTurns: turns,
   };
+  if ("runtimeV2Checkpoints" in runtimeSnapshot) {
+    runtimeSnapshot.runtimeV2Checkpoints = serializeRuntimeV2CheckpointMap(runtimeSnapshot.runtimeV2Checkpoints);
+  }
   return {
     ...current,
     ...incoming,

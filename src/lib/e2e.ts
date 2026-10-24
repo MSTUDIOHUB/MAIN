@@ -8906,6 +8906,7 @@ function seedRealOmlxPlanFlowScenario() {
   const applyRealOmlxWorkspaceFixture = () =>
     useAppStore.setState((state) => ({
     ...state,
+    ...(realOmlxConfig.skills ? { skills: realOmlxConfig.skills } : {}),
     config: {
       ...state.config,
       language: "zh",
@@ -8923,9 +8924,9 @@ function seedRealOmlxPlanFlowScenario() {
         toolProtocol: "auto",
       },
       workspace,
-      instructionsEnabled: false,
+      instructionsEnabled: realOmlxConfig.productionTools === true,
       hooksEnabled: false,
-      sessionRecordingEnabled: false,
+      sessionRecordingEnabled: realOmlxConfig.productionTools === true,
     },
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
@@ -8950,7 +8951,7 @@ function seedRealOmlxPlanFlowScenario() {
           date: new Date(now).toISOString(),
           active: true,
           storageStatus: "temporary",
-          recordingDisabled: true,
+          recordingDisabled: !realOmlxConfig.productionTools,
           messages: [],
         },
       ],
@@ -8977,7 +8978,7 @@ function seedRealOmlxPlanFlowScenario() {
     isPlanApproved: false,
     readOnlyAutoApproveForSession: true,
     autoApproveTools: true,
-    autoApproveToolScopes: ["workspace_write", "shell"],
+    autoApproveToolScopes: realOmlxConfig.productionTools ? ["workspace_write", "shell", "local_file_read", "external_write", "browser_control", "mcp_action"] : ["workspace_write", "shell"],
     isGenerating: false,
     agentStatus: "idle",
     runtimeEvents: [],

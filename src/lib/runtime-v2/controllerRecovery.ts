@@ -1,4 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { isRuntimeV2UnexecutedToolReceipt } from "./toolReceipt";
 import type {
   RuntimeV2Command,
   RuntimeV2Projection,
@@ -215,6 +216,7 @@ export function decideRuntimeV2SemanticFailureRecovery(input: {
 }): Exclude<RuntimeV2FailureRecoveryDecision, {
   readonly kind: "continue" | "hard_stop" | "lifecycle_boundary";
 }> | null {
+  if (isRuntimeV2UnexecutedToolReceipt(input.event)) return null;
   const toolFailed =
     input.event.type === "tool.completed" &&
     input.event.status !== "succeeded";

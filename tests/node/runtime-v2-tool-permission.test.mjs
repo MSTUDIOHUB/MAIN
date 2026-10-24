@@ -87,6 +87,29 @@ async function pendingReview(f) {
   return { pending, resolve: f.state.pendingReviewResolve };
 }
 
+test("external local reads honor the live session auto-approval scope without fabricating path grants", async () => {
+  for (const [enabled, scopes, expected] of [
+    [true, ["local_file_read"], true],
+    [false, ["local_file_read"], false],
+    [true, ["workspace_write"], false],
+    [true, [], false],
+  ]) {
+    const f = fixture({ autoApproveTools: enabled, autoApproveToolScopes: scopes });
+    const result = await authorizeToolForCurrentTurn(f.ports, "read_file", { path: "/outside/SKILL.md" });
+    assert.equal(result.allowed, expected);
+    assert.equal(result.allowExternalLocalRead, expected);
+    assert.equal(result.approvalRequired === true, !expected);
+    assert.deepEqual(f.state.approvedLocalFileReadPaths, []);
+  }
+});
+
+test("explicit read review still overrides session auto-approval of external files", async () => {
+  const f = fixture({ autoApproveTools: true, autoApproveToolScopes: ["local_file_read"], approvalRequiredCapabilities: ["workspace_read"] });
+  const result = await authorizeToolForCurrentTurn(f.ports, "read_file", { path: "/outside/SKILL.md" });
+  assert.equal(result.allowed, false);
+  assert.equal(result.approvalRequired, true);
+});
+
 test("missing and stale Turn consent pause the exact shell call without granting broader authority", async () => {
   for (const consent of [null, { turnId: "old-turn", granted: true }, { turnId: "turn", granted: false }]) {
     const f = fixture({ consent });

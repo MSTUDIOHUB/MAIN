@@ -5,6 +5,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 
 import ts from "typescript";
+import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
@@ -38,6 +39,7 @@ const projectSessionMutationCoordinator = await loadCommonJs(
 );
 
 const ipc = await loadCommonJs("src/lib/ipc.ts", {
+  "./runtime-v2/checkpoint": createTsModuleLoader()("src/lib/runtime-v2/checkpoint.ts"),
   "@tauri-apps/api/core": {
     invoke: async (command, args) => {
       invokeState.calls.push({ command, args });

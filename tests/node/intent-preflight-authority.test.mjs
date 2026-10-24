@@ -76,6 +76,34 @@ test("semantic preflight drops model authority, commands, and completion claims"
   assert.deepEqual(result.semantic.forbiddenCapabilities, ["workspace_write", "command"]);
 });
 
+for (const [language, input, question] of [
+  ["zh", "请直接完成当前项目的修改，运行命令并验证交互。", "需要运行命令，是否确认继续？"],
+  ["en", "Complete this project change, run commands and verify interaction.", "May I proceed with commands and interaction checks?"],
+]) test(`preflight cannot invent execution consent from needsUserChoice alone (${language})`, async () => {
+  const wire = candidate({ workType: "implement", answerFormat: "report", requiredCapabilities: ["workspace_read", "workspace_write", "command"], forbiddenCapabilities: [] });
+  const plain = await loadPreflight(wire)({ ...params, input, language });
+  const flagged = await loadPreflight({ ...wire, needsUserChoice: true, question })({ ...params, input, language });
+  assert.equal(flagged.needsUserChoice, false);
+  assert.equal(flagged.intent, "execute");
+  assert.deepEqual(flagged.commandDirective, plain.commandDirective);
+  assert.deepEqual(flagged.semantic.approvalRequiredCapabilities, []);
+  assert.equal(flagged.question, undefined);
+});
+
+test("a clarification must identify a supported gap grounded in the current input", async () => {
+  const input = "Deploy to staging or production; I have not selected the target.";
+  const wire = candidate({ workType: "operate", requiredCapabilities: ["command"], forbiddenCapabilities: [] });
+  const clarification = { kind: "target_ambiguity", field: "deployment target", evidence: "staging or production", question: "Which target?", choices: ["staging", "production"] };
+  const result = await loadPreflight({ ...wire, needsUserChoice: true, question: clarification.question, clarification })({ ...params, input });
+  assert.equal(result.needsUserChoice, true);
+  assert.deepEqual(result.semantic.clarification, clarification);
+  for (const invalid of [{ ...clarification, kind: "execution_approval" }, { ...clarification, evidence: "not in current request" }, { ...clarification, choices: ["invented", "production"] }]) {
+    const ignored = await loadPreflight({ ...wire, needsUserChoice: true, question: "Confirm?", clarification: invalid })({ ...params, input });
+    assert.equal(ignored.needsUserChoice, false);
+    assert.equal(ignored.semantic.clarification, undefined);
+  }
+});
+
 test("current manual review requirements are restrictive semantics, never model approval", async () => {
   const wire = candidate({ workType: "operate", requiredCapabilities: ["command"], forbiddenCapabilities: [], approvalRequiredCapabilities: ["command", "command"] });
   wire.approved = true;

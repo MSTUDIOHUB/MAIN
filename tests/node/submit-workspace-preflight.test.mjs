@@ -11,6 +11,7 @@ function createHarness(candidate) {
   const semanticResponse = candidate && {
     confidence: candidate.confidence, needsUserChoice: candidate.needsUserChoice === true,
     title: candidate.title, question: candidate.question ?? (candidate.needsUserChoice ? "Please clarify the requested work." : undefined),
+    clarification: candidate.clarification,
     semantic: { objective: "Handle the requested task", workType: intent === "execute" ? "operate" : intent === "analyze" ? "investigate" : intent === "plan" ? "plan" : "answer",
       answerFormat: "answer", requiredCapabilities: capabilities, forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
   };
@@ -158,16 +159,31 @@ test("semantic calibration returns explanation requests to respond without grant
   assert.equal(harness.resumes[0].options.commandDirective.requiresApproval, false);
 });
 
-test("missing or ambiguous semantic results cannot resume a lexical fallback", async () => {
-  for (const [candidate, kind] of [[{ ...operation, needsUserChoice: true }, "blocked"], [null, "error"]]) {
-    const harness = createHarness(candidate);
+test("missing semantics cannot resume a lexical fallback", async () => {
+    const harness = createHarness(null);
     assert.equal(harness.route("Inspect the current service.").handled, true);
     const action = await harness.complete();
     assert.equal(action.kind, "conclude_without_execution");
-    assert.equal(action.resultKind, kind);
+    assert.equal(action.resultKind, "error");
     assert.equal(harness.resumes.length, 0);
     assert.equal(harness.pending.length, 0);
-  }
+});
+
+test("unsubstantiated preflight confirmation resumes under existing scopes without granting consent", async () => {
+  const harness = createHarness({ ...operation, needsUserChoice: true, question: "May I start?" });
+  harness.route("Inspect the current service.");
+  assert.equal((await harness.complete()).kind, "resume");
+  assert.equal(harness.resumes[0].options.executionConsentGranted, undefined);
+  assert.equal(harness.pending.length, 0);
+});
+
+test("a grounded workspace clarification is handed to Runtime pause on the admitted Turn", async () => {
+  const clarification = { kind: "target_ambiguity", field: "target", evidence: "staging or production", question: "Which target?", choices: ["staging", "production"] };
+  const harness = createHarness({ ...operation, needsUserChoice: true, question: clarification.question, clarification });
+  harness.route("Inspect staging or production; target is undecided.");
+  assert.equal((await harness.complete()).kind, "resume");
+  assert.deepEqual(harness.resumes[0].options.semanticIntent.clarification, clarification);
+  assert.equal(harness.pending.length, 0, "no presentation-only resolver or blocked final");
 });
 
 test("valid low confidence semantics retain their capability decision", async () => {

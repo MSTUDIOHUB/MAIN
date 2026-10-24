@@ -1968,9 +1968,14 @@ export default function App() {
         optionValue: text,
         isCustomReply,
       });
+    const ownsExecutionBlockerChoice = !!choiceRequest?.executionBlocker &&
+      state.activeActionRequest?.kind === "user_choice" &&
+      isExactUserChoiceResolutionIdentity(state.activeActionRequest, choiceRequest) &&
+      state.harnessRunMarker?.status === "paused" &&
+      state.harnessRunMarker.runId === choiceRequest.runId;
     const hasConflictingRuntimeOwner = state.isGenerating ||
       state.agentStatus === "running" ||
-      state.agentStatus === "pending_review" ||
+      (state.agentStatus === "pending_review" && !ownsExecutionBlockerChoice) ||
       (!!state.activeActionRequest && state.activeActionRequest.requestId !== choiceRequest?.requestId);
     if (!sourceTurn || !exactChoiceIdentity || hasConflictingRuntimeOwner) {
       appendDebugLog("warn", "ui.quickReply_identity_rejected", {

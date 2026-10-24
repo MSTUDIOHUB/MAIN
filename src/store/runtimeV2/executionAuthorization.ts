@@ -453,11 +453,16 @@ export async function authorizeToolForCurrentTurn(
     return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "local_file_read") {
-    const approved = !!localFileReadPath &&
-      isLocalFileReadApproved(
-        localFileReadPath,
-        state.approvedLocalFileReadPaths,
-      );
+    const pathApproved = !!localFileReadPath && isLocalFileReadApproved(localFileReadPath, state.approvedLocalFileReadPaths);
+    const sessionApproved = state.autoApproveTools === true && isAllowedBySessionAutoApprove(
+      risk, catalogResolution.entry.source, state.autoApproveToolScopes, authorization.policy,
+    );
+    const approved = pathApproved || sessionApproved;
+    input.logStoreEvent?.("runtime_v2_local_read_authorized", {
+      sessionKey: input.context.runSessionKey, turnId: input.context.turnId, risk, autoApproveTools: state.autoApproveTools === true,
+      scopes: state.autoApproveToolScopes || [], decision: approved ? "allow" : "ask",
+      source: pathApproved ? "exact_path" : sessionApproved ? "session_scope" : "human_required",
+    });
     return approved
       ? { allowed: true, reason: null, allowExternalLocalRead: true }
       : {

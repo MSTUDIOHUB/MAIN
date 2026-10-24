@@ -22,8 +22,7 @@ export function withRuntimeV2ModelReceipt(input: RuntimeV2ExecutionPortsInput, p
       throw new Error("RUNTIME_V2_CHAT_EFFECT_SURFACE_DENIED");
     }
     const event = await port.execute(request);
-    const skillGuidance = request.command.kind === "execute_tool" && request.command.payload.toolName === "load_skill";
-    if ((!isReadOnlyContext(input) && !skillGuidance) || event.type !== "tool.completed") return event;
+    if (event.type !== "tool.completed") return event;
     const callId = String(request.command.payload.toolCallId || "");
     const message = [...input.live.messages].reverse().find((item) => item.role === "tool" && item.tool_call_id === callId);
     return { ...event, modelContent: typeof message?.content === "string" ? message.content : JSON.stringify({ status: event.status, presentation: event.presentation }) };

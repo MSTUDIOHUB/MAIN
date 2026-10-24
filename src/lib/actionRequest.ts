@@ -84,6 +84,7 @@ export interface PlanReviewActionRequest extends ActionRequestBase {
 
 export interface UserChoiceActionRequest extends ActionRequestBase {
   kind: "user_choice";
+  executionBlocker?: { readonly sessionEpoch: string };
   optionValues: string[];
   allowCustomReply: boolean;
 }
@@ -115,7 +116,7 @@ export type ToolPermissionResolutionIdentity = Pick<
 /** Durable identity stored with an awaiting-choice assistant block. */
 export type UserChoiceResolutionIdentity = Pick<
   UserChoiceActionRequest,
-  "sessionKey" | "turnId" | "runId" | "requestId" | "parentRunId" | "optionValues" | "allowCustomReply" | "status"
+  "sessionKey" | "turnId" | "runId" | "requestId" | "parentRunId" | "optionValues" | "allowCustomReply" | "status" | "executionBlocker"
 >;
 
 export type PlanReviewResolutionIdentity = Pick<
@@ -218,6 +219,7 @@ export function toUserChoiceResolutionIdentity(
     optionValues: [...request.optionValues],
     allowCustomReply: request.allowCustomReply,
     status: request.status,
+    ...(request.executionBlocker ? { executionBlocker: request.executionBlocker } : {}),
   };
 }
 
@@ -227,6 +229,7 @@ export function isExactUserChoiceResolutionIdentity(
 ): boolean {
   if (!current || !submitted || current.status !== "pending" || submitted.status !== "pending") return false;
   return current.sessionKey === submitted.sessionKey &&
+    current.executionBlocker?.sessionEpoch === submitted.executionBlocker?.sessionEpoch &&
     current.turnId === submitted.turnId &&
     current.runId === submitted.runId &&
     current.requestId === submitted.requestId &&
@@ -638,6 +641,8 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
     return {
       ...base,
       kind,
+      ...(record.executionBlocker && typeof record.executionBlocker === "object" && typeof (record.executionBlocker as any).sessionEpoch === "string"
+        ? { executionBlocker: { sessionEpoch: (record.executionBlocker as any).sessionEpoch } } : {}),
       optionValues: Array.isArray(record.optionValues)
         ? record.optionValues.map(normalizeNonEmptyString).filter(Boolean)
         : [],

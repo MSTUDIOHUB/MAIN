@@ -48,6 +48,7 @@ import {
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
 import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
 import { runtimeV2AutomaticObservationDeferredReceipt, runtimeV2ToolPreExecutionReceipt } from "./executionToolGateReceipt";
+import { runtimeV2StructuredToolOutcome } from "./executionToolOutcome";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -442,6 +443,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
             )
           : rawOutput;
         const output = runtimeV2ToolModelContent(input, toolName, receiptOutput, { parallelReadCount });
+        const outcome = runtimeV2StructuredToolOutcome(toolName, rawOutput);
         const completion = toolCompletionFor(
           input,
           command,
@@ -449,10 +451,11 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           args,
           target,
           receiptOutput,
-          "succeeded",
-          undefined,
+          outcome.status,
+          outcome.failureKind,
           sourceVersion,
           diffPreview,
+          outcome.failureReasonCode,
         );
         const semanticStatus = toolResultStatusForCompletion(completion);
         const effectCommitted = recordRuntimeV2CommittedToolEffect({

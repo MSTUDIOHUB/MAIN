@@ -543,21 +543,11 @@ for (const candidate of [
       harness.resolve(0, candidate);
       await waitFor(() => harness.workflows.length > 0 || harness.store.getState().runtimeEvents.some((event) =>
         event.type === "turn.completed" && event.turnId === receipt.turnId));
-      if (candidate.needsUserChoice) {
-        assert.equal(harness.workflows.length, 0, "clarification concludes without opening any workflow tools");
-        const terminals = harness.store.getState().runtimeEvents.filter((event) => event.type === "turn.completed" && event.turnId === receipt.turnId);
-        assert.equal(terminals.length, 1);
-        assert.equal(terminals[0].resultKind, "blocked");
-        assert.ok(harness.store.getState().taskFlow.some((block) => block.turnId === receipt.turnId &&
-          block.type === "agent" && block.visibility === "assistant_final" && /Run it\?/.test(block.content)));
-        assert.equal(harness.store.getState().workspaceTurnQueue.entries.length, 0);
-      } else {
         assert.equal(harness.workflows.length, 1);
         assert.equal(harness.workflows[0].turnId, receipt.turnId);
-        assert.equal(harness.workflows[0].effectiveRunIntent, "execute", "valid semantic intent survives a confidence of 0.6");
+        assert.equal(harness.workflows[0].effectiveRunIntent, "execute", "valid semantics survive low confidence or an unsubstantiated confirmation flag");
         assert.deepEqual(harness.workflows[0].options.semanticIntent, semanticFixture(candidate).semantic);
         assert.equal(harness.workflows[0].options.executionConsentGranted, undefined);
-      }
       assert.equal(harness.store.getState().pendingRunDecision, null);
       assert.equal(harness.requests.length, 1);
     } finally { harness.cleanup(); }
