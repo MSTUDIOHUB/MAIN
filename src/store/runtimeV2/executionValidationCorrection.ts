@@ -1,4 +1,5 @@
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 
 export interface RuntimeV2ValidationCorrectionWindow {
   readonly active: boolean;
@@ -65,7 +66,7 @@ function realFailedValidation(
   TurnAggregateV1["events"][number],
   { type: "validation.completed" }
 > {
-  return event.type === "validation.completed" &&
+  return isRuntimeV2ValidationAttempt(event) &&
     !event.passed &&
     (
       event.failureKind === "assertion_failed" ||
@@ -103,7 +104,7 @@ export function deriveRuntimeV2ValidationCorrectionWindow(
       TurnAggregateV1["events"][number],
       { type: "validation.completed" }
     > =>
-      event.type === "validation.completed" &&
+      isRuntimeV2ValidationAttempt(event) &&
       event.sequence > latestMutationSequence,
   );
   if (validations.some((event) => event.passed)) return inactive;

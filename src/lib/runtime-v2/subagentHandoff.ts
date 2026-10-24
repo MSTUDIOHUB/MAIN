@@ -5,6 +5,7 @@ import type {
   RuntimeV2RunIdentity,
   RuntimeV2SubagentHandoffApplicationSource,
 } from "./contracts";
+import { explicitlyReferencesEvidenceId } from "./subagentReport";
 
 type HandoffDeliveredEvent = Extract<
   RuntimeV2Event,
@@ -20,14 +21,13 @@ function boundedEvidenceIds(
 ): readonly string[] {
   return [...new Set(values
     .map((value) => String(value || "").trim().slice(0, 512))
-    .filter(Boolean))]
-    .slice(0, 64);
+    .filter(Boolean))];
 }
 
 function normalizedEvidenceIds(
   evidenceIds: readonly string[],
 ): readonly string[] | null {
-  if (!Array.isArray(evidenceIds) || evidenceIds.length > 64) return null;
+  if (!Array.isArray(evidenceIds)) return null;
   const normalized = evidenceIds.map((id) =>
     typeof id === "string" ? id.trim() : ""
   );
@@ -78,22 +78,6 @@ function scalarStrings(
   if (typeof value !== "object") return [];
   return Object.values(value as Record<string, unknown>)
     .flatMap((entry) => scalarStrings(entry, depth + 1));
-}
-
-function escapedPattern(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function explicitlyReferencesEvidenceId(
-  values: readonly string[],
-  evidenceId: string,
-): boolean {
-  const pattern = new RegExp(
-    `(^|[^A-Za-z0-9_.:/-])${escapedPattern(evidenceId)}(?=$|[^A-Za-z0-9_.:/-])`,
-  );
-  return values.some((value) =>
-    value === evidenceId || pattern.test(value)
-  );
 }
 
 export function runtimeV2SubagentHandoffApplicationSource(
@@ -162,7 +146,7 @@ export function referencedRuntimeV2SubagentEvidenceIds(input: {
   }
   const values = referenceValues(input.sourceEvent);
   return boundedEvidenceIds(input.evidenceIds).filter((evidenceId) =>
-    explicitlyReferencesEvidenceId(values, evidenceId)
+    values.some((value) => explicitlyReferencesEvidenceId(value, evidenceId))
   );
 }
 

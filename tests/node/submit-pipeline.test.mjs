@@ -1036,7 +1036,7 @@ test("effective intent decision keeps an identity-validated choice inside Goal r
   }));
 
   assert.equal(decision.effectiveRunIntent, "goal");
-  assert.equal(decision.shouldForceExecuteForAutoApprove, false);
+  assert.equal(Object.hasOwn(decision, "shouldForceExecuteForAutoApprove"), false);
 });
 
 test("effective intent decision downgrades untrusted Goal intents but preserves explicit creation", () => {
@@ -1064,6 +1064,52 @@ test("effective intent decision downgrades untrusted Goal intents but preserves 
     },
   }));
   assert.equal(explicit.effectiveRunIntent, "goal");
+});
+
+test("admitted direct Execute binds execution consent to this Turn without enabling auto approval", () => {
+  const decision = resolveSubmitRuntimeDecision({
+    effectiveRunIntent: "execute",
+    currentMainModeKey: "main_mode",
+    isPlanApproved: false,
+    autoApproveTools: false,
+    executionConsentGranted: false,
+    shouldExecuteOnceFromReplyOption: false,
+    preservePlanState: false,
+  });
+  const patch = buildSubmitRunStatePatch({
+    turnId: "turn-direct-command",
+    isHidden: false,
+    currentInput: "Run the project's CLI and return its actual output",
+    preferredLanguage: "en",
+    shouldArchiveChoiceFeedback: false,
+    currentNormalizedStreamState: {},
+    effectiveWorkflowMode: decision.effectiveWorkflowMode,
+    preservePlanState: false,
+    shouldGrantExecutionConsentForTurn: decision.shouldGrantExecutionConsentForTurn,
+    currentConfig: { workflowMode: "chat" },
+  });
+
+  assert.equal(decision.runtimeRunIntent, "execute");
+  assert.deepEqual(patch.currentTurnExecutionConsent, {
+    turnId: "turn-direct-command",
+    granted: true,
+  });
+  assert.equal(Object.hasOwn(patch, "autoApproveTools"), false);
+  assert.equal(Object.hasOwn(patch, "approvedShellPermissionRules"), false);
+
+  for (const effectiveRunIntent of ["respond", "analyze", "plan"]) {
+    const readDecision = resolveSubmitRuntimeDecision({
+      effectiveRunIntent,
+      currentMainModeKey: "main_mode",
+      isPlanApproved: false,
+      autoApproveTools: false,
+      executionConsentGranted: false,
+      shouldExecuteOnceFromReplyOption: false,
+      preservePlanState: false,
+    });
+    assert.equal(readDecision.shouldGrantExecutionConsentForTurn, false,
+      `${effectiveRunIntent} must not gain execution authority`);
+  }
 });
 
 test("approved-plan child run cannot inherit generic consent before Harness admission", () => {
@@ -2090,7 +2136,7 @@ test("preflight result decision preserves model-provided user choice options", (
   );
 });
 
-test("preflight result decision asks before upgrading natural chat to execution", () => {
+test("preflight result decision hands semantic execution to the ordinary tool approval contract", () => {
   const decision = resolveSubmitPreflightResultDecision({
     text: "顺手把这个文件改掉",
     preferredLanguage: "zh",
@@ -2109,17 +2155,13 @@ test("preflight result decision asks before upgrading natural chat to execution"
     },
   });
 
-  assert.equal(decision.kind, "ask_execution_confirmation");
+  assert.equal(decision.kind, "resume_with_preflight");
   assert.equal(decision.resolvedIntent, "execute");
   assert.equal(decision.preflightSuggestsOperation, true);
-  assert.equal(decision.pendingRunDecision.suggestedIntent, "execute");
-  assert.deepEqual(
-    decision.pendingRunDecision.options.map((option) => option.id),
-    ["execute", "respond", "plan"],
-  );
+  assert.equal(decision.pendingRunDecision, null);
 });
 
-test("preflight result decision resumes with local resolution when preflight returns nothing", () => {
+test("missing semantics open recovery instead of resuming the lexical result", () => {
   const decision = resolveSubmitPreflightResultDecision({
     text: "解释一下这个设计",
     preferredLanguage: "en",
@@ -2130,12 +2172,12 @@ test("preflight result decision resumes with local resolution when preflight ret
     preflight: null,
   });
 
-  assert.equal(decision.kind, "resume_with_preflight");
-  assert.equal(decision.pendingRunDecision, null);
+  assert.equal(decision.kind, "ask_user_choice");
+  assert.equal(decision.pendingRunDecision.source, "preflight");
   assert.equal(decision.resolvedIntent, "respond");
   assert.equal(decision.commandDirective.kind, "none");
   assert.equal(decision.preflightSuggestsOperation, false);
-  assert.match(decision.intentSummary, /Respond|natural reply/i);
+  assert.match(decision.intentSummary, /could not interpret|no tools/i);
 });
 
 test("preflight staleness decision ignores unchanged empty composer input", () => {
@@ -2260,7 +2302,7 @@ test("preflight effect action discards stale composer state before applying deci
   assert.equal(action.log.hasExplicitShortcut, true);
 });
 
-test("preflight effect action applies pending decisions before inactive-session checks", () => {
+test("preflight effect action rejects inactive owners before applying pending decisions", () => {
   const effect = buildSubmitBlockingPreflightEffect({
     resolution: baseResolution({ intent: "plan", riskLevel: "high", reason: "ambiguous scope" }),
     currentMainModeKey: "main_mode",
@@ -2289,9 +2331,8 @@ test("preflight effect action applies pending decisions before inactive-session 
     isOriginSessionActive: false,
   });
 
-  assert.equal(action.kind, "set_pending_decision");
-  assert.equal(action.pendingRunDecision.source, "preflight");
-  assert.equal(action.pendingRunDecision.title, "先规划还是直接执行？");
+  assert.equal(action.kind, "skip_inactive_session");
+  assert.equal(action.sessionKey, "workspace:1");
 });
 
 test("preflight effect action skips inactive sessions or resumes with forced skip-intent options", () => {

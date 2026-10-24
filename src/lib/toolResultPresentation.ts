@@ -1,5 +1,6 @@
 import { sanitizeAIOutput, stripAnsi } from "./sanitize";
 import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
+import { presentToolReadResult } from "./toolReadPresentation";
 
 export type ToolResultPresentationLanguage = "zh" | "en";
 export type ToolResultSectionTone = "default" | "error" | "muted";
@@ -17,6 +18,7 @@ export interface ToolResultPresentation {
   meta: string[];
   text: string;
   parsed: boolean;
+  displayTarget?: string;
 }
 
 const TERMINAL_TOOL_NAMES = new Set([
@@ -314,6 +316,9 @@ export function buildToolResultPresentation(input: {
   if (isTerminalToolName(input.toolName)) {
     return buildTerminalPresentation(input.toolName, message, language);
   }
+
+  const read = presentToolReadResult(input.toolName, message, language);
+  if (read) return read;
 
   const text = sanitizeAIOutput(message);
   return {

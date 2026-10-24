@@ -1,4 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../turnCapabilities";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2AcceptanceEvidenceRequirementSlot,
@@ -45,6 +46,8 @@ export interface RuntimeV2Admission {
   readonly run: RuntimeV2RunIdentity;
   readonly strategy: RuntimeV2Strategy;
   readonly objective: string;
+  readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly constraints?: readonly string[];
   readonly acceptanceCriteria?: readonly string[];
   readonly acceptanceCriterionIds?: readonly string[];
@@ -119,6 +122,12 @@ export class RuntimeV2Controller {
       turn: input.turn,
       strategy: input.strategy,
       objective: input.objective,
+      ...(input.capabilityRestrictions !== undefined ? {
+        capabilityRestrictions: normalizeTurnCapabilityRestrictions(input.capabilityRestrictions),
+      } : {}),
+      ...(input.approvalRequiredCapabilities !== undefined ? {
+        approvalRequiredCapabilities: normalizeTurnApprovalCapabilities(input.approvalRequiredCapabilities),
+      } : {}),
       constraints: input.constraints || [],
       acceptanceCriteria: input.acceptanceCriteria || [],
       ...(input.acceptanceCriterionIds
@@ -131,11 +140,25 @@ export class RuntimeV2Controller {
           }
         : {}),
     }));
+    return this.startRun(
+      input.run,
+      input.initialPhase || (input.strategy === "plan" ? "planning" : "preparing"),
+    );
+  }
+
+  /** Complete an admitted Turn's Run boundary after an interrupted admission.
+   * This is the same primitive used by fresh admission; it grants no effect
+   * authority and cannot create a second Run for an active aggregate. */
+  async startRun(
+    run: RuntimeV2RunIdentity,
+    phase: NonNullable<RuntimeV2Admission["initialPhase"]> = "preparing",
+  ): Promise<TurnAggregateV1> {
+    if (this.requireAggregate().run) throw new Error("Runtime v2 Run is already started.");
     return this.apply(asEvent({
       ...this.eventBase(),
       type: "run.started",
-      run: input.run,
-      phase: input.initialPhase || (input.strategy === "plan" ? "planning" : "preparing"),
+      run,
+      phase,
     }));
   }
 
@@ -180,6 +203,18 @@ export class RuntimeV2Controller {
       run: state.run.identity,
       signal,
     }));
+  }
+
+  async pauseRun(blocker: import("./contracts").RuntimeV2ExecutionBlocker): Promise<TurnAggregateV1> {
+    return this.apply(asEvent({ ...this.eventBase(), type: "run.paused", run: this.requireAggregate().run!.identity, blocker }));
+  }
+
+  async recordUserWait(commandKey: string, requestId: string, waiting: boolean): Promise<void> {
+    await this.apply(asEvent({ ...this.eventBase(), type: waiting ? "run.wait_started" : "run.wait_ended", run: this.requireAggregate().run!.identity, commandKey, requestId }));
+  }
+
+  async resumeRun(requestId: string): Promise<TurnAggregateV1> {
+    return this.apply(asEvent({ ...this.eventBase(), type: "run.resumed", run: this.requireAggregate().run!.identity, requestId }));
   }
 
   async recordObservation(input: { id: string; kind: "source" | "tool" | "validation" | "subagent" | "user"; target: string; version?: string | null }): Promise<TurnAggregateV1> {

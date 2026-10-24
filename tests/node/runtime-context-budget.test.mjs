@@ -508,6 +508,26 @@ test("one resolved Run budget drives provider settings and read_file windows", (
   assert.ok(args.max_chars > 32_000);
 });
 
+test("Skill reference windows share the Run read budget and support explicit continuation", () => {
+  const resolved = budget.computeRuntimeContextBudget({
+    configuredContextLimit: 32_768, providerContextLimit: 262_144,
+    modelLoaded: true, availableMemoryBytes: 12 * GIB,
+  });
+  const initial = executionText.runtimeV2ContextBoundToolArguments("load_skill", { skill_id: "s:12345678" }, resolved);
+  assert.ok(initial.max_chars < resolved.readWindowChars, "the default reference entry should leave room for task evidence");
+  const calls = [{ name: "read_file" }, { name: "load_skill" }];
+  const parallelReadCount = executionText.runtimeV2ParallelReadCount(calls);
+  assert.equal(parallelReadCount, 2);
+  const continuation = executionText.runtimeV2ContextBoundToolArguments("load_skill", {
+    skill_id: "s:12345678", start_line: 100, expected_version: "12345678", max_chars: resolved.readWindowChars,
+  }, resolved, { parallelReadCount });
+  assert.equal(continuation.start_line, 100);
+  assert.equal(continuation.expected_version, "12345678");
+  assert.equal(continuation.max_chars, Math.floor(resolved.readWindowChars / 2));
+  const providerManaged = executionText.runtimeV2ContextBoundToolArguments("load_skill", { skill_id: "s:12345678" });
+  assert.ok(providerManaged.max_chars > 0);
+});
+
 test("Runtime v2 preserves a complete admitted read window instead of truncating it again", () => {
   const resolved = budget.computeRuntimeContextBudget({
     configuredContextLimit: 32_768,
@@ -586,7 +606,9 @@ test("native and compatibility tool protocols share a bounded decision output bu
   for (const [mode, expected] of [
     ["execute", providerRequest.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS],
     ["validate", providerRequest.RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS],
-    ["conclude", providerRequest.RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS],
+    // Answer synthesis consumes its Run allocation within the shared parent
+    // request ceiling; it is not bounded by the smaller action-recovery cap.
+    ["conclude", providerRequest.RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS],
   ]) {
     assert.equal(
       providerRequest.runtimeV2ExecutionProviderOutputTokenLimit(
@@ -615,23 +637,19 @@ test("native and compatibility tool protocols share a bounded decision output bu
   );
 });
 
-test("source-only effect pressure uses capability-gated action decoding", () => {
+test("semantic action and recovery boundaries preserve configured reasoning", () => {
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "explicit",
-      sourceOnlyFrontier: true,
-      hasMutationTool: false,
       providerSupportsReasoningToggle: true,
       structuredActionRequired: true,
     }),
-    "off",
-    "a required action decodes committed evidence instead of opening a second hidden analysis phase",
+    "explicit",
+    "required action selection does not prove a reasoning decoder failure",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "explicit",
-      sourceOnlyFrontier: true,
-      hasMutationTool: false,
       providerSupportsReasoningToggle: false,
       structuredActionRequired: true,
     }),
@@ -641,28 +659,25 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: false,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       structuredActionRequired: true,
     }),
-    "off",
-    "a closed state-machine action boundary decodes a tool immediately instead of opening another hidden essay",
+    "auto",
+    "an action boundary preserves the model's configured reasoning",
   );
+  for (const configured of ["auto", "explicit", "off"]) {
+    assert.equal(
+      providerRequest.runtimeV2ExecutionReasoningRequest({
+        configured,
+        providerSupportsReasoningToggle: true,
+      }),
+      configured,
+      "visible source and an available mutation tool do not create an action boundary",
+    );
+  }
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
-      providerSupportsReasoningToggle: true,
-    }),
-    "off",
-  );
-  assert.equal(
-    providerRequest.runtimeV2ExecutionReasoningRequest({
-      configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: false,
     }),
     "auto",
@@ -671,41 +686,26 @@ test("source-only effect pressure uses capability-gated action decoding", () => 
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: false,
-      hasMutationTool: true,
-      providerSupportsReasoningToggle: true,
-    }),
-    "auto",
-  );
-  assert.equal(
-    providerRequest.runtimeV2ExecutionReasoningRequest({
-      configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       recoveringFromRejectedAction: true,
       recoveryStage: "reconsider",
     }),
-    "off",
-    "a rejected structured action switches directly to bounded action decoding",
+    "auto",
+    "semantic rejection does not change reasoning capability",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       recoveringFromRejectedAction: true,
       recoveryStage: "reframe",
     }),
-    "off",
-    "a sustained rejected-action loop cannot reopen long-form reasoning",
+    "auto",
+    "sustained semantic rejection remains an optional-action decision",
   );
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "off",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       recoveringFromRejectedAction: true,
       recoveryStage: "alternative",
@@ -775,4 +775,39 @@ test("pressure compaction never drops a trailing phase authority instruction", (
     message.role === "user" &&
     message.content === "fix the complete objective"
   ));
+});
+
+test("lossless Run pressure evicts complete tool batches across intervening anchors", () => {
+  const messages = [
+    { role: "system", content: "root authority" },
+    { role: "user", content: "current objective" },
+    { role: "assistant", content: "old batch", tool_calls: [
+      { id: "old-a", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+      { id: "old-b", type: "function", function: { name: "read_file", arguments: '{"path":"b.ts"}' } },
+    ] },
+    { role: "tool", tool_call_id: "old-a", content: "const a = 1;\r\n".repeat(1_200) },
+    { role: "system", content: "workspace authority anchor" },
+    { role: "tool", tool_call_id: "old-b", content: "const b = 2;\r\n".repeat(1_200) },
+    { role: "assistant", content: "latest command", tool_calls: [
+      { id: "current", type: "function", function: { name: "run_command", arguments: '{"command":"test"}' } },
+    ] },
+    { role: "tool", tool_call_id: "current", content: "exitCode: 0\noriginal receipt\r\n" },
+    { role: "system", content: "current phase authority" },
+  ];
+  const before = structuredClone(messages);
+  const bounded = budget.boundRuntimeMessageGroupsToInputBudget(messages, 1_000);
+  assert.deepEqual(messages, before);
+  assert.deepEqual(bounded, messages.filter((message) => message.content !== "old batch" && !["old-a", "old-b"].includes(message.tool_call_id)));
+  assert.equal(bounded.at(-2), messages.at(-2), "retained tool bytes remain identical objects");
+});
+
+test("lossless Run pressure rejects an oversized latest evidence packet instead of cropping source", () => {
+  const messages = [
+    { role: "system", content: "root authority" },
+    { role: "user", content: "current objective" },
+    { role: "assistant", content: "", tool_calls: [{ id: "source", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] },
+    { role: "tool", tool_call_id: "source", content: "const a = 1;\r\n".repeat(1_200) },
+  ];
+  assert.throws(() => budget.boundRuntimeMessageGroupsToInputBudget(messages, 100), /RUNTIME_CONTEXT_BUDGET_EXCEEDED/);
+  assert.equal(messages.at(-1).content, "const a = 1;\r\n".repeat(1_200));
 });

@@ -79,10 +79,13 @@ interface ActionCardProps {
   toolName: string;
   target: string;
   toolStatus: "pending" | "executed" | "rejected" | "running" | "failed";
+  toolOutcome?: "not_executed" | "blocked" | "failed" | "succeeded";
+  diagnosticDetails?: string;
   message?: string;
   diff?: { old: string; new: string; path?: string };
   shellPermissionDecision?: { requiresApproval?: boolean };
   permissionRisk?: ToolPermissionActionRequest["risk"];
+  permissionApprovalRequiredCapability?: ToolPermissionActionRequest["approvalRequiredCapability"];
   intentSummary?: string;
   why?: string;
   evidence?: string;
@@ -146,7 +149,7 @@ function compactExplanation(text?: string, maxChars = 180) {
   return normalized.length <= maxChars ? normalized : `${normalized.slice(0, maxChars - 3).trim()}...`;
 }
 
-export default function ActionCard({ blockId, toolName, target, toolStatus, message, diff, shellPermissionDecision, permissionRisk, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
+export default function ActionCard({ blockId, toolName, target, toolStatus, toolOutcome, diagnosticDetails, message, diff, shellPermissionDecision, permissionRisk, permissionApprovalRequiredCapability, intentSummary, why, evidence, observationSummary, onAllow, onAllowForSession, onReject, autoApproveTools, onToggleAutoApprove, autoCollapse }: ActionCardProps) {
   const language = useAppStore((s) => s.config.language);
   const activeProfile = useAppStore((s) => s.config.activeProfile);
   const setIsSettingsOpen = useAppStore((s) => s.setIsSettingsOpen);
@@ -156,7 +159,11 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   const uiLanguage = language === "en" ? "en" : "zh";
   const localizedVerb = getToolPresentationLabel(toolName, uiLanguage);
   const feedbackStatus = normalizeChatFeedbackStatus(toolStatus);
-  const feedbackCopy = getChatFeedbackStatusCopy(feedbackStatus, uiLanguage);
+  const outcomeLabel = toolOutcome === "not_executed" ? uiLanguage === "zh" ? "未执行" : "Not executed"
+    : toolOutcome === "blocked" ? uiLanguage === "zh" ? "被阻止" : "Blocked"
+    : toolOutcome === "failed" ? uiLanguage === "zh" ? "执行失败" : "Execution failed" : null;
+  const feedbackCopy = outcomeLabel ? { label: outcomeLabel, shortLabel: outcomeLabel }
+    : getChatFeedbackStatusCopy(feedbackStatus, uiLanguage);
   const IconComponent = info.icon;
   const isPending = toolStatus === "pending";
   const isRunning = toolStatus === "running";
@@ -165,8 +172,10 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   const isFailed = toolStatus === "failed";
   const isDone = isExecuted || isRejected || isFailed;
   const isSystemErrorCard = toolName === "Error";
+  const resultPresentation = useMemo(() => buildToolResultPresentation({ toolName, message, language: uiLanguage }), [toolName, message, uiLanguage]);
+  const rawDiagnosticDetails = diagnosticDetails || (resultPresentation.kind === "text" && resultPresentation.parsed ? message : undefined);
   const isShellApprovalGated = !!shellPermissionDecision?.requiresApproval;
-  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk);
+  const requiresPerCallApproval = requiresPerCallToolPermissionApproval(permissionRisk, permissionApprovalRequiredCapability);
 
   // ── Collapsible state: expanded while pending/running, collapsed when done ──
   const [expanded, setExpanded] = useState(!isDone);
@@ -557,6 +566,11 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
           </div>
         )}
 
+        {isPending && permissionApprovalRequiredCapability && (
+          <p className="mt-2 text-[11px] text-[var(--text-secondary)]">
+            {language === "zh" ? "本轮要求这类操作逐次单独批准；自动审查不能代替此次批准。" : "This Turn requires separate approval for each matching action; Auto Review cannot replace it."}
+          </p>
+        )}
         {/* Auto-approve toggle — only when pending */}
         {isPending && onToggleAutoApprove && !isShellApprovalGated && !requiresPerCallApproval && (
           <div data-testid="action-card-auto-approve" className="mt-2.5 pt-2.5 border-t border-[#27272a] flex items-center gap-2">
@@ -576,13 +590,15 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
             </div>
           )}
 
+        {rawDiagnosticDetails && (
+          <details data-testid="tool-debug-details" className="mt-3 border-t border-[var(--surface-border-soft)] pt-2 text-[11px] text-[var(--surface-text-muted)]">
+            <summary className="cursor-pointer">{language === "zh" ? "调试详情" : "Debug details"}</summary>
+            <pre className="mt-2 whitespace-pre-wrap break-words font-mono">{rawDiagnosticDetails}</pre>
+          </details>
+        )}
         {/* Expandable message area — pending cards may include permission preflight details. */}
         {message && repeatedBrowserFailureCalls.length === 0 && (() => {
-          const presentation = buildToolResultPresentation({
-            toolName: isSystemErrorCard ? "Error" : toolName,
-            message,
-            language: uiLanguage,
-          });
+          const presentation = resultPresentation;
           if (!presentation.text.trim() && presentation.sections.length === 0) return null;
           return (
             <div className="mt-3 pt-3 border-t border-[#27272a]">

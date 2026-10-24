@@ -121,8 +121,9 @@ export function runtimeV2ChildToolOutputContent(
   toolName: string,
   value: unknown,
   budget?: RuntimeContextBudget | null,
+  options: { readonly parallelReadCount?: number } = {},
 ): string {
-  return boundedRuntimeV2ToolContent(toolName, value, budget);
+  return boundedRuntimeV2ToolContent(toolName, value, budget, options);
 }
 
 export function runtimeV2ChildOutputTokenLimit(

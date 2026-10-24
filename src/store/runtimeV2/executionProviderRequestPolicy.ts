@@ -1,5 +1,5 @@
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
-import type { OpenAiToolChoice, StreamSettings } from "../../lib/streaming";
+import { isStreamOutputLimited, type OpenAiToolChoice, type StreamResult, type StreamSettings } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   RuntimeV2ProviderProtocolError,
@@ -63,11 +63,15 @@ export function runtimeV2ExecutionEffectiveToolChoice(input: {
 export function runtimeV2RecoveryRequiresStructuredAction(
   pressure: RuntimeV2ProviderRecoveryPressure | null | undefined,
 ): boolean {
-  return !!pressure;
+  // A complete ordinary reply carries a strategy/acceptance gap, not a failed
+  // structured decoding attempt. Keep prose and optional authorized actions
+  // available so recovery can use its exact causal feedback.
+  return !!pressure && ["empty_response", "provider_response_rejected", "output_truncated"].includes(pressure.reason);
 }
 
 export function shouldRetryRuntimeV2WithoutReasoning(input: {
   readonly finishReason: string | null | undefined;
+  readonly clientStopReason?: StreamResult["clientStopReason"];
   readonly reasoningChars: number;
   readonly actionChars?: number;
   readonly toolCallCount: number;
@@ -81,18 +85,19 @@ export function shouldRetryRuntimeV2WithoutReasoning(input: {
   const boundedVisibleDraft =
     input.structuredActionRequired === true &&
     Number(input.actionChars) > 0;
-  return input.availableToolCount > 0 &&
-    input.finishReason === "length" &&
+  return isStreamOutputLimited(input) &&
     input.toolCallCount === 0 &&
-    (boundedReasoningDraft || boundedVisibleDraft);
+    (boundedReasoningDraft ||
+      (input.availableToolCount > 0 && boundedVisibleDraft));
 }
 
 export function runtimeV2ProviderOutputWasTruncated(input: {
   readonly finishReason: string | null | undefined;
+  readonly clientStopReason?: StreamResult["clientStopReason"];
   readonly toolCallCount: number;
   readonly availableToolCount: number;
 }): boolean {
-  return input.finishReason === "length" &&
+  return isStreamOutputLimited(input) &&
     input.toolCallCount === 0;
 }
 
@@ -127,16 +132,24 @@ export function runtimeV2ExecutionProviderOutputTokenLimit(
   const recoveryPressure = command.payload.recoveryPressure;
   const recovering = !!recoveryPressure &&
     typeof recoveryPressure === "object" &&
-    !Array.isArray(recoveryPressure);
-  const modeLimit = actionWindow || recovering
+    !Array.isArray(recoveryPressure) &&
+    (recoveryPressure as Record<string, unknown>).reason !== "non_actionable_response";
+  const answering = mode === "chat" || mode === "analyze" || mode === "conclude";
+  // Answer synthesis uses the Run's output allocation, bounded by the same
+  // parent-request ceiling as an ordinary observation. An action recovery
+  // cap must not consume the answer budget merely because prior output was
+  // truncated. The smaller conclusion value is only a no-budget fallback.
+  const modeLimit = answering
+    ? mode === "conclude" && !budget
+      ? RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS
+      : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS
+    : actionWindow || recovering
     ? RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS
     : mode === "validate"
       ? RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS
       : mode === "execute"
         ? RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS
-        : mode === "conclude"
-          ? RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS
-          : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS;
+        : RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS;
   return Math.max(
     1,
     Math.min(
@@ -148,38 +161,19 @@ export function runtimeV2ExecutionProviderOutputTokenLimit(
 }
 
 /**
- * Once exact source is visible but no workspace effect exists, a documented
- * reasoning toggle can switch the next request into action decoding. This is
- * capability- and state-based; model/provider names never enter the policy.
+ * Preserve configured reasoning outside a real action/recovery boundary.
+ * Visible source alone does not require action decoding or a workspace effect.
  */
 export function runtimeV2ExecutionReasoningRequest(input: {
   readonly configured: StreamSettings["reasoningRequest"];
-  readonly sourceOnlyFrontier: boolean;
-  readonly hasMutationTool: boolean;
   readonly providerSupportsReasoningToggle: boolean;
   readonly structuredActionRequired?: boolean;
   readonly recoveringFromRejectedAction?: boolean;
   readonly recoveryStage?: string;
   readonly actionWindow?: RuntimeV2ProviderActionWindow | null;
 }): StreamSettings["reasoningRequest"] {
-  // A state-machine-required action already has its causal boundary in the
-  // durable transcript. Opening another hidden analysis phase here lets a
-  // model reconsider a closed branch, repeat unavailable reads, or serialize
-  // a required tool schema as prose. Decode the next structured action
-  // directly when the adapter exposes a documented reasoning toggle.
-  if (
-    input.structuredActionRequired &&
-    input.providerSupportsReasoningToggle
-  ) {
-    return "off";
-  }
-  if (
-    input.recoveringFromRejectedAction &&
-    input.providerSupportsReasoningToggle &&
-    input.configured !== "off"
-  ) {
-    return "off";
-  }
+  // Semantic rejection is not evidence of a reasoning/decoder failure. Only
+  // the request-local, output-limited retry below may disable reasoning.
   if (
     input.actionWindow &&
     input.providerSupportsReasoningToggle &&
@@ -187,13 +181,7 @@ export function runtimeV2ExecutionReasoningRequest(input: {
   ) {
     return "explicit";
   }
-  return !input.recoveringFromRejectedAction &&
-      input.sourceOnlyFrontier &&
-      input.hasMutationTool &&
-      input.providerSupportsReasoningToggle &&
-      input.configured !== "off"
-    ? "off"
-    : input.configured;
+  return input.configured;
 }
 
 export function runtimeV2ProviderProtocolError(input: {

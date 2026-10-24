@@ -4,6 +4,7 @@ import {
   WORKSPACE_INSTRUCTION_SOURCES,
   WORKSPACE_TURN_QUEUE_SCHEMA_VERSION,
   type WorkspaceInstruction,
+  type WorkspaceInstructionDispatchClaim,
   type WorkspaceInstructionAttachment,
   type WorkspaceInstructionPayload,
   type WorkspaceInstructionReceipt,
@@ -48,6 +49,11 @@ export type WorkspaceTurnQueueCommand =
   | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueClaimIdentity & {
       /** Claim the FIFO head. No clientSubmissionId is accepted, so callers cannot skip it. */
       readonly type: "claim";
+    })
+  | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueClaimIdentity & {
+      readonly type: "set_dispatch_phase";
+      readonly fromPhase: "dispatch" | "intent_preflight";
+      readonly phase: "dispatch" | "intent_preflight";
     })
   | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueClaimIdentity & {
       /** A nonterminal dispatch attempt ended; put the exact head back in the queue. */
@@ -469,6 +475,32 @@ function claimIdentityMatches(
     claim.sessionEpoch === identity.sessionEpoch;
 }
 
+/** Reuse the exact durable-admission fence for async submission continuations. */
+export function isWorkspaceInstructionDispatchClaimCurrent(
+  queue: WorkspaceTurnQueueState | null | undefined,
+  options: {
+    adoptExistingTurn?: boolean;
+    workspaceInstructionClaim?: WorkspaceInstructionDispatchClaim;
+    turnIdOverride?: string;
+    admittedUserBlockId?: number;
+  } | undefined,
+): boolean {
+  const claim = options?.workspaceInstructionClaim;
+  const head = queue?.entries[0];
+  return options?.adoptExistingTurn === true && !!claim &&
+    queue?.sessionKey === claim.sessionKey &&
+    queue.sessionEpoch === claim.sessionEpoch &&
+    head?.status === "dispatching" &&
+    head.claim?.claimId === claim.claimId &&
+    head.receipt.receiptId === claim.receiptId &&
+    head.receipt.turnId === claim.turnId &&
+    head.receipt.userBlockId === claim.admittedUserBlockId &&
+    head.instruction.clientSubmissionId === claim.clientSubmissionId &&
+    buildWorkspaceTurnQueueEntryIdentity(head) === claim.instructionEnvelopeIdentity &&
+    options.turnIdOverride === claim.turnId &&
+    options.admittedUserBlockId === claim.admittedUserBlockId;
+}
+
 function replaceEntry(
   entries: readonly WorkspaceTurnQueueEntry[],
   index: number,
@@ -542,6 +574,16 @@ export function reduceWorkspaceTurnQueue(
   if (command.at < state.updatedAt) return rejected(state, "invalid_command_time");
 
   switch (command.type) {
+    case "set_dispatch_phase": {
+      const head = state.entries[0];
+      if (!head || head.status !== "dispatching") return rejected(state, "entry_state_conflict", head);
+      if (!claimIdentityMatches(head.claim, command)) return rejected(state, "claim_id_mismatch", head);
+      if ((head.claim?.phase || "dispatch") !== command.fromPhase || command.fromPhase === command.phase) {
+        return rejected(state, "entry_state_conflict", head);
+      }
+      const entry = freezeEntry({ ...head, claim: Object.freeze({ ...head.claim!, phase: command.phase }), updatedAt: command.at });
+      return applied(state, command.at, replaceEntry(state.entries, 0, entry), entry);
+    }
     case "commit": {
       const index = state.entries.findIndex((entry) => entryIdentityMatches(entry, command));
       if (index < 0) return rejected(state, "entry_not_found");
@@ -646,12 +688,14 @@ function normalizeClaim(
     value.sessionKey !== sessionKey ||
     value.sessionEpoch !== sessionEpoch ||
     !isValidEventTime(value.claimedAt)
+    || (value.phase !== undefined && value.phase !== "dispatch" && value.phase !== "intent_preflight")
   ) return null;
   return Object.freeze({
     claimId: value.claimId,
     sessionKey,
     sessionEpoch,
     claimedAt: value.claimedAt,
+    ...(value.phase ? { phase: value.phase } : {}),
   });
 }
 

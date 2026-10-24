@@ -85,6 +85,58 @@ function tool(name, description = "") {
   };
 }
 
+test("MCP permissions retain each attached server identity when endpoints overlap", () => {
+  const url = "http://127.0.0.1:9100/mcp";
+  const manual = { name: "Browser", type: "http", url, enabled: true };
+  const extension = { name: "gemini:fixture:research", type: "http", url, enabled: true };
+  const registered = (name, serverName) => ({
+    name,
+    description: "Inspect",
+    inputSchema: { type: "object" },
+    _mainMcpOrigin: { serverName, serverUrl: url, remoteName: "query" },
+  });
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: [tool("manual_query", "Inspect"), tool("extension_query", "Inspect")],
+    mcpTools: [registered("manual_query", manual.name), registered("extension_query", extension.name)],
+    mcpServers: [manual, extension],
+  });
+  assert.equal(registry.tools.manual_query.serverName, "Browser");
+  assert.equal(registry.tools.manual_query.risk, "browser_control");
+  assert.equal(registry.tools.manual_query.autoExecutable, false);
+  assert.equal(registry.tools.extension_query.serverName, extension.name);
+  assert.equal(registry.tools.extension_query.risk, "external_read");
+  assert.equal(registry.tools.extension_query.autoExecutable, true);
+});
+
+test("attached MCP identities cannot borrow an enabled server at the same URL", () => {
+  const url = "http://127.0.0.1:9100/mcp";
+  const mcpTool = {
+    name: "query", description: "Inspect", inputSchema: { type: "object" },
+    _mainMcpOrigin: { serverName: "Browser", serverUrl: url, remoteName: "query" },
+  };
+  for (const servers of [
+    [{ name: "gemini:fixture:research", type: "http", url, enabled: true }],
+    [{ name: "Browser", type: "http", url, enabled: false }, { name: "gemini:fixture:research", type: "http", url, enabled: true }],
+  ]) {
+    const registry = buildToolCapabilityRegistry({ toolDefinitions: [tool("query", "Inspect")], mcpTools: [mcpTool], mcpServers: servers });
+    assert.equal(registry.tools.query.enabled, false);
+    assert.equal(registry.tools.query.autoExecutable, false);
+  }
+});
+
+test("legacy MCP tools without an attached identity retain URL fallback", () => {
+  const url = "http://127.0.0.1:9100/mcp";
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: [tool("query", "Inspect")],
+    mcpTools: [{ name: "query", description: "Inspect", inputSchema: { type: "object" } }],
+    mcpServers: [{ name: "Browser", type: "http", url, enabled: true }],
+    mcpToolServerMap: { query: url },
+  });
+  assert.equal(registry.tools.query.serverName, "Browser");
+  assert.equal(registry.tools.query.risk, "browser_control");
+  assert.equal(registry.tools.query.enabled, true);
+});
+
 test("built-in tool risks separate read, write, shell, and destructive operations", () => {
   assert.equal(classifyBuiltInTool("read_file"), "read_only");
   assert.equal(classifyBuiltInTool("knowledge_search"), "read_only");

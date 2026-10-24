@@ -43,6 +43,9 @@ import {
   getMdViewerWorkPlanGaps,
 } from "./realOmlxMdViewerPlanOracle";
 import { expectRuntimeV2ReadOnlyCollaboration } from "./runtimeV2StructuralAssertions";
+import { invokeRuntimeToolBridge } from "./runtimeToolBridge";
+import { verifyUnityCollector } from "./realUnityCollectorOracle";
+import { observeRuntimeTask } from "./runtimeTaskObservation";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
@@ -1251,10 +1254,27 @@ test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-fl
 
 test.beforeEach(async ({ page }) => {
   const customWorkspace = process.env.REAL_OMLX_WORKSPACE;
-  const workspace = customWorkspace
+  const workspace = customWorkspace && process.env.MAIN_DETERMINISTIC_PAUSE_E2E === "1"
+    ? await fs.mkdtemp(path.join(path.resolve(customWorkspace), "independent-test-")) : customWorkspace
     ? path.resolve(customWorkspace)
     : await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
   (page as any).__realOmlxWorkspace = workspace;
+  if (process.env.MAIN_DETERMINISTIC_PAUSE_E2E === "1") await fs.writeFile(path.join(workspace, "fixture.txt"), "Deterministic production boundary fixture.\n");
+  const providerWire: any[] = [];
+  (page as any).__realOmlxProviderWire = providerWire;
+  const productionTools = realOmlxFixture === "unity";
+  // This disposable database starts empty, unlike the already-running MAIN
+  // installation being reproduced. Finish its schema bootstrap before UI
+  // persistence and Session list requests begin concurrently. Do not retry a
+  // save or weaken CAS when initialization fails.
+  if (productionTools) await invokeRuntimeToolBridge(workspace, "list_project_sessions");
+  const skillIds = (process.env.MAIN_TEST_SKILL_PACKAGE_IDS || "").split(",").filter(Boolean);
+  const skills = productionTools ? await Promise.all(skillIds.map(async packageId => {
+    const meta = await invokeRuntimeToolBridge(workspace, "inspect_global_skill_package", { packageId });
+    return { id: packageId, name: meta.name, desc: "Installed Unity Skills", type: "package", active: true,
+      packageStorage: { kind: "global", packageId }, entryPoint: meta.entryPoint, entryPoints: meta.entryPoints };
+  })) : undefined;
+  await page.exposeFunction("__MAIN_E2E_NATIVE_TOOL", (cmd: string, args: unknown) => invokeRuntimeToolBridge(workspace, cmd, args));
   const csvSeedFiles: Record<string, string> = {
     "package.json": JSON.stringify({
       name: "csv-direct-edit-recovery-fixture",
@@ -1483,7 +1503,7 @@ test.beforeEach(async ({ page }) => {
     prunedDirectories: initialWorkspaceInventory.prunedDirectories,
     skippedEntries: initialWorkspaceInventory.skippedEntries,
   })}`);
-  const fixtureMutationBaseline = await readFixtureMutationContents(workspace);
+  const fixtureMutationBaseline = realOmlxFixture === "unity" ? {} : await readFixtureMutationContents(workspace);
   await page.exposeFunction("__MAIN_E2E_INSPECT_FIXTURE_MUTATION", async () =>
     await inspectFixtureMutation(workspace, fixtureMutationBaseline)
   );
@@ -1603,6 +1623,7 @@ test.beforeEach(async ({ page }) => {
     responseText: string;
     timeoutMs: number | null;
     deadlineAt: number | null;
+    protocolEvidencePath?: string;
   };
   const chatStreams = new Map<string, RealOmlxChatStream>();
   const summarizeRuntimeV2ToolCalls = (text: string) => {
@@ -1731,6 +1752,24 @@ test.beforeEach(async ({ page }) => {
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
     }
+    providerWire.push({ at: new Date().toISOString(), streamId, model,
+      toolChoice: parsedBody?.tool_choice, template: parsedBody?.chat_template_kwargs, maxTokens: parsedBody?.max_tokens,
+      messageDigest: createHash("sha256").update(JSON.stringify(parsedBody?.messages)).digest("hex"),
+      roles: (parsedBody?.messages as any[] || []).map(message => message.role),
+      tools: (parsedBody?.tools as any[] || []).map(tool => tool.function?.name) });
+    const protocolEvidenceDirectory = String(process.env.REAL_OMLX_PROTOCOL_EVIDENCE_DIR || "").trim();
+    const protocolEvidencePath = protocolEvidenceDirectory
+      ? path.join(protocolEvidenceDirectory, streamId.replace(/[^a-z0-9_-]/gi, "_"))
+      : undefined;
+    if (protocolEvidencePath && parsedBody) {
+      await fs.mkdir(protocolEvidenceDirectory, { recursive: true });
+      // Credentials are transport headers; record only the model payload.
+      await fs.writeFile(`${protocolEvidencePath}.request.json`, JSON.stringify({
+        model: parsedBody.model, messages: parsedBody.messages, tools: parsedBody.tools,
+        max_tokens: parsedBody.max_tokens, tool_choice: parsedBody.tool_choice,
+        chat_template_kwargs: parsedBody.chat_template_kwargs,
+      }, null, 2));
+    }
     const requestMessages = Array.isArray(parsedBody?.messages)
       ? parsedBody.messages as Array<Record<string, unknown>>
       : [];
@@ -1853,6 +1892,7 @@ test.beforeEach(async ({ page }) => {
       responseText: "",
       timeoutMs,
       deadlineAt: timeoutMs === null ? null : Date.now() + timeoutMs,
+      protocolEvidencePath,
     };
     // Register the lease before waiting for response headers. OMLX can spend
     // substantial time in prefill, and cancellation must still reach that
@@ -1938,6 +1978,14 @@ test.beforeEach(async ({ page }) => {
         );
       }
       if (done) {
+        if (stream.protocolEvidencePath) {
+          await fs.writeFile(`${stream.protocolEvidencePath}.response.sse`, stream.responseText);
+          await fs.writeFile(`${stream.protocolEvidencePath}.response-meta.json`, JSON.stringify({
+            totalChars: stream.chars,
+            recordedChars: stream.responseText.length,
+            truncated: stream.chars > stream.responseText.length,
+          }, null, 2));
+        }
         chatStreams.delete(String(streamId));
         console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
         const toolCalls = summarizeRuntimeV2ToolCalls(
@@ -1998,7 +2046,7 @@ test.beforeEach(async ({ page }) => {
     });
   });
 
-  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture, limits }) => {
+  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture, limits, productionTools, skills }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
     (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ ??= {
       authoringContractIds: [],
@@ -2052,7 +2100,7 @@ test.beforeEach(async ({ page }) => {
       await (window as any).__MAIN_E2E_DISK_WRITE(path, content);
     };
     (window as any).__REAL_OMLX_WORKSPACE__ = workspace;
-    (window as any).__REAL_OMLX_CONFIG__ = { endpoint, apiKey };
+    (window as any).__REAL_OMLX_CONFIG__ = { endpoint, apiKey, productionTools, skills };
 
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
     const callbacks = new Map<number, unknown>();
@@ -2120,6 +2168,10 @@ test.beforeEach(async ({ page }) => {
       tail: ptyBuffer.slice(-8_000),
     });
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (productionTools && ["shell_permission_preflight", "run_command", "get_system_memory", "inspect_global_skill_package", "read_global_skill_package_file", "save_project_session", "load_project_session", "load_project_session_meta", "list_project_sessions"].includes(cmd)) {
+        return await (window as any).__MAIN_E2E_NATIVE_TOOL(cmd, args || {});
+      }
+      if (productionTools && ["browser_evaluate", "spawn_pty", "write_pty"].includes(cmd)) throw new Error(`PRODUCTION_TEST_CAPABILITY_UNAVAILABLE: ${cmd}`);
       if (cmd === "web_search" || cmd === "web_fetch") return await (window as any).__MAIN_E2E_WEB_READ(cmd, args);
       if (cmd === "append_debug_log") {
         const raw = args || {};
@@ -2256,6 +2308,9 @@ test.beforeEach(async ({ page }) => {
           while (!canceledStreamIds.has(streamId)) {
             const next = await (window as any).__MAIN_E2E_CHAT_STREAM_READ(streamId);
             if (next?.chunk) {
+              if (/"(?:content|reasoning_content|reasoning)"\s*:\s*"[^"\s]/.test(next.chunk)) {
+                (window as any).__MAIN_E2E_CHAT_TRANSPORT_CHUNKS = ((window as any).__MAIN_E2E_CHAT_TRANSPORT_CHUNKS || 0) + 1;
+              }
               emitTauriEvent("chat-stream-chunk", { stream_id: streamId, chunk: next.chunk });
             }
             if (next?.done) break;
@@ -2718,6 +2773,7 @@ test.beforeEach(async ({ page }) => {
     devServerUrl: realOmlxDevServerUrl,
     fixture: realOmlxFixture,
     limits: REAL_OMLX_WORKSPACE_PROXY_LIMITS,
+    productionTools, skills,
   });
 });
 
@@ -2858,6 +2914,279 @@ test.afterEach(async ({ page }, testInfo) => {
 });
 
 for (const model of models) {
+  test(`deterministic production unexecuted Skills recover without replaying failed effects with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
+    test.setTimeout(90_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      const responses = new Map<string, string[]>();
+      (window as any).__SKIP_RECOVERY_REQUESTS__ = [];
+      (window as any).__MAIN_E2E_CHAT_STREAM_OPEN = async (args: any) => {
+        const requests = (window as any).__SKIP_RECOVERY_REQUESTS__;
+        requests.push(JSON.parse(args.body));
+        const count = requests.length;
+        const skills = [{ name: "load_skill", arguments: { skill_id: "s:76d7f9e6" } },
+          { name: "load_skill", arguments: { skill_id: "s:e84abf7c" } }];
+        const failed = { name: "run_command", arguments: { command: "printf x >> effect.txt; exit 6", description: "Exercise a partial failed effect once" } };
+        const calls = count === 1 ? [{ name: "run_command", arguments: { command: "printf denied > /dev/null", description: "Exercise the production path guard" } }, ...skills]
+          : count === 2 ? skills : count === 3 ? [failed, { name: "run_command", arguments: { command: "printf y >> downstream.txt", description: "Must not run after a failed predecessor" } }]
+          : [failed];
+        const delta = { tool_calls: calls.map((call, index) => ({ index, id: `skip-recovery-${count}-${index}`, type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) };
+        responses.set(args.streamId || args.stream_id, [`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\ndata: [DONE]\n\n`]);
+      };
+      (window as any).__MAIN_E2E_CHAT_STREAM_READ = async (id: string) => { const items = responses.get(id) || []; return items.length ? { chunk: items.shift(), done: false } : { done: true }; };
+      (window as any).__MAIN_E2E_CHAT_STREAM_CANCEL = async (id: string) => { responses.delete(id); };
+    });
+    await page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      useAppStore.getState().sendMessage("读取 Unity 指南并检查命令结果。保留失败证据，不重复副作用。", undefined,
+        { resolvedIntent: "execute", runtimeIntentOverride: "execute", skipIntentResolution: true, turnTitle: "生产未执行回执验证", intentSummary: "Verify unexecuted Skill recovery", subagentPreferenceOverride: "forbidden" });
+    });
+    const snapshot = async () => page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+      const state = useAppStore.getState();
+      return { checkpoint: normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[state.currentTurnId!]), request: state.activeActionRequest,
+        requests: (window as any).__SKIP_RECOVERY_REQUESTS__, taskFlow: state.taskFlow };
+    });
+    await expect.poll(async () => (await snapshot()).request?.kind, { timeout: 60_000 }).toBe("user_choice");
+    const paused = await snapshot();
+    await fs.writeFile(testInfo.outputPath("unexecuted-skill-production.json"), JSON.stringify(paused, null, 2));
+    const events = paused.checkpoint!.aggregate.events;
+    const skills = events.filter(event => event.type === "tool.completed" && event.presentation?.toolName === "load_skill");
+    expect(skills.filter(event => event.status === "blocked" && event.failureReasonCode === "provider_batch_predecessor_failed")).toHaveLength(2);
+    expect(skills.filter(event => event.status === "succeeded")).toHaveLength(2);
+    expect(events.filter(event => event.type === "tool.completed" && event.failureReasonCode === "command_exit_nonzero")).toHaveLength(1);
+    expect(await fs.readFile(path.join(workspace, "effect.txt"), "utf8")).toBe("x");
+    expect(await fs.stat(path.join(workspace, "downstream.txt")).then(() => true, () => false)).toBe(false);
+    await page.waitForTimeout(750);
+    expect((await snapshot()).requests.length).toBe(paused.requests.length);
+    expect(paused.requests).toHaveLength(4);
+    await page.getByTestId("execution-capsule-reply-option-1").click();
+    await expect.poll(async () => (await snapshot()).checkpoint?.aggregate.terminalOutcome?.resultKind).toBe("canceled");
+  });
+
+  test(`deterministic production pause recheck and stop preserve one Run with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
+    test.setTimeout(90_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      const responses = new Map<string, string[]>();
+      (window as any).__PAUSE_REQUEST_COUNT__ = 0;
+      (window as any).__MAIN_E2E_CHAT_STREAM_OPEN = async (args: any) => {
+        const count = ++(window as any).__PAUSE_REQUEST_COUNT__;
+        const call = count === 1 ? { name: "run_command", arguments: { command: "printf x >> effect.txt", description: "Create one marker" } }
+          : count === 4 ? { name: "read_file", arguments: { path: "effect.txt" } }
+          : { name: "missing_fixture_tool", arguments: {} };
+        const chunk = { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `fixture-call-${count}`, type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] }, finish_reason: null }] };
+        responses.set(args.streamId || args.stream_id, [`data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\ndata: [DONE]\n\n`]);
+      };
+      (window as any).__MAIN_E2E_CHAT_STREAM_READ = async (id: string) => {
+        const items = responses.get(id) || [];
+        return items.length ? { chunk: items.shift(), done: false } : { done: true };
+      };
+      (window as any).__MAIN_E2E_CHAT_STREAM_CANCEL = async (id: string) => { responses.delete(id); };
+    });
+    await page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      useAppStore.getState().sendMessage("执行一次本地命令创建 effect.txt，然后检查实际内容。遇到不可用工具请保留真实回执。", undefined,
+        { resolvedIntent: "execute", runtimeIntentOverride: "execute", skipIntentResolution: true, turnTitle: "生产暂停验证", intentSummary: "Verify durable execution pause", subagentPreferenceOverride: "forbidden" });
+    });
+    const state = async () => page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+      const s = useAppStore.getState();
+      return { checkpoint: normalizeRuntimeV2Checkpoint(s.runtimeV2Checkpoints[s.currentTurnId!]), request: s.activeActionRequest,
+        generating: s.isGenerating, requests: (window as any).__PAUSE_REQUEST_COUNT__, events: s.runtimeEvents, taskFlow: s.taskFlow };
+    });
+    await expect.poll(async () => (await state()).request?.kind, { timeout: 45_000 }).toBe("user_choice");
+    const first = await state();
+    await page.waitForTimeout(500);
+    expect((await state()).requests).toBe(first.requests);
+    expect(await fs.readFile(path.join(workspace, "effect.txt"), "utf8")).toBe("x");
+    await page.getByTestId("execution-capsule-reply-option-0").click();
+    await expect.poll(async () => (await state()).checkpoint?.aggregate.events.filter(event => event.type === "run.resumed").length, { timeout: 45_000 }).toBe(1);
+    await expect.poll(async () => {
+      const current = await state();
+      return current.request?.kind === "user_choice" && current.request.requestId !== first.request?.requestId;
+    }, { timeout: 45_000 }).toBe(true);
+    const second = await state();
+    expect(second.checkpoint?.aggregate.run?.identity.runId).toBe(first.checkpoint?.aggregate.run?.identity.runId);
+    expect(second.checkpoint?.aggregate.events.filter(event => event.type === "run.started")).toHaveLength(1);
+    expect(await fs.readFile(path.join(workspace, "effect.txt"), "utf8")).toBe("x");
+    await page.getByTestId("execution-capsule-reply-option-1").click();
+    await expect.poll(async () => (await state()).checkpoint?.aggregate.terminalOutcome?.resultKind).toBe("canceled");
+    const final = await state();
+    expect(final.checkpoint?.aggregate.events.filter(event => event.type === "run.completed")).toHaveLength(1);
+    expect(final.checkpoint?.aggregate.events.filter(event => event.type === "turn.completed")).toHaveLength(1);
+    await expect.poll(async () => (await state()).taskFlow.filter(block => block.type === "agent" && block.visibility === "assistant_final").length).toBe(1);
+    await fs.writeFile(testInfo.outputPath("pause-recheck-stop.json"), JSON.stringify(final, null, 2));
+  });
+
+  test(`deterministic production intent clarification pauses and resumes one Run with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
+    test.setTimeout(90_000);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      const responses = new Map<string, string[]>();
+      (window as any).__CLARIFICATION_REQUESTS__ = [];
+      (window as any).__MAIN_E2E_CHAT_STREAM_OPEN = async (args: any) => {
+        const requests = (window as any).__CLARIFICATION_REQUESTS__;
+        requests.push(JSON.parse(args.body));
+        const count = requests.length;
+        const clarification = { kind: "target_ambiguity", field: "target", evidence: "staging or production", question: "请选择检查目标。", choices: ["staging", "production"] };
+        const content = count === 1 ? JSON.stringify({ semantic: { objective: "检查用户选择的目标", workType: "operate", answerFormat: "report",
+          requiredCapabilities: ["command"], forbiddenCapabilities: [], approvalRequiredCapabilities: [] }, confidence: 0.9, needsUserChoice: true, question: clarification.question, clarification }) : null;
+        const call = count === 2 ? { name: "run_command", arguments: { command: "printf chosen-target", description: "Inspect selected target" } }
+          : { name: "missing_fixture_tool", arguments: {} };
+        const delta = content ? { content } : { tool_calls: [{ index: 0, id: `clarification-${count}`, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] };
+        responses.set(args.streamId || args.stream_id, [`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: content ? "stop" : "tool_calls" }] })}\n\ndata: [DONE]\n\n`]);
+      };
+      (window as any).__MAIN_E2E_CHAT_STREAM_READ = async (id: string) => { const items = responses.get(id) || []; return items.length ? { chunk: items.shift(), done: false } : { done: true }; };
+      (window as any).__MAIN_E2E_CHAT_STREAM_CANCEL = async (id: string) => { responses.delete(id); };
+      (window as any).__CODELY_E2E__.sendDirectEditMessage("Inspect staging or production; I have not selected the target.");
+    });
+    const state = async () => page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+      const s = useAppStore.getState();
+      return { checkpoint: normalizeRuntimeV2Checkpoint(s.runtimeV2Checkpoints[s.currentTurnId!]), request: s.activeActionRequest, generating: s.isGenerating,
+        requests: (window as any).__CLARIFICATION_REQUESTS__, taskFlow: s.taskFlow };
+    });
+    await expect.poll(async () => (await state()).request?.kind, { timeout: 45_000 }).toBe("user_choice");
+    const paused = await state();
+    expect(paused.checkpoint?.aggregate.run?.blocker?.reasonCode).toBe("intent_clarification");
+    expect(paused.requests).toHaveLength(1);
+    await page.waitForTimeout(500);
+    expect((await state()).requests).toHaveLength(1);
+    expect(paused.checkpoint?.aggregate.terminalOutcome).toBeNull();
+    await page.getByTestId("execution-capsule-reply-option-0").click();
+    await expect.poll(async () => (await state()).checkpoint?.aggregate.events.filter(event => event.type === "run.resumed").length, { timeout: 45_000 }).toBe(1);
+    await expect.poll(async () => { const s = await state(); return s.request?.kind === "user_choice" && s.request.requestId !== paused.request?.requestId; }, { timeout: 45_000 }).toBe(true);
+    const resumed = await state();
+    expect(resumed.checkpoint?.aggregate.run?.identity.runId).toBe(paused.checkpoint?.aggregate.run?.identity.runId);
+    expect(resumed.checkpoint?.aggregate.events.filter(event => event.type === "run.started")).toHaveLength(1);
+    expect(resumed.requests[1].messages).toContainEqual({ role: "user", content: "staging" });
+    expect(resumed.checkpoint?.aggregate.events.find(event => event.type === "run.decision_recorded")).toMatchObject({ choice: "recheck", reply: "staging" });
+    await fs.writeFile(testInfo.outputPath("production-clarification.json"), JSON.stringify(resumed, null, 2));
+    await page.getByTestId("execution-capsule-reply-option-1").click();
+    await expect.poll(async () => (await state()).checkpoint?.aggregate.terminalOutcome?.resultKind).toBe("canceled");
+  });
+
+  test(`real OMLX Unity Execute uses production tool boundaries with ${model}`, async ({ page }, testInfo) => {
+    test.skip(realOmlxFixture !== "unity");
+    test.setTimeout(realOmlxExecutionTimeoutMs + 360_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const evidenceDir = process.env.REAL_OMLX_EVIDENCE_DIR || testInfo.outputPath("unity-evidence");
+    await fs.mkdir(evidenceDir, { recursive: true });
+    const wire = (page as any).__realOmlxProviderWire as any[];
+    const navigations: Array<{ at: number; url: string; afterSubmission: boolean }> = [];
+    let submitted = false;
+    page.on("framenavigated", frame => {
+      if (frame === page.mainFrame()) navigations.push({ at: Date.now(), url: frame.url(), afterSubmission: submitted });
+    });
+    const original = await fs.readFile(process.env.MAIN_ORNITH_REQUEST_FILE!, "utf8");
+    const request = original.replaceAll("/Users/michael/Documents/Unity/TestCli", workspace);
+    await fs.writeFile(path.join(evidenceDir, "request.txt"), request);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(true));
+    submitted = true;
+    const admission = await page.evaluate(async text => {
+      const bridge = (window as any).__CODELY_E2E__;
+      await bridge?.sendDirectEditMessage?.(text);
+      return bridge?.lastWorkspaceInstructionAcceptance;
+    }, request);
+    await fs.writeFile(path.join(evidenceDir, "submission-admission.json"), JSON.stringify(admission || null, null, 2));
+    const targetTurnId = admission?.receipt?.turnId || null;
+    const snapshot = async () => page.evaluate(async targetTurnId => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+      const state = useAppStore.getState();
+      const owner = targetTurnId || state.currentTurnId;
+      const checkpoint = owner ? normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[owner]) : null;
+      return { checkpoint, targetTurnId, currentTurnId: state.currentTurnId, conversationTurns: state.conversationTurns, currentSessionId: state.currentSessionId, agentStatus: state.agentStatus, isGenerating: state.isGenerating, activeActionRequest: state.activeActionRequest,
+        taskFlow: state.taskFlow, runtimeEvents: state.runtimeEvents, debug: (window as any).__REAL_OMLX_DEBUG_LOGS__,
+        dispatchError: (window as any).__CODELY_E2E__?.dispatchError };
+    }, targetTurnId);
+    let final: any = null;
+    let runtimeWaitError: string | null = null;
+    try {
+      await expect.poll(async () => {
+        final = await snapshot();
+        if (navigations.some(item => item.afterSubmission)) return "host_reloaded";
+        return observeRuntimeTask(final).state;
+      }, { timeout: realOmlxExecutionTimeoutMs }).not.toBe("running");
+    } catch (error) { runtimeWaitError = String(error); } finally {
+      final = await snapshot();
+      if (navigations.some(item => item.afterSubmission)) runtimeWaitError = "The test page navigated after submission; this is a host interruption, not model completion.";
+      await fs.writeFile(path.join(evidenceDir, "browser-lifecycle.json"), JSON.stringify({ navigations, stable: !navigations.some(item => item.afterSubmission) }, null, 2));
+      if (final.checkpoint?.aggregate.run?.status === "paused") {
+        const before = wire.length;
+        await page.waitForTimeout(1_500);
+        final.pauseQuiet = { before, after: wire.length, passed: before === wire.length };
+      }
+      const stepPresentation = await page.locator('[data-testid="live-turn-step"], [data-testid="turn-archive-step"]').evaluateAll(rows => rows.map(row => ({
+        status: row.getAttribute("data-status"),
+        summary: (row.querySelector('[data-testid="turn-archive-step-toggle"]') as HTMLElement | null)?.innerText || "",
+      })));
+      await fs.writeFile(path.join(evidenceDir, "ui-step-presentation.json"), JSON.stringify({ steps: stepPresentation,
+        protocolCodesInSummary: stepPresentation.filter(row => /TOOL_(?:ERROR|BLOCKED|NOT_EXECUTED|RESULT_EMPTY)|READ_FILE_RESULT|FILE_UNCHANGED_STUB|provider_batch_predecessor_(?:failed|unsettled)|provider-call-[\w-]+|"type":"skill\.loaded"|main-skill:\/\//.test(row.summary)),
+      }, null, 2));
+      await fs.writeFile(path.join(evidenceDir, "runtime.json"), JSON.stringify(final, null, 2));
+      await fs.writeFile(path.join(evidenceDir, "outbound-protocol.json"), JSON.stringify(wire, null, 2));
+      await page.screenshot({ path: path.join(evidenceDir, "main.png"), fullPage: true });
+    }
+    const observation = observeRuntimeTask(final);
+    let persistedSession: any = null;
+    let persistenceError: string | null = null;
+    try {
+      await expect.poll(async () => {
+        persistedSession = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: final.currentSessionId });
+        const checkpoints = Object.values(persistedSession?.runtimeSnapshot?.runtimeV2Checkpoints || {}) as any[];
+        const owner = targetTurnId || final.currentTurnId;
+        const turn = persistedSession?.runtimeSnapshot?.conversationTurns?.find((item: any) => item.id === owner);
+        return final.checkpoint ? checkpoints.some(checkpoint => checkpoint.owner?.turnId === owner && !checkpoint.aggregate && !checkpoint.scheduledCommands &&
+          checkpoint.events?.length >= final.checkpoint.events.length)
+          : turn?.runtimeOutcome?.status === "completed" && turn.runtimeOutcome.runId === observation.outcome?.runId;
+      }, { timeout: 15_000 }).toBe(true);
+    } catch (error) { persistenceError = String(error); }
+    await fs.writeFile(path.join(evidenceDir, "persisted-session-before-cleanup.json"), JSON.stringify(persistedSession, null, 2));
+    const aggregate = final.checkpoint?.aggregate;
+    const outcome = observation.outcome;
+    const validators = aggregate?.events.filter((event: any) => event.type === "validation.completed" && event.passed) || [];
+    let cleanupError: string | null = null;
+    const acceptance: any = { outcome, observation, runtimeWaitError, persistenceError, paused: aggregate?.run?.blocker || null, pauseQuiet: final.pauseQuiet,
+      passedValidations: validators.length, unityVerification: "pending", cleanup: { required: observation.shouldCancel } };
+    // Save the original task verdict before cleanup. A cleanup failure must
+    // never erase admission, tool or functional failure evidence.
+    await fs.writeFile(path.join(evidenceDir, "acceptance.json"), JSON.stringify(acceptance, null, 2));
+    if (observation.shouldCancel) {
+      try {
+        await page.evaluate(async targetTurnId => { const { useAppStore } = await import("/src/store/useAppStore.ts"); const state = useAppStore.getState(); const owner = targetTurnId || state.currentTurnId; if (owner) state.closeTurnAsCanceled(owner, { reason: "user_cancelled", message: "Validation ended; evidence retained." }); }, targetTurnId);
+        await expect.poll(async () => observeRuntimeTask(await snapshot()).outcome?.resultKind, { timeout: 30_000 }).toBe("canceled");
+      } catch (error) { cleanupError = String(error); }
+    }
+    const cleaned = await snapshot();
+    await fs.writeFile(path.join(evidenceDir, "cleanup.json"), JSON.stringify({ ...cleaned, cleanupError, skippedAlreadyTerminal: !observation.shouldCancel }, null, 2));
+    persistedSession = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: final.currentSessionId }).catch(error => ({ loadError: String(error) }));
+    await fs.writeFile(path.join(evidenceDir, "persisted-session.json"), JSON.stringify(persistedSession, null, 2));
+    try { Object.assign(acceptance, await verifyUnityCollector(workspace, evidenceDir)); }
+    catch (error) { Object.assign(acceptance, { userInteractionVerified: false, gaps: [String(error)] }); }
+    Object.assign(acceptance, { unityVerification: "completed", cleanup: { required: observation.shouldCancel, error: cleanupError, observation: observeRuntimeTask(cleaned) } });
+    await fs.writeFile(path.join(evidenceDir, "acceptance.json"), JSON.stringify(acceptance, null, 2));
+    expect(runtimeWaitError, runtimeWaitError || "Runtime settled").toBeNull();
+    expect(persistenceError, persistenceError || "Canonical ledger persisted").toBeNull();
+    expect(cleanupError, cleanupError || "Cleanup preserved the task verdict").toBeNull();
+    expect(observation.consistencyErrors).toEqual([]);
+    expect(outcome?.resultKind, JSON.stringify(acceptance)).toBe("success");
+    expect(acceptance.sceneSaved).toBe(true);
+    expect(acceptance.userInteractionVerified, JSON.stringify(acceptance.gaps)).toBe(true);
+  });
+
   test(`real OMLX MAIN plan/approve/execute reaches one structural terminal outcome with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
     const originalMutationContents = await readFixtureMutationContents(workspace);
@@ -3497,7 +3826,7 @@ for (const model of models) {
     }
   });
 
-  test(`real OMLX Direct Edit repairs a failed finite validation with ${model}`, async ({ page }) => {
+  test(`real OMLX Direct Edit repairs a failed finite validation with ${model}`, async ({ page }, testInfo) => {
     test.skip(!runDirectEditRecovery || realOmlxFixture !== "csv");
     const workspace = (page as any).__realOmlxWorkspace as string;
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
@@ -3535,6 +3864,9 @@ for (const model of models) {
     );
     await expect(finalAssistantMessage).toBeVisible();
     const finalAssistantText = String(await finalAssistantMessage.textContent() || "").trim();
+    const completionArtifact = testInfo.outputPath("direct-execute-completion.json");
+    await fs.writeFile(completionArtifact, JSON.stringify({ runtimeV2: terminalSnapshot?.runtimeV2, finalAssistantText, currentTurnStatus: terminalSnapshot?.currentTurnStatus, agentStatus: terminalSnapshot?.agentStatus, isGenerating: terminalSnapshot?.isGenerating }, null, 2));
+    await testInfo.attach("direct-execute-completion.json", { path: completionArtifact, contentType: "application/json" });
     expect(finalAssistantText.length).toBeGreaterThan(0);
     expect(finalAssistantText).not.toContain("agent_loop_completed");
     expect((terminalSnapshot?.taskFlowPreview || []).some((block: { turnId?: string; type?: string; visibility?: string; content?: string }) =>
@@ -4617,7 +4949,277 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
 });
 
 
+async function expectRealReadOnlyCancellation(page: Page, testInfo: TestInfo) {
+  // Cancel while the real local provider is streaming, through the same
+  // Store transaction as the desktop Stop button. Queue/CAS durability is
+  // covered separately because this browser fixture disables recording.
+  const priorChunks = await page.evaluate(() => (window as any).__MAIN_E2E_CHAT_TRANSPORT_CHUNKS || 0);
+  await page.evaluate(() => (window as any).__CODELY_E2E__.sendReadOnlyMessage("请详细推导一个通用算法，枚举并解释前 100 个质数的试除过程和每一步的正确性，分步骤完整输出。无需联网。"));
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
+    const chunks = await page.evaluate(() => (window as any).__MAIN_E2E_CHAT_TRANSPORT_CHUNKS || 0);
+    return snapshot.isGenerating && !snapshot.aggregate?.terminalOutcome && chunks > priorChunks;
+  }, { timeout: 180_000, intervals: [250] }).toBe(true);
+  await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
+    return snapshot.aggregate?.terminalOutcome?.resultKind === "canceled" && !snapshot.isGenerating && snapshot.agentStatus === "idle";
+  }, { timeout: 60_000, intervals: [250] }).toBe(true);
+  const canceled = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
+  expect(canceled.finals).toHaveLength(1);
+  expect(Date.parse(canceled.session.updatedAt)).toBeGreaterThan(Date.UTC(2025, 0, 1));
+  expect(canceled.aggregate.events.filter((event: any) => event.type === "run.completed" || event.type === "turn.completed").map((event: any) => event.type)).toEqual(["run.completed", "turn.completed"]);
+  await fs.writeFile(testInfo.outputPath("chat-canceled.json"), JSON.stringify(canceled, null, 2));
+}
+
+function expectWorkspaceConclusionOrder(snapshot: any): void {
+  const events = (snapshot.runtimeV2?.events || []).filter((event: any) =>
+    event.type === "run.completed" || event.type === "turn.completed" ||
+    (event.type === "projection.published" && event.audience === "final" && event.projectionKind === "final")
+  );
+  expect(events.map((event: any) => event.type)).toEqual(["run.completed", "projection.published", "turn.completed"]);
+}
+
 for (const model of models) {
+  test(`real OMLX workspace game design continuity through Composer with ${model}`, async ({ page }, testInfo) => {
+    // A real dense local model may spend most of a request on reasoning and
+    // then need a complete-answer recovery. Allow both within each window.
+    test.setTimeout(110 * 60_000);
+    const stopOnMutationPressure = process.env.REAL_OMLX_DESIGN_AUDIT_STOP_ON_MUTATION_PRESSURE === "1";
+    const hasRequiredMutationPressure = (snapshot: any) => (snapshot.runtimeV2?.debug || []).some((entry: any) =>
+      entry.source?.endsWith("runtime_v2_context_prepared") &&
+      entry.data?.toolChoice === "required" &&
+      Array.isArray(entry.data?.allowedToolNames) && entry.data.allowedToolNames.length > 0 &&
+      entry.data.allowedToolNames.every((name: string) => ["replace_in_file", "apply_patch", "delete_workspace_path"].includes(name))
+    );
+    const fullPrompts = [
+      "我打算用unity开发一款游戏，我有一些想法请帮我一起完善游戏设计的部分，请跟我一起讨论并给我提出一些建议并记录我的选择，最后我们会生成一份游戏开发文档。",
+      "我的核心想法是一个海岛送货游戏，玩家接委托、规划路线并发现新岛屿。我希望体验轻松，开发规模适合一个人。你觉得最值得先确定什么？先不写代码，也不要现在生成完整文档。",
+      "先确定 PC、单人和俯视角。节奏上暂时选每天必须完成送货指标，给玩家一点压力。战斗和收费方式先不确定。请记录我的选择，并帮我看看这些选择有什么取舍。",
+      "我改主意了，取消每日必须达标，改成自由安排送货，不完成也没有惩罚。平台和视角保持之前的决定。这样核心循环应该怎么调整？请更新记录。",
+      "先别写文档，请回顾我们已经确认的决定、改过的决定，以及还没有决定的部分。不要替我补齐空白。",
+      "成长机制我决定选船舶升级，具体包括货舱容量和航行速度；暂不加入角色技能树。战斗和收费方式继续待定。请记录这个决定，并简短指出它对之前核心循环的影响。",
+      "现在请根据刚才的讨论生成第一版游戏开发文档，直接在聊天中给出 Markdown 正文。明确区分已确认设计和待定问题，把修改后的决定作为当前版本。不要写代码或创建 Unity 工程。",
+    ];
+    const focusedRevisions = process.env.REAL_OMLX_DESIGN_FOCUSED_REVISIONS === "1";
+    const prompts = focusedRevisions ? [
+      fullPrompts[0],
+      "我的核心想法是一个海岛送货游戏，玩家接委托、规划路线并发现新岛屿。我希望体验轻松，开发规模适合一个人。先确定 PC、单人和俯视角。节奏上暂时选每天必须完成送货指标，给玩家一点压力。战斗和收费方式先不确定。请记录我的选择，并帮我看看这些选择有什么取舍。先不写代码，也不要现在生成完整文档。",
+      `${fullPrompts[3]}成长机制我决定选船舶升级，具体包括货舱容量和航行速度；暂不加入角色技能树。战斗和收费方式继续待定。请更新记录，并区分已确认设计、建议和未决定的部分。`,
+      fullPrompts[6],
+    ] : fullPrompts;
+    const records: Array<Record<string, any>> = [];
+    const transcriptPath = testInfo.outputPath("unity-design-conversation.json");
+    const saveTranscript = async () => {
+      await fs.writeFile(transcriptPath, JSON.stringify({
+        model, submission: "native workspace Composer; no resolvedIntent override or intent-resolution bypass",
+        recording: "browser fixture disables session recording; this test evaluates same-session conversational continuity, not cold restore",
+        focusedRevisions, prompts, records,
+      }, null, 2));
+      await fs.writeFile(testInfo.outputPath("unity-design-conversation.md"), records.map((record, index) =>
+        `## Round ${index + 1}\n\nUser:\n\n${record.prompt}\n\nMAIN (${record.intent}/${record.strategy}):\n\n${record.answer || "[no final answer]"}\n`
+      ).join("\n"));
+    };
+    try {
+      await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+      await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+      const initial = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      expect(initial.workflowMode).toBe("edit");
+      expect(initial.currentWorkspace).toBeTruthy();
+      expect(initial.conversationTurns).toBe(0);
+      const readmePath = process.env.REAL_OMLX_WORKSPACE && realOmlxMutationFile === "README.md"
+        ? path.join(initial.currentWorkspace, "README.md") : null;
+      const originalReadme = readmePath ? await fs.readFile(readmePath, "utf8") : null;
+      // The shared execution fixture starts with auto-review enabled. Use the
+      // actual UI to start with the product's default review setting. Later
+      // turns enable auto-review to prove permission does not change intent.
+      const reviewToggle = page.getByTestId("composer-auto-review-toggle");
+      await expect(reviewToggle).toHaveAttribute("aria-pressed", "true");
+      await reviewToggle.click();
+      await expect(reviewToggle).toHaveAttribute("aria-pressed", "false");
+      for (const [index, prompt] of prompts.entries()) {
+        const previousTurnId = records.at(-1)?.snapshot?.currentTurnId || null;
+        const previousRunId = records.at(-1)?.snapshot?.runtimeV2?.runId || null;
+        if (index === 3) {
+          page.once("dialog", async (dialog) => {
+            expect(dialog.message()).toMatch(/Auto Review|自动审查/);
+            await dialog.accept();
+          });
+          await reviewToggle.click();
+          await expect(reviewToggle).toHaveAttribute("aria-pressed", "true");
+        }
+        await expect(reviewToggle).toHaveAttribute("aria-pressed", String(index >= 3));
+        await page.getByTestId("composer-textarea").fill(prompt);
+        await page.getByTestId("composer-send-button").click();
+        await expect.poll(async () => {
+          const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+          return snapshot.conversationTurns > index &&
+            !!snapshot.currentTurnId && snapshot.currentTurnId !== previousTurnId &&
+            !!snapshot.runtimeV2?.runId && snapshot.runtimeV2.runId !== previousRunId &&
+            snapshot.currentTurnPrompt === prompt &&
+            snapshot.runtimeV2?.turnId === snapshot.currentTurnId && (
+            (!!snapshot.runtimeV2?.terminalOutcome && !snapshot.isGenerating && snapshot.agentStatus === "idle") ||
+            !!snapshot.activeActionRequest ||
+            (stopOnMutationPressure && hasRequiredMutationPressure(snapshot))
+          );
+        }, { timeout: 900_000, intervals: [1000] }).toBe(true);
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+        const finals = (snapshot.runtimeV2?.projections || []).filter((projection: any) => projection.audience === "final" && projection.kind === "final");
+        records.push({
+          prompt, autoReview: index >= 3, intent: snapshot.currentTurnIntent, strategy: snapshot.runtimeV2?.strategy,
+          answer: finals.map((projection: any) => projection.markdown).join("\n\n"),
+          terminalOutcome: snapshot.runtimeV2?.terminalOutcome || null,
+          activeActionRequest: snapshot.activeActionRequest,
+          snapshot,
+        });
+        await fs.writeFile(testInfo.outputPath(`unity-design-round-${index + 1}.json`), JSON.stringify(snapshot, null, 2));
+        await saveTranscript();
+        console.log(`[unity-design-round] ${JSON.stringify({ round: index + 1, intent: snapshot.currentTurnIntent, strategy: snapshot.runtimeV2?.strategy, resultKind: snapshot.runtimeV2?.terminalOutcome?.resultKind, activeAction: snapshot.activeActionRequest?.kind || null, answerChars: String(records.at(-1)?.answer || "").length })}`);
+        if (stopOnMutationPressure && hasRequiredMutationPressure(snapshot)) {
+          await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+          await expect.poll(async () => {
+            const canceled = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+            return canceled.runtimeV2?.terminalOutcome?.resultKind === "canceled" && !canceled.isGenerating && canceled.agentStatus === "idle";
+          }, { timeout: 30_000, intervals: [250] }).toBe(true);
+          await fs.writeFile(testInfo.outputPath("unity-design-audit-canceled.json"), JSON.stringify(await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot()), null, 2));
+          throw new Error("DISCUSSION_ROUTED_TO_REQUIRED_MUTATION: stopped the real run after capturing mutation-only execution pressure.");
+        }
+        expect(snapshot.currentWorkspace).toBe(initial.currentWorkspace);
+        expect(snapshot.currentSessionId).toBe(initial.currentSessionId);
+        expect(snapshot.currentTurnPrompt).toBe(prompt);
+        expect(snapshot.isGenerating).toBe(false);
+        expect(snapshot.agentStatus).toBe("idle");
+        expect(["chat", "analyze"]).toContain(snapshot.runtimeV2?.strategy);
+        expect(snapshot.activeActionRequest, "Design discussion should not require an execution/plan approval").toBeNull();
+        expect((snapshot.runtimeV2?.evidence || []).filter((item: any) => item.kind === "mutation")).toHaveLength(0);
+        expect((snapshot.runtimeV2?.commands || []).filter((command: any) =>
+          ["write_file", "replace_in_file", "apply_patch", "delete_workspace_path", "run_command"].includes(command.toolName)
+        )).toHaveLength(0);
+        if (readmePath) expect(await fs.readFile(readmePath, "utf8")).toBe(originalReadme);
+        await expect.poll(async () => {
+          const latest = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+          return !latest.isGenerating && latest.agentStatus === "idle";
+        }, { timeout: 30_000, intervals: [250] }).toBe(true);
+        expect(snapshot.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
+        expect(finals).toHaveLength(1);
+        expect(snapshot.runtimeV2?.terminal?.exactlyOnce).toBe(true);
+        expectWorkspaceConclusionOrder(snapshot);
+      }
+      await page.screenshot({ path: testInfo.outputPath("unity-design-completed.png"), fullPage: true });
+      await testInfo.attach("unity-design-conversation", { path: transcriptPath, contentType: "application/json" });
+    } catch (error) {
+      const failure = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot());
+      await fs.writeFile(testInfo.outputPath("unity-design-failure.json"), JSON.stringify(failure, null, 2));
+      await saveTranscript();
+      await page.screenshot({ path: testInfo.outputPath("unity-design-failure.png"), fullPage: true });
+      if (failure?.isGenerating) await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration());
+      throw error;
+    }
+  });
+
+  test(`real OMLX workspace scoped discussion through Composer with ${model}`, async ({ page }, testInfo) => {
+    test.skip(!process.env.REAL_OMLX_WORKSPACE || realOmlxMutationFile !== "README.md");
+    test.setTimeout(12 * 60_000);
+    const prompt = "请帮我完善项目设计，跟我讨论并记录我的选择，以后再生成 README.md。";
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+    const initial = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    expect(initial.workflowMode).toBe("edit");
+    const readmePath = path.join(initial.currentWorkspace, "README.md");
+    const before = await fs.readFile(readmePath, "utf8");
+    // A workspace scope and permission to run tools do not request a source edit.
+    await expect(page.getByTestId("composer-auto-review-toggle")).toHaveAttribute("aria-pressed", "true");
+    await page.getByTestId("composer-textarea").fill(prompt);
+    await page.getByTestId("composer-send-button").click();
+    try {
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+        return snapshot.conversationTurns === 1 && !!snapshot.currentTurnId &&
+          snapshot.currentTurnId !== initial.currentTurnId && snapshot.currentTurnPrompt === prompt &&
+          !!snapshot.runtimeV2?.runId && snapshot.runtimeV2.runId !== initial.runtimeV2?.runId &&
+          snapshot.runtimeV2.turnId === snapshot.currentTurnId &&
+          ((!!snapshot.runtimeV2.terminalOutcome && !snapshot.isGenerating && snapshot.agentStatus === "idle") ||
+            !!snapshot.activeActionRequest);
+      }, { timeout: 600_000, intervals: [1000] }).toBe(true);
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      await fs.writeFile(testInfo.outputPath("workspace-scoped-discussion.json"), JSON.stringify(snapshot, null, 2));
+      expect(snapshot.currentWorkspace).toBe(initial.currentWorkspace);
+      expect(snapshot.currentSessionId).toBe(initial.currentSessionId);
+      expect(["chat", "analyze"]).toContain(snapshot.runtimeV2?.strategy);
+      expect(snapshot.activeActionRequest).toBeNull();
+      expect(snapshot.isGenerating).toBe(false);
+      expect(snapshot.agentStatus).toBe("idle");
+      expect(snapshot.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
+      expect(snapshot.runtimeV2?.terminal?.exactlyOnce).toBe(true);
+      expectWorkspaceConclusionOrder(snapshot);
+      expect((snapshot.runtimeV2?.evidence || []).filter((item: any) => item.kind === "mutation")).toHaveLength(0);
+      expect((snapshot.runtimeV2?.commands || []).filter((command: any) =>
+        ["write_file", "replace_in_file", "apply_patch", "delete_workspace_path", "run_command"].includes(command.toolName)
+      )).toHaveLength(0);
+      const finals = (snapshot.runtimeV2?.projections || []).filter((item: any) => item.audience === "final" && item.kind === "final");
+      expect(finals).toHaveLength(1);
+      expect(finals[0].markdown.trim().length).toBeGreaterThan(0);
+      expect(await fs.readFile(readmePath, "utf8")).toBe(before);
+      await page.screenshot({ path: testInfo.outputPath("workspace-scoped-discussion-completed.png"), fullPage: true });
+    } catch (error) {
+      const failure = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot());
+      await fs.writeFile(testInfo.outputPath("workspace-scoped-discussion-failure.json"), JSON.stringify(failure, null, 2));
+      if (failure?.isGenerating) await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration());
+      throw error;
+    }
+  });
+
+  test(`real OMLX workspace explicit edit through Composer with ${model}`, async ({ page }, testInfo) => {
+    test.skip(!process.env.REAL_OMLX_WORKSPACE || realOmlxMutationFile !== "README.md");
+    test.setTimeout(20 * 60_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const prompt = "请直接修改 README.md，在文件末尾另起一行添加 Design validation complete.，保留原有内容。然后运行 node -e \"const fs = require('node:fs'); const assert = require('node:assert/strict'); assert.ok(fs.readFileSync('README.md', 'utf8').includes('Design validation complete.'))\" 验证结果。不要生成计划。完成后说明修改与验证结果。";
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+    const initial = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    expect(initial.workflowMode).toBe("edit");
+    const before = await fs.readFile(path.join(workspace, "README.md"), "utf8");
+    await expect(page.getByTestId("composer-auto-review-toggle")).toHaveAttribute("aria-pressed", "true");
+    await page.getByTestId("composer-textarea").fill(prompt);
+    await page.getByTestId("composer-send-button").click();
+    try {
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+        return snapshot.conversationTurns === 1 && !!snapshot.currentTurnId &&
+          snapshot.currentTurnId !== initial.currentTurnId && snapshot.currentTurnPrompt === prompt &&
+          !!snapshot.runtimeV2?.runId && snapshot.runtimeV2.runId !== initial.runtimeV2?.runId &&
+          snapshot.runtimeV2.turnId === snapshot.currentTurnId &&
+          !!snapshot.runtimeV2.terminalOutcome && !snapshot.isGenerating && snapshot.agentStatus === "idle";
+      }, { timeout: 900_000, intervals: [1000] }).toBe(true);
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      await fs.writeFile(testInfo.outputPath("workspace-explicit-edit.json"), JSON.stringify(snapshot, null, 2));
+      expect(snapshot.currentTurnPrompt).toBe(prompt);
+      expect(snapshot.runtimeV2?.strategy).toBe("execute");
+      expect(snapshot.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
+      expect(snapshot.runtimeV2?.terminal?.exactlyOnce).toBe(true);
+      expectWorkspaceConclusionOrder(snapshot);
+      const after = await fs.readFile(path.join(workspace, "README.md"), "utf8");
+      expect(after.startsWith(before.trimEnd())).toBe(true);
+      expect(after.slice(before.trimEnd().length).trim()).toBe("Design validation complete.");
+      const events = snapshot.runtimeV2?.events || [];
+      const mutationIndex = events.findLastIndex((event: any) =>
+        event.type === "tool.completed" && event.status === "succeeded" &&
+        (event.evidence || []).some((item: any) => item.kind === "mutation")
+      );
+      expect(mutationIndex).toBeGreaterThanOrEqual(0);
+      expect(events.some((event: any, index: number) =>
+        index > mutationIndex && event.type === "validation.completed" && event.passed === true
+      )).toBe(true);
+      expect((snapshot.runtimeV2?.projections || []).filter((item: any) => item.audience === "final" && item.kind === "final")).toHaveLength(1);
+      await page.screenshot({ path: testInfo.outputPath("workspace-explicit-edit-completed.png"), fullPage: true });
+    } catch (error) {
+      const failure = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot());
+      await fs.writeFile(testInfo.outputPath("workspace-explicit-edit-failure.json"), JSON.stringify(failure, null, 2));
+      if (failure?.isGenerating) await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+      throw error;
+    }
+  });
+
   test(`real OMLX Chat web and ordinary multi-turn replies reach idle with ${model}`, async ({ page }, testInfo) => {
     page.on("framenavigated", (frame) => { if (frame === page.mainFrame()) console.log(`[chat-test-navigation] ${frame.url()}`); });
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
@@ -4637,6 +5239,7 @@ for (const model of models) {
       expect(snapshot.aggregate.terminalOutcome.resultKind).toBe("success");
       expect(snapshot.finals).toHaveLength(1);
       expect(snapshot.finals[0].trim().length).toBeGreaterThan(0);
+      expect(snapshot.session.title).not.toMatch(/^\s*[{[]|<think|<analysis/i);
       const terminalEvents = snapshot.aggregate.events.filter((event: any) => event.type === "run.completed" || event.type === "turn.completed" || (event.type === "projection.published" && event.projection.kind === "final"));
       expect(terminalEvents.map((event: any) => event.type)).toEqual(["run.completed", "projection.published", "turn.completed"]);
       return snapshot;
@@ -4644,15 +5247,29 @@ for (const model of models) {
     await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(true, "bing"));
     const web = await send("请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。");
     const searches = web.aggregate.events.filter((event: any) => event.type === "command.scheduled" && event.command.payload.toolName === "web_search");
-    expect(searches.length).toBeGreaterThan(0);
+    // The exact source URL is supplied. A direct authorized fetch is a valid
+    // evidence path; do not require a redundant discovery tool ceremony.
     expect(searches.every((event: any) => event.command.payload.arguments.provider === "bing")).toBe(true);
     expect(web.aggregate.events.some((event: any) => event.type === "tool.completed" && event.presentation?.toolName === "web_fetch" && event.status === "succeeded")).toBe(true);
     expect(web.finals[0]).toMatch(/developer\.mozilla\.org/);
+    expect(web.finals[0]).toMatch(/detach|分离|byteLength|无法.{0,12}(?:访问|使用)|不可.{0,8}(?:访问|使用)/i);
+    const followUp = await send("继续依据同一份 MDN 文档回答：如果没有传 transfer，只做普通 structuredClone，原 ArrayBuffer 是否仍然可用？请给来源链接。");
+    expect(followUp.finals[0]).toMatch(/developer\.mozilla\.org/);
+    expect(followUp.finals[0]).toMatch(/仍|依然|不会|可以|可用|remains|still|not detached/i);
     await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
     await send("本轮我们讨论一个虚构项目，代号是青岚 742。请记住这个代号并简短回复。无需联网。");
     const ordinary = await send("刚才提到的虚构项目代号是什么？只回答代号。无需联网。");
     expect(ordinary.finals[0]).toMatch(/青岚\s*742/);
     expect(ordinary.aggregate.networkRead.enabled).toBe(false);
     expect(ordinary.aggregate.events.some((event: any) => event.type === "command.scheduled" && ["web_search", "web_fetch"].includes(event.command.payload.toolName))).toBe(false);
+
+    await expectRealReadOnlyCancellation(page, testInfo);
+  });
+
+  test(`real OMLX Chat cancellation preserves its terminal with ${model}`, async ({ page }, testInfo) => {
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.prepareReadOnlyChat)).toBe(true);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    await expectRealReadOnlyCancellation(page, testInfo);
   });
 }

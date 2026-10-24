@@ -3,6 +3,8 @@ import {
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
 import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
+import type { RuntimeV2NormalizedProviderResult, RuntimeV2NormalizedToolCall, TurnAggregateV1 } from "../../lib/runtime-v2";
+import { runtimeV2ProviderToolCallIdentity } from "./providerToolSurface";
 
 interface RuntimeV2RepeatedActionFeedbackInput {
   readonly call: {
@@ -12,6 +14,7 @@ interface RuntimeV2RepeatedActionFeedbackInput {
   readonly reason: "already_completed" | "already_rejected";
   readonly workspace: string;
   readonly visibleSourceTargets?: readonly string[];
+  readonly failureDetail?: string;
 }
 
 function boundedWorkspaceFeedbackTarget(
@@ -65,6 +68,7 @@ export function runtimeV2RepeatedActionFeedback(
     `ACTION_NOT_EXECUTED: the latest ${input.call.name} action matched one ${completed ? "already completed" : "already rejected"} at the current mutation boundary.`,
   ];
   const targets = boundedRejectedMutationTargets(input);
+  if (input.failureDetail) lines.push(`Original failure: ${input.failureDetail.slice(0, 800)}`);
   if (!completed && targets.length > 0) {
     const visibleTargets = new Set(
       (input.visibleSourceTargets || [])
@@ -92,4 +96,40 @@ export function runtimeV2RepeatedActionFeedback(
     );
   }
   return lines.join("\n");
+}
+
+export function buildRuntimeV2RepeatedActionReceipts(input: {
+  calls: readonly RuntimeV2NormalizedToolCall[];
+  aggregate: TurnAggregateV1 | null;
+  reason: "already_completed" | "already_rejected";
+  workspace: string;
+  visibleSourceTargets: readonly string[];
+  observed: ReadonlySet<string> | undefined;
+  nextId: () => string;
+}): NonNullable<RuntimeV2NormalizedProviderResult["actionReceipts"]> {
+  const commands = new Map(input.aggregate?.events.flatMap(event => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []) || []);
+  return input.calls.map(call => {
+    const actionIdentity = runtimeV2ProviderToolCallIdentity(call);
+    const failure = [...(input.aggregate?.events || [])].reverse().find(event => {
+      if (event.type !== "tool.completed" || event.status === "succeeded") return false;
+      const command = commands.get(event.idempotencyKey);
+      return command && runtimeV2ProviderToolCallIdentity({ name: String(command.payload.toolName), arguments: command.payload.arguments as Record<string, unknown> || {} }) === actionIdentity;
+    });
+    const feedback = runtimeV2RepeatedActionFeedback({ ...input, call,
+      failureDetail: failure?.type === "tool.completed" ? `${failure.status}: ${failure.failureReasonCode || failure.failureKind}: ${failure.presentation?.message || ""}` : undefined });
+    return { call: { ...call, id: input.nextId(), arguments: isWorkspaceMutationToolName(call.name)
+      ? { runtime_v2_rejected_action: actionIdentity, effect: "none" } : call.arguments },
+      actionIdentity, status: "rejected", reasonCode: input.reason, feedback,
+      priorFeedbackObserved: input.observed?.has(actionIdentity) === true };
+  });
+}
+
+export function runtimeV2DeferredToolReceipts(calls: readonly RuntimeV2NormalizedToolCall[], nextId: () => string): NonNullable<RuntimeV2NormalizedProviderResult["actionReceipts"]> {
+  return calls.map(call => {
+    const actionIdentity = runtimeV2ProviderToolCallIdentity(call);
+    return { call: { ...call, id: nextId(), arguments: isWorkspaceMutationToolName(call.name)
+      ? { runtime_v2_rejected_action: actionIdentity, effect: "none" } : call.arguments },
+      actionIdentity, status: "not_executed", reasonCode: "provider_batch_deferred",
+      feedback: "ACTION_NOT_EXECUTED: this call was deferred by batch ordering or matched a prior action. No new effect ran for this call. Reuse its committed result or propose it separately after observing the selected calls' results." };
+  });
 }

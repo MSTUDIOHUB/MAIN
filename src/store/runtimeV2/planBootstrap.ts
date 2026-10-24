@@ -25,6 +25,7 @@ import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { resolveRuntimeV2ObjectiveAdmission } from "./submissionContext";
 import { renderProjectBaselineContext } from "../../lib/workspaceAdmission";
 import { planSettlement, terminalPlanOutcome } from "./planSettlement";
+import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 import { restorePlanHistory } from "./planHistory";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
@@ -62,11 +63,7 @@ function identities(
   input: RuntimeV2PlanRunnerInput,
   turn: ConversationTurn,
 ): PlanBootstrapReady["identity"] {
-  const lifecycle = state?.planLifecycle;
-  const sessionEpoch = lifecycle?.sessionKey === input.context.runSessionKey &&
-      String(lifecycle.sessionEpoch || "").trim()
-    ? String(lifecycle.sessionEpoch).trim()
-    : `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
+  const sessionEpoch = resolveRuntimeV2SessionEpoch(state, input.context, turn);
   return {
     turn: {
       workspaceKey: String(input.context.runWorkspace || "global").trim() ||
@@ -242,6 +239,8 @@ export async function bootstrapRuntimeV2Plan(
           ? "required"
           : "optional",
       objective: admission.objective,
+      capabilityRestrictions: admission.capabilityRestrictions,
+      approvalRequiredCapabilities: admission.approvalRequiredCapabilities,
       constraints: admission.constraints,
       acceptanceCriteria: admission.acceptanceCriteria.map(
         (criterion) => criterion.text,
@@ -285,10 +284,15 @@ export async function bootstrapRuntimeV2Plan(
 
   const evidence: WorkPlanRuntimeEvidence[] = [];
   const evidenceContents = new Map<string, string>();
+  const objective = ledger.snapshot()!.objective;
+  const canCollectWorkspace = !objective.capabilityRestrictions?.includes("workspace_read") &&
+    !objective.approvalRequiredCapabilities?.includes("workspace_read");
   const oldOverview = existing?.aggregate.events.find((entry) => entry.type === "observation.recorded" && entry.evidence.id === "E1");
   const collected = existing ? {
     overview: oldOverview?.type === "observation.recorded" && oldOverview.modelContent
       ? oldOverview.modelContent : "Historical workspace overview unavailable; use focused reads if needed.",
+  } : !canCollectWorkspace ? {
+    overview: "Workspace discovery requires an individually authorized read tool; no automatic workspace overview was collected.",
   } : await collectInitialOverview({
     runner: input,
     turn,

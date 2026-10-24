@@ -43,6 +43,8 @@ pub enum ShellRedirectionKind {
     Input,
     Output,
     Append,
+    /// Duplicate only the existing stdout/stderr streams; target is an fd.
+    StdioDuplication,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,8 @@ pub enum ShellRedirectionKind {
 pub struct ShellRedirection {
     pub kind: ShellRedirectionKind,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fd: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +142,22 @@ enum QuoteState {
 pub fn inspect_shell_command(
     command: &str,
 ) -> Result<TrustedShellInspection, ShellValidationError> {
+    inspect_shell_command_with_workspace(command, None)
+}
+
+/// Absolute argv paths require a concrete workspace and canonical containment.
+/// The context-free inspector deliberately keeps its stricter lexical policy.
+pub fn inspect_shell_command_in_workspace(
+    command: &str,
+    workspace_root: impl AsRef<Path>,
+) -> Result<TrustedShellInspection, ShellValidationError> {
+    inspect_shell_command_with_workspace(command, Some(workspace_root.as_ref()))
+}
+
+fn inspect_shell_command_with_workspace(
+    command: &str,
+    workspace_root: Option<&Path>,
+) -> Result<TrustedShellInspection, ShellValidationError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return Err(ShellValidationError::critical(
@@ -153,20 +173,14 @@ pub fn inspect_shell_command(
             "NUL bytes are not valid shell input",
         ));
     }
-    if command.contains(['\n', '\r']) {
-        return Err(ShellValidationError::critical(
-            ShellViolationKind::Newline,
-            None::<String>,
-            "multi-line shell input is not permitted",
-        ));
-    }
-
-    let raw_segments = split_structured_segments(trimmed)?;
+    // Scan the original bytes so leading/trailing shell newlines cannot be
+    // hidden by trim. Quoted line breaks are ordinary argument data.
+    let raw_segments = split_structured_segments(command)?;
     let mut segments = Vec::with_capacity(raw_segments.len());
     let mut overall_risk = TrustedExecutionRisk::Low;
     for (raw, connector_after) in raw_segments {
         let (words, redirections) = parse_segment_words_and_redirections(&raw)?;
-        validate_segment_semantics(&raw, &words)?;
+        validate_segment_semantics(&raw, &words, workspace_root)?;
         let risk = if !redirections.is_empty() {
             TrustedExecutionRisk::High
         } else if connector_after.is_some() {
@@ -203,6 +217,13 @@ fn split_structured_segments(
 
     while index < chars.len() {
         let ch = chars[index];
+        if matches!(ch, '\n' | '\r') && (quote.is_none() || escaped) {
+            return Err(ShellValidationError::critical(
+                ShellViolationKind::Newline,
+                Some(current),
+                "unquoted shell line breaks and escaped line continuations are not permitted",
+            ));
+        }
         if escaped {
             current.push(ch);
             escaped = false;
@@ -324,6 +345,16 @@ fn split_structured_segments(
             ));
         }
 
+        // The ampersand in an unquoted output-descriptor operator belongs to
+        // that operator, not to shell background execution. The word parser
+        // below still validates both descriptor numbers and rejects all other
+        // descriptor forms before policy matching or execution.
+        if ch == '>' && chars.get(index + 1) == Some(&'&') {
+            current.push_str(">&");
+            index += 2;
+            continue;
+        }
+
         let connector = match ch {
             ';' => {
                 if matches!(chars.get(index + 1), Some(';' | '&')) {
@@ -436,6 +467,7 @@ fn parse_segment_words_and_redirections(
     let mut words = Vec::new();
     let mut redirections = Vec::new();
     let mut current = String::new();
+    let mut word_has_quoting = false;
     let mut quote = None;
     let mut escaped = false;
     let mut index = 0;
@@ -449,6 +481,7 @@ fn parse_segment_words_and_redirections(
             continue;
         }
         if ch == '\\' && quote != Some(QuoteState::Single) {
+            word_has_quoting = true;
             escaped = true;
             index += 1;
             continue;
@@ -465,29 +498,57 @@ fn parse_segment_words_and_redirections(
             continue;
         }
         if ch == '\'' {
+            word_has_quoting = true;
             quote = Some(QuoteState::Single);
             index += 1;
             continue;
         }
         if ch == '"' {
+            word_has_quoting = true;
             quote = Some(QuoteState::Double);
             index += 1;
             continue;
         }
         if ch.is_whitespace() {
             push_word(&mut words, &mut current);
+            word_has_quoting = false;
             index += 1;
             continue;
         }
         if matches!(ch, '<' | '>') {
-            push_word(&mut words, &mut current);
+            // An IO number is unquoted digits immediately before the operator.
+            // Quoted/escaped digits are ordinary argv, as is a spaced `2 >`.
+            let source_fd = if !word_has_quoting
+                && !current.is_empty()
+                && current.chars().all(|value| value.is_ascii_digit())
+            {
+                let source = match current.as_str() {
+                    "0" if ch == '<' => 0,
+                    "1" if ch == '>' => 1,
+                    "2" if ch == '>' => 2,
+                    _ => {
+                        return Err(ShellValidationError::critical(
+                            ShellViolationKind::DangerousRedirection,
+                            Some(segment),
+                            "only standard input, stdout and stderr redirections are permitted",
+                        ))
+                    }
+                };
+                current.clear();
+                Some(source)
+            } else {
+                push_word(&mut words, &mut current);
+                None
+            };
+            word_has_quoting = false;
             let (kind, consumed) = match (ch, chars.get(index + 1)) {
                 ('>', Some('>')) => (ShellRedirectionKind::Append, 2),
-                ('>', Some('&' | '|' | '(')) | ('<', Some('<' | '>' | '&' | '(')) => {
+                ('>', Some('&')) => (ShellRedirectionKind::StdioDuplication, 2),
+                ('>', Some('|' | '(')) | ('<', Some('<' | '>' | '&' | '(')) => {
                     return Err(ShellValidationError::critical(
                         ShellViolationKind::DangerousRedirection,
                         Some(segment),
-                        "descriptor, heredoc, process, and clobber redirections are not permitted",
+                        "input-descriptor, heredoc, process, and clobber redirections are not permitted",
                     ));
                 }
                 ('>', _) => (ShellRedirectionKind::Output, 1),
@@ -506,9 +567,25 @@ fn parse_segment_words_and_redirections(
                     "redirection target is missing",
                 ));
             }
-            validate_relative_workspace_token(&target, segment, true)?;
-            words.push(target.clone());
-            redirections.push(ShellRedirection { kind, target });
+            let source_fd = if kind == ShellRedirectionKind::StdioDuplication {
+                if !matches!(target.as_str(), "1" | "2") {
+                    return Err(ShellValidationError::critical(
+                        ShellViolationKind::DangerousRedirection,
+                        Some(segment),
+                        "only stdout/stderr duplication is permitted; descriptor close, move and arbitrary targets are not",
+                    ));
+                }
+                Some(source_fd.unwrap_or(1))
+            } else {
+                validate_workspace_path_token(&target, segment, true, None)?;
+                words.push(target.clone());
+                source_fd
+            };
+            redirections.push(ShellRedirection {
+                kind,
+                target,
+                source_fd,
+            });
             index = next_index;
             continue;
         }
@@ -590,7 +667,11 @@ fn push_word(words: &mut Vec<String>, current: &mut String) {
     }
 }
 
-fn validate_segment_semantics(segment: &str, words: &[String]) -> Result<(), ShellValidationError> {
+fn validate_segment_semantics(
+    segment: &str,
+    words: &[String],
+    workspace_root: Option<&Path>,
+) -> Result<(), ShellValidationError> {
     let executable_index = words
         .iter()
         .position(|word| !is_environment_assignment(word))
@@ -642,7 +723,7 @@ fn validate_segment_semantics(segment: &str, words: &[String]) -> Result<(), She
     }
 
     for word in words {
-        validate_relative_workspace_token(word, segment, false)?;
+        validate_workspace_path_token(word, segment, false, workspace_root)?;
     }
     Ok(())
 }
@@ -689,10 +770,11 @@ fn is_shell_command_flag(word: &str) -> bool {
             && lower[1..].chars().any(|flag| flag == 'c'))
 }
 
-fn validate_relative_workspace_token(
+fn validate_workspace_path_token(
     word: &str,
     segment: &str,
     redirection: bool,
+    workspace_root: Option<&Path>,
 ) -> Result<(), ShellValidationError> {
     let Some(candidate) = normalized_workspace_path_candidate(word) else {
         return Ok(());
@@ -705,18 +787,24 @@ fn validate_relative_workspace_token(
         return Ok(());
     }
     let path = Path::new(&candidate);
-    let escapes = path.is_absolute()
+    let trusted_absolute = !redirection
+        && path.is_absolute()
+        && workspace_root.is_some_and(|root| {
+            resolve_workspace_path(root, path, WorkspacePathMode::AllowMissing).is_ok()
+        });
+    let escapes = ((path.is_absolute() || is_windows_absolute_path(&candidate))
+        && !trusted_absolute)
         || candidate.starts_with('~')
-        || is_windows_absolute_path(&candidate)
         || candidate
             .split(['/', '\\'])
             .any(|component| component == "..")
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        });
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || (!trusted_absolute
+            && path
+                .components()
+                .any(|component| matches!(component, Component::RootDir | Component::Prefix(_))));
     if escapes {
         return Err(ShellValidationError::critical(
             if redirection {
@@ -728,7 +816,11 @@ fn validate_relative_workspace_token(
             if redirection {
                 "redirection target must be a workspace-relative path"
             } else {
-                "shell path must remain workspace-relative"
+                if workspace_root.is_some() {
+                    "shell path must remain within the canonical workspace"
+                } else {
+                    "shell path must remain workspace-relative"
+                }
             },
         ));
     }
@@ -740,8 +832,7 @@ fn normalized_workspace_path_candidate(word: &str) -> Option<String> {
         .strip_prefix("--")
         .and_then(|value| value.split_once('=').map(|(_, path)| path))
         .or_else(|| word.split_once('=').map(|(_, value)| value))
-        .unwrap_or(word)
-        .trim();
+        .unwrap_or(word);
     if candidate.starts_with('-') {
         // For compact short options such as `-Cpath` or `-Ipath`, remove only
         // the option letter. Stripping every leading alphabetic character
@@ -1057,7 +1148,7 @@ pub fn prepare_trusted_shell_execution(
     working_directory: impl AsRef<Path>,
     command: &str,
 ) -> Result<PreparedTrustedShellExecution, TrustedExecutionError> {
-    let inspection = inspect_shell_command(command)?;
+    let inspection = inspect_shell_command_in_workspace(command, workspace_root.as_ref())?;
     let trusted_working_directory =
         resolve_workspace_working_directory(workspace_root.as_ref(), working_directory)?;
     for segment in &inspection.segments {
@@ -1088,13 +1179,16 @@ pub fn prepare_trusted_shell_execution(
             let existing_path = fs::symlink_metadata(&candidate_path).is_ok();
             if obvious_path || existing_path {
                 resolve_workspace_path(
-                    trusted_working_directory.root(),
+                    workspace_root.as_ref(),
                     candidate_path,
                     WorkspacePathMode::AllowMissing,
                 )?;
             }
         }
         for redirection in &segment.redirections {
+            if redirection.kind == ShellRedirectionKind::StdioDuplication {
+                continue;
+            }
             resolve_workspace_path(
                 trusted_working_directory.root(),
                 trusted_working_directory.path().join(&redirection.target),
@@ -1343,12 +1437,319 @@ mod tests {
             "printf ok >> ../out",
             "cat < ~/.ssh/id_rsa",
             "cat <<EOF",
-            "printf ok 2>&1",
+            "printf ok 2>&3",
         ] {
             inspect_shell_command(command).expect_err(command);
         }
         inspect_shell_command("printf ok > reports/out.txt")
             .expect("workspace-relative redirection should remain inspectable");
+    }
+
+    #[test]
+    fn stdio_duplication_preserves_shell_connectors_and_argv() {
+        let command = "which example && example --version 2>&1 || echo \"EXAMPLE_CLI_NOT_FOUND\"";
+        let inspection =
+            inspect_shell_command(command).expect("stderr-to-stdout is not background execution");
+        assert_eq!(inspection.command, command);
+        assert_eq!(inspection.segments.len(), 3);
+        assert_eq!(
+            inspection.segments[0].connector_after,
+            Some(ShellConnector::And)
+        );
+        assert_eq!(
+            inspection.segments[1].connector_after,
+            Some(ShellConnector::Or)
+        );
+        assert_eq!(inspection.segments[1].words, ["example", "--version"]);
+        assert_eq!(inspection.risk, TrustedExecutionRisk::High);
+        for command in [
+            "printf ok 2>&1",
+            "printf ok 1>&2",
+            "printf ok >&2",
+            "printf ok 2>& 1",
+        ] {
+            let segment = &inspect_shell_command(command).expect(command).segments[0];
+            assert_eq!(segment.words, ["printf", "ok"], "{command}");
+            assert_eq!(segment.redirections.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&segment.redirections[0]).unwrap()["kind"],
+                "stdio_duplication"
+            );
+        }
+        for command in ["printf '%s' '2>&1'", "printf '%s' 2\\>\\&1"] {
+            let inspection = inspect_shell_command(command).expect(command);
+            assert!(inspection.segments[0].redirections.is_empty());
+            assert_eq!(inspection.segments[0].words.last().unwrap(), "2>&1");
+        }
+        for command in [
+            "printf '%s' '2'>&1",
+            "printf '%s' \\2>&1",
+            "printf '%s' 2 >&1",
+        ] {
+            let inspection = inspect_shell_command(command).expect(command);
+            assert_eq!(inspection.segments[0].words, ["printf", "%s", "2"]);
+            assert_eq!(inspection.segments[0].redirections[0].source_fd, Some(1));
+        }
+    }
+
+    #[test]
+    fn stdio_duplication_keeps_background_and_descriptor_escapes_closed() {
+        for command in [
+            "printf ok 2>&1 &",
+            "printf ok 2>&1& echo no",
+            "printf ok 2> &1",
+            "printf ok 3>&1",
+            "printf ok 2>&3",
+            "printf ok 2>&0",
+            "printf ok 0>&1",
+            "printf ok 3>captured.txt",
+            "printf ok 9>>captured.txt",
+            "cat 9<captured.txt",
+            "printf ok 2>&-",
+            "printf ok 2>&1-",
+            "printf ok 2>&file",
+            "printf ok 2<&1",
+            "printf ok 2>>&1",
+            "printf ok 2>&1$(pwd)",
+            "printf ok 2>&1; sh -c pwd",
+            "printf ok 2>&1 > ../outside",
+            "printf ok 2>&1 > /tmp/outside",
+        ] {
+            inspect_shell_command(command).expect_err(command);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_duplication_is_not_a_workspace_file_but_file_redirects_still_are() {
+        let root = workspace();
+        let outside = workspace();
+        fs::write(outside.path().join("secret"), "untouched").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("1")).unwrap();
+        prepare_trusted_shell_execution(root.path(), root.path(), "printf ok 2>&1")
+            .expect("descriptor 1 is not the symlink named 1");
+        prepare_trusted_shell_execution(root.path(), root.path(), "printf ok 2>1")
+            .expect_err("a file redirect through the same symlink still escapes");
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_duplication_executes_original_stderr_routing_and_file_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = workspace();
+        runtime.block_on(async {
+            let result = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "ls definitely-missing-stdio-duplication 2>&1 || printf FALLBACK",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("execute merged stderr");
+            assert!(result.success);
+            assert!(result
+                .stdout
+                .contains("definitely-missing-stdio-duplication"));
+            assert!(result.stdout.ends_with("FALLBACK"));
+            assert!(result.stderr.is_empty());
+            let reversed = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "printf stdout 1>&2",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("execute stdout-to-stderr");
+            assert!(reversed.success);
+            assert_eq!(reversed.stdout, "");
+            assert_eq!(reversed.stderr, "stdout");
+            let to_file = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "ls definitely-missing-stdio-duplication > captured.txt 2>&1 || printf FALLBACK",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("file target remains workspace-bound");
+            assert_eq!(to_file.stdout, "FALLBACK");
+            assert!(to_file.stderr.is_empty());
+            assert!(fs::read_to_string(root.path().join("captured.txt"))
+                .unwrap()
+                .contains("definitely-missing-stdio-duplication"));
+            let from_original_stdout = execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "ls definitely-missing-stdio-duplication 2>&1 > captured.txt || printf FALLBACK",
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .expect("descriptor duplication keeps its original position");
+            assert!(from_original_stdout
+                .stdout
+                .contains("definitely-missing-stdio-duplication"));
+            assert!(from_original_stdout.stdout.ends_with("FALLBACK"));
+            assert!(from_original_stdout.stderr.is_empty());
+            assert_eq!(
+                fs::read_to_string(root.path().join("captured.txt")).unwrap(),
+                ""
+            );
+        });
+    }
+
+    #[test]
+    fn quoted_newline_is_literal_argv_without_additional_shell_segments() {
+        for quote in ['\'', '"'] {
+            let body = "first line\nsecond line\r\nthird line";
+            let command = format!("printf '%s' {quote}{body}{quote}");
+            let inspection =
+                inspect_shell_command(&command).expect("quoted line breaks are argv data");
+            assert_eq!(inspection.segments.len(), 1);
+            assert_eq!(inspection.segments[0].words, ["printf", "%s", body]);
+            assert_eq!(inspection.command, command);
+        }
+        let script = "var score = 0;\nscore += 1;\n";
+        let inspection = inspect_shell_command(&format!("tool --eval '{script}'"))
+            .expect("multiline language snippets remain one argument");
+        assert_eq!(inspection.segments[0].words, ["tool", "--eval", script]);
+    }
+
+    #[test]
+    fn quoted_newline_keeps_unquoted_controls_and_expansion_rejected() {
+        for command in [
+            "printf ok\nprintf bad",
+            "printf ok\r\nprintf bad",
+            "\nprintf ok",
+            "printf ok\n",
+            "printf 'literal\nnewline'\nprintf bad",
+            "printf ok \\\nprintf bad",
+            "printf \"literal\\\ncontinuation\"",
+            "printf \"literal\n$(pwd)\"",
+            "printf \"literal\n$HOME\"",
+            "printf \"literal\n`pwd`\"",
+            "printf 'literal\n\0'",
+            "printf 'unterminated\n",
+            "printf \"unterminated\n",
+        ] {
+            inspect_shell_command(command).expect_err(command);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quoted_newline_executes_literal_bytes_and_a_multiline_python_filter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = workspace();
+        runtime.block_on(async {
+            let body = "first line\nsecond line\r\nthird line";
+            let output = execute_trusted_shell(root.path(), root.path(), &format!("printf '%s' '{body}'"),
+                Duration::from_secs(2), None).await.expect("quoted bytes reach the real process unchanged");
+            assert!(output.success);
+            assert_eq!(output.stdout, body);
+            assert_eq!(output.stderr, "");
+            let command = r#"printf '%s' '{"data":{"items":[{"name":"pipeline","version":"0.9"}]}}' | python3 -c "
+import json,sys
+for item in json.load(sys.stdin)['data']['items']:
+    if 'pipeline' in item['name']:
+        print(item['name'] + ': ' + item['version'])
+""#;
+            let inspection = inspect_shell_command(command).expect("quoted Python is not a multiline shell program");
+            assert_eq!(inspection.segments.len(), 2);
+            assert_eq!(inspection.segments[0].connector_after, Some(ShellConnector::Pipe));
+            assert_eq!(inspection.segments[1].words[0..2], ["python3", "-c"]);
+            assert!(inspection.segments[1].words[2].starts_with("\nimport json,sys\n"));
+            let output = execute_trusted_shell(root.path(), root.path(), command,
+                Duration::from_secs(3), None).await.expect("a real Python filter can consume the pipeline");
+            assert!(output.success, "{}", output.stderr);
+            assert_eq!(output.stdout, "pipeline: 0.9\n");
+            assert_eq!(output.stderr, "");
+        });
+    }
+
+    #[test]
+    fn workspace_bound_shell_accepts_absolute_argv_inside_the_canonical_root() {
+        let temp = workspace();
+        let root = temp.path().join("Workspace With Spaces");
+        fs::create_dir_all(root.join("Assets")).unwrap();
+        fs::write(root.join("Assets/input.txt"), "input").unwrap();
+        let canonical = canonical_workspace_root(&root).unwrap();
+        let canonical_text = canonical.display().to_string();
+        for command in [
+            format!(
+                "tool inspect --project-path '{}' --format json",
+                canonical_text
+            ),
+            format!(
+                "tool inspect --project-path '{}' --format json",
+                root.display()
+            ),
+            format!("tool inspect --project-path='{}'", canonical_text),
+            format!("tool inspect -C'{}'", canonical_text),
+            format!("PROJECT_PATH='{}' tool inspect", canonical_text),
+            format!("cat '{}/Assets/input.txt'", canonical_text),
+            format!("tool inspect --output='{}/Assets/new.txt'", canonical_text),
+        ] {
+            inspect_shell_command(&command).expect_err("unbound inspection remains strict");
+            let prepared = prepare_trusted_shell_execution(&root, &root, &command)
+                .unwrap_or_else(|error| panic!("{command}: {error}"));
+            assert_eq!(prepared.inspection().command, command);
+            assert_eq!(prepared.working_directory(), canonical);
+        }
+    }
+
+    #[test]
+    fn workspace_bound_shell_rejects_absolute_escapes_and_redirections() {
+        let temp = workspace();
+        let root = temp.path().join("project");
+        let sibling = temp.path().join("project-other");
+        fs::create_dir_all(root.join("safe")).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let canonical = canonical_workspace_root(&root).unwrap();
+        let sibling = fs::canonicalize(sibling).unwrap();
+        for command in [
+            format!("tool inspect --project-path '{}'", sibling.display()),
+            format!("tool inspect --project-path='{}'", sibling.display()),
+            format!("tool inspect -C'{}'", sibling.display()),
+            format!("tool inspect '{}/safe/../safe'", canonical.display()),
+            format!("printf ok > '{}/out.txt'", canonical.display()),
+            "tool inspect ../outside".to_string(),
+        ] {
+            prepare_trusted_shell_execution(&root, &root, &command).expect_err(&command);
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&sibling, root.join("escape")).unwrap();
+            fs::write(sibling.join("secret.txt"), "secret").unwrap();
+            std::os::unix::fs::symlink(sibling.join("secret.txt"), root.join("escape-file "))
+                .unwrap();
+            for command in [
+                format!("cat '{}/escape-file '", canonical.display()),
+                "cat 'escape-file '".to_string(),
+            ] {
+                prepare_trusted_shell_execution(&root, &root, &command).expect_err(&command);
+            }
+            for suffix in ["escape", "escape/missing.txt"] {
+                let command = format!(
+                    "tool inspect --project-path='{}/{}'",
+                    canonical.display(),
+                    suffix
+                );
+                prepare_trusted_shell_execution(&root, &root, &command).expect_err(&command);
+            }
+        }
     }
 
     #[test]

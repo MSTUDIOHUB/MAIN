@@ -125,6 +125,112 @@ const fixtureFiles = {
   ".ssh/id_ed25519": "must-not-leak\n",
 };
 
+const unityMetadata = {
+  "ProjectSettings/ProjectVersion.txt": "m_EditorVersion: 2022.3.62t16\nm_EditorVersionWithRevision: 2022.3.62t16 (ab17684acf1d)\nm_TuanjieEditorVersion: 1.10.4\n",
+  "Packages/manifest.json": JSON.stringify({
+    dependencies: {
+      "com.unity.render-pipelines.universal": "14.2.0-t1",
+      "com.example.git-package": "https://example.test/package.git#main",
+    },
+  }),
+};
+
+test("Unity metadata supplies versioned engine and UPM facts on Unix and Windows without inferred commands", async () => {
+  for (const workspace of ["/fixture/Unity Project/", "C:\\fixture\\Unity Project\\"]) {
+    const io = createMemoryIo({
+      ...unityMetadata,
+      "ProjectSettings/ProjectVersion.txt": unityMetadata["ProjectSettings/ProjectVersion.txt"].replaceAll("\n", "\r\n"),
+      "Assembly-CSharp.csproj": "<Project />\n",
+      "Assets/Scripts/Game.cs": "class Game {}\n",
+      "Library/PackageCache/generated/package.json": '{"scripts":{"test":"must-not-read"}}',
+      "Temp/Generated.csproj": "must-not-read",
+    });
+    const result = await baseline.buildProjectBaselineContext({ workspace, io });
+    assert.equal(result.workspace.canonicalPath, normalize(workspace));
+    for (const [name, version, selector] of [["unity", "2022.3.62t16", "m_EditorVersion"], ["tuanjie", "1.10.4", "m_TuanjieEditorVersion"]]) {
+      const fact = result.facts.runtimes.find((item) => item.name === name);
+      const anchor = result.anchors.find((item) => item.path === "ProjectSettings/ProjectVersion.txt");
+      assert.equal(fact?.version, version);
+      assert.deepEqual(fact.provenance, { path: anchor.path, selector, contentHash: anchor.contentHash });
+      assert.equal(anchor.kind, "config");
+    }
+    const upm = result.facts.packageManagers.find((fact) => fact.name === "upm");
+    const manifest = result.anchors.find((anchor) => anchor.path === "Packages/manifest.json");
+    assert.equal(manifest?.kind, "manifest");
+    assert.deepEqual(upm?.provenance, { path: manifest.path, selector: "project_manifest", contentHash: manifest.contentHash });
+    assert.ok(result.facts.languages.some((fact) => fact.name === "C#"));
+    assert.deepEqual(result.facts.scripts, []);
+    assert.ok(io.reads.includes("ProjectSettings/ProjectVersion.txt"));
+    assert.ok(io.reads.includes("Packages/manifest.json"));
+    assert.ok(io.reads.every((filePath) => !/^(Library|Temp)\//.test(filePath)));
+    assert.doesNotMatch(JSON.stringify(result.facts), /example\.test|npm run|must-not-read/);
+  }
+});
+
+test("Unity directory names and missing or damaged metadata do not assert engine or UPM identity", async () => {
+  const empty = await baseline.buildProjectBaselineContext({
+    workspace: "/fixture/repo",
+    io: createMemoryIo({}, { directories: ["Assets", "Packages", "ProjectSettings", "Library", "Temp"] }),
+  });
+  assert.deepEqual(empty.facts.runtimes, []);
+  assert.deepEqual(empty.facts.packageManagers, []);
+  for (const [version, manifest] of [
+    ["m_EditorVersion: not-a-version\n", "{broken"],
+    ["m_EditorVersion: 2022.3.62f1\nm_EditorVersion: 6000.0.23f1\n", "[]"],
+    ["m_EditorVersionWithRevision: 2022.3.62f1 (revision)\n", '{"dependencies":[]}'],
+    ["m_EditorVersion:\n", '{"dependencies":{"com.unity.test-framework":null}}'],
+  ]) {
+    const result = await baseline.buildProjectBaselineContext({
+      workspace: "/fixture/repo",
+      io: createMemoryIo({ "ProjectSettings/ProjectVersion.txt": version, "Packages/manifest.json": manifest }),
+    });
+    assert.deepEqual(result.facts.runtimes, []);
+    assert.deepEqual(result.facts.packageManagers, []);
+    assert.ok(result.diagnostics.some((item) => item.code === "manifest_parse_failed" && item.path === "Packages/manifest.json"));
+  }
+  for (const manifest of ["{}", '{"dependencies":{}}', '{"scopedRegistries":[]}']) {
+    const result = await baseline.buildProjectBaselineContext({
+      workspace: "/fixture/repo",
+      io: createMemoryIo({ "Packages/manifest.json": manifest }),
+    });
+    assert.ok(result.facts.packageManagers.some((fact) => fact.name === "upm"), "UPM project manifest properties are optional");
+  }
+});
+
+test("Unity metadata retains symlink and byte-boundary protections", async () => {
+  for (const symlink of ["Packages", "Packages/manifest.json", "ProjectSettings", "ProjectSettings/ProjectVersion.txt"]) {
+    const io = createMemoryIo(unityMetadata, { symlinks: [symlink] });
+    const result = await baseline.buildProjectBaselineContext({ workspace: "/fixture/repo", io });
+    const skippedPath = symlink.startsWith("Packages") ? "Packages/manifest.json" : "ProjectSettings/ProjectVersion.txt";
+    assert.ok(!io.reads.includes(skippedPath), `must not read through ${symlink}`);
+    assert.ok(!result.anchors.some((anchor) => anchor.path === skippedPath));
+  }
+  const io = createMemoryIo(unityMetadata);
+  const bounded = await baseline.buildProjectBaselineContext({
+    workspace: "/fixture/repo",
+    io,
+    limits: { maxAnchorBytes: 10 },
+  });
+  assert.deepEqual(bounded.facts.runtimes, []);
+  assert.deepEqual(bounded.facts.packageManagers, []);
+  assert.ok(!io.reads.some((filePath) => filePath === "Packages/manifest.json" || filePath === "ProjectSettings/ProjectVersion.txt"));
+  assert.deepEqual(bounded.omissions.filter((item) => /^(Packages|ProjectSettings)\//.test(item.path)), [
+    { path: "Packages/manifest.json", reason: "anchor_too_large" },
+    { path: "ProjectSettings/ProjectVersion.txt", reason: "anchor_too_large" },
+  ]);
+});
+
+test("Unity metadata changes and previous parser results invalidate the baseline", async () => {
+  const original = await baseline.buildProjectBaselineContext({ workspace: "/fixture/repo", io: createMemoryIo(unityMetadata) });
+  const updated = await baseline.buildProjectBaselineContext({
+    workspace: "/fixture/repo",
+    io: createMemoryIo({ ...unityMetadata, "ProjectSettings/ProjectVersion.txt": "m_EditorVersion: 6000.0.23f1\n" }),
+  });
+  assert.deepEqual(baseline.compareProjectBaselineContexts(original, updated).reasons, ["anchors", "facts"]);
+  assert.ok(baseline.PROJECT_BASELINE_PARSER_VERSION > 1);
+  assert.deepEqual(baseline.compareProjectBaselineContexts({ ...original, parserVersion: 1 }, original).reasons, ["parser_version"]);
+});
+
 test("baseline is deterministic, bounded, provenance-rich, and contains no secret or script body", async () => {
   const firstIo = createMemoryIo(fixtureFiles, {
     directories: [".git", "empty", "src/components"],

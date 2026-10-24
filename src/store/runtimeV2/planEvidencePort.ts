@@ -1,4 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { getToolTarget } from "../../lib/toolTarget";
 import { executeTool } from "../../lib/toolExecutor";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
@@ -76,7 +78,13 @@ export async function executeReadOnlyPlanTool(input: {
   readonly logStoreEvent: RuntimeV2PlanLog;
 }): Promise<void> {
   const args = input.call.arguments;
-  if (!PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name)) {
+  const restriction = runtimeV2BuiltinCapabilityRestriction(
+    normalizeTurnCapabilityRestrictions(input.ledger.snapshot()?.objective.capabilityRestrictions), input.call.name,
+  );
+  const review = runtimeV2BuiltinCapabilityRestriction(
+    normalizeTurnApprovalCapabilities(input.ledger.snapshot()?.objective.approvalRequiredCapabilities), input.call.name,
+  );
+  if (restriction || review || !PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name)) {
     await settlePlanTool({
       ledger: input.ledger,
       run: input.run,
@@ -86,7 +94,9 @@ export async function executeReadOnlyPlanTool(input: {
     input.messages.push({
       role: "tool",
       tool_call_id: input.call.id,
-      content: "PLAN_TOOL_BLOCKED: use a read-only tool or submit_runtime_v2_work_plan.",
+      content: restriction ? `TURN_CAPABILITY_RESTRICTED: ${restriction}` : review
+        ? `TURN_TOOL_REVIEW_REQUIRED: ${review}. This Plan read adapter cannot approve an invocation; use Execute for individually reviewed tools.`
+        : "PLAN_TOOL_BLOCKED: use a read-only tool or submit_runtime_v2_work_plan.",
     });
     await input.ledger.recordSoftSignal(
       input.run,
@@ -113,6 +123,10 @@ export async function executeReadOnlyPlanTool(input: {
       output,
       input.context.runtimeContextBudget,
     );
+    const partialSkill = input.call.name === "load_skill" && (() => {
+      try { return JSON.parse(String(output)).complete === false; }
+      catch { return false; }
+    })();
     const version = input.call.name === "load_skill"
       ? (() => {
           try {
@@ -141,7 +155,13 @@ export async function executeReadOnlyPlanTool(input: {
       target,
       version,
       statement: input.call.name === "load_skill"
-        ? `已加载 Skill ${target} 的冻结工作流说明；它不构成项目源码证据。`
+        ? args.operation === "list"
+          ? `已查看 Skill 目录 ${target} 的元数据；未加载正文，不构成项目源码证据。`
+          : args.resource !== undefined
+          ? `已读取 Skill ${target} 的${partialSkill ? "部分" : ""}参考说明；不代表完整 Skill 已加载，不构成项目源码证据。`
+          : partialSkill
+          ? `已读取 Skill ${target} 的目录或部分说明；完整内容仍可继续读取，不构成项目源码证据。`
+          : `已加载 Skill ${target} 的冻结工作流说明；它不构成项目源码证据。`
         : `${input.call.name} 已确认 ${target} 的当前内容。`,
     };
     const previousContent = existingEvidence

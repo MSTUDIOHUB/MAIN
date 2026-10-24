@@ -202,15 +202,13 @@ test("early Plan hydration busy gate retains validated Goal authority and refres
   );
 });
 
-test("new empty workspace sessions discover persisted plans without manufacturing approval", () => {
+test("new empty workspace sessions discover persisted plans without manufacturing approval", async () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
-  const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
   const planExecutionResumeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"), "utf8");
   const appSource = fsSync.readFileSync(path.join(workspaceRoot, "src/App.tsx"), "utf8");
 
   assert.doesNotMatch(storeSource, /promoteTasksToExecuting/);
   assert.match(storeSource, /isPlanApproved:\s*false,\s*planStage:\s*nextStage/);
-  assert.match(submitIntentRoutingSource, /controlAction === "resume_plan_execution"[\s\S]*?startPlanExecutionResume\(\{/);
   assert.match(storeSource, /startPlanExecutionResume: \(resumeRequest\) =>[\s\S]*?runSubmitPlanExecutionResumeEffect\(\{/);
   assert.match(planExecutionResumeSource, /kind:\s*"discovery_only"/);
   assert.match(planExecutionResumeSource, /requiresTurnAdmission:\s*true/);
@@ -226,4 +224,38 @@ test("new empty workspace sessions discover persisted plans without manufacturin
   assert.match(appSource, /hydrateWorkspacePlanForEmptySession\("new_session"\)/);
   assert.doesNotMatch(appSource, /promoteTasksToExecuting/);
   assert.match(appSource, /hydrationWorkspace[\s\S]*hydrationSessionKey[\s\S]*saveCurrentRuntimeToSession/);
+
+  const { runSubmitPlanExecutionResumeEffect } = loadTranspiledModuleSync(
+    path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"),
+  );
+  const persistedPlan = { kind: "plan", path: ".MAIN/plans/plan.md", content: "Review this persisted plan", title: "Plan", updatedAt: 1 };
+  let state = { currentWorkspace: "/workspace-empty-plan", planArtifacts: [], planTasks: [], planStage: "idle", isPlanApproved: false };
+  const logs = [];
+  let discoveries = 0;
+  let blocked = 0;
+  const result = await runSubmitPlanExecutionResumeEffect({
+    text: "Continue the existing plan", preferredLanguage: "en", shouldRouteContinuationToPlanResume: true,
+    getState: () => state,
+    setState: (patch) => { state = { ...state, ...patch }; },
+    applyPreRunSessionPatch: () => {},
+    hydrateExistingPlanArtifactsForWorkspace: async (workspace, language) => {
+      assert.equal(workspace, "/workspace-empty-plan");
+      assert.equal(language, "en");
+      discoveries += 1;
+      return { artifacts: [persistedPlan], tasks: [], hasTasksArtifact: false };
+    },
+    logStoreEvent: (event) => logs.push(event),
+    onResumeBlocked: () => { blocked += 1; },
+  });
+  assert.equal(discoveries, 1);
+  assert.equal(result.kind, "discovery_only");
+  assert.equal(result.reason, "plan_resume_requires_explicit_turn_approval");
+  assert.equal(result.requiresTurnAdmission, true);
+  assert.equal(result.requiresApproval, true);
+  assert.equal(state.isPlanApproved, false);
+  assert.equal(state.planApprovalChoice, null);
+  assert.equal(state.planStage, "plan");
+  assert.deepEqual(state.planArtifacts, [persistedPlan]);
+  assert.equal(blocked, 1);
+  assert.ok(logs.includes("existing_plan_discovered_for_review"));
 });

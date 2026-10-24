@@ -1,7 +1,7 @@
 {
   "name": "main-local-agent",
   "private": true,
-  "version": "2.3.5",
+  "version": "2.3.7",
   "description": "An open-source, local-first desktop agent workbench for building and operating model-agnostic AI agents.",
   "license": "Apache-2.0",
   "repository": {
@@ -58,6 +58,7 @@
     "react-syntax-highlighter": "^16.1.1",
     "remark-gfm": "^4.0.1",
     "tailwindcss": "^4.2.2",
+    "yaml": "^2.9.1",
     "zustand": "^5.0.12"
   },
   "devDependencies": {

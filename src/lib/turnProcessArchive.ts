@@ -9,6 +9,7 @@ import type { ProgressNarrationPhase } from "./progressNarration";
 import { isInternalRuntimeProgressBlock } from "./runtimeProgressVisibility";
 import { normalizeTurnRuntimePhase, type TurnRuntimePhase } from "./turnPhase";
 import { deriveThoughtDisplay } from "./thoughtDisplay";
+import { buildToolResultPresentation } from "./toolResultPresentation";
 import {
   isPlanCandidateBlock,
   isPlanGenerationFailureBlock,
@@ -16,7 +17,11 @@ import {
 } from "./chat/chatBlockVisibility";
 
 export type TurnArchiveStepKind = "thinking" | "discover" | "inspect" | "edit" | "command" | "verify" | "blocked" | "message";
-export type TurnArchiveStepStatus = "running" | "done" | "failed" | "rejected";
+export type TurnArchiveStepStatus = "running" | "done" | "failed" | "rejected" | "not_executed" | "blocked";
+
+function isStoppedStepStatus(status: TurnArchiveStepStatus): boolean {
+  return status === "failed" || status === "rejected" || status === "not_executed" || status === "blocked";
+}
 
 export interface TurnArchiveStep {
   id: string;
@@ -188,6 +193,7 @@ function isLiveProcessCandidate(block: any): boolean {
 }
 
 function mapToolStatus(block: any): TurnArchiveStepStatus {
+  if (block?.toolOutcome === "not_executed" || block?.toolOutcome === "blocked") return block.toolOutcome;
   const status = String(block?.toolStatus || block?.status || "").toLowerCase();
   if (status === "failed" || status === "error") return "failed";
   if (status === "rejected") return "rejected";
@@ -392,8 +398,12 @@ function noteMatchesStepKind(note: string, kind: TurnArchiveStepKind): boolean {
   return true;
 }
 
-function getBlockResultLine(block: any): string {
+function getBlockResultLine(block: any, language: ToolPresentationLanguage): string {
   if (isProgressBlock(block)) return firstMeaningfulLine(String(block.evidence || block.action || block.why || block.title || ""));
+  if (isToolBlock(block) && (block.toolStatus === "executed" || block.toolOutcome === "succeeded")) {
+    const read = buildToolResultPresentation({ toolName: getSemanticToolName(block), message: block.message, language });
+    if (read.kind === "text" && read.parsed) return read.meta[0] || firstMeaningfulLine(read.text);
+  }
   return firstMeaningfulLine(String(block?.observationSummary || block?.message || block?.summary || block?.resultPreview || block?.output || block?.content || ""));
 }
 
@@ -421,6 +431,7 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
   const target = compactActivityTargetForTitle(String(block.target || compactTarget(block, language) || ""), toolName);
   const rawTarget = target || (language === "zh" ? "目标" : "target");
   if (language === "en") {
+    if (toolName === "load_skill") return `read Skill ${rawTarget}`;
     if (toolName === "grep_search" || toolName === "glob_search" || toolName === "knowledge_search") return `searched ${rawTarget}`;
     if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt") return `read ${rawTarget}`;
     if (toolName === "get_file_outline") return `outlined ${rawTarget}`;
@@ -433,6 +444,7 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (toolName === "computer_use") return `controlled ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
   }
+  if (toolName === "load_skill") return `读取技能 ${rawTarget}`;
   if (toolName === "grep_search" || toolName === "glob_search" || toolName === "knowledge_search" || toolName.startsWith("repo_map_")) return `搜索 ${rawTarget}`;
   if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt") return `读取 ${rawTarget}`;
   if (toolName === "get_file_outline") return `查看结构 ${rawTarget}`;
@@ -497,6 +509,7 @@ function emptyActivityMetrics(): ActivityMetrics {
 }
 
 const EXPLORING_TOOL_NAMES = new Set([
+  "load_skill",
   "get_project_skeleton",
   "list_directory",
   "glob_search",
@@ -577,7 +590,7 @@ function classifyToolActivityKind(
   toolName: string,
   status: TurnArchiveStepStatus,
 ): ActivityCellKind {
-  if (status === "failed" || status === "rejected") {
+  if (isStoppedStepStatus(status)) {
     // A rejected edit is still an edit attempt even when the preflight
     // correctly prevented a diff. Calling it a generic blocked/paused step
     // falsely implies that the whole Turn stopped.
@@ -731,8 +744,9 @@ function addActivityMetricsFromBlock(metrics: ActivityMetrics, block: any): void
   metrics.tools += 1;
   const status = mapToolStatus(block);
   if (status === "failed") metrics.failed += 1;
-  if (status === "rejected" || status === "failed" || getToolStepKind(block) === "blocked") metrics.blocked += 1;
+  if (isStoppedStepStatus(status) || getToolStepKind(block) === "blocked") metrics.blocked += 1;
   if (isActivityCachedResult(block)) metrics.cached += 1;
+  if (status === "not_executed" || status === "blocked") return;
 
   if (toolName === "read_file") metrics.filesRead += 1;
   else if (toolName === "read_document" || toolName === "knowledge_get_excerpt") metrics.documentsRead += 1;
@@ -762,6 +776,8 @@ function addActivityMetrics(left: ActivityMetrics, right: ActivityMetrics): Acti
 function mergeActivityStatus(left: TurnArchiveStepStatus, right: TurnArchiveStepStatus): TurnArchiveStepStatus {
   if (left === "failed" || right === "failed") return "failed";
   if (left === "rejected" || right === "rejected") return "rejected";
+  if (left === "blocked" || right === "blocked") return "blocked";
+  if (left === "not_executed" || right === "not_executed") return "not_executed";
   if (left === "running" || right === "running") return "running";
   return "done";
 }
@@ -807,6 +823,7 @@ function makeExplorationRepeatParts(items: any[], language: ToolPresentationLang
   const counts = new Map<string, { target: string; count: number; cached: number }>();
   for (const item of items) {
     if (!isToolBlock(item) || !isExploringToolName(getSemanticToolName(item))) continue;
+    if (item.toolOutcome === "not_executed" || item.toolOutcome === "blocked") continue;
     const target = compactTarget(item, language);
     if (!target) continue;
     const key = `${getSemanticToolName(item)}:${target}`.toLowerCase();
@@ -834,6 +851,7 @@ function makeUniqueExplorationMetricParts(items: any[], metrics: ActivityMetrics
   let terminalReads = 0;
   for (const item of items) {
     if (!isToolBlock(item)) continue;
+    if (item.toolOutcome === "not_executed" || item.toolOutcome === "blocked") continue;
     const toolName = getSemanticToolName(item);
     const target = compactTarget(item, language);
     if (toolName === "read_file" || toolName === "read_document" || toolName === "knowledge_get_excerpt" || toolName === "get_file_outline" || toolName === "analyze_tabular_document" || toolName === "query_tabular_document") {
@@ -856,6 +874,9 @@ function makeUniqueExplorationMetricParts(items: any[], metrics: ActivityMetrics
 }
 
 function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, language: ToolPresentationLanguage): string {
+  if (status === "not_executed") return language === "zh" ? "未执行" : "Not executed";
+  if (status === "blocked") return language === "zh" ? "被阻止" : "Blocked";
+  if (status === "failed" && kind !== "edit") return language === "zh" ? "执行失败" : "Execution failed";
   const running = status === "running";
   const failed = status === "failed" || status === "rejected";
   if (language === "en") {
@@ -958,7 +979,7 @@ function buildActivityCellFromItems(
     return current;
   }, "done");
   const targets = uniqueTargets(items, language);
-  const latestEvidence = compactLine([...items].reverse().map(getBlockResultLine).find(Boolean) || "", 180);
+  const latestEvidence = compactLine([...items].reverse().map(item => getBlockResultLine(item, language)).find(Boolean) || "", 180);
   const planRuntimePhase = getFirstPlanRuntimeArchivePhase(items);
   const progressItem = [...items].reverse().find(isProgressBlock);
   const observedFact = compactLine(
@@ -973,7 +994,7 @@ function buildActivityCellFromItems(
     return ids.map((id) => id.trim()).filter(Boolean);
   }))).slice(0, 12);
   const hypothesisStatus: ActivityCell["hypothesisStatus"] =
-    status === "failed" || status === "rejected"
+    isStoppedStepStatus(status)
       ? "blocked"
       : status === "done"
       ? "confirmed"
@@ -1129,7 +1150,7 @@ function canMergeActivityCells(current: ActivityCell | null, next: ActivityCell)
     return current.purposeKey === next.purposeKey;
   }
   if (current.kind === "exploring" && next.kind === "exploring") return true;
-  if (current.status === "failed" || current.status === "rejected") return false;
+  if (isStoppedStepStatus(current.status)) return false;
   return current.purposeKey === next.purposeKey && current.kind === next.kind;
 }
 
@@ -1180,8 +1201,8 @@ function defaultNarrativeForStep(
   const targets = step.targets.length > 0
     ? step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ")
     : language === "zh" ? "当前工作区" : "current workspace";
-  const resultLine = compactLine(step.items.map(getBlockResultLine).find(Boolean) || step.summary || "", 150);
-  const failed = step.status === "failed" || step.status === "rejected" || step.kind === "blocked";
+  const resultLine = compactLine(step.items.map(item => getBlockResultLine(item, language)).find(Boolean) || step.summary || "", 150);
+  const failed = isStoppedStepStatus(step.status) || step.kind === "blocked";
 
   if (language === "en") {
     if (step.kind === "thinking") {
@@ -1320,7 +1341,7 @@ function makeNarrativeIntent(step: TurnArchiveStep, language: ToolPresentationLa
 
   const targets = makeTargetSummary(step.targets, language);
   const toolCount = countToolItems(step);
-  const failed = step.status === "failed" || step.status === "rejected" || step.kind === "blocked";
+  const failed = isStoppedStepStatus(step.status) || step.kind === "blocked";
   const firstToolIntent = step.items
     .filter(isToolBlock)
     .map((item) => compactLine(String(item.intentSummary || ""), 220))
@@ -1418,7 +1439,7 @@ function canMergeSteps(current: TurnArchiveStep | null, next: TurnArchiveStep, m
   if (!current) return false;
   if (current.phase || next.phase) return false;
   if (current.status !== next.status) return false;
-  if (current.status === "failed" || current.status === "rejected") return false;
+  if (isStoppedStepStatus(current.status)) return false;
   if (isContextPhase(current.kind) && isContextPhase(next.kind)) return true;
   return current.kind === next.kind && current.kind !== "thinking" && current.kind !== "message" && current.kind !== "blocked";
 }
@@ -1434,7 +1455,7 @@ function canMergeStrategyStep(current: TurnArchiveStep | null, next: TurnArchive
   }
   if (!isToolStrategyStep(current) || !isToolStrategyStep(next)) return false;
   if (current.status !== next.status) return false;
-  if (current.status === "failed" || current.status === "rejected") return false;
+  if (isStoppedStepStatus(current.status)) return false;
   const samePhase = (isContextPhase(current.kind) && isContextPhase(next.kind)) || current.kind === next.kind;
   if (!samePhase) return false;
   if (!pendingNote || !current.note || processNotesOverlap(current.note, pendingNote)) return true;
@@ -1551,6 +1572,8 @@ function getPhaseKey(step: TurnArchiveStep): string {
 function mergeStepStatus(left: TurnArchiveStepStatus, right: TurnArchiveStepStatus): TurnArchiveStepStatus {
   if (left === "failed" || right === "failed") return "failed";
   if (left === "rejected" || right === "rejected") return "rejected";
+  if (left === "blocked" || right === "blocked") return "blocked";
+  if (left === "not_executed" || right === "not_executed") return "not_executed";
   if (left === "running" || right === "running") return "running";
   return "done";
 }
@@ -1558,7 +1581,7 @@ function mergeStepStatus(left: TurnArchiveStepStatus, right: TurnArchiveStepStat
 function canMergePhasedStep(current: TurnArchiveStep | null, next: TurnArchiveStep): boolean {
   if (!current || !current.phase || !next.phase) return false;
   if (getPhaseKey(current) !== getPhaseKey(next)) return false;
-  if (current.status === "failed" || current.status === "rejected") return false;
+  if (isStoppedStepStatus(current.status)) return false;
   const nextToolCount = countToolItems(next);
   return nextToolCount === 0 || countToolItems(current) + nextToolCount <= MAX_PHASE_TOOL_ITEMS;
 }
@@ -1700,9 +1723,9 @@ function canMergeCodexActivityStep(current: TurnArchiveStep | null, next: TurnAr
   ) {
     return false;
   }
+  if (isStoppedStepStatus(current.status)) return false;
+  if (isStoppedStepStatus(next.status)) return false;
   if (current.activity.kind === "exploring" && next.activity.kind === "exploring") return true;
-  if (current.status === "failed" || current.status === "rejected") return false;
-  if (next.status === "failed" || next.status === "rejected") return false;
   return current.activity.kind === next.activity.kind && current.activity.purposeKey === next.activity.purposeKey;
 }
 
@@ -1784,7 +1807,7 @@ function makeStep(input: {
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
     const semanticKind = getToolStepKind(block);
-    const kind = (status === "failed" || status === "rejected") && semanticKind !== "edit"
+    const kind = isStoppedStepStatus(status) && semanticKind !== "edit"
       ? "blocked"
       : semanticKind;
     const target = compactTarget(block, language);
@@ -1803,7 +1826,7 @@ function makeStep(input: {
       ...(phase ? { phase } : {}),
       targets: target ? [target] : [],
       items: [block],
-      expandedByDefault: status === "failed" || status === "rejected",
+      expandedByDefault: isStoppedStepStatus(status),
       sourceIndex: index,
       sourceEndIndex: index,
     };
@@ -1883,7 +1906,7 @@ function finalizeStep(
         includeThoughts: includeThoughtNotes,
       })
     : "");
-  const intent = phase?.title || (hasPersistedIntent ? persistedIntent : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language));
+  const intent = hasPersistedIntent ? persistedIntent : step.items.length > 1 && phase ? phase.title : makeNarrativeIntent({ ...step, targets, ...narrative, note, summary }, language);
   return {
     ...step,
     ...(phase ? { phase } : {}),

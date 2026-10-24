@@ -89,6 +89,10 @@ function harness(providerResults, options = {}) {
       async request({ command }) {
         requests.push(command);
         providerCalls += 1;
+        if (!providerResults.length) {
+          abort.abort();
+          throw new Error("Read-only fixture provider responses exhausted.");
+        }
         const value = providerResults.shift();
         if (value instanceof Error) throw value;
         if (typeof value === "function") return value({ abort, advance: (ms) => { clock += ms; } });
@@ -103,8 +107,10 @@ function harness(providerResults, options = {}) {
       },
     },
     scheduler: {
-      async execute() {
+      prepareSchedule: options.prepareSchedule,
+      async execute(input) {
         schedulerCalls += 1;
+        if (options.schedulerExecute) return options.schedulerExecute(input);
         throw new Error("scheduler port must be unreachable");
       },
     },
@@ -124,6 +130,7 @@ function harness(providerResults, options = {}) {
     requests,
     read: () => ({ aggregate, providerCalls, toolCalls, schedulerCalls }),
     now: () => clock,
+    advance: (ms) => { clock += ms; },
   };
 }
 
@@ -144,6 +151,152 @@ function receipt(command, data, extra = {}) {
   return { type: "tool.completed", run: command.run, idempotencyKey: command.idempotencyKey, status: "succeeded", evidence: [{ id: `E${command.payload.toolCallId.replace(/\D/g, "") || 1}`, kind: "tool", target: "query", version: progress.readOnlyEvidenceVersion("web_search", data) }], modelContent: JSON.stringify(data), ...extra };
 }
 
+test("search recovery keeps authorized source reads available until the answer is complete", async () => {
+  const fetch = { visibleText: "", toolCalls: [{ id: "f4", name: "web_fetch", arguments: { url: "https://example.com/source" } }], diagnostics: [] };
+  const h = harness([call("s1", "one"), call("s2", "two"), call("s3", "three"), fetch, answer], {
+    toolExecute: ({ command }) => receipt(command, command.payload.toolName === "web_fetch"
+      ? { url: "https://example.com/source", content: "verified source fact" }
+      : resultData(command.payload.arguments.query)),
+  });
+  const result = await runLoop(h);
+  assert.equal(result.resultKind, "success");
+  assert.equal(h.requests[3].payload.mode, "chat");
+  assert.equal(h.requests[3].payload.recoveryPressure.reason, "non_novel_evidence");
+  assert.equal(h.requests[3].payload.conclusionKind, undefined);
+  const tools = auth.providerToolDefinitionsForCommand({ get: () => ({ config: {} }), context: { runtimeRunIntent: "respond", runWorkspace: "", networkRead: enabled, turnId: turn.turnId }, live: types.createRuntimeV2LiveExecutionState() }, h.requests[3]);
+  assert.ok(tools.some((tool) => tool.function.name === "web_fetch"));
+  assert.equal(h.read().toolCalls, 4);
+});
+
+test("analyze joins an active child after a valid parent draft and regenerates the answer from its handoff", async () => {
+  let joined = false;
+  let schedulerAttempts = 0;
+  const childEvidence = { id: "child-review:E1", kind: "subagent", target: "src/source.ts", version: "source-v1" };
+  const completedAnswer = { visibleText: "已整合子任务证据 child-review:E1 的最终答复。", toolCalls: [], diagnostics: [] };
+  const surface = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/providerToolSurface.ts"));
+  const initialBatch = surface.boundRuntimeV2ProviderToolCalls([
+    { id: "spawn-child", name: "spawn_subagent", arguments: { objective: "Review source" } },
+    { id: "parent-read-1", name: "read_file", arguments: { path: "README.md" } },
+    { id: "parent-read-2", name: "read_file", arguments: { path: "src/main.ts" } },
+  ], new Set(), new Set(), { maxSpawnSubagents: 1 });
+  const h = harness([
+    { visibleText: "", toolCalls: initialBatch.accepted, diagnostics: [] },
+    () => {
+      assert.equal(h.read().toolCalls, 2, "the decision's independent reads execute before another provider request");
+      return { visibleText: "交接前的完整父线程答复。", toolCalls: [], diagnostics: [] };
+    },
+    ({ abort }) => {
+      // Bound the failing fixture: an unnecessary provider request before
+      // joining cannot spin forever while the child is still in flight.
+      if (!joined) abort.abort();
+      return completedAnswer;
+    },
+    ({ abort }) => { abort.abort(); return { visibleText: "", toolCalls: [], diagnostics: [] }; },
+  ], {
+    toolExecute: ({ command }) => receipt(command, { content: "Parent source fact" }, {
+      evidence: [{ id: `E-${command.payload.toolCallId}`, kind: "source", target: command.payload.arguments.path, version: "source-v1" }],
+    }),
+    prepareSchedule: async ({ command }) => ({
+      type: "subagents.scheduled", run: command.run, maxActiveSubagents: 1,
+      jobs: runtime.scheduleRuntimeV2Subagents({
+        parentRun: command.run, maxActiveJobs: 1, requestedAt: 100,
+        nextId: () => "child-review",
+        candidates: [{ scopeKey: "source-review", taskKind: "review", accessMode: "read", objective: "Review source", allowedPaths: ["src/source.ts"], sourceToolCallId: command.payload.toolCallId }],
+      }).jobs,
+    }),
+    schedulerExecute: async ({ command, scheduledSubagents }) => {
+      const job = scheduledSubagents[0];
+      // A broken join adapter must fail this finite fixture promptly too.
+      if (++schedulerAttempts > 2) { h.abort.abort(); return []; }
+      if (command.kind === "schedule_subagents") return [{ type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "request_opened", at: 100 } }];
+      assert.equal(command.kind, "join_subagents");
+      assert.deepEqual(command.payload.jobIds, ["child-review"]);
+      const beforeJoin = { ...h.read().aggregate, scheduledCommands: [] };
+      assert.equal(progress.latestReadOnlyAnswer(beforeJoin), "", "a pending child draft cannot pass the ordinary acceptance gate");
+      assert.equal(progress.latestReadOnlyAnswer(beforeJoin, { allowPendingChildJoin: true }), "交接前的完整父线程答复。");
+      joined = true;
+      return [
+        { type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "closed", at: 100 } },
+        { type: "subagent.completed", run: command.run, jobId: job.id, status: "degraded", summary: "A source fact is ready for the parent.", evidence: [childEvidence] },
+        { type: "subagent.handoff_delivered", run: command.run, jobId: job.id, contextEntryId: `child:${job.id}`, evidenceIds: [childEvidence.id] },
+      ];
+    },
+  });
+  const result = await runLoop(h, { strategy: "analyze", decisionInput: () => ({ subagentPreference: "allowed", subagentCapacity: 1 }) });
+  assert.equal(result.resultKind, "success");
+  assert.equal(h.requests.length, 3);
+  assert.deepEqual(result.aggregate.events.filter((event) => event.type === "command.scheduled").map((event) => event.command.kind), ["request_model", "schedule_subagents", "execute_tool", "execute_tool", "request_model", "join_subagents", "request_model", "finalize_turn"]);
+  assert.equal(h.requests.at(-1).payload.mode, "analyze", "joining must preserve ordinary read authority");
+  assert.equal(progress.latestReadOnlyAnswer({ ...result.aggregate, terminalOutcome: null }), completedAnswer.visibleText);
+  const adoption = result.aggregate.events.find((event) => event.type === "subagent.handoff_applied");
+  const parentResponse = result.aggregate.events.find((event) => event.eventId === adoption.sourceEventId);
+  assert.equal(adoption.source, "provider_result");
+  assert.equal(parentResponse.result.visibleText, completedAnswer.visibleText);
+  const mismatchedAdoption = { ...result.aggregate, events: result.aggregate.events.map((event) => event === adoption ? { ...event, sourceEventId: "different-parent-response" } : event) };
+  assert.equal(progress.latestReadOnlyAnswer(mismatchedAdoption), "", "an adoption for another parent response must not validate this answer");
+  const newerDelivery = { ...result.aggregate, events: [...result.aggregate.events, { ...adoption, type: "subagent.handoff_delivered", eventId: "newer-handoff" }] };
+  assert.equal(progress.latestReadOnlyAnswer(newerDelivery), "", "a newer child handoff invalidates the old synthesis");
+  assert.equal(result.aggregate.events.filter((event) => event.type === "run.completed").length, 1);
+  assert.equal(result.aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
+  assert.equal(result.aggregate.events.filter((event) => event.type === "projection.published" && event.projection.kind === "final").length, 1);
+});
+
+test("analyze lets the parent take over a slow child handoff without spending the recovery lease on the join", async () => {
+  for (const status of ["degraded", "failed"]) {
+    const evidence = status === "degraded"
+      ? [{ id: "slow-child:E1", kind: "subagent", target: "src/source.ts", version: "v1" }]
+      : [];
+    const h = harness([
+      { visibleText: "", diagnostics: [], toolCalls: [{ id: "spawn", name: "spawn_subagent", arguments: { objective: "Review source" } }] },
+      { visibleText: "", diagnostics: [], toolCalls: [{ id: "wait", name: "wait_subagents", arguments: { subagent_ids: "slow-child" } }] },
+      answer,
+    ], {
+      prepareSchedule: async ({ command }) => ({
+        type: "subagents.scheduled", run: command.run, maxActiveSubagents: 1,
+        jobs: runtime.scheduleRuntimeV2Subagents({
+          parentRun: command.run, maxActiveJobs: 1, requestedAt: h.now(), nextId: () => "slow-child",
+          candidates: [{ scopeKey: "source", taskKind: "explore", accessMode: "read", objective: "Review source", allowedPaths: ["src/source.ts"], sourceToolCallId: command.payload.toolCallId }],
+        }).jobs,
+      }),
+      schedulerExecute: async ({ command, scheduledSubagents }) => {
+        const job = scheduledSubagents[0];
+        if (command.kind === "schedule_subagents") return [{ type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "request_opened", at: h.now() } }];
+        assert.equal(command.kind, "join_subagents");
+        // The production incident waited eleven minutes for report repair.
+        // A failed child still resolves a delegated obligation for takeover.
+        h.advance(11 * 60_000);
+        return [
+          { type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "closed", at: h.now() } },
+          { type: "subagent.completed", run: command.run, jobId: job.id, status, summary: "Parent must take over.", evidence },
+          { type: "subagent.handoff_delivered", run: command.run, jobId: job.id, contextEntryId: `child:${job.id}`, evidenceIds: evidence.map((item) => item.id) },
+        ];
+      },
+    });
+    const result = await runLoop(h, { strategy: "analyze", decisionInput: () => ({ subagentPreference: "allowed", subagentCapacity: 1 }) });
+    assert.equal(result.resultKind, "success", `${status} must return work to the parent`);
+    assert.equal(h.requests.length, 3);
+    assert.equal(h.requests[1].payload.recoveryPressure, undefined, "successful scheduling is orchestration progress");
+    assert.equal(h.requests[2].payload.recoveryPressure, undefined, "the resolved child is a new parent decision boundary");
+    assert.equal(result.aggregate.subagents[0].status, status);
+    assert.equal(result.aggregate.subagents[0].report, null, "takeover does not fabricate a child report");
+    assert.equal(result.aggregate.events.filter((event) => event.type === "run.completed").length, 1);
+    assert.equal(result.aggregate.events.filter((event) => event.type === "turn.completed").length, 1);
+    assert.equal(result.aggregate.events.filter((event) => event.type === "projection.published" && event.projection.kind === "final").length, 1);
+  }
+});
+
+test("replayed child deliveries cannot repeatedly renew read-only recovery", () => {
+  const handoff = { type: "subagent.handoff_delivered", jobId: "child", evidenceIds: ["child:E1"] };
+  const events = [
+    { ...handoff, at: 1 },
+    { type: "provider.responded", at: 2, result: { visibleText: "", toolCalls: [], diagnostics: [] } },
+    { ...handoff, at: 3 },
+  ].map((event, sequence) => ({ ...event, sequence }));
+  const recovery = progress.deriveReadOnlyRecoveryWindow({ events, pendingToolCalls: [], scheduledCommands: [] });
+  assert.equal(recovery.startedAt, 2);
+  assert.equal(recovery.pressure.occurrence, 1);
+});
+
 test("network permission is frozen and absent/invalid legacy snapshots stay disabled", () => {
   const state = { webSearchEnabled: true, webSearchProvider: "bing" };
   const policy = network.captureNetworkRead(state);
@@ -163,12 +316,28 @@ test("search version ignores query spelling, result order and tracking URLs but 
   assert.notEqual(progress.readOnlyEvidenceVersion("web_fetch", { final_url: "https://example.com", content: "fact", truncated: true }), progress.readOnlyEvidenceVersion("web_fetch", { final_url: "https://example.com", content: "fact", truncated: false }));
 });
 
-test("two settled non-novel batches close tools and produce a real answer", async () => {
+test("Bing tracking identity and unverified reader pages cannot mint fresh source versions", () => {
+  const target = "https://example.com/source";
+  const encoded = Buffer.from(target).toString("base64url");
+  assert.equal(progress.normalizedEvidenceUrl(`https://www.bing.com/ck/a?p=first&u=a1${encoded}&ntb=1`), target);
+  assert.equal(progress.readOnlyEvidenceVersion("web_search", resultData("one", "fact", target)), progress.readOnlyEvidenceVersion("web_search", resultData("two", "fact", `https://www.bing.com/ck/a?p=other&u=a1${encoded}`)));
+  const unavailable = { url: target, content: "An error page body", retrieval: { usable: false, readerStatus: 200, originStatus: 404, directError: "HTTP 404" } };
+  assert.deepEqual(progress.webEvidenceVersions("web_fetch", unavailable), []);
+});
+
+test("search discovery without reading a source cannot indefinitely renew semantic progress", async () => {
+  const h = harness([call("s1", "first"), call("s2", "different"), call("s3", "another"), answer], { toolExecute: ({ command }) => receipt(command, resultData(command.payload.arguments.query, "different snippet", `https://example.com/${command.payload.arguments.query}`)) });
+  await runLoop(h);
+  assert.equal(h.requests.at(-1).payload.conclusionKind, undefined);
+  assert.equal(h.requests.at(-1).payload.recoveryPressure.occurrence, 2);
+});
+
+test("settled non-novel batches provide recovery guidance before a real answer", async () => {
   const h = harness([call("s1", "one"), call("s2", "two"), call("s3", "three"), answer], { toolExecute: ({ command }) => receipt(command, resultData(command.payload.arguments.query)) });
   const result = await runLoop(h);
   assert.equal(result.resultKind, "success");
-  assert.deepEqual(h.requests.map((item) => item.payload.mode), ["chat", "chat", "chat", "conclude"]);
-  assert.equal(h.requests.at(-1).payload.conclusionKind, "read_only");
+  assert.deepEqual(h.requests.map((item) => item.payload.mode), ["chat", "chat", "chat", "chat"]);
+  assert.equal(h.requests.at(-1).payload.conclusionKind, undefined);
   assert.equal(h.requests.at(-1).payload.recoveryPressure.reason, "non_novel_evidence");
   assert.equal(h.requests.at(-1).payload.recoveryPressure.occurrence, 2);
   const order = result.aggregate.events.filter((event) => event.type === "run.completed" || (event.type === "projection.published" && event.projection.kind === "final") || event.type === "turn.completed").map((event) => event.type);
@@ -176,7 +345,8 @@ test("two settled non-novel batches close tools and produce a real answer", asyn
 });
 
 test("replayed successes with empty evidence do not clear pressure; new evidence does", async () => {
-  const h = harness([call("s1", "one"), call("s2", "replay"), call("s3", "new"), call("s4", "repeat"), answer], { toolExecute: ({ command }) => receipt(command, resultData("ignored", ["s3", "s4"].includes(command.payload.toolCallId) ? "new fact" : "same fact"), command.payload.toolCallId === "s2" ? { receiptOrigin: "replayed", evidence: [] } : {}) });
+  const fetch = (id) => ({ visibleText: "", diagnostics: [], toolCalls: [{ id, name: "web_fetch", arguments: { url: "https://example.com/source" } }] });
+  const h = harness([call("s1", "one"), call("s2", "replay"), fetch("s3"), fetch("s4"), answer], { toolExecute: ({ command }) => receipt(command, command.payload.toolName === "web_fetch" ? { url: "https://example.com/source", content: "new source fact" } : resultData("ignored"), command.payload.toolCallId === "s2" ? { receiptOrigin: "replayed", evidence: [] } : {}) });
   await runLoop(h);
   assert.equal(h.requests[2].payload.recoveryPressure.occurrence, 1);
   assert.equal(h.requests[3].payload.recoveryPressure, undefined);
@@ -214,24 +384,51 @@ test("recovery lease exhaustion without an answer is error even with evidence", 
   assert.match(result.reason, /恢复租约/);
 });
 
-test("an empty or truncated conclusion is an error, never a successful placeholder", async () => {
+test("an empty or truncated conclusion recovers before a truthful final answer", async () => {
   for (const final of [{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "unfinished", toolCalls: [], diagnostics: [{ code: "output_truncated", message: "length", retryable: false }] }]) {
-    const h = harness([{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "", toolCalls: [], diagnostics: [] }, final]);
-    assert.equal((await runLoop(h)).resultKind, "error");
-    assert.equal(h.requests.at(-1).payload.mode, "conclude");
+    const h = harness([{ visibleText: "", toolCalls: [], diagnostics: [] }, { visibleText: "", toolCalls: [], diagnostics: [] }, final, answer]);
+    assert.equal((await runLoop(h)).resultKind, "success");
+    assert.equal(h.requests.length, 4);
+    assert.equal(h.requests.at(-1).payload.mode, "chat");
   }
   assert.equal(requestPolicy.runtimeV2ProviderOutputWasTruncated({ finishReason: "length", toolCallCount: 0, availableToolCount: 0 }), true);
 });
 
-test("history keeps all distinct evidence while affordable and compresses atomic pairs only under pressure", () => {
+test("recovery survives repeated empty responses until a valid answer within its lease", async () => {
+  const h = harness([...Array(6).fill({ visibleText: "", toolCalls: [], diagnostics: [] }), answer]);
+  const result = await runLoop(h);
+  assert.equal(result.resultKind, "success");
+  assert.equal(h.requests.length, 7);
+  assert.ok(h.requests.every((request) => request.payload.mode === "chat"));
+});
+
+test("the incident's repeated action commentary cannot finish Chat", async () => {
+  const commentary = "让我尝试从东方财富网获取科创板芯片指数的数据。";
+  const h = harness([{ ...call("s1", "source"), visibleText: commentary }, { ...answer, visibleText: commentary }, answer], { toolExecute: ({ command }) => receipt(command, resultData("source")) });
+  const result = await runLoop(h);
+  assert.equal(h.requests.length, 3);
+  assert.equal(result.aggregate.events.find((event) => event.type === "projection.published" && event.projection.kind === "final").projection.markdown, answer.visibleText);
+  assert.equal(h.requests[2].payload.recoveryPressure.occurrence, 1);
+});
+
+test("history preserves distinct evidence and tool pairs but references duplicate Web bodies even under budget", () => {
   const pair = (id, content) => [{ role: "assistant", content: "", tool_calls: [{ id, type: "function", function: { name: "web_fetch", arguments: "{}" } }] }, { role: "tool", tool_call_id: id, content }];
   const messages = [{ role: "system", content: "instructions" }, { role: "user", content: "old question" }, { role: "assistant", content: "old answer" }, { role: "user", content: "current question" }, ...pair("one", "A ".repeat(1000)), ...pair("two", "B ".repeat(1000)), ...pair("again", "A ".repeat(1000))];
-  assert.deepEqual(history.boundReadOnlyHistory(messages, { contextLimit: 100_000, reservedOutputTokens: 4_000 }), messages);
+  const affordable = history.boundReadOnlyHistory(messages, { contextLimit: 100_000, reservedOutputTokens: 4_000 });
+  assert.equal(affordable.length, messages.length);
+  assert.equal(affordable.find((item) => item.tool_call_id === "one").content, "A ".repeat(1000));
+  assert.equal(affordable.find((item) => item.tool_call_id === "two").content, "B ".repeat(1000));
+  assert.equal(JSON.parse(affordable.find((item) => item.tool_call_id === "again").content).receiptReplayOf, "one");
+  assert.equal(messages.at(-1).content, "A ".repeat(1000), "canonical history remains lossless");
   const bounded = history.boundReadOnlyHistory(messages, { contextLimit: 1500, reservedOutputTokens: 300 });
   assert.ok(token.estimateMessagesTokens(bounded) <= 1200);
   for (const item of bounded.filter((item) => item.role === "tool")) assert.ok(bounded.some((candidate) => candidate.tool_calls?.some((call) => call.id === item.tool_call_id)));
   for (const item of bounded.filter((item) => item.tool_calls?.length)) for (const call of item.tool_calls) assert.ok(bounded.some((candidate) => candidate.tool_call_id === call.id));
   assert.ok(bounded.some((item) => item.content === "current question"));
+  for (const item of bounded.filter((item) => item.role === "tool" && String(item.content).includes('"receiptReplayOf"'))) {
+    const original = bounded.find((candidate) => candidate.tool_call_id === JSON.parse(item.content).receiptReplayOf);
+    assert.ok(original && !original.content.includes('"receiptReplayOf"'), "replay references always point to a retained original body");
+  }
 });
 
 test("cold restore reconstructs exact tool pairs and evidence ordinals from the ledger", async () => {
@@ -291,7 +488,7 @@ test("executor forces the captured provider and disables Rust cross-provider fal
   } finally { ipc.webSearch = original; }
 });
 
-test("legacy iteration signals select conclusion once without becoming a terminal", async () => {
+test("legacy iteration signals do not withdraw safe read authority", async () => {
   const h = harness([answer]);
   const result = await runLoop(h);
   const last = result.aggregate.events.findIndex((event) => event.type === "command.scheduled" && event.command.kind === "request_model");
@@ -300,7 +497,8 @@ test("legacy iteration signals select conclusion once without becoming a termina
   const next = runtime.decideNextCommands(state);
   assert.equal(state.terminalOutcome, null);
   assert.equal(next[0].kind, "request_model");
-  assert.equal(next[0].payload.conclusionKind, "read_only");
+  assert.equal(next[0].payload.mode, "chat");
+  assert.equal(next[0].payload.conclusionKind, undefined);
 });
 
 test("large Web receipts retain valid JSON and redirect identity for cold replay", () => {

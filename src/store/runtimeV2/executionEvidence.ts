@@ -1,4 +1,4 @@
-import { readOnlyEvidenceVersion } from "../../lib/runtime-v2/readOnlyProgress";
+import { readOnlyEvidenceVersion, webEvidenceVersions } from "../../lib/runtime-v2/readOnlyProgress";
 import {
   runtimeV2EvidenceVersion,
   type RuntimeV2Command,
@@ -26,6 +26,7 @@ import {
   runtimeV2ToolEvidenceProjection,
   runtimeV2ToolHasStructuredValidatorContract,
 } from "./executionEffectEvidence";
+import { runtimeV2ProviderToolCallIdentity } from "./providerReadReceipts";
 
 type RuntimeV2ToolFailureKind = NonNullable<Extract<
   RuntimeV2EventDraft,
@@ -56,7 +57,7 @@ export function recordToolResultHistory(input: {
   appendRuntimeV2ToolResultHistory(
     input.ports.live,
     toolCallId,
-    input.content,
+    input.status === "succeeded" ? input.content : `[runtime-v2 failed action: ${runtimeV2ProviderToolCallIdentity({ name: input.toolName, arguments: input.command.payload.arguments as Record<string, unknown> || {} })}]\n${input.content}`,
   );
 }
 
@@ -486,7 +487,7 @@ export function toolCompletionFor(
     return toolResultEvent(
       command,
       status,
-      status === "succeeded"
+      status === "succeeded" && webEvidenceVersions(toolName, output)?.length !== 0
         ? projection.targets.map((resolvedTarget) => ({
             id: nextEvidenceId(input.live),
             kind: projection.kind,
@@ -498,7 +499,7 @@ export function toolCompletionFor(
                 : null,
           }))
         : [],
-      failureKind === "assertion_failed"
+      failureKind === "assertion_failed" || failureKind === "not_executed"
         ? "protocol_invalid"
         : failureKind,
       presentation,

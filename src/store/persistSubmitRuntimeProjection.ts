@@ -1,3 +1,22 @@
+import type { ProjectSessionSaveOptions } from "../lib/projectSessionMutationCoordinator";
+
+export type SubmitSessionPersistence = (
+  scopeKey: string,
+  session: unknown,
+  options?: ProjectSessionSaveOptions,
+) => Promise<unknown>;
+
+/** Owner checks run at the durable queue head, before bytes can commit. */
+export function withSubmitSessionPersistenceOwner(
+  persist: SubmitSessionPersistence,
+  isCurrent: () => boolean,
+): SubmitSessionPersistence {
+  return (scopeKey, session, options) => persist(scopeKey, session, {
+    ...options,
+    isCurrent: () => isCurrent() && (options?.isCurrent?.() ?? true),
+  });
+}
+
 export interface SubmitRuntimeProjectionBaseInput<TState extends Record<string, any>> {
   state: TState;
   scopeKey: string;
@@ -9,7 +28,8 @@ export interface SubmitRuntimeProjectionBaseInput<TState extends Record<string, 
 
 export interface PersistSubmitRuntimeProjectionInput<TState extends Record<string, any>>
   extends SubmitRuntimeProjectionBaseInput<TState> {
-  persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
+  persistSessionRecord: SubmitSessionPersistence;
+  isCurrent?: () => boolean;
 }
 
 function prepareSubmitRuntimeProjection<TState extends Record<string, any>>(
@@ -109,7 +129,7 @@ export async function persistSubmitRuntimeProjection<TState extends Record<strin
     const saved = await input.persistSessionRecord(input.scopeKey, {
       ...sessionRecord,
       ...sessionPatch,
-    });
+    }, input.isCurrent ? { isCurrent: input.isCurrent } : undefined);
     committedPatch = {
       ...sessionPatch,
       ...(saved && typeof saved === "object" ? saved : {}),

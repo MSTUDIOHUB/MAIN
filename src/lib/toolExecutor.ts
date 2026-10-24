@@ -70,10 +70,9 @@ import {
 import { runGitDiffTool, runGitStatusTool } from "./gitTools";
 import {
   LOAD_SKILL_TOOL_NAME,
-  isSkillVisibleToModel,
-  loadSkillContent,
   type SkillCatalogSnapshot,
 } from "./agentSkills";
+import { executeAgentSkillTool } from "./agentSkillExecutor";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -376,18 +375,7 @@ export async function executeTool(
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
   if (executionName === LOAD_SKILL_TOOL_NAME) {
-    const skillId = String(args.skill_id || "").trim();
-    if (!options.skillCatalog) {
-      throw new Error("SKILL_CATALOG_UNAVAILABLE: no Skill catalog was admitted for this Turn.");
-    }
-    if (!isSkillVisibleToModel(options.skillCatalog, skillId)) {
-      throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
-    }
-    return JSON.stringify({
-      type: "skill.loaded",
-      ...loadSkillContent(options.skillCatalog, skillId),
-      effect: "instructions_loaded_no_additional_permissions",
-    });
+    return executeAgentSkillTool(options.skillCatalog, args);
   }
 
   // ── MCP tool routing ────────────────────────────────────────

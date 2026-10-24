@@ -11,6 +11,9 @@ const browserChannel =
 
 export default defineConfig({
   testDir: "./tests/e2e",
+  // Playwright cleans this directory at startup. Keep unrelated native/runtime
+  // validation evidence in test-results outside its disposable output tree.
+  outputDir: "./test-results/playwright",
   fullyParallel: false,
   workers: 1,
   timeout: 30_000,

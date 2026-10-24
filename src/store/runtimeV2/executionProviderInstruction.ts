@@ -69,6 +69,7 @@ export function providerModeInstruction(
   toolSurface: {
     readonly hasReadFile: boolean;
     readonly hasMutation: boolean;
+    readonly hasCreateFile?: boolean;
     readonly hasSpawnSubagent: boolean;
     readonly hasWaitSubagents: boolean;
     readonly hasMaterializedSourceEvidence?: boolean;
@@ -155,7 +156,7 @@ export function providerModeInstruction(
     toolSurface.hasSpawnSubagent
       ? [
           command.payload.collaborationPreferred === true
-            ? `The user explicitly prefers collaboration and ${remainingSubagentCapacity} new child slot(s) are available. If this objective contains at least two genuinely independent bounded work packages, prioritize issuing up to ${remainingSubagentCapacity} spawn_subagent calls in this decision and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
+            ? `The user explicitly prefers collaboration and ${remainingSubagentCapacity} new child slot(s) are available. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
             : "Delegation is optional.",
           "Use read-only children for parallel investigation. Use implement/write only after the parent has an evidence-backed solution: provide an explicit operation, implementation_plan, success criteria, and every exact non-overlapping file target; never grant a directory and let the child choose writes. The child stages one transaction and Runtime commits it at join; the parent still owns cross-file integration and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
         ].join(" ")
@@ -172,8 +173,14 @@ export function providerModeInstruction(
     Math.floor(Number(recoveryPressure?.occurrence) || 0),
   );
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const recoveringCompleteReply = recoveryPressure?.reason === "non_actionable_response";
   const recoveryGuidance = recoveryPressure
-    ? [
+    ? recoveringCompleteReply
+      ? [
+          `RECOVERY_PIVOT ${recoveryOccurrence}: the previous decision returned a complete no-tool reply, with no executable effect (${recoveryPressure.reason}).`,
+          "Continue from the actual reply and its adjacent Runtime feedback. Advance the user's currently authorized effect when supported by the evidence; if an essential decision or authority is missing, explain that exact gap and ask a focused clarification. Do not repeat the same reply or manufacture a workspace mutation.",
+        ].join(" ")
+      : [
         `RECOVERY_PIVOT ${recoveryOccurrence}: the previous provider decision produced no executable progress (${String(recoveryPressure.reason || "non_actionable_response")}).`,
         recoveryStage === "reconsider"
           ? "Re-read the latest structured failure feedback and submit an action whose normalized tool arguments are materially different from the closed action."
@@ -250,11 +257,22 @@ export function providerModeInstruction(
           "Submit one workspace mutation against an exact source target already visible in this request, or return a concise incomplete report without a tool call. Collaboration cannot replace this parent action, and creating an unrelated file cannot discharge this existing-source effect debt. If a mutation is rejected because one exact target source is missing, Runtime opens a target-locked source recovery window. Inspection and validation reopen immediately after a mutation commits.",
         ].join(" ")
     : "";
+  const ordinaryEffectGuidance = !toolSurface.actionWindow &&
+    !toolSurface.executionContractAdvanceRequired && !toolSurface.validationCorrectionActive &&
+    !toolSurface.validationCommandUnavailable
+    ? [
+        toolSurface.hasCreateFile
+          ? "New files within the authorized target scope may be created with the advertised write_file tool; they do not require reading nonexistent existing-file source or an existing-source lease. Normal creation preflight and permission checks still apply."
+          : "",
+        "Commands and external operations do not require a file-source lease; use their advertised tools under their own authorization, target scope and verification contracts. A source read neither authorizes those effects nor creates a requirement to modify that file.",
+      ].filter(Boolean).join(" ")
+    : "";
   if (mode === "chat" || mode === "analyze" || (mode === "conclude" && command.payload.conclusionKind === "read_only")) {
-    if (mode === "conclude") return "Return one complete Markdown answer now from the conversation and available evidence. Tools are closed. State information gaps explicitly; never invent facts or claim that unavailable checks succeeded.";
+    if (mode === "conclude") return "Return one complete Markdown answer now from the conversation and available evidence. Tools are closed. Deliver the answer itself, not a promise of future work or a replay of tool commentary. Address the user's requested points, distinguishing supported findings from information gaps; never invent facts or claim that unavailable checks succeeded.";
     return [
       mode === "chat" ? "Answer the user using the supplied conversation. Only exposed Skill and Web context reads are available." : "Analyze the admitted sources with read-only authority.",
       command.payload.recoveryPressure ? "The last decision added no new evidence. Read again only for a concrete remaining information gap using a materially different source or reading method; otherwise answer now." : "Use a focused read only when a concrete fact is missing, then return a complete Markdown answer.",
+      "Search hits are discovery leads: check their subject, date and source before using them. Rewording searches alone does not establish source progress. Unrelated results, error pages and retrieval.usable=false receipts do not resolve an information gap. Fetch a relevant direct source or state what could not be verified.",
       mode === "analyze" ? collaborationGuidance : "",
     ].filter(Boolean).join(" ");
   }
@@ -326,9 +344,11 @@ export function providerModeInstruction(
         ? "VALIDATION_ACTION_WINDOW: repeated inspection or a no-effect attempt has closed the observation branch. Submit one advertised finite validation, or—only when the visible current source proves the implementation is incomplete—one bounded workspace mutation against that source. Collaboration and more inspection cannot replace this parent action."
         : "",
       "Validate the latest committed mutation now with a finite test, assertion, build, lint, typecheck, browser, or desktop interaction appropriate to the user's observable acceptance criteria.",
+      "Continue any still-needed authorized external actions through their advertised tools before the final check. Ordinary shell actions produce tool results and do not discharge the latest file mutation's validation debt.",
+      ordinaryEffectGuidance,
       toolSurface.executionContractAdvanceRequired
         ? "If the repair spans more files, continue with one contracted mutation now; otherwise validate. Runtime keeps validation debt attached to the newest commit."
-        : "If the repair spans more files or the visible post-edit source proves work remains, continue with one exact source-backed mutation; Runtime returns to editing and keeps validation debt attached to the newest commit. Do not mutate merely to avoid a failing check. Safe reads remain available when a genuinely missing post-edit fact is required; a read or diff alone is not validation.",
+        : "If authorized implementation work remains, continue it with the advertised tools within the current target scope. Existing-file edits require their exact current visible source. Runtime returns to editing and keeps validation debt attached to the newest mutation. Do not mutate merely to avoid a failing check. Safe reads remain available for a specific missing fact; a read or diff alone is not validation.",
       "Static checks prove only static properties. User-visible behavior requires a test, browser interaction, or desktop interaction that observes that behavior.",
       preferredValidationCommand
         ? `A suitable finite workspace validation is ${JSON.stringify(preferredValidationCommand)}.`
@@ -343,25 +363,26 @@ export function providerModeInstruction(
     executionContractAdvanceGuidance,
     validationCorrectionGuidance,
     actionWindowGuidance,
-    toolSurface.sourceOnlyFrontier
+    toolSurface.sourceOnlyFrontier && !recoveringCompleteReply
       ? toolSurface.actionWindow
         ? toolSurface.actionWindow === "corrective_source"
           ? "The next decision must materialize the one exact target named by the mutation-source failure."
           : "The current mutation boundary already has exact versioned source but no committed workspace effect. The next decision must resolve that effect debt rather than open another observation."
-        : "The current mutation boundary already has exact versioned source but no committed workspace effect. If the visible source supports a safe coherent repair, submit the mutation now. Continue reading only when you can name one missing path, range, or fact required to edit safely; broad exploration does not advance the objective."
+        : "This boundary has versioned evidence about existing files but no recorded file mutation. Those reads do not select the implementation targets or require a repair to the files already read. Reuse the available facts to advance the user's complete objective; read again only for a specific missing fact that blocks the next authorized action."
       : "",
     toolSurface.hasReadFile
       ? toolSurface.actionWindow === "corrective_source"
         ? "Only the advertised single target-locked corrective read is available; general safe-reading guidance does not reopen repository inspection at this boundary."
         : toolSurface.hasMaterializedSourceEvidence
-        ? "Exact versioned source is visible in this decision request. Use only that visible source for a mutation or validation; request a different target or missing range when needed. Safe reads remain available after every edit and failed validation."
+        ? "For modifications to an existing file, use only its exact current source visible in this decision request. Read a missing target or range before changing it. Safe reads remain available after edits and failed validation unless the current recovery or sealed contract explicitly narrows them."
         : command.payload.hasVersionedSourceEvidence === true
-          ? "Versioned source exists in the runtime cache but is not visible in this decision request, so it is not write authority. Request the exact intended path or range again; MAIN may replay it without another disk read."
-          : "No versioned source evidence is committed yet. Read the exact existing file before changing it. Safe reads remain available after every edit and failed validation."
+          ? "Versioned existing-file source is cached but is not visible in this decision request, so it does not authorize edits to those files. Request the exact existing target or range again; MAIN may replay it without another disk read."
+          : "No existing-file source is visible yet. Read the exact current target before modifying an existing file. Safe reads remain available after every edit and failed validation."
       : "",
     toolSurface.hasMutation
-      ? "Make the smallest coherent change that addresses all currently supported gaps, preserving unrelated behavior."
+      ? "Source visibility is editing authority, not an obligation to write. Make a workspace change only when the user's current request authorizes that effect; keep any authorized change as small and coherent as the full objective permits, preserving unrelated behavior."
       : "",
+    ordinaryEffectGuidance,
     editableSourceGuidance,
     toolSurface.validationCorrectionActive
       ? "The failed acceptance boundary requires a source-backed workspace mutation before another validation."
@@ -369,7 +390,7 @@ export function providerModeInstruction(
     preferredValidationCommand
       ? `A suitable finite workspace validation is ${JSON.stringify(preferredValidationCommand)}.`
       : "",
-    "If work remains, choose one real structured tool action. A response without a tool call ends the Run and will be judged only by committed mutation and validation evidence; return prose only when you are done.",
+    "If an authorized effect remains, use a real structured tool action when the necessary evidence is available. For a command or external-operation task without required artifact changes or acceptance debt, return a complete final report when actual successful receipts cover the user's full request. A successful intermediate action does not require you to stop; continue using tools while work remains. File mutations still require subsequent matching validation. If essential user input or authority is missing, state the exact unfinished work and needed clarification; never invent an effect to claim progress.",
     collaborationGuidance,
   ].filter(Boolean).join(" ");
 }

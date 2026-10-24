@@ -8892,6 +8892,7 @@ function seedRealOmlxPlanFlowScenario() {
 
   const params = new URLSearchParams(window.location.search);
   const model = params.get("model") || "e2e-placeholder-model";
+  const workspaceConversation = params.get("workspaceConversation") === "1";
   const realOmlxConfig = (window as any).__REAL_OMLX_CONFIG__ || {};
   const workspace = String(
     (window as any).__REAL_OMLX_WORKSPACE__ ||
@@ -8905,10 +8906,11 @@ function seedRealOmlxPlanFlowScenario() {
   const applyRealOmlxWorkspaceFixture = () =>
     useAppStore.setState((state) => ({
     ...state,
+    ...(realOmlxConfig.skills ? { skills: realOmlxConfig.skills } : {}),
     config: {
       ...state.config,
       language: "zh",
-      workflowMode: "plan",
+      workflowMode: workspaceConversation ? "edit" : "plan",
       activeProfile: "local",
       local: {
         ...state.config.local,
@@ -8922,9 +8924,9 @@ function seedRealOmlxPlanFlowScenario() {
         toolProtocol: "auto",
       },
       workspace,
-      instructionsEnabled: false,
+      instructionsEnabled: realOmlxConfig.productionTools === true,
       hooksEnabled: false,
-      sessionRecordingEnabled: false,
+      sessionRecordingEnabled: realOmlxConfig.productionTools === true,
     },
     currentWorkspace: workspace,
     selectedWorkspace: workspace,
@@ -8949,7 +8951,7 @@ function seedRealOmlxPlanFlowScenario() {
           date: new Date(now).toISOString(),
           active: true,
           storageStatus: "temporary",
-          recordingDisabled: true,
+          recordingDisabled: !realOmlxConfig.productionTools,
           messages: [],
         },
       ],
@@ -8976,7 +8978,7 @@ function seedRealOmlxPlanFlowScenario() {
     isPlanApproved: false,
     readOnlyAutoApproveForSession: true,
     autoApproveTools: true,
-    autoApproveToolScopes: ["workspace_write", "shell"],
+    autoApproveToolScopes: realOmlxConfig.productionTools ? ["workspace_write", "shell", "local_file_read", "external_write", "browser_control", "mcp_action"] : ["workspace_write", "shell"],
     isGenerating: false,
     agentStatus: "idle",
     runtimeEvents: [],
@@ -8989,7 +8991,7 @@ function seedRealOmlxPlanFlowScenario() {
     pendingReviewResolve: null,
     pendingReviewTaskId: null,
     elapsedTime: 0,
-    showPlanPanel: true,
+    showPlanPanel: !workspaceConversation,
     showTerminal: false,
     showFilePanel: false,
     showDiff: false,
@@ -9047,6 +9049,7 @@ function seedRealOmlxPlanFlowScenario() {
     const turn = [...state.conversationTurns].reverse().find((turn) => !!state.runtimeV2Checkpoints?.[turn.id]);
     return { isGenerating: state.isGenerating, agentStatus: state.agentStatus, turnCount: state.conversationTurns.length,
       turn, aggregate: turn ? normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[turn.id])?.aggregate : null,
+      session: state.sessionsByWorkspace[GLOBAL_CHAT_KEY]?.find((session) => session.id === state.currentSessionId),
       finals: state.taskFlow.filter((block) => block.turnId === turn?.id && block.type === "agent" && block.visibility === "assistant_final").flatMap((block) => block.type === "agent" ? [block.content] : []),
     };
   };
@@ -9766,6 +9769,7 @@ function seedRealOmlxPlanFlowScenario() {
     return {
       model,
       currentWorkspace: state.currentWorkspace,
+      workflowMode: state.config.workflowMode,
       currentSessionId: state.currentSessionId,
       agentStatus: state.agentStatus,
       isGenerating: state.isGenerating,

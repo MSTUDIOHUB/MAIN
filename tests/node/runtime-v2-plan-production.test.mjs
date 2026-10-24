@@ -61,6 +61,7 @@ function loadTsWithMocks(sourcePath, mocks, scopedCache = new Map()) {
   return module.exports;
 }
 
+const { isStreamOutputLimited } = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
 const runtime = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
 const adapter = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/workPlanAdapter.ts"));
 const approval = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planApproval.ts"));
@@ -122,6 +123,7 @@ test("Plan preserves an admitted read_file window without a second truncation", 
       },
     },
     ledger: {
+      snapshot: () => null,
       schedule: async () => ({ idempotencyKey: "plan-read-large" }),
       settleCommand: async (event) => settlements.push(event),
       recordSoftSignal: async () => undefined,
@@ -143,6 +145,50 @@ test("Plan preserves an admitted read_file window without a second truncation", 
   assert.equal(evidenceContents.get("E1"), sourceWindow);
   assert.match(messages[0]?.content || "", /TAIL_MARKER$/);
   assert.equal(messages[0]?.content.includes(sourceWindow), true);
+});
+
+test("Plan actual read execution honors durable capability restrictions despite permissive context", async () => {
+  let executed = 0;
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async () => { executed++; return "must not execute"; } }],
+  ]));
+  const messages = [];
+  const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: { runWorkspace: "/fixture", runSessionKey: "session", capabilityRestrictions: [] },
+    ledger: {
+      snapshot: () => ({ objective: { capabilityRestrictions: ["workspace_read"] } }),
+      schedule: async () => ({ idempotencyKey: "restricted-plan-read" }),
+      settleCommand: async (event) => settlements.push(event),
+      recordSoftSignal: async () => undefined,
+    }, run, call: { id: "restricted-read", name: "read_file", arguments: { path: "private.txt" } },
+    messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(executed, 0);
+  assert.equal(settlements[0].status, "blocked");
+  assert.deepEqual(settlements[0].evidence, []);
+  assert.match(messages[0].content, /TURN_CAPABILITY_RESTRICTED: workspace_read/);
+});
+
+test("Plan direct reads cannot bypass durable individual review requirements", async () => {
+  let executed = 0;
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async () => { executed++; return "must not execute"; } }],
+  ]));
+  const messages = []; const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: { runWorkspace: "/fixture", runSessionKey: "session", approvalRequiredCapabilities: [] },
+    ledger: {
+      snapshot: () => ({ objective: { approvalRequiredCapabilities: ["workspace_read"] } }),
+      schedule: async () => ({ idempotencyKey: "manual-plan-read" }),
+      settleCommand: async (event) => settlements.push(event), recordSoftSignal: async () => undefined,
+    }, run, call: { id: "manual-read", name: "read_file", arguments: { path: "private.txt" } },
+    messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(executed, 0);
+  assert.equal(settlements[0].status, "blocked");
+  assert.deepEqual(settlements[0].evidence, []);
+  assert.match(messages[0].content, /TURN_TOOL_REVIEW_REQUIRED: workspace_read/);
 });
 
 function plan() {
@@ -834,7 +880,7 @@ async function runProductionPlanScenario(
     ["../../lib/toolTarget", {
       getToolTarget: (_name, args) => String(args.path || args.query || ""),
     }],
-    ["../../lib/streaming", { streamChatCompletion: (...args) => {
+    ["../../lib/streaming", { isStreamOutputLimited, streamChatCompletion: (...args) => {
       if (++mockProviderCalls > 50) { abortCtrl.abort("test mock did not converge"); throw new Error("test mock did not converge"); }
       return streamCompletion(...args);
     } }],
@@ -3112,55 +3158,17 @@ test("production Plan runs, joins, and adopts one read-only child before review"
           /^child:[0-9a-f]{32}:E1$/,
           "provider-facing child evidence ids must stay compact and stable",
         );
-        if (childRound === 2) {
-          childInFlight = false;
-          return {
-            content: "The reviewed owner is in src/main.js.",
-            semanticContent: "The reviewed owner is in src/main.js.",
-            actionableContent: "The reviewed owner is in src/main.js.",
-            toolCalls: [],
-            usage: {},
-            protocolViolation: null,
-          };
-        }
-      assert.match(
-        transcript,
-        /CHILD_REPORT_REJECTED/,
-          "an uncited ordinary final must receive one causal report repair turn",
-        );
-        assert.equal(
-          tools.length,
-          1,
-          "the bounded report-repair turn must expose one report tool",
-        );
-        assert.equal(
-          tools[0]?.function?.name,
-          "submit_runtime_v2_subagent_report",
-        );
-        assert.deepEqual(
-          tools[0]?.function?.parameters?.properties?.findings?.items
-            ?.properties?.evidence_ids?.items?.enum,
-          [evidenceId],
-        );
+        assert.equal(childRound, 2);
+        assert.ok(tools.some((tool) => tool.function.name === "read_file"), "ordinary final and safe reads share one child surface");
+        assert.equal(tools.some((tool) => tool.function.name === "submit_runtime_v2_subagent_report"), false);
         childInFlight = false;
         const childSummary =
           `The reviewed owner is in src/main.js (${evidenceId}).`;
         return {
-          content: "",
-          semanticContent: "",
-          actionableContent: "",
-          toolCalls: [{
-            id: "submit-child-report",
-            name: "submit_runtime_v2_subagent_report",
-            arguments: JSON.stringify({
-              summary: childSummary,
-              findings: [{
-                statement: "The reviewed owner is in src/main.js.",
-                evidence_ids: [evidenceId],
-              }],
-              unresolved: [],
-            }),
-          }],
+          content: childSummary,
+          semanticContent: childSummary,
+          actionableContent: childSummary,
+          toolCalls: [],
           usage: {},
           protocolViolation: null,
         };
@@ -3394,7 +3402,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
   );
   assert.equal(parentReadWhileChildActive, true);
   assert.equal(parentRound, 6);
-  assert.equal(childRound, 3);
+  assert.equal(childRound, 2);
   const aggregate = result.checkpoint.aggregate;
   const events = aggregate.events;
   const sequenceOf = (type) => events.find((entry) => entry.type === type)?.sequence;
@@ -6319,4 +6327,55 @@ test("Plan cold history never attaches a future receipt to an interrupted reused
   assert.equal(tools.length, 2);
   assert.equal(JSON.parse(tools[0].content).historicalContentUnavailable, true);
   assert.equal(tools[1].content, "The resumed file's actual source.");
+});
+
+
+test("Plan distinguishes client output guards from real provider length without accepting an incomplete response", async () => {
+  for (const cause of ["reasoning_char_limit", "action_char_limit", "provider_length", "stop"]) {
+    const logs = [];
+    const settlements = [];
+    const readTool = {
+      type: "function",
+      function: { name: "read_file", description: "Read source", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+    };
+    const isClientStop = cause.endsWith("char_limit");
+    const port = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planProviderPort.ts"), new Map([
+      ["../../lib/streaming", {
+        isStreamOutputLimited,
+        streamChatCompletion: async () => ({
+          content: "An unfinished planning draft.", semanticContent: "An unfinished planning draft.",
+          toolCalls: [], usage: {}, protocolViolation: null,
+          finishReason: isClientStop ? null : cause === "provider_length" ? "length" : "stop",
+          ...(isClientStop ? { clientStopReason: cause } : {}),
+        }),
+      }],
+      ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ markFirstToken() {}, reportFailure() {}, release() {}, setPressureHandler() {} }) }],
+      ["../../lib/providerLaneSettings", {
+        deriveBudgetedStreamSettings: () => ({}),
+        deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+      }],
+      ["./planModelProtocol", { ...planProtocol, planModelTools: () => [readTool], selectPlanModelTools: () => [readTool] }],
+    ]));
+    const result = await port.requestPlanModel({
+      get: () => ({ config: {} }),
+      context: { abortCtrl: new AbortController(), phaseLanguage: "en", runWorkspace: "/fixture" },
+      ledger: {
+        snapshot: () => ({ objective: { text: "Inspect before planning" }, evidence: [] }),
+        schedule: async () => ({ idempotencyKey: "plan-limited" }),
+        settleCommand: async (event) => { settlements.push(event); },
+      },
+      run, messages: [{ role: "user", content: "Inspect source before planning." }],
+      deadlineAt: Date.now() + 30_000, stage: "discovery", evidence: [], evidenceContents: new Map(), collaboration: {}, submissionRepairPending: false,
+      logStoreEvent: (eventName, data) => logs.push({ eventName, data }),
+    });
+    const diagnostic = result.diagnostics.find((item) => item.code === "output_truncated");
+    assert.equal(!!diagnostic, cause !== "stop", cause);
+    assert.deepEqual(result.toolCalls, []);
+    assert.deepEqual(settlements.at(-1).result.diagnostics, result.diagnostics);
+    const shape = logs.find((entry) => entry.eventName === "runtime_v2_plan_provider_response_shape").data;
+    assert.equal(shape.finishReason, isClientStop ? null : cause === "provider_length" ? "length" : "stop");
+    assert.equal(shape.clientStopReason, isClientStop ? cause : null);
+    assert.equal(shape.stopSource, isClientStop ? "client_guard" : cause === "provider_length" ? "provider" : null);
+    if (isClientStop) assert.match(diagnostic.message, new RegExp(cause));
+  }
 });

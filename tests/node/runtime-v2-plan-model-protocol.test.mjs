@@ -66,8 +66,15 @@ test("plan intent analysis receives the collaboration method before decompositio
     overview: "src/components/editor.js\nsrc/components/toolbar.js",
   });
   const system = String(messages[0]?.content || "");
+  assert.equal(messages[0]?.role, "system",
+    "the initial planning request receives the method before the user's decomposition begins");
   assert.match(system, /\[COLLABORATION METHOD\]/);
-  assert.match(system, /During intent analysis/);
+  assert.match(system, /requested deliverable and depth/);
+  assert.match(system, /independent result only when it benefits.*justify coordination/);
+  assert.match(system, /Delegation remains optional/);
+  assert.doesNotMatch(system, /as many.*children|prioritize.*spawn_subagent/);
+  assert.equal(messages[1]?.content, "Repair the multi-file open flow.",
+    "collaboration guidance must preserve the original requested outcome");
   assert.match(system, /evidence-backed solution/);
   assert.match(system, /every exact non-overlapping file target/);
   assert.match(system, /Do not grant a directory/);
@@ -130,10 +137,9 @@ test("Plan discovers Skill metadata without preloading the body and offers load_
     (tool) => tool.function.name === "load_skill",
   );
   assert.ok(loadSkill);
-  assert.deepEqual(
-    loadSkill.function.parameters.properties.skill_id.enum,
-    ["panel:review"],
-  );
+  assert.equal(loadSkill.function.parameters.properties.skill_id.type, "string");
+  assert.equal(loadSkill.function.parameters.properties.skill_id.enum, undefined,
+    "Plan shares compact references and validates the admitted identity at execution");
 });
 
 test("Plan exposes only bounded read-only collaboration tools from live capacity", () => {

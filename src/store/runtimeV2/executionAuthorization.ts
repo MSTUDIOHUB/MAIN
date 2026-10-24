@@ -7,6 +7,7 @@ import {
 import { shellPermissionPreflight } from "../../lib/ipc";
 import {
   canApplyShellAutoReview,
+  getShellPermissionCommandForTool,
   resolveShellAutoApproval,
 } from "../../lib/shellAutoApproval";
 import {
@@ -14,6 +15,7 @@ import {
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
@@ -51,6 +53,8 @@ import {
 } from "./executionValidationCorrection";
 import {
   authorizationFor,
+  runtimeV2ToolCapabilityRestriction,
+  runtimeV2ToolApprovalCapability,
   isRuntimeV2EffectRisk,
   isRuntimeV2ObservationRisk,
   runtimeV2CatalogToolSource,
@@ -75,7 +79,6 @@ export {
   runtimeV2ProviderActionWindowFor,
 } from "./executionProviderActionWindow";
 export {
-  correctiveFiniteValidationCommand,
   finiteValidationCommandRejection,
   type RuntimeV2FiniteValidationRejection,
 } from "./executionValidationCommand";
@@ -387,6 +390,12 @@ export async function authorizeToolForCurrentTurn(
     };
   }
   const exposedName = catalogResolution.entry.exposedName;
+  const restriction = runtimeV2ToolCapabilityRestriction(input, exposedName, args);
+  if (restriction) return {
+    allowed: false,
+    reason: `TURN_CAPABILITY_RESTRICTED: ${restriction}`,
+    allowExternalLocalRead: false,
+  };
   const localFileReadPath = getLocalFileReadPathForToolCall(
     exposedName,
     args,
@@ -419,26 +428,41 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
+  const approvalRequiredCapability = runtimeV2ToolApprovalCapability(input, exposedName, args);
+  const manualReview = approvalRequiredCapability ? {
+    allowed: false as const,
+    reason: "This Turn requires separate human approval for this action.",
+    allowExternalLocalRead: false,
+    approvalRequired: true,
+    approvalRequiredCapability,
+    risk,
+    ...(localFileReadPath ? { localFileReadPath } : {}),
+  } : null;
+  if (risk === "external_read") {
+    const networkTool = catalogResolution.entry.source === "built_in" && (exposedName === "web_search" || exposedName === "web_fetch");
+    if (networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)) {
+      return { allowed: false, reason: "当前会话未启用网络访问。", allowExternalLocalRead: false };
+    }
+  }
+  const shellCommand = risk === "shell" || getShellPermissionCommandForTool(exposedName, args);
+  if (manualReview && !shellCommand) return manualReview;
   if (risk === "read_only") {
     return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "external_read") {
-    const networkTool = catalogResolution.entry.source === "built_in" &&
-      (exposedName === "web_search" || exposedName === "web_fetch");
-    return networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)
-      ? {
-          allowed: false,
-          reason: "当前会话未启用网络访问。",
-          allowExternalLocalRead: false,
-        }
-      : { allowed: true, reason: null, allowExternalLocalRead: false };
+    return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "local_file_read") {
-    const approved = !!localFileReadPath &&
-      isLocalFileReadApproved(
-        localFileReadPath,
-        state.approvedLocalFileReadPaths,
-      );
+    const pathApproved = !!localFileReadPath && isLocalFileReadApproved(localFileReadPath, state.approvedLocalFileReadPaths);
+    const sessionApproved = state.autoApproveTools === true && isAllowedBySessionAutoApprove(
+      risk, catalogResolution.entry.source, state.autoApproveToolScopes, authorization.policy,
+    );
+    const approved = pathApproved || sessionApproved;
+    input.logStoreEvent?.("runtime_v2_local_read_authorized", {
+      sessionKey: input.context.runSessionKey, turnId: input.context.turnId, risk, autoApproveTools: state.autoApproveTools === true,
+      scopes: state.autoApproveToolScopes || [], decision: approved ? "allow" : "ask",
+      source: pathApproved ? "exact_path" : sessionApproved ? "session_scope" : "human_required",
+    });
     return approved
       ? { allowed: true, reason: null, allowExternalLocalRead: true }
       : {
@@ -451,38 +475,62 @@ export async function authorizeToolForCurrentTurn(
         };
   }
   const consent = state.currentTurnExecutionConsent;
-  if (consent?.turnId !== input.context.turnId || consent.granted !== true) {
-    return {
-      allowed: false,
-      reason: `执行 ${risk} 工具前需要本轮执行授权。`,
-      allowExternalLocalRead: false,
-    };
-  }
-  if (risk === "workspace_write") {
-    return { allowed: true, reason: null, allowExternalLocalRead: false };
-  }
-  if (risk === "shell") {
+  const hasConsent = consent?.turnId === input.context.turnId && consent.granted === true;
+  // A dangerous shell command is classified as destructive, but still needs
+  // the shell guard's exact decision/approval packet at the execution boundary.
+  if (shellCommand) {
     const shell = await resolveShellAutoApproval({
       toolName: exposedName,
       args,
       workspace: input.context.runWorkspace || "",
       preflight: shellPermissionPreflight,
     });
-    if (!canApplyShellAutoReview(shell)) {
+    if (shell.error || shell.decision?.decision === "deny") {
       return {
         allowed: false,
-        reason: shell.error || "该 Shell 命令需要单独审批，未执行。",
+        reason: shell.error || shell.decision?.reviewReason || "该 Shell 命令已被权限策略拒绝。",
         allowExternalLocalRead: false,
+      };
+    }
+    if (manualReview) return { ...manualReview, ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}) };
+    const autoReviewAllowed = state.autoApproveTools === true &&
+      isAllowedBySessionAutoApprove(
+        risk,
+        catalogResolution.entry.source,
+        state.autoApproveToolScopes,
+        authorization.policy,
+      );
+    // Turn consent authorizes the task, while only the explicit session
+    // Auto Review scope may turn a shell-policy ask into an approval packet.
+    if (!hasConsent || !canApplyShellAutoReview(shell) ||
+      (shell.decision?.decision === "ask" && !autoReviewAllowed)) {
+      return {
+        allowed: false,
+        reason: "该 Shell 命令需要单独审批，未执行。",
+        allowExternalLocalRead: false,
+        approvalRequired: true,
+        risk,
+        ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}),
       };
     }
     return {
       allowed: true,
       reason: null,
       allowExternalLocalRead: false,
-      ...(shell.approval
-        ? { shellPermissionApproval: shell.approval }
-        : {}),
+      ...(shell.approval ? { shellPermissionApproval: shell.approval } : {}),
     };
+  }
+  if (!hasConsent) {
+    return {
+      allowed: false,
+      reason: `执行 ${risk} 工具前需要本轮执行授权。`,
+      allowExternalLocalRead: false,
+      approvalRequired: true,
+      risk,
+    };
+  }
+  if (risk === "workspace_write") {
+    return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (isPerCallOnlyToolRisk(risk)) {
     return {

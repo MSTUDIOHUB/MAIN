@@ -63,6 +63,7 @@ const {
   getIntentPolicy,
   hasExplicitUnityConsoleDiagnosticCue,
   inferCommandDirective,
+  normalizeCommandDirective,
   looksLikeAmbiguousChatExecutionInput,
   looksLikeExplicitWorkspaceMutationRequest,
   looksLikePreviousTurnContinuationInput,
@@ -194,6 +195,28 @@ test("read-only and plan-first constraints suppress mutation authority", () => {
   }
 });
 
+test("a prohibition on a different operation does not cancel a requested repair", () => {
+  for (const input of [
+    "Fix src/main.ts; do not run tests.",
+    "Fix src/main.ts; do not execute tests.",
+    "请修复 src/main.ts；不要运行测试。",
+    "请修复 src/main.ts；不要执行测试。",
+  ]) {
+    assert.equal(looksLikeExplicitWorkspaceMutationRequest(input), true, input);
+    const result = resolveTurnRunIntent(input, createContext({ hasWorkspace: true }));
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "file_modify", input);
+    assert.equal(result.commandDirective.exactCommand, undefined, input);
+  }
+  for (const input of [
+    "Fix src/main.ts; do not modify any files.",
+    "请修复 src/main.ts；不要修改任何文件。",
+  ]) {
+    assert.equal(looksLikeExplicitWorkspaceMutationRequest(input), false, input);
+    assert.notEqual(resolveTurnRunIntent(input, createContext({ hasWorkspace: true })).intent, "execute", input);
+  }
+});
+
 test("fix requests with analysis-domain nouns enter execute workflow", () => {
   for (const input of [
     "修复数据分析展示问题",
@@ -252,6 +275,7 @@ test("natural-language run-and-repair requests route by the requested repair out
   assert.equal(explicitMixed.commandDirective.kind, "file_modify");
 
   const commandOnly = resolveTurnRunIntent("npm test", createContext());
+  assert.equal(commandOnly.intent, "execute");
   assert.equal(commandOnly.commandDirective.kind, "shell");
   assert.equal(commandOnly.commandDirective.exactCommand, "npm test");
   const commandOnlyContract = buildEffectiveTurnContract({
@@ -262,6 +286,58 @@ test("natural-language run-and-repair requests route by the requested repair out
   });
   assert.equal(commandOnlyContract.mutationExpected, false);
   assert.equal(commandOnlyContract.validationExpected, true);
+});
+
+test("read-only questions, prohibitions, and quoted operations do not authorize a command", () => {
+  for (const input of [
+    "刚才提到的测试通过，是你本轮实际运行的结果，还是已有文档中的记录？请只说明来源，不要执行测试。",
+    "Were the passing tests you mentioned actually run in this turn, or recorded in existing documentation? Please only explain the source; do not execute tests.",
+    "不要运行测试，只回答之前结果的来源。",
+    "Do not run tests. Tell me the source of the previous result.",
+    "你说的“运行测试”来自哪里？请只解释记录，不要执行测试。",
+    "Please explain the source of the phrase 'run test scripts'; do not execute anything.",
+  ]) {
+    const result = resolveTurnRunIntent(input, createContext({ hasWorkspace: true }));
+    assert.equal(result.intent, "respond", input);
+    assert.equal(result.commandDirective.kind, "none", input);
+    assert.equal(result.commandDirective.exactCommand, undefined, input);
+    assert.equal(result.requiresApproval, false, input);
+    assert.equal(result.needsDecision, undefined, input);
+    const contract = buildEffectiveTurnContract({
+      conversationIntent: result.intent,
+      commandDirective: result.commandDirective,
+    });
+    assert.equal(contract.allowedToolRisks, "read_only", input);
+    assert.equal(contract.mutationExpected, false, input);
+    assert.equal(contract.validationExpected, false, input);
+    assert.equal(contract.operationApprovalState, "not_required", input);
+  }
+});
+
+test("operation metadata is subordinate to an already resolved read-only intent", () => {
+  for (const intent of ["respond", "discuss", "analyze", "summarize", "report"]) {
+    for (const input of ["run test scripts", "git push", "repair src/App.tsx", "execute Unity editor script"]) {
+      const directive = inferCommandDirective(input, intent);
+      assert.equal(["shell", "git", "file_modify", "unity"].includes(directive.kind), false, `${intent}: ${input}`);
+      assert.equal(directive.requiresApproval, false, `${intent}: ${input}`);
+    }
+    const staleOperation = { kind: "shell", action: "test", exactCommand: "npm test", source: "preflight", requiresApproval: true };
+    const normalized = normalizeCommandDirective(staleOperation, undefined, intent);
+    assert.equal(normalized.kind, "none", intent);
+    assert.equal(normalized.exactCommand, undefined, intent);
+    assert.equal(normalized.requiresApproval, false, intent);
+
+    const contract = buildEffectiveTurnContract({
+      conversationIntent: intent,
+      commandDirective: staleOperation,
+      executionConsentGranted: true,
+    });
+    assert.equal(contract.allowedToolRisks, "read_only", intent);
+    assert.equal(contract.mutationExpected, false, intent);
+    assert.equal(contract.validationExpected, false, intent);
+    assert.equal(contract.operationApprovalState, "not_required", intent);
+    assert.equal(contract.completionEvidenceRequired, "answer", intent);
+  }
 });
 
 test("an unapproved Plan describes future effects without entering execution evidence", () => {
@@ -556,7 +632,13 @@ test("unity console diagnostic cue ignores explicit no-error phrasing", () => {
   assert.equal(hasExplicitUnityConsoleDiagnosticCue("检查一下Unity console的报错"), true);
   assert.equal(hasExplicitUnityConsoleDiagnosticCue("Unity 里没有报错，但蛇没有移动"), false);
   assert.equal(hasExplicitUnityConsoleDiagnosticCue("no compile error, only runtime behavior issue"), false);
-  assert.equal(inferCommandDirective("Unity 里没有报错，但蛇没有移动", "analyze").action, "unity_workflow");
+  assert.equal(inferCommandDirective("Unity 里没有报错，但蛇没有移动", "analyze").kind, "none");
+  const diagnosticDirective = inferCommandDirective("检查一下Unity console的报错", "analyze");
+  const contract = buildEffectiveTurnContract({ conversationIntent: "analyze", commandDirective: diagnosticDirective });
+  assert.equal(diagnosticDirective.action, "console_diagnostics");
+  assert.equal(contract.allowedToolRisks, "read_only");
+  assert.equal(contract.validationExpected, false);
+  assert.equal(contract.operationApprovalState, "not_required");
 });
 
 test("complex multi-file generation asks for user choice before planning or execution", () => {
@@ -729,9 +811,9 @@ test("composer suggestion ignore and locked intent do not override explicit user
   );
 });
 
-test("ordinary low-risk respond requests should not block on preflight", () => {
+test("ordinary natural requests use the shared semantic preflight", () => {
   const result = resolveTurnRunIntent("帮我解释一下这个模块现在在做什么", createContext());
-  assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), false);
+  assert.equal(shouldUseBlockingIntentPreflight(result, "main_mode"), true);
 });
 
 test("ambiguous chat-versus-execute requests use blocking preflight", () => {
@@ -759,7 +841,7 @@ test("low-confidence non-respond requests can still opt into blocking preflight"
   );
 });
 
-test("output-style intents do not block on preflight", () => {
+test("response style cannot bypass semantic preflight", () => {
   assert.equal(
     shouldUseBlockingIntentPreflight(
       {
@@ -771,8 +853,18 @@ test("output-style intents do not block on preflight", () => {
       },
       "main_mode",
     ),
-    false,
+    true,
   );
+});
+
+test("lexical confidence and suggested controls never bypass natural semantic calibration", () => {
+  for (const intent of ["respond", "analyze", "report", "execute", "plan"]) {
+    for (const hasWorkspace of [false, true]) {
+      const hint = { intent, reason: "lexical hint", confidence: 1, riskLevel: "low", bypassMainRouter: true, needsDecision: true };
+      assert.equal(shouldUseBlockingIntentPreflight(hint, "main_mode", "full natural request", hasWorkspace), true);
+      assert.equal(shouldUseBlockingIntentPreflight(hint, "plan_mode", "full natural request", hasWorkspace), false);
+    }
+  }
 });
 
 test("high-risk multi-step implementation suggests planning first", () => {
@@ -876,27 +968,7 @@ test("continuation resumes an unfinished execute turn", () => {
   );
 });
 
-test("store asks before executing when preflight upgrades natural chat to operations", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
-  const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
-  const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
-  const preflightExecutorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"), "utf8");
-
-  assert.match(source, /startBlockingPreflight: \(blockingPreflightEffect\) =>/);
-  assert.match(submitIntentRoutingSource, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
-  assert.match(source, /void startSubmitBlockingPreflightEffect\(\{/);
-  assert.match(preflightExecutorSource, /return executeSubmitBlockingPreflight\(\{/);
-  assert.match(preflightExecutorSource, /const action = resolveSubmitPreflightEffectAction/);
-  assert.match(preflightExecutorSource, /action\.kind === "set_pending_decision"/);
-  assert.match(turnSubmissionSource, /const preflightDecision = resolveSubmitPreflightResultDecision/);
-  assert.match(turnSubmissionSource, /preflightDecision\.kind === "ask_execution_confirmation"/);
-  assert.match(turnSubmissionSource, /pendingRunDecision: preflightDecision\.pendingRunDecision!/);
-  assert.match(turnSubmissionSource, /const shouldAskForPreflightExecutionDecision =/);
-  assert.match(turnSubmissionSource, /localWasNatural[\s\S]*preflightSuggestsOperation[\s\S]*pendingRunDecision/);
-  assert.match(turnSubmissionSource, /decisionOptions: \["execute", "respond", "plan"\]/);
-});
-
-test("store forces auto-approved visible turns into execution semantics", () => {
+test("tool auto-approval grants action consent without deciding the requested intent", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
   const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
@@ -904,11 +976,8 @@ test("store forces auto-approved visible turns into execution semantics", () => 
   assert.match(source, /const intentRouting = resolveAndApplySubmitIntentRouting/);
   assert.match(submitIntentRoutingSource, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
   assert.match(source, /autoApproveTools: state\.autoApproveTools/);
-  assert.match(submitIntentRoutingSource, /const shouldForceExecuteForAutoApprove =\s*initialIntentDecision\.shouldForceExecuteForAutoApprove/);
-  assert.match(turnSubmissionSource, /const shouldForceExecuteForAutoApprove =/);
-  assert.match(turnSubmissionSource, /autoApproveTools === true/);
-  assert.match(turnSubmissionSource, /effectiveRunIntent = "execute"/);
-  assert.match(submitIntentRoutingSource, /!shouldForceExecuteForAutoApprove &&\s*!input\.options\?\.skipIntentResolution/);
+  assert.doesNotMatch(submitIntentRoutingSource, /shouldForceExecuteForAutoApprove/);
+  assert.doesNotMatch(turnSubmissionSource, /shouldForceExecuteForAutoApprove/);
   assert.match(source, /const runtimeDecision = resolveSubmitRuntimeDecision/);
   assert.match(source, /shouldExecuteOnceFromReplyOption,\s*preservePlanState,/);
   assert.match(source, /autoApproveTools: state\.autoApproveTools/);

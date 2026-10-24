@@ -9,6 +9,7 @@ import ts from "typescript";
 const workspaceRoot = process.cwd();
 const moduleCache = new Map();
 let tauriInvoke = async () => "";
+let semanticPreflightStream = null;
 
 function loadTranspiledModuleSync(sourcePath) {
   const normalizedPath = path.resolve(sourcePath);
@@ -57,6 +58,12 @@ function loadTranspiledModuleSync(sourcePath) {
   };
 
   new Function("exports", "module", "require", transpiled)(module.exports, module, runtimeRequire);
+  if (normalizedPath === path.join(workspaceRoot, "src/lib/streaming.ts")) {
+    const realStream = module.exports.streamChatCompletion;
+    module.exports.streamChatCompletion = (...args) => semanticPreflightStream &&
+      args[5] === 512 && Array.isArray(args[4]) && args[4].length === 0
+      ? semanticPreflightStream(...args) : realStream(...args);
+  }
   moduleCache.set(normalizedPath, module.exports);
   return module.exports;
 }
@@ -107,6 +114,66 @@ const runtimeV2 = loadTranspiledModuleSync(
 
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
+
+test("the first Run after restoring a metadata-only Session keeps its canonical epoch across persistence", () => {
+  const { buildPersistedAppState } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/persistState.ts"));
+  const { createRuntimeV2RunnerIdentity } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionRunnerIdentity.ts"));
+  const { buildRuntimeV2ReadOnlyIdentities } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/readOnlyRunner.ts"));
+  const workspace = "/tmp/metadata-only-session";
+  const sessionId = 731;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const sessionEpoch = "canonical-empty-session-epoch";
+  const original = useAppStore.getState();
+  const persisted = JSON.parse(JSON.stringify(buildPersistedAppState({
+    ...original, currentWorkspace: workspace, currentSessionId: sessionId,
+    sessionsByWorkspace: { [workspace]: [{ id: sessionId, planLifecycleEpoch: sessionEpoch, messages: [], runtimeSnapshot: {} }] },
+  })));
+  assert.equal(persisted.sessionsByWorkspace[workspace][0].runtimeSnapshot, undefined);
+  const turn = { id: "first-turn", clientSubmissionId: "first-submission", userPrompt: "Received?", status: "done", mode: "edit", blockIds: [], createdAt: 1 };
+  const state = { ...original, ...persisted, conversationTurns: [turn] };
+  const context = { turnId: turn.id, runSessionKey: sessionKey, runSessionId: sessionId, runScopeKey: workspace, runWorkspace: workspace, harnessRunId: "first-run" };
+  for (const identities of [buildRuntimeV2ReadOnlyIdentities(state, context, turn), createRuntimeV2RunnerIdentity(state, context, turn)]) {
+    assert.equal(identities.turn.sessionEpoch, sessionEpoch);
+    assert.equal(identities.run.sessionEpoch, sessionEpoch);
+    const aggregate = runtimeV2.transition(null, {
+      schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "first-admission", at: 1,
+      type: "turn.admitted", turn: identities.turn, strategy: "chat", objective: turn.userPrompt, constraints: [], acceptanceCriteria: [],
+    });
+    const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ revision: 1, aggregate, updatedAt: 1 });
+    const serialized = JSON.parse(JSON.stringify(runtimeV2.serializeRuntimeV2CheckpointMap({ [turn.id]: checkpoint })));
+    const restored = normalizeSessionRuntimeSnapshot({ runtimeV2Checkpoints: serialized }, {
+      workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: sessionEpoch,
+    });
+    assert.equal(restored.runtimeV2Checkpoints[turn.id]?.owner.sessionEpoch, sessionEpoch);
+    const rejected = normalizeSessionRuntimeSnapshot({ runtimeV2Checkpoints: serialized }, {
+      workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: "replacement-epoch",
+    });
+    assert.equal(rejected.runtimeV2Checkpoints[turn.id], undefined);
+  }
+});
+
+test("runtime Session admission rejects stale exact-turn receipts and ignores foreign owners", () => {
+  const { resolveRuntimeV2SessionEpoch } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/sessionIdentity.ts"));
+  const context = { runSessionKey: "/tmp/owner:9", runScopeKey: "/tmp/owner", runSessionId: 9 };
+  const turn = { id: "owned-turn", clientSubmissionId: "owned-submission", workspaceInstructionReceiptId: "owned-receipt" };
+  const receipt = { ...turn, turnId: turn.id, receiptId: turn.workspaceInstructionReceiptId,
+    sessionKey: context.runSessionKey, sessionEpoch: "epoch-current" };
+  const state = { sessionsByWorkspace: { [context.runScopeKey]: [{ id: 9, planLifecycleEpoch: "epoch-current" }] },
+    planLifecycle: { sessionKey: "/foreign:9", sessionEpoch: "foreign-epoch" },
+    workspaceInstructionLedger: [{ receipt }] };
+  assert.equal(resolveRuntimeV2SessionEpoch(state, context, turn), "epoch-current");
+  assert.throws(() => resolveRuntimeV2SessionEpoch({ ...state,
+    workspaceInstructionLedger: [{ receipt: { ...receipt, sessionEpoch: "epoch-stale" } }],
+  }, context, turn), /RUNTIME_V2_SESSION_OWNER_MISMATCH/);
+  for (const foreign of [{ turnId: "different-turn" }, { sessionKey: "/different:9" }, { clientSubmissionId: "different-submission" }]) {
+    assert.equal(resolveRuntimeV2SessionEpoch({ ...state,
+      workspaceInstructionLedger: [{ receipt: { ...receipt, ...foreign, sessionEpoch: "foreign-epoch" } }],
+    }, context, turn), "epoch-current");
+  }
+  assert.equal(resolveRuntimeV2SessionEpoch({ ...state, planLifecycle: null }, {
+    ...context, runSessionEpoch: "captured-epoch",
+  }, turn), "captured-epoch");
+});
 
 test("workspace Session containers normalize Chat turns to task turns", () => {
   const turns = [{
@@ -1099,8 +1166,23 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     releaseTree = resolve;
   });
   const streamInvocations = [];
+  const semanticRequests = [];
 
   try {
+    semanticPreflightStream = async (messages, settings) => {
+      semanticRequests.push(messages);
+      assert.equal(settings.reasoningRequest, "off");
+      assert.equal(JSON.parse(messages[1].content).currentRequest, queue.entries[0].instruction.payload.text);
+      return {
+        content: JSON.stringify({
+          semantic: { objective: "Summarize this workspace in one sentence", workType: "investigate",
+            answerFormat: "summary", requiredCapabilities: ["workspace_read"],
+            forbiddenCapabilities: ["workspace_write", "command", "external_interaction"], approvalRequiredCapabilities: [] },
+          confidence: 0.99, needsUserChoice: false,
+        }),
+        toolCalls: [], finishReason: "stop",
+      };
+    };
     globalThis.window = {
       localStorage: {
         getItem: (key) => localStorageValues.get(String(key)) ?? null,
@@ -1175,6 +1257,8 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
 
     assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
     await treeStarted;
+    assert.equal(semanticRequests.length, 1, "the admitted FIFO head is interpreted exactly once");
+    assert.equal(streamInvocations.length, 0, "the runtime failure fixture starts only after semantic admission and discovery");
     assert.equal(
       useAppStore.getState().workspaceTurnQueue.entries.length,
       0,
@@ -1223,6 +1307,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     assert.equal(turn?.runtimeOutcome?.resultKind, "error");
     assert.equal(settled.isGenerating, false);
     assert.equal(settled.agentStatus, "idle");
+    assert.equal(semanticRequests.length, 1, "read-only recovery does not start a second routing request");
     assert.match(turn?.summary || "", /恢复租约|recovery/i);
     assert.equal(
       settled.taskFlow.filter((block) =>
@@ -1234,6 +1319,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     );
   } finally {
     releaseTree?.();
+    semanticPreflightStream = null;
     Date.now = defaultDateNow;
     tauriInvoke = defaultTauriInvoke;
     if (originalWindow === undefined) delete globalThis.window;
@@ -6233,6 +6319,111 @@ test("an emergency terminal envelope restores through the canonical Turn final a
       "schemaVersion",
     ],
   );
+});
+
+test("Stop on a full ledger cold-restores one canceled envelope, terminal sequence, and final", async () => {
+  const { commitCanceledTurn } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/commitCanceledTurn.ts"));
+  const { captureCanceledTurnControlPlaneFence } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/canceledTurnProjection.ts"));
+  const workspace = "/tmp/runtime-v2-cancel-capacity";
+  const sessionKey = `${workspace}:99`;
+  const turnId = "turn-cancel-capacity";
+  const owner = { workspaceKey: workspace, sessionKey, sessionEpoch: "cancel-capacity-epoch",
+    clientSubmissionId: "cancel-capacity-submission", turnId };
+  const run = { sessionKey, sessionEpoch: owner.sessionEpoch, turnId, runId: "cancel-capacity-run", parentRunId: null, attemptId: "cancel-capacity-attempt" };
+  let aggregate = null;
+  let ordinal = 0;
+  const append = (type, fields) => {
+    aggregate = runtimeV2.transition(aggregate, {
+      schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: aggregate?.nextSequence || 0,
+      eventId: `capacity-restore-${++ordinal}`, at: ordinal, type, ...fields,
+    });
+  };
+  append("turn.admitted", { turn: owner, strategy: "chat", objective: "Question", constraints: [], acceptanceCriteria: [] });
+  append("run.started", { run, phase: "observing" });
+  while (aggregate.events.length < runtimeV2.MAX_RUNTIME_V2_CHECKPOINT_EVENTS) {
+    const projection = { id: `capacity-view-${ordinal}`, audience: "timeline", markdown: "Progress", kind: "timeline", dedupeKey: `capacity-view-${ordinal}` };
+    append("projection.published", { run, audience: "timeline", projectionId: projection.id, projection });
+  }
+  const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ revision: aggregate.events.length, aggregate, updatedAt: aggregate.updatedAt });
+  let state = {
+    config: useAppStore.getState().config,
+    currentTurnId: turnId, agentStatus: "running", isGenerating: true, abortController: new AbortController(),
+    taskFlow: [{ id: 1, turnId, type: "user", content: "Question" }],
+    conversationTurns: [{ id: turnId, clientSubmissionId: owner.clientSubmissionId,
+      userPrompt: "Question", title: "Question", mode: "chat", intent: "chat", displayIntent: "chat",
+      status: "executing", blockIds: [1], collapsed: false, createdAt: 1, elapsedTime: 0 }],
+    runtimeEvents: [{ schemaVersion: 2, type: "run.started", threadId: sessionKey, turnId,
+      timestampMs: 1, runId: run.runId, parentRunId: null }],
+    runtimeV2Checkpoints: { [turnId]: checkpoint },
+    runtimeV2EmergencyTerminalEnvelopes: {},
+    harnessRunMarker: { schemaVersion: 1, instanceId: "cancel-capacity-instance", runId: run.runId,
+      sessionKey, workspace, sessionId: 99, turnId, activeRunId: run.runId, activeParentRunId: null,
+      parentRunId: null, status: "running", workflowMode: "chat", runtimeIntent: "chat", planStage: "idle",
+      isPlanApproved: false, startedAt: 1, updatedAt: 1, closedAt: null, closeReason: null },
+  };
+  let durableSnapshot;
+  let revisionToken = {};
+  let nextId = 2;
+  const result = await commitCanceledTurn({
+    sessionKey, scopeKey: workspace, sessionId: 99, turnId, runId: run.runId,
+    reason: "user_cancelled", message: "Canceled.", isCurrent: () => true,
+    controlPlaneFence: captureCanceledTurnControlPlaneFence({ state, sessionKey, turnId, runId: run.runId }),
+    nextTaskId: () => nextId++, sessionGet: () => state, getSessionRevisionToken: () => revisionToken,
+    persistProjection: async (projected) => {
+      durableSnapshot = JSON.parse(JSON.stringify({ ...projected,
+        runtimeV2Checkpoints: runtimeV2.serializeRuntimeV2CheckpointMap(projected.runtimeV2Checkpoints),
+      }));
+      return projected;
+    },
+    publishProjection: (publication) => {
+      state = publication.durableState || publication.projectedState;
+      revisionToken = {};
+      return { published: true, disposition: "published" };
+    },
+    nowMs: Date.now,
+  });
+  assert.equal(result.disposition, "committed_durable");
+  assert.equal(Object.hasOwn(durableSnapshot.runtimeV2Checkpoints[turnId], "aggregate"), false);
+  const restored = normalizeSessionRuntimeSnapshot(durableSnapshot, {
+    workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: owner.sessionEpoch,
+  });
+  assert.equal(restored.runtimeV2EmergencyTerminalEnvelopes[turnId].resultKind, "canceled");
+  assert.equal(restored.runtimeV2Checkpoints[turnId].aggregate.events.length, 2048);
+  assert.equal(restored.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
+  assert.equal(restored.conversationTurns[0].status, "done");
+  assert.equal(restored.harnessRunMarker.terminalResultKind, "canceled");
+  assert.equal(restored.taskFlow.filter((block) => block.turnId === turnId && block.visibility === "assistant_final").length, 1);
+  assert.deepEqual(restored.runtimeEvents.filter((event) =>
+    event.turnId === turnId && ["run.aborted", "run.completed", "turn.completed"].includes(event.type)
+  ).map((event) => event.type), ["run.aborted", "run.completed", "turn.completed"]);
+});
+
+test("restore accepts only owner-matching canceled size envelopes at the admitted/no-Run boundary", () => {
+  const workspace = "/tmp/runtime-v2-admitted-cancel";
+  const sessionKey = `${workspace}:99`;
+  const owner = { workspaceKey: workspace, sessionKey, sessionEpoch: "admitted-cancel-epoch", clientSubmissionId: "admitted-cancel-submission", turnId: "admitted-cancel-turn" };
+  const run = { sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId, runId: "admitted-cancel-run", parentRunId: null, attemptId: "admitted-cancel-attempt" };
+  const aggregate = runtimeV2.transition(null, { schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "admitted-cancel", at: 1,
+    type: "turn.admitted", turn: owner, strategy: "chat", objective: "Question", constraints: [], acceptanceCriteria: [] });
+  const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ revision: 1, aggregate, updatedAt: 1 });
+  const restore = (resultKind, reasonCode, candidateRun = run) => {
+    const envelope = runtimeV2.createRuntimeV2EmergencyTerminalEnvelope({ owner, run: candidateRun, resultKind, reasonCode, language: "en", at: Date.now(), lastRevision: 1, hasMutation: false });
+    return normalizeSessionRuntimeSnapshot({
+      runtimeV2Checkpoints: runtimeV2.serializeRuntimeV2CheckpointMap({ [owner.turnId]: checkpoint }),
+      runtimeV2EmergencyTerminalEnvelopes: { [owner.turnId]: envelope },
+      conversationTurns: [{ id: owner.turnId, clientSubmissionId: owner.clientSubmissionId, userPrompt: "Question", title: "Question", mode: "chat", intent: "chat", displayIntent: "chat", status: "executing", blockIds: [], collapsed: false, createdAt: 1 }],
+      taskFlow: [], runtimeEvents: [],
+    }, { workspacePath: workspace, expectedSessionKey: sessionKey, expectedSessionEpoch: owner.sessionEpoch });
+  };
+  const restored = restore("canceled", "checkpoint_size_budget_exceeded");
+  assert.equal(restored.runtimeV2EmergencyTerminalEnvelopes[owner.turnId]?.resultKind, "canceled");
+  assert.equal(restored.runtimeV2Checkpoints[owner.turnId].aggregate.run, null);
+  assert.equal(restored.conversationTurns[0].runtimeOutcome.resultKind, "canceled");
+  assert.equal(restored.taskFlow.filter((block) => block.visibility === "assistant_final").length, 1);
+  assert.deepEqual(restored.runtimeEvents.filter((event) => ["run.aborted", "run.completed", "turn.completed"].includes(event.type)).map((event) => event.type), ["run.aborted", "run.completed", "turn.completed"]);
+  for (const [kind, reason] of [["error", "checkpoint_size_budget_exceeded"], ["canceled", "checkpoint_event_budget_exceeded"]]) {
+    assert.equal(restore(kind, reason).runtimeV2EmergencyTerminalEnvelopes[owner.turnId], undefined);
+  }
 });
 
 test("restore rejects an emergency terminal envelope whose checkpoint revision drifted", () => {

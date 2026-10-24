@@ -99,8 +99,8 @@ export function localizeProjectInitReviewError(
 
   if (code) return messages[code][language];
   return language === "en"
-    ? "MAIN could not complete project initialization. Regenerate the preview and try again."
-    : "MAIN 无法完成项目初始化。请重新生成预览后重试。";
+    ? "MAIN could not generate or refresh the project notes. Regenerate the preview and try again."
+    : "MAIN 无法生成或刷新项目说明。请重新生成预览后重试。";
 }
 
 function getDiffTone(line: string): DiffTone {
@@ -119,7 +119,7 @@ function statusLabel(
   const isEnglish = language === "en";
   if (phase === "loading") return isEnglish ? "Generating preview" : "正在生成预览";
   if (phase === "committing") return isEnglish ? "Writing AGENTS.md" : "正在写入 AGENTS.md";
-  if (phase === "success") return isEnglish ? "Initialization complete" : "初始化完成";
+  if (phase === "success") return isEnglish ? "Project notes saved" : "项目说明已保存";
   if (phase === "error") return isEnglish ? "Preview needs attention" : "预览需要处理";
 
   switch (status) {
@@ -127,7 +127,7 @@ function statusLabel(
     case "ready_update":
       return isEnglish ? "Ready for review" : "可以审阅";
     case "already_initialized":
-      return isEnglish ? "Already initialized" : "项目已经初始化";
+      return isEnglish ? "Project notes already exist" : "已有项目说明快照";
     case "no_changes":
       return isEnglish ? "No changes needed" : "无需更改";
     case "invalid_managed_block":
@@ -176,9 +176,9 @@ export default function ProjectInitReviewModal({
 
   const copy = isEnglish
     ? {
-        eyebrow: "WORKSPACE INITIALIZATION",
-        title: "Review project instructions",
-        description: "MAIN will only write this reviewed AGENTS.md after you confirm.",
+        eyebrow: "PROJECT NOTES · AGENTS.md",
+        title: "Generate / refresh project notes",
+        description: "MAIN generates a deterministic project-facts snapshot for AGENTS.md and writes it only after you confirm. This is optional: MAIN reads the project baseline on every Turn. Use /init --refresh to update an existing managed section.",
         workspace: "Captured workspace",
         target: "Target file",
         operation: "Operation",
@@ -187,9 +187,11 @@ export default function ProjectInitReviewModal({
         noWrite: "No write needed",
         fingerprint: "Baseline fingerprint",
         diff: "Proposed diff",
-        emptyDiff: "There are no file changes to display.",
+        emptyDiff: status === "already_initialized"
+          ? "A project-facts snapshot already exists. Use /init --refresh to rescan and review an update; human rules outside the managed section are preserved."
+          : "There are no file changes to display.",
         loading: "Scanning bounded project metadata and preparing a deterministic preview…",
-        success: "AGENTS.md is up to date. New turns can use the refreshed project instructions.",
+        success: "The project-facts snapshot has been saved to AGENTS.md. New Turns will read the saved project notes.",
         invalidBlock: "The managed markers in AGENTS.md are missing or ambiguous. MAIN will not guess which content it may replace.",
         confirm: "Confirm and write",
         committing: "Writing…",
@@ -198,9 +200,9 @@ export default function ProjectInitReviewModal({
         regenerate: "Regenerate preview",
       }
     : {
-        eyebrow: "工作区初始化",
-        title: "审阅项目说明",
-        description: "只有在你确认后，MAIN 才会写入这份已经审阅的 AGENTS.md。",
+        eyebrow: "项目说明 · AGENTS.md",
+        title: "生成／刷新项目说明",
+        description: "MAIN 根据项目元数据确定性生成 AGENTS.md 事实快照，只有确认后才写入。此操作可选：MAIN 每轮都会自动读取项目基线。已有托管区块时，使用 /init --refresh 更新。",
         workspace: "已捕获的工作区",
         target: "目标文件",
         operation: "操作",
@@ -209,9 +211,11 @@ export default function ProjectInitReviewModal({
         noWrite: "无需写入",
         fingerprint: "基线指纹",
         diff: "拟议变更",
-        emptyDiff: "没有需要展示的文件变更。",
+        emptyDiff: status === "already_initialized"
+          ? "已有项目事实快照。使用 /init --refresh 可重新扫描并审阅更新，托管区块外的人工规则会保留。"
+          : "没有需要展示的文件变更。",
         loading: "正在扫描有界的项目元数据，并生成确定性预览…",
-        success: "AGENTS.md 已更新。后续回合可以使用刷新后的项目说明。",
+        success: "项目事实快照已保存到 AGENTS.md。后续回合会读取这份项目说明。",
         invalidBlock: "AGENTS.md 中的托管标记缺失或存在歧义。MAIN 不会猜测可以替换哪一段内容。",
         confirm: "确认并写入",
         committing: "正在写入…",

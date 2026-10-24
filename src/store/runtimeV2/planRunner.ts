@@ -91,7 +91,7 @@ export async function runSubmitRuntimeV2Plan(
         break;
       }
       const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, {
-        finalTextIsProgress: false, includeChildEvidence: true,
+        finalTextIsProgress: false,
       });
       const recoveryExpired = recovery && runtimeV2ProviderRecoveryStallExpired({
         startedAt: recovery.startedAt, reason: recovery.pressure.reason,

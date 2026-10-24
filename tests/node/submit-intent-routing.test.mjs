@@ -131,111 +131,48 @@ function createHarness(overrides = {}) {
   };
 }
 
-test("submit intent routing suppresses the same ignored decision and falls back to respond", () => {
-  const text = "总结并修复这个登录模块的问题";
-  const harness = createHarness({
-    text,
-    dismissedPendingDecisionInputKey: text,
+// These assertions replace the old lexical fast-path contract: no natural
+// phrase can approve a plan, start its resume, or choose a capability surface.
+for (const text of [
+  "分别生成两个文件", "Generate two files separately.",
+  "先分析再修复并验证", "Analyze, fix the cause, and validate.",
+  "解释这个删除命令 rm -rf example", "Explain this deletion command: rm -rf example",
+  "Hello!", "npm test", "继续执行计划",
+  "总结并修复这个登录模块的问题",
+]) {
+  test(`natural input uses semantic admission once: ${text}`, () => {
+    const harness = createHarness({ text, hasWorkspace: true,
+      hasPlanArtifacts: true, isPlanApproved: true, planStage: "executing",
+      dismissedPendingDecisionInputKey: text });
+    assert.deepEqual(harness.resolve(), { handled: true, returnValue: true });
+    assert.equal(harness.calls.preflights.length, 1);
+    assert.equal(harness.calls.preflights[0].request.input, text);
+    assert.equal(harness.calls.approvedPlans, 0);
+    assert.equal(harness.calls.planResumes.length, 0);
+    assert.deepEqual(harness.calls.preRunPatches, []);
   });
-  const result = harness.resolve();
+}
 
-  assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "respond");
-  assert.deepEqual(harness.calls.patches, [
-    { dismissedPendingDecisionInputKey: null },
-  ]);
-  assert.deepEqual(harness.calls.preRunPatches, []);
-  assert.equal(harness.calls.logs[0].event, "intent_decision_suppressed_for_same_input");
-  assert.equal(harness.calls.logs[0].data.source, "resolution");
+test("a continuation supplies its exact prior objective as context without inheriting a route", () => {
+  const prior = { userPrompt: "Inspect first; do not modify this baseline." };
+  const harness = createHarness({ text: "现在修复并验证。", hasWorkspace: true,
+    shouldContinuePreviousTurnIntent: true, previousTurnContinuationTarget: prior,
+    previousTurnContinuationIntent: "analyze", currentTurnIntent: "analyze" });
+  assert.equal(harness.resolve().handled, true);
+  const request = harness.calls.preflights[0].request;
+  assert.equal(request.input, "现在修复并验证。");
+  assert.equal(request.previousRequest, prior.userPrompt);
+  assert.equal(harness.calls.planResumes.length, 0);
 });
 
-test("submit intent routing applies pending decision for reused execution-looking turns", () => {
-  const harness = createHarness({
-    text: "总结并修复这个登录模块的问题",
-    currentTurn: { userPrompt: "前一轮" },
-    currentTurnIntent: "respond",
-    shouldReuseExistingTurnIntent: true,
-  });
-  const result = harness.resolve();
-
-  assert.deepEqual(result, { handled: true, returnValue: true });
-  assert.equal(harness.calls.preRunPatches.length, 1);
-  const pending = harness.calls.preRunPatches[0].pendingRunDecision;
-  assert.equal(pending.kind, "intent_confirmation");
-  assert.equal(pending.suggestedIntent, "plan");
-  assert.deepEqual(
-    pending.options.map((option) => option.id),
-    ["plan", "respond", "execute"],
-  );
-  assert.deepEqual(harness.calls.planResumes, []);
-  assert.deepEqual(harness.calls.preflights, []);
+test("an explicit capsule is passed as a mode boundary while its natural restrictions are interpreted", () => {
+  const harness = createHarness({ text: "Only inspect; do not write or run commands.", hasWorkspace: true,
+    lockedComposerIntent: "execute" });
+  assert.equal(harness.resolve().handled, true);
+  assert.equal(harness.calls.preflights[0].request.explicitIntent, "execute");
 });
 
-test("submit intent routing starts approved plan resume as an early handled effect", () => {
-  const harness = createHarness({
-    text: "继续执行计划",
-    hasPlanArtifacts: true,
-    isPlanApproved: true,
-    planStage: "executing",
-    currentTurnId: "turn-current",
-    planExecutionResumeContinuationTarget: { id: "turn-plan" },
-  });
-  const result = harness.resolve();
-
-  assert.deepEqual(result, { handled: true, returnValue: true });
-  assert.equal(harness.calls.planResumes.length, 1);
-  assert.equal(harness.calls.planResumes[0].text, "继续执行计划");
-  assert.equal(harness.calls.planResumes[0].uiParentTurnId, "turn-plan");
-  assert.equal(harness.calls.planResumes[0].commandDirective.kind, "plan_resume");
-  assert.deepEqual(harness.calls.preRunPatches, []);
-});
-
-test("submit intent routing starts blocking preflight for ambiguous chat execution input", () => {
-  const harness = createHarness({
-    text: "我希望加一个设置按钮",
-  });
-  const result = harness.resolve();
-
-  assert.deepEqual(result, { handled: true, returnValue: true });
-  assert.equal(harness.calls.preflights.length, 1);
-  assert.equal(harness.calls.preflights[0].request.input, "我希望加一个设置按钮");
-  assert.equal(harness.calls.preflights[0].request.mainModeKey, "main_mode");
-  assert.equal(harness.calls.preflights[0].sendOriginSessionKey, "workspace::7");
-  assert.deepEqual(harness.calls.preRunPatches, []);
-});
-
-test("workspace submissions continue into Turn creation without pre-turn intent gates", () => {
-  const harness = createHarness({
-    text: "我希望加一个设置按钮",
-    hasWorkspace: true,
-  });
-  const result = harness.resolve();
-
-  assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "execute");
-  assert.equal(result.effectiveCommandDirective.kind, "file_modify");
-  assert.deepEqual(harness.calls.preRunPatches, []);
-  assert.deepEqual(harness.calls.preflights, []);
-  assert.equal(harness.calls.logs[0].event, "workspace_turn_intent_resolved");
-});
-
-test("real compound repair instructions cannot degrade into workspace search", () => {
-  const harness = createHarness({
-    text: "The editor must not show filename or Unsaved document tabs. Opening a local Markdown file still opens an erroneous save-path dialog. Find the root causes fix the underlying operation order and run real validation to confirm completion.",
-    preferredLanguage: "en",
-    hasWorkspace: true,
-  });
-  const result = harness.resolve();
-
-  assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "execute");
-  assert.equal(result.effectiveCommandDirective.kind, "file_modify");
-  assert.equal(result.effectiveCommandDirective.action, "workspace_file_change");
-  assert.equal(harness.calls.logs[0].event, "workspace_turn_intent_resolved");
-  assert.equal(harness.calls.logs[0].data.mutationSurfaceElevated, false);
-});
-
-test("workspace mutation directives reopen execution even when semantic intent says respond", () => {
+test("operation metadata cannot override semantic intent without an explicit execution choice", () => {
   const resolution = {
     intent: "respond",
     reason: "router classified this as ordinary conversation",
@@ -253,10 +190,20 @@ test("workspace mutation directives reopen execution even when semantic intent s
     },
   };
 
+  for (const intent of ["respond", "discuss", "analyze", "summarize", "report"]) {
+    for (const kind of ["file_modify", "shell", "git", "unity"]) {
+      assert.equal(resolveWorkspaceTurnRuntimeIntent({
+        hasWorkspace: true,
+        currentMainModeKey: "main_mode",
+        shouldExecuteOnceFromReplyOption: false,
+        resolution: { ...resolution, intent, commandDirective: { ...resolution.commandDirective, kind } },
+      }), intent, `${intent}: ${kind}`);
+    }
+  }
   assert.equal(resolveWorkspaceTurnRuntimeIntent({
     hasWorkspace: true,
     currentMainModeKey: "main_mode",
-    shouldExecuteOnceFromReplyOption: false,
+    shouldExecuteOnceFromReplyOption: true,
     resolution,
   }), "execute");
   assert.equal(resolveWorkspaceTurnRuntimeIntent({
@@ -265,19 +212,6 @@ test("workspace mutation directives reopen execution even when semantic intent s
     shouldExecuteOnceFromReplyOption: false,
     resolution,
   }), "respond");
-});
-
-test("complex workspace submissions enter Plan without a pre-turn decision", () => {
-  const harness = createHarness({
-    text: "生成一套游戏框架代码包括文件夹，实现完整的回合制战斗系统。",
-    hasWorkspace: true,
-  });
-  const result = harness.resolve();
-
-  assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "plan");
-  assert.deepEqual(harness.calls.preRunPatches, []);
-  assert.deepEqual(harness.calls.preflights, []);
 });
 
 test("hidden skip-intent control prompts do not infer shell directives from embedded commands", () => {

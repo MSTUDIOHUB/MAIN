@@ -8,13 +8,30 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
       window.localStorage.clear();
+      window.sessionStorage.removeItem("__SKILLS_RUNTIME_SESSIONS__");
       window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
     }
 
     let callbackId = 1;
     const callbacks = new Map<number, unknown>();
     const requests: Array<{ body: string }> = [];
-    (window as any).__SKILLS_RUNTIME_E2E__ = { requests };
+    const deletedPackages: Array<{ localPath: string; workspace: string }> = [];
+    const extractedPackages: string[] = [];
+    const globalPackageId = "a".repeat(64);
+    const entryPoints = [
+      "skills-main/skills/unity-cli/SKILL.md",
+      "skills-main/skills/zzz-folder/SKILL.md",
+    ];
+    const packageRoot = ".protocols/unity-skills-fixture";
+    const packageFiles = Object.fromEntries(entryPoints.map((entry, index) => [
+      `${packageRoot}/${entry}`,
+      ["---", `name: ${index ? "zzz-sprite-tool" : "unity-cli"}`, "description: Unity fixture workflow.", "---", index ? "UNITY_LAST_SKILL_SENTINEL" : "UNITY_CLI_SKILL_SENTINEL"].join("\n"),
+    ]));
+    const globalMeta = {
+      packageId: globalPackageId, name: "Unity Skills", entryPoint: entryPoints[0],
+      entryPoints, files: entryPoints, reused: false,
+    };
+    (window as any).__SKILLS_RUNTIME_E2E__ = { requests, deletedPackages, extractedPackages };
 
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= {
       unregisterListener: () => {},
@@ -42,22 +59,143 @@ test.beforeEach(async ({ page }) => {
         return { total_gb: 32, available_gb: 24 };
       }
       if (cmd === "discover_personal_agent_skills") return [];
-      if (cmd === "glob_search") return [];
-      if (cmd === "read_file") throw new Error("ENOENT");
-      if (
-        cmd === "list_project_sessions" ||
-        cmd === "rebuild_project_sessions_index"
-      ) {
-        return [];
+      if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? "");
+      if (cmd === "get_workspace_root") return "/tmp/e2e-cloud-tool-fallback";
+      if (cmd === "plugin:dialog|open") return "/tmp/unity-skills.zip";
+      if (cmd === "extract_global_skill_package") {
+        const state = (window as any).__SKILLS_RUNTIME_E2E__;
+        // Global imports have no workspace argument, including in project chat.
+        if (args?.workspace !== undefined) throw new Error("Global import must not bind a workspace");
+        extractedPackages.push("global");
+        if (state.extractError) throw new Error(state.extractError);
+        if (state.holdExtraction) await new Promise<void>((resolve) => { state.releaseExtraction = resolve; });
+        state.extractionSettled = true;
+        return { ...globalMeta, reused: extractedPackages.length > 1 };
       }
-      if (cmd === "save_project_session") return args?.session ?? {};
-      if (cmd === "load_project_session") return {};
+      if (cmd === "inspect_global_skill_package") {
+        if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
+        return globalMeta;
+      }
+      if (cmd === "read_global_skill_package_file") {
+        if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
+        const source = packageFiles[`${packageRoot}/${String(args?.relativePath ?? "")}`];
+        if (source === undefined) throw new Error("ENOENT");
+        return (window as any).__SKILLS_RUNTIME_E2E__.invalidMetadata
+          ? "---\nname: [broken\n---\nInvalid metadata fixture" : source;
+      }
+      if (cmd === "extract_protocol_package") {
+        extractedPackages.push(String(args?.workspace ?? ""));
+        const state = (window as any).__SKILLS_RUNTIME_E2E__;
+        if (state.extractError) throw new Error(state.extractError);
+        if (state.holdExtraction) await new Promise<void>((resolve) => { state.releaseExtraction = resolve; });
+        return { name: "Unity Skills", entry_point: entryPoints[0], entry_points: entryPoints, local_path: packageRoot };
+      }
+      if (cmd === "delete_protocol_package") {
+        deletedPackages.push({ localPath: String(args?.localPath ?? ""), workspace: String(args?.workspace ?? "") });
+        return null;
+      }
+      if (cmd === "glob_search") {
+        const pattern = String(args?.pattern ?? "");
+        return pattern.startsWith(packageRoot)
+          ? Object.keys(packageFiles)
+          : [];
+      }
+      if (cmd === "read_file") {
+        const target = String(args?.path ?? "");
+        if (target in packageFiles) {
+          return (window as any).__SKILLS_RUNTIME_E2E__.invalidMetadata
+            ? "---\nname: [broken\n---\nInvalid metadata fixture"
+            : packageFiles[target];
+        }
+        throw new Error("ENOENT");
+      }
+      if (["list_project_sessions", "rebuild_project_sessions_index", "save_project_session", "load_project_session", "load_project_session_meta", "load_project_session_page"].includes(cmd)) {
+        const records = JSON.parse(window.sessionStorage.getItem("__SKILLS_RUNTIME_SESSIONS__") || "{}");
+        const workspace = String(args?.workspace ?? "");
+        const sessions = records[workspace] || {};
+        if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") {
+          return Object.values(sessions).map((record: any) => {
+            const { messages: _messages, runtimeSnapshot: _runtime, ...meta } = record;
+            return meta;
+          });
+        }
+        const candidate = (args?.session || {}) as Record<string, any>;
+        const id = String(cmd === "save_project_session" ? candidate.id : args?.sessionId);
+        if (cmd === "save_project_session") {
+          const previousRevision = sessions[id]?.storageRevision || 0;
+          if ((candidate.storageRevision || 0) !== previousRevision) throw new Error("Session storage revision conflict");
+          const saved = {
+            ...candidate, workspaceRoot: workspace, storageVersion: 3,
+            storageRevision: previousRevision + 1, storageStatus: "ok",
+            updatedAtMs: candidate.updatedAtMs || Date.now(),
+          };
+          records[workspace] = { ...sessions, [id]: saved };
+          window.sessionStorage.setItem("__SKILLS_RUNTIME_SESSIONS__", JSON.stringify(records));
+          return saved;
+        }
+        const record = sessions[id] || {
+          id, title: "Missing Session", date: "", active: false, messages: [],
+          messageCount: 0, turnCount: 0, workspaceRoot: workspace,
+          storageVersion: 3, storageRevision: 0, storageStatus: "missing",
+        };
+        if (cmd === "load_project_session_meta") {
+          const { messages: _messages, ...meta } = record;
+          return meta;
+        }
+        if (cmd === "load_project_session_page") {
+          const turns = record.runtimeSnapshot?.conversationTurns || [];
+          const endTurnIndex = Math.min(turns.length, Number(args?.beforeTurnIndex ?? turns.length));
+          const startTurnIndex = Math.max(0, endTurnIndex - Number(args?.limit || 40));
+          const pageTurns = turns.slice(startTurnIndex, endTurnIndex);
+          const turnIds = new Set(pageTurns.map((turn: any) => turn.id));
+          return {
+            sessionId: id, turns: pageTurns,
+            messages: (record.messages || []).filter((message: any) => turnIds.has(message.turnId)),
+            startTurnIndex, endTurnIndex, totalTurns: turns.length,
+            hasMore: startTurnIndex > 0, nextBeforeTurnIndex: startTurnIndex || null,
+          };
+        }
+        return record;
+      }
       if (cmd === "proxy_request") {
         // Yield once so the test exercises the same async React/runtime
         // scheduling boundary as the other cloud provider E2E fixtures.
         await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         const body = String(args?.body ?? "{}");
         requests.push({ body });
+        if (body.includes("Interpret MAIN's current user request.")) {
+          return JSON.stringify({ output_text: JSON.stringify({
+            semantic: {
+              objective: "提供技能工作流建议",
+              workType: (window as any).__SKILLS_RUNTIME_E2E__.providerFlow === "list-load" ? "investigate" : "answer",
+              answerFormat: "answer", requiredCapabilities: [], forbiddenCapabilities: [], approvalRequiredCapabilities: [],
+            }, confidence: 0.99, needsUserChoice: false,
+          }) });
+        }
+        if ((window as any).__SKILLS_RUNTIME_E2E__.providerFlow === "list-load") {
+          const receipts: any[] = [];
+          const collectReceipts = (value: any) => {
+            if (typeof value === "string" && value.trim().startsWith("{")) {
+              try { collectReceipts(JSON.parse(value)); } catch { /* ordinary text */ }
+            } else if (Array.isArray(value)) {
+              value.forEach(collectReceipts);
+            } else if (value && typeof value === "object") {
+              if (value.type === "skill.catalog" || value.type === "skill.loaded") receipts.push(value);
+              else Object.values(value).forEach(collectReceipts);
+            }
+          };
+          collectReceipts(JSON.parse(body));
+          const nativeCall = (callId: string, args: Record<string, unknown>) => JSON.stringify({
+            output: [{ type: "function_call", call_id: callId, name: "load_skill", arguments: JSON.stringify(args) }],
+          });
+          if (receipts.some((receipt) => receipt.type === "skill.loaded")) {
+            return JSON.stringify({ output_text: "已通过分页目录找到并加载最后一个 Unity 技能。" });
+          }
+          const lastPage = receipts.filter((receipt) => receipt.type === "skill.catalog").at(-1);
+          if (!lastPage) return nativeCall("skill-list-first", { operation: "list", limit: 1 });
+          if (lastPage.nextCursor) return nativeCall("skill-list-next", { operation: "list", limit: 1, cursor: lastPage.nextCursor });
+          return nativeCall("skill-load-last", { skill_id: lastPage.entries.at(-1).id });
+        }
         return JSON.stringify({ output_text: "skills-runtime-e2e-ok" });
       }
       return null;
@@ -74,6 +212,27 @@ function runtimeRequestSummary(body: string) {
     body,
     toolNames,
   };
+}
+
+async function createRuntimeSession(page: import("@playwright/test").Page, workspace: boolean) {
+  // The shared legacy cloud fixture seeds a Session without its admission
+  // epoch. Create one through the real UI, which owns Session identity; the
+  // storage adapter above preserves it instead of inventing an epoch per Turn.
+  await (workspace
+    ? page.getByTestId("workspace-new-session")
+    : page.getByTitle("新建聊天", { exact: true })).click();
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state;
+    const scope = state.currentWorkspace || "__MAIN_GLOBAL_CHAT__";
+    return state.sessionsByWorkspace?.[scope]?.find((session: any) => session.id === state.currentSessionId)?.planLifecycleEpoch;
+  })).toMatch(/^plan-session-/);
+}
+
+async function submitSkillRequest(page: import("@playwright/test").Page, text: string) {
+  // Exercise Composer -> semantic preflight -> Turn admission -> provider loop.
+  // The legacy scenario bridge deliberately bypasses intent routing.
+  await page.getByTestId("composer-textarea").fill(text);
+  await page.getByTestId("composer-send-button").click();
 }
 
 test("panel Agent Skill persists manual-only admission into the next Turns", async ({
@@ -148,16 +307,12 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
     rehydratedModal.getByText("仅手动", { exact: true }),
   ).toBeVisible();
   await rehydratedHeading.locator("xpath=following-sibling::button").click();
+  await createRuntimeSession(page, false);
 
   await page.evaluate(() => {
     (window as any).__SKILLS_RUNTIME_E2E__.requests.length = 0;
   });
-  const ordinarySent = await page.evaluate(() =>
-    (window as any).__CODELY_E2E__?.sendCloudMessage?.(
-      "请直接回答一个普通问题。",
-    ),
-  );
-  expect(ordinarySent).toBe(true);
+  await submitSkillRequest(page, "请直接回答一个普通问题。");
   await expect
     .poll(async () =>
       page.evaluate(
@@ -190,12 +345,7 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
   await page.evaluate(() => {
     (window as any).__SKILLS_RUNTIME_E2E__.requests.length = 0;
   });
-  const explicitSent = await page.evaluate((name) =>
-    (window as any).__CODELY_E2E__?.sendCloudMessage?.(
-      `请使用 @${name} 给出一句建议。`,
-    ), SKILL_NAME,
-  );
-  expect(explicitSent).toBe(true);
+  await submitSkillRequest(page, `请使用 @${SKILL_NAME} 给出一句建议。`);
   await expect
     .poll(async () =>
       page.evaluate((previousTurnId) => {
@@ -225,4 +375,188 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
   expect(explicitRuntimeRequests[0].body).toContain(SKILL_NAME);
   expect(explicitRuntimeRequests[0].body).toContain(SKILL_SENTINEL);
   expect(explicitRuntimeRequests[0].toolNames).toContain("load_skill");
+});
+
+
+async function openPackageForm(page: import("@playwright/test").Page) {
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  const heading = page.getByRole("heading", { name: "技能与提示词" });
+  const modal = heading.locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+  await modal.getByRole("button", { name: "添加技能" }).click();
+  await modal.getByRole("button", { name: "协议包", exact: true }).click();
+  return modal;
+}
+
+test("a Unity skill collection imports all entries and activates the final skill after reload", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await expect(modal.getByText("zzz-sprite-tool", { exact: true })).toBeVisible();
+  for (const themeMode of ["light", "dark", "black"] as const) {
+    await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), themeMode);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", themeMode);
+    await modal.screenshot({ path: testInfo.outputPath(`unity-skills-import-${themeMode}.png`) });
+  }
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const data = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}");
+    return data?.state?.skills?.find((skill: any) => skill.name === "Unity Skills")?.entryPoints;
+  })).toEqual(["skills-main/skills/unity-cli/SKILL.md", "skills-main/skills/zzz-folder/SKILL.md"]);
+  await page.reload();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await expect(page.getByText("Unity Skills", { exact: true })).toBeVisible();
+  await expect(page.getByText("包含 2 个技能", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "编辑技能: Unity Skills", exact: true }).click();
+  await expect(page.getByText("zzz-sprite-tool", { exact: true })).toBeVisible();
+  await expect(page.getByText("zzz-folder", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+  await createRuntimeSession(page, true);
+  await submitSkillRequest(page, "请使用 $zzz-sprite-tool 给出一句建议。");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
+  const requests = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
+  expect(requests.some((body: string) => body.includes("[EXPLICITLY ACTIVATED SKILL") && body.includes("UNITY_LAST_SKILL_SENTINEL"))).toBe(true);
+});
+
+test("canceling a global import leaves shared cache unregistered", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "取消", exact: true }).click();
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages)).toEqual([]);
+  expect(await page.evaluate(() => {
+    const data = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}");
+    return (data?.state?.skills || []).some((skill: any) => skill.name === "Unity Skills");
+  })).toBe(false);
+});
+
+test("a global collection installs without a workspace and survives reload", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  const modal = await openPackageForm(page);
+  await expect(modal.getByText("全局安装，一次导入后可在所有项目中使用。", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  await expect(modal.getByText("全局 · 所有项目", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const state = JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state;
+    const skill = state.skills.find((candidate: any) => candidate.name === "Unity Skills");
+    return { storage: skill?.packageStorage, scope: skill?.workspaceScope ?? null, workspace: state.currentWorkspace || null };
+  })).toEqual({ storage: { kind: "global", packageId: "a".repeat(64) }, scope: null, workspace: null });
+  await page.reload();
+  await createRuntimeSession(page, false);
+  await submitSkillRequest(page, "请使用 $zzz-sprite-tool 给出一句建议。");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
+  const bodies: string[] = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
+  expect(bodies.some((body) => body.includes("[EXPLICITLY ACTIVATED SKILL") && body.includes("UNITY_LAST_SKILL_SENTINEL"))).toBe(true);
+  // Reopen a project through the scenario's normal startup and create a real
+  // Session. The same registration works without another ZIP extraction.
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await createRuntimeSession(page, true);
+  await submitSkillRequest(page, "请使用 $zzz-sprite-tool 给出一句建议。");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
+  const projectBodies: string[] = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((request: any) => request.body));
+  expect(projectBodies.some((body) => body.includes("[EXPLICITLY ACTIVATED SKILL") && body.includes("UNITY_LAST_SKILL_SENTINEL"))).toBe(true);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.extractedPackages)).toEqual([]);
+});
+
+test("reimporting identical content preserves the existing registration and manual policy", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.locator('input[type="text"]').first().fill("My Unity Skills");
+  await modal.locator('input[type="checkbox"]').uncheck();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  const before = await page.evaluate(() => JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state.skills.find((skill: any) => skill.name === "My Unity Skills"));
+  await modal.getByRole("button", { name: "添加技能", exact: true }).click();
+  await modal.getByRole("button", { name: "协议包", exact: true }).click();
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  const registrations = await page.evaluate(() => JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state.skills.filter((skill: any) => skill.packageStorage?.kind === "global"));
+  expect(registrations).toEqual([before]);
+  expect(registrations[0].allowImplicitInvocation).toBe(false);
+  await expect(modal.getByText("仅手动", { exact: true })).toBeVisible();
+});
+
+
+test("closing during extraction cannot register a late global package", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.holdExtraction = true; });
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__SKILLS_RUNTIME_E2E__.releaseExtraction)).toBe("function");
+  await modal.getByRole("button", { name: "关闭", exact: true }).click();
+  await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.releaseExtraction());
+  await expect.poll(() => page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.extractionSettled)).toBe(true);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages)).toEqual([]);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await expect(page.getByText("Unity Skills", { exact: true })).toHaveCount(0);
+});
+
+test("invalid skill ZIP errors remain visible with a retry action", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.extractError = "ZIP must contain SKILL.md"; });
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByRole("alert")).toContainText("ZIP must contain SKILL.md");
+  await expect(modal.getByRole("button", { name: "上传 ZIP", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("button", { name: "保存技能", exact: true })).toBeDisabled();
+});
+
+test("load_skill lists every collection page then loads a discovered Skill through the provider loop", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  await modal.getByRole("button", { name: "完成", exact: true }).click();
+  await createRuntimeSession(page, true);
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.providerFlow = "list-load"; });
+  await submitSkillRequest(page, "请从已安装技能中找到精灵工作流并给出建议。");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind ?? null)).toBe("success");
+  const runtimeBodies: string[] = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests
+    .map((request: any) => request.body).filter((body: string) => body.includes("[MAIN RUNTIME V2]")));
+  expect(runtimeBodies).toHaveLength(4);
+  for (const body of runtimeBodies.slice(0, 3)) expect(body).not.toContain("UNITY_LAST_SKILL_SENTINEL");
+  expect(runtimeBodies[3]).toContain("UNITY_LAST_SKILL_SENTINEL");
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  const receiptsFromBody = (body: string) => {
+    const result: any[] = [];
+    const collect = (value: any) => {
+      if (typeof value === "string" && value.trim().startsWith("{")) {
+        try { collect(JSON.parse(value)); } catch { /* ordinary text */ }
+      } else if (Array.isArray(value)) value.forEach(collect);
+      else if (value && typeof value === "object") {
+        if (value.type === "skill.catalog" || value.type === "skill.loaded") result.push(value);
+        else Object.values(value).forEach(collect);
+      }
+    };
+    collect(JSON.parse(body));
+    return result;
+  };
+  const firstPage = receiptsFromBody(runtimeBodies[1]).at(-1);
+  const lastPage = receiptsFromBody(runtimeBodies[2]).at(-1);
+  const loaded = receiptsFromBody(runtimeBodies[3]).at(-1);
+  expect(firstPage.entries.map((entry: any) => entry.name)).toEqual(["unity-cli"]);
+  expect(firstPage.nextCursor).toBeTruthy();
+  expect(lastPage.entries.map((entry: any) => entry.name)).toEqual(["zzz-sprite-tool"]);
+  expect(lastPage.nextCursor).toBeNull();
+  expect(loaded.type).toBe("skill.loaded");
+  expect(loaded.name).toBe("zzz-sprite-tool");
+  expect(snapshot.toolNames).toContain("load_skill");
+  expect(snapshot.visibleFinalCount).toBe(1);
+});
+
+
+test("invalid SKILL frontmatter is reported in the import preview", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.invalidMetadata = true; });
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByRole("alert")).toContainText("部分技能说明无法完整解析或读取");
+  await modal.getByRole("button", { name: "取消", exact: true }).click();
 });

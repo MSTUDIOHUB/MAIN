@@ -142,7 +142,7 @@ export function resolveWorkspaceInstructionIntentHint(
   instruction: WorkspaceInstruction,
 ): ResolvedRunIntent | null {
   return normalizeWorkspaceInstructionIntentHint(
-    instruction.payload.dispatchHints?.resolvedIntent,
+    instruction.payload.dispatchHints?.explicitIntent ?? instruction.payload.dispatchHints?.resolvedIntent,
   );
 }
 

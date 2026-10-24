@@ -13,6 +13,7 @@ import {
 } from "./executionProviderHistory";
 import {
   requestRuntimeV2ProviderOnce,
+  runtimeV2ExecutionProviderOutputTokenLimit,
 } from "./executionProviderRequest";
 import {
   rejectRuntimeV2UnexpectedProviderTool,
@@ -44,7 +45,15 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
       requestDeadlineAt: input.requestDeadlineAt,
       transport: null,
       signal: input.signal,
-      task: (request) => requestRuntimeV2ProviderOnce({
+      task: (request) => {
+        input.ports.logStoreEvent("runtime_v2_provider_request_opened", {
+          turnId: input.command.run.turnId, runId: input.command.run.runId,
+          phase: input.command.phase, mode: input.command.payload.mode,
+          transport: null, allowedToolNames: [], hasFallback: false,
+          timeoutMs: request.timeoutMs ?? null,
+          maxOutputTokens: runtimeV2ExecutionProviderOutputTokenLimit(input.command, false, input.ports.context.runtimeContextBudget),
+        });
+        return requestRuntimeV2ProviderOnce({
         live: input.ports.live,
         ports: input.ports,
         command: input.command,
@@ -53,7 +62,8 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
         toolChoice: null,
         signal: request.signal,
         timeoutMs: request.timeoutMs,
-      }),
+        });
+      },
     });
   } catch (error) {
     if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
@@ -74,6 +84,6 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
       () => input.ports.nextId("provider-tool-call"),
     ),
   };
-  rememberRuntimeV2ProviderResult(input.ports, result);
+  rememberRuntimeV2ProviderResult(input.ports, result, input.command, []);
   return result;
 }

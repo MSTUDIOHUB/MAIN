@@ -1,6 +1,15 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2ResultKind } from "./contracts";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { latestRuntimeV2Answer } from "./providerAnswer";
+import {
+  deriveRuntimeV2ExecutionContract,
+  RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
+} from "./executionContract";
+import { latestRuntimeV2DirectExecuteValidationSequence, runtimeV2DirectExecuteReadyForConclusion, summarizeRuntimeV2ExecuteEvidence } from "./phaseTransition";
+import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
+import { isRuntimeV2ReadOnlyToolName } from "./workspaceReadPolicy";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 
 /** Facts supplied by a store adapter after it has inspected actual tool and
  * validation receipts. Provider wording is intentionally reduced to a
@@ -20,41 +29,105 @@ export interface RuntimeV2CompletionDecision {
   readonly resultReason: string;
 }
 
-/**
- * Only the evidence-ready `conclude` request may supply terminal provider text.
- * A tool-free `execute` or `validate` response is recovery input, even when it
- * contains polished prose. Protocol diagnostics are excluded from both paths.
- */
+/** One canonical action frontier shared by command and mutation completion.
+ * No control-plane receipt or skipped sibling can manufacture an effect. */
+function completedRuntimeV2ActionFacts(
+  aggregate: TurnAggregateV1,
+  afterSequence = -1,
+): { hasOperation: boolean; allSettled: boolean } {
+  if (!aggregate.run) return { hasOperation: false, allSettled: false };
+
+  // Unlike recovery fingerprints, this key preserves every normalized tool
+  // argument. Only the same action can resolve its earlier failed receipt.
+  const actionKey = (toolName: string, args: unknown): string => JSON.stringify(
+    [toolName, args],
+    (_key, value) => value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)))
+      : value,
+  );
+  const commands = new Map<string, { key: string; operation: boolean; readOnly: boolean }>();
+  const completedKeys = new Set<string>();
+  const results = new Map<string, { settled: boolean; operation: boolean }>();
+  for (const event of aggregate.events) {
+    if (!("run" in event) || event.run.runId !== aggregate.run.identity.runId) continue;
+    if (event.type === "command.scheduled") {
+      const command = event.command;
+      if (command.kind !== "execute_tool" && command.kind !== "execute_validation") continue;
+      const name = String(command.payload.toolName || "");
+      const key = actionKey(name, command.payload.arguments || {});
+      const readOnly = isRuntimeV2ReadOnlyToolName(name);
+      const operation = !!name && !readOnly &&
+        name !== RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
+        !isWorkspaceMutationToolName(name);
+      commands.set(command.idempotencyKey, { key, operation, readOnly });
+      continue;
+    }
+    if (event.type !== "tool.completed" && event.type !== "validation.completed") continue;
+    const command = commands.get(event.idempotencyKey);
+    if (!command) continue;
+    completedKeys.add(event.idempotencyKey);
+    if (event.sequence <= afterSequence) continue;
+    const skipped = event.type === "validation.completed"
+      ? !isRuntimeV2ValidationAttempt(event)
+      : event.failureReasonCode === "provider_batch_predecessor_failed" ||
+        event.failureReasonCode === "provider_batch_predecessor_unsettled";
+    // A skipped sibling was not attempted. Its real predecessor failure
+    // remains in this frontier until that same action actually succeeds.
+    if (skipped) continue;
+    const succeeded = event.type === "validation.completed" ? event.passed : event.status === "succeeded";
+    const executed = event.type === "validation.completed" || event.receiptOrigin !== "replayed";
+    const hasEffect = executed && event.evidence.some((evidence) =>
+      evidence.kind === "tool" || evidence.kind === "mutation" || evidence.kind === "validation",
+    );
+    results.set(command.key, {
+      settled: succeeded && (command.readOnly || hasEffect),
+      operation: succeeded && command.operation && hasEffect,
+    });
+  }
+  return {
+    hasOperation: [...results.values()].some((result) => result.operation),
+    allSettled: [...commands.keys()].every((key) => completedKeys.has(key)) &&
+      [...results.values()].every((result) => result.settled),
+  };
+}
+
+/** Ordinary command tasks have no file artifact to mutate or validate. Their
+ * real effect receipts may support a later natural final, without switching
+ * the next request to `conclude` or withdrawing Execute tools. */
+export function runtimeV2CommandTaskReadyForConclusion(
+  aggregate: TurnAggregateV1,
+): boolean {
+  if (
+    aggregate.strategy !== "execute" || !aggregate.run ||
+    aggregate.workPlan || aggregate.sealedWorkPlan ||
+    aggregate.objective.acceptanceEvidenceRequirements?.some((requirement) => requirement !== null) ||
+    deriveRuntimeV2ExecutionContract(aggregate) ||
+    summarizeRuntimeV2ExecuteEvidence(aggregate, {
+      isMutationToolName: isWorkspaceMutationToolName,
+    }).mutationCount > 0
+  ) return false;
+  const facts = completedRuntimeV2ActionFacts(aggregate);
+  return facts.hasOperation && facts.allSettled;
+}
+
+/** Ordinary Execute may finish through a clean natural response after real
+ * command results or current mutation validation. Neither receipts nor an
+ * intermediate pass forces the model to stop its remaining authorized work. */
 export function latestRuntimeV2ProviderConclusionText(
   aggregate: TurnAggregateV1,
 ): string {
-  const scheduledModes = new Map<string, string>();
-  for (const event of aggregate.events) {
-    if (
-      event.type === "command.scheduled" &&
-      event.command.kind === "request_model"
-    ) {
-      scheduledModes.set(
-        event.command.idempotencyKey,
-        String(event.command.payload.mode || "").trim(),
-      );
-    }
-  }
-  for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
-    const event = aggregate.events[index]!;
-    if (event.type !== "provider.responded") continue;
-    const mode = scheduledModes.get(event.idempotencyKey) || "";
-    if (
-      mode !== "conclude" ||
-      event.result.toolCalls.length > 0 ||
-      event.result.diagnostics.length > 0
-    ) {
-      continue;
-    }
-    const text = String(event.result.visibleText || "").trim();
-    if (text) return text.slice(0, 24_000);
-  }
-  return "";
+  const naturalFinalReady = runtimeV2CommandTaskReadyForConclusion(aggregate) || (
+    aggregate.strategy === "execute" && !aggregate.workPlan && !aggregate.sealedWorkPlan &&
+    !deriveRuntimeV2ExecutionContract(aggregate) &&
+    runtimeV2DirectExecuteReadyForConclusion(aggregate) &&
+    completedRuntimeV2ActionFacts(aggregate, latestRuntimeV2DirectExecuteValidationSequence(aggregate)).allSettled
+  );
+  return (
+    latestRuntimeV2Answer(aggregate, true) ||
+    (naturalFinalReady
+      ? latestRuntimeV2Answer(aggregate)
+      : "")
+  ).slice(0, 24_000);
 }
 
 export function exhaustedRuntimeV2ResultKind(
@@ -76,9 +149,8 @@ export function exhaustedRuntimeV2ResultKind(
 
 /**
  * Determine only outcomes that the runtime can prove from structured facts.
- * A provider response without a tool call is a finish signal only after the
- * evidence gate selected `conclude`. The Runtime never upgrades prose into
- * success: structured mutation and validation facts still decide the outcome.
+ * A provider response without a tool call is a finish signal after verified
+ * mutations or actual command results. Prose alone never creates evidence.
  */
 export function decideRuntimeV2TerminalOutcome(
   aggregate: TurnAggregateV1,
@@ -107,6 +179,12 @@ export function decideRuntimeV2TerminalOutcome(
         resultKind: "success",
         resultReason:
           "最新工作区效果已由后续有限验证确认，并已生成基于实际证据的完成报告。",
+      };
+    }
+    if (facts.mutationCount === 0 && runtimeV2CommandTaskReadyForConclusion(aggregate)) {
+      return {
+        resultKind: "success",
+        resultReason: "请求的命令或外部操作已取得实际成功回执，并已生成基于实际证据的完成报告。",
       };
     }
     return facts.mutationCount > 0

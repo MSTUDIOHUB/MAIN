@@ -3,7 +3,7 @@ import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
 import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
-import { streamChatCompletion } from "../../lib/streaming";
+import { isStreamOutputLimited, streamChatCompletion } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   isRequiredToolChoiceCompatibilityErrorMessage,
@@ -96,10 +96,7 @@ export async function requestRuntimeV2ChildStep(input: {
           : []),
       ];
       const budget = input.ports.context.runtimeContextBudget;
-      const admittedOutputTokens = runtimeV2ChildOutputTokenLimit(budget);
-      const maxOutputTokens = input.responseMode === "report_required"
-        ? Math.min(4_096, admittedOutputTokens)
-        : admittedOutputTokens;
+      const maxOutputTokens = runtimeV2ChildOutputTokenLimit(budget);
       const boundedRequestMessages = budget
         ? boundRuntimeMessagesToContext(requestMessages, {
             contextLimit: budget.contextLimit,
@@ -222,7 +219,22 @@ export async function requestRuntimeV2ChildStep(input: {
           },
         });
 
-        let normalized = normalizeProviderResponseV1({
+        // An output limit is capacity evidence, not evidence that the
+        // transport cannot express tools. Never parse or execute an action
+        // from an incomplete response, including a partially streamed call.
+        const outputTruncated = isStreamOutputLimited(wire);
+        let normalized: RuntimeV2NormalizedProviderResult = outputTruncated ? {
+          visibleText: wire.semanticContent || streamedText,
+          toolCalls: [],
+          usage: wire.usage,
+          diagnostics: [{
+            code: "output_truncated",
+            message: wire.clientStopReason
+              ? `Client ${wire.clientStopReason} guard ended child output before a complete response.`
+              : "Child output reached its admitted token allocation before a complete response.",
+            retryable: true,
+          }],
+        } : normalizeProviderResponseV1({
           visibleText: wire.semanticContent || streamedText,
           content: wire.actionableContent || wire.content || streamedText,
           toolCalls: wire.toolCalls,
@@ -266,7 +278,23 @@ export async function requestRuntimeV2ChildStep(input: {
         const visibleText = sanitizeAssistantDisplayContent(
           normalized.visibleText || "",
         ).trim();
+        if (outputTruncated) {
+          input.ports.logStoreEvent("runtime_v2_subagent_output_truncated", {
+            turnId: input.job.run.turnId,
+            runId: input.job.run.runId,
+            jobId: input.job.id,
+            transport: attempt.variant,
+            finishReason: wire.finishReason || null,
+            clientStopReason: wire.clientStopReason || null,
+            stopSource: wire.clientStopReason ? "client_guard" : "provider",
+            maxOutputTokens,
+            visibleTextChars: visibleText.length,
+            reasoningChars: String(wire.reasoningContent || "").length,
+            partialToolCalls: wire.toolCalls.length,
+          });
+        }
         if (
+          !outputTruncated &&
           input.responseMode === "report_required" &&
           normalized.toolCalls.length === 0
         ) {
@@ -276,6 +304,7 @@ export async function requestRuntimeV2ChildStep(input: {
           );
         }
         if (
+          !outputTruncated &&
           input.responseMode === "report_required" &&
           normalized.toolCalls.length !== 1
         ) {
@@ -285,8 +314,10 @@ export async function requestRuntimeV2ChildStep(input: {
           );
         }
         if (
-          unexpected.length > 0 ||
-          normalized.diagnostics.some((diagnostic) => diagnostic.retryable)
+          !outputTruncated && (
+            unexpected.length > 0 ||
+            normalized.diagnostics.some((diagnostic) => diagnostic.retryable)
+          )
         ) {
           throw new RuntimeV2ProviderProtocolError(
             unexpected.length > 0
@@ -306,7 +337,14 @@ export async function requestRuntimeV2ChildStep(input: {
           transport: attempt.variant,
           toolName: normalized.toolCalls[0]?.name || null,
           toolNames: normalized.toolCalls.map((call) => call.name),
-          concluded: normalized.toolCalls.length === 0,
+          concluded: normalized.toolCalls.length === 0 && normalized.diagnostics.length === 0,
+          finishReason: wire.finishReason || null,
+          clientStopReason: wire.clientStopReason || null,
+          stopSource: wire.clientStopReason ? "client_guard" : outputTruncated ? "provider" : null,
+          maxOutputTokens,
+          visibleTextChars: visibleText.length,
+          reasoningChars: String(wire.reasoningContent || "").length,
+          diagnosticCodes: normalized.diagnostics.map((item) => item.code),
         });
         return {
           ...normalized,

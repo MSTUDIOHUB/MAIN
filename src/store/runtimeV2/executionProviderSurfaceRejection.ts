@@ -9,26 +9,20 @@ import {
 } from "../../lib/workspacePaths";
 import {
   appendRuntimeV2ProviderFeedbackHistory,
-  appendRuntimeV2RejectedToolCallHistory,
+  appendRuntimeV2RejectedToolCallBatchHistory,
   rememberRuntimeV2ProviderResult,
 } from "./executionProviderHistory";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import {
   runtimeV2ProviderToolCallIdentity,
-  scopeRuntimeV2ProviderToolCallIds,
   unexpectedRuntimeV2ProviderToolNames,
 } from "./providerToolSurface";
-import {
-  correctiveFiniteValidationCommand,
-  finiteValidationCommandRejection,
-} from "./executionValidationCommand";
 import {
   latestRuntimeV2CorrectiveMutationFailure,
   type RuntimeV2ProviderEffectFacts,
 } from "./executionProviderEffectFacts";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { deriveRuntimeV2ValidationCorrectionWindow } from "./executionValidationCorrection";
-import { preferredFiniteValidationCommand } from "./executionProviderContext";
 import {
   runtimeV2ProviderToolArgumentViolation,
 } from "./executionProviderTools";
@@ -46,15 +40,6 @@ function rejectedProviderResult(input: {
 }): RuntimeV2NormalizedProviderResult {
   const actionIdentity = input.actionIdentity ||
     runtimeV2ProviderToolCallIdentity(input.rejectedCall);
-  const [historyCall] = scopeRuntimeV2ProviderToolCallIds(
-    [input.rejectedCall],
-    () => input.ports.nextId("provider-rejected-tool-call"),
-  );
-  appendRuntimeV2RejectedToolCallHistory(input.ports.live, {
-    call: historyCall!,
-    actionIdentity,
-    feedback: input.feedback,
-  });
   appendRuntimeV2ProviderFeedbackHistory(input.ports.live, {
     code: input.feedbackCode,
     feedback: input.feedback,
@@ -63,6 +48,17 @@ function rejectedProviderResult(input: {
     ...input.result,
     visibleText: "",
     toolCalls: [],
+    actionReceipts: input.result.toolCalls.map((call) => {
+      const rejected = call.id === input.rejectedCall.id || (input.reason === "tool_surface_rejected" && call.name === input.rejectedCall.name);
+      const identity = input.actionIdentity && call.id === input.rejectedCall.id ? input.actionIdentity
+        : input.reason === "tool_surface_rejected" ? runtimeV2UnavailableToolSemanticIdentity(call) : runtimeV2ProviderToolCallIdentity(call);
+      const safeCall = { ...call, id: input.ports.nextId("provider-settled-tool-call"), arguments: ["write_file", "replace_in_file", "apply_patch"].includes(call.name)
+        ? { runtime_v2_rejected_action: identity, effect: "none" } : call.arguments };
+      const feedback = rejected ? input.feedback : "ACTION_NOT_EXECUTED: provider_batch_predecessor_failed. No effect ran; propose this action again after correcting the rejected batch.";
+      return { call: safeCall, actionIdentity: identity, status: rejected ? "rejected" as const : "not_executed" as const,
+        reasonCode: rejected ? input.reason : "provider_batch_predecessor_failed", feedback,
+        priorFeedbackObserved: rejected && input.ports.live.latestProviderRequestRejectedIdentities?.has(identity) === true };
+    }),
     diagnostics: [
       ...input.result.diagnostics,
       {
@@ -73,7 +69,8 @@ function rejectedProviderResult(input: {
       },
     ],
   };
-  rememberRuntimeV2ProviderResult(input.ports, rejectedResult);
+  appendRuntimeV2RejectedToolCallBatchHistory(input.ports.live, rejectedResult.actionReceipts!);
+  rememberRuntimeV2ProviderResult(input.ports, rejectedResult, input.command);
   input.ports.logStoreEvent("runtime_v2_provider_action_rejected", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
@@ -141,7 +138,7 @@ export function rejectRuntimeV2UnexpectedProviderTool(input: {
   const feedback = [
     `TOOL_SURFACE_REJECTED: ${unexpected.join(", ")} is not available in this decision.`,
     `Allowed tools: ${allowedToolNames.join(", ")}.`,
-    "The requested action was not executed and its branch is closed. Submit exactly one advertised structured action now; do not repeat, narrate, or request a hidden tool.",
+    "No action in this batch ran. Use an advertised tool with corrected arguments, or explain the exact missing prerequisite. Do not invent a tool or a filesystem location for a managed resource.",
   ].join("\n");
   return rejectedProviderResult({
     ...input,
@@ -156,6 +153,21 @@ export function rejectRuntimeV2UnexpectedProviderTool(input: {
       semanticActionIdentity: actionIdentity,
     },
   });
+}
+
+/** An earlier rejected shell cannot silently disappear and release its dependent tail. */
+export function rejectRuntimeV2FailedShellPredecessor(input: {
+  ports: RuntimeV2ExecutionPortsInput;
+  command: RuntimeV2Command;
+  result: RuntimeV2NormalizedProviderResult;
+  rejectedIdentities: ReadonlySet<string>;
+}): RuntimeV2NormalizedProviderResult | null {
+  const index = input.result.toolCalls.findIndex(call => call.name === "run_command" &&
+    input.rejectedIdentities.has(runtimeV2ProviderToolCallIdentity(call)));
+  if (index < 0 || !input.result.toolCalls.slice(index + 1).some(call => call.name === "run_command")) return null;
+  return rejectedProviderResult({ ...input, rejectedCall: input.result.toolCalls[index]!, reason: "already_rejected",
+    feedbackCode: "provider_batch_predecessor_failed",
+    feedback: "ACTION_NOT_EXECUTED: an earlier shell command in this batch was already blocked or failed. No command in this batch ran. Re-observe the missing prerequisite or propose independent work separately; downstream commands cannot assume predecessor success." });
 }
 
 /** OpenAI-compatible servers may return native tool arguments that violate
@@ -185,56 +197,6 @@ export function rejectRuntimeV2InvalidProviderToolArguments(input: {
     reason: "tool_arguments_rejected",
     logData: {
       schemaViolation: violation.reason,
-    },
-  });
-}
-
-/** A validation-mode run_command is admitted by argument semantics, not by
- * its broad tool name. Source searches must not enter the ledger as ordinary
- * execute_tool effects while the phase is waiting for validation; otherwise
- * no validation.completed event exists to return a failed check to editing. */
-export function rejectRuntimeV2InvalidValidationCommand(input: {
-  readonly ports: RuntimeV2ExecutionPortsInput;
-  readonly command: RuntimeV2Command;
-  readonly tools: readonly ToolDefinition[];
-  readonly result: RuntimeV2NormalizedProviderResult;
-}): RuntimeV2NormalizedProviderResult | null {
-  if (String(input.command.payload.mode || "").trim() !== "validate") {
-    return null;
-  }
-  const invalid = input.result.toolCalls.flatMap((call) => {
-    if (call.name !== "run_command") return [];
-    const command = String(
-      call.arguments.command || call.arguments.cmd || "",
-    ).trim();
-    const rejection = finiteValidationCommandRejection(command);
-    return rejection ? [{ call, command, rejection }] : [];
-  })[0];
-  if (!invalid) return null;
-  const correctiveCommand =
-    correctiveFiniteValidationCommand(invalid.command) ||
-    input.ports.live.correctiveValidationCommand ||
-    (typeof input.ports.get === "function"
-      ? preferredFiniteValidationCommand(input.ports)
-      : "");
-  input.ports.live.correctiveValidationCommand = correctiveCommand;
-  const feedback = [
-    "VALIDATION_COMMAND_REJECTED: this run_command does not preserve one finite acceptance exit status; no command ran.",
-    invalid.rejection.message,
-    correctiveCommand
-      ? `The workspace is already bound. Submit exactly ${JSON.stringify(correctiveCommand)} as command next, without cd, redirection, pipe, tail, semicolon, echo, or another wrapper.`
-      : "Use one bounded build, test, lint, typecheck, check, or inline assertion command (for example npm test, npm run build, cargo test, or a bounded node assertion), or use browser_evaluate for observable UI behavior.",
-    "Do not use grep/find/cat/sed to discharge validation debt and do not repeat the mutation while validation tools are the only advertised actions.",
-  ].join("\n");
-  return rejectedProviderResult({
-    ...input,
-    rejectedCall: invalid.call,
-    feedbackCode: "validation_command_rejected",
-    feedback,
-    reason: "validation_command_not_finite",
-    logData: {
-      rejectionReason: invalid.rejection.rejectionReason,
-      correctiveCommand: correctiveCommand || null,
     },
   });
 }

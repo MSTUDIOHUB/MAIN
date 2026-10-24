@@ -25,12 +25,9 @@ export function advanceRuntimeV2ProviderRecoveryStallLease(input: {
   readonly now: number;
 }): RuntimeV2ProviderRecoveryStallLease | null {
   if (!input.pressure) return null;
-  const startedAt = input.current &&
-      Number.isFinite(input.current.startedAt)
-    ? input.current.startedAt
-    : Number.isFinite(input.startedAt)
+  const startedAt = Number.isFinite(input.startedAt)
       ? Number(input.startedAt)
-      : input.now;
+      : input.current?.startedAt ?? input.now;
   return {
     startedAt,
     reason: input.pressure.reason,

@@ -26,11 +26,9 @@ export function runtimeV2CorrectiveMutationFailureLimitReached(
  * receives one target-locked source decision. Any subsequent editor is
  * authorized independently by the ordinary mutation preflight; Runtime never
  * asks the model to reconstruct the rejected patch merely to make progress.
- * A repeated-action recovery enters after the first proven closed decision
- * while a source-only frontier is still waiting for its next real workspace
- * effect. One cached source replay is itself the permitted context restore;
- * the following decision sees that exact source and must not reopen reads.
- * Cold resume or evicted source therefore reopens inspection automatically.
+ * Source reads, equivalent observations and cache replay do not create a
+ * workspace mutation obligation. Only an actual rejected editor or validation
+ * boundary may narrow the ordinary inspect/act/report decision surface.
  */
 export function runtimeV2ProviderActionWindowFor(input: {
   readonly command: Pick<RuntimeV2Command, "payload">;
@@ -87,12 +85,6 @@ export function runtimeV2ProviderActionWindowFor(input: {
       !Array.isArray(recovery)
     ? recovery as Record<string, unknown>
     : null;
-  const pressure = input.command.payload.effectPressure;
-  const pressureRecord = pressure &&
-      typeof pressure === "object" &&
-      !Array.isArray(pressure)
-      ? pressure as Record<string, unknown>
-      : null;
   const repeatedObservation =
     (input.effects.repeatedObservationToolNames?.size || 0) > 0 ||
     (input.effects.replayedSourceReceiptCountSinceMutation || 0) >= 1;
@@ -101,7 +93,8 @@ export function runtimeV2ProviderActionWindowFor(input: {
     mode === "validate" &&
     (
       repeatedObservation ||
-      Number(recoveryRecord?.occurrence) >= 1
+      (recoveryRecord?.reason !== "non_actionable_response" &&
+        Number(recoveryRecord?.occurrence) >= 1)
     )
   ) {
     // Validation already has a durable mutation boundary to verify. One
@@ -110,19 +103,6 @@ export function runtimeV2ProviderActionWindowFor(input: {
     // validation safely returns the reducer to editing. This also covers an
     // attempted mutation that was rejected at the advertised tool surface;
     // protocol failures are projected into recoveryPressure by the ledger.
-    return "closed_recovery";
-  }
-  if (
-    input.sourceCoverage.length > 0 &&
-    pressureRecord?.reason === "source_only_frontier" &&
-    (
-      repeatedObservation ||
-      (
-        recoveryRecord?.reason === "repeated_action_rejected" &&
-        Number(recoveryRecord.occurrence) >= 1
-      )
-    )
-  ) {
     return "closed_recovery";
   }
   return null;

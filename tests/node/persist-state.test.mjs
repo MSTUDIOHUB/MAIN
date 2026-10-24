@@ -70,6 +70,13 @@ test("persist schema version is bumped for runtime payload slimming", () => {
   assert.equal(LOCAL_PERSIST_SCHEMA_VERSION, 2);
 });
 
+test("extension installation metadata persists while discovered connector schemas do not", () => {
+  const installations = [{ id: "extension-one", packageHash: "revision-one" }];
+  const persisted = buildPersistedAppState({ geminiExtensions: installations, extensionMcpDiscovery: { old: { tools: ["stale"] } } });
+  assert.deepEqual(persisted.geminiExtensions, installations);
+  assert.equal(Object.hasOwn(persisted, "extensionMcpDiscovery"), false);
+});
+
 test("hydration drops stale Goal composer intent without changing other intents", () => {
   assert.equal(sanitizeHydratedLockedComposerIntent("goal"), null);
   assert.equal(sanitizeHydratedLockedComposerIntent("plan"), "plan");

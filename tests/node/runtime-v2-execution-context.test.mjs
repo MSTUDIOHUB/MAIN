@@ -130,6 +130,10 @@ const executionText = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionText.ts",
 ));
+const modelToolReceipt = loadTs(path.join(
+  workspaceRoot,
+  "src/store/runtimeV2/readOnlyToolReceipt.ts",
+));
 const executionToolDefinitions = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionToolDefinitions.ts",
@@ -427,6 +431,58 @@ test("successful empty tool output is explicit model evidence", () => {
     evidence.toolResultContentForModel(null),
     "TOOL_RESULT_EMPTY: the tool completed successfully and returned no content or matches.",
   );
+});
+
+test("production command receipt preserves a complete structured result that fits the Run window", () => {
+  const stdout = JSON.stringify({ success: true, data: { entries: [
+    { name: "related catalog entry", description: "x".repeat(18_000) },
+    { name: "requested target", schema: { required: ["TARGET_SCHEMA_EVIDENCE"] } },
+  ] } });
+  const nativeResult = { exitCode: 0, success: true, stdout, stderr: "", stdoutTruncated: false, stderrTruncated: false };
+  const content = modelToolReceipt.runtimeV2ToolModelContent({ context: {
+    runtimeRunIntent: "execute", runtimeContextBudget: { readWindowChars: 64_000, inputBudget: 101_581, outputBudget: 4096 },
+  } }, "run_command", nativeResult);
+  assert.ok(content.includes("TARGET_SCHEMA_EVIDENCE"), "the result fits the Run window but its tail schema was discarded");
+  assert.equal(content, evidence.toolResultContentForModel(nativeResult));
+  assert.equal(JSON.parse(content.slice("exitCode: 0\n".length)).data.entries[1].schema.required[0], "TARGET_SCHEMA_EVIDENCE");
+});
+
+test("command result windows charge escaped metadata and report the exact original UTF16 prefix", () => {
+  const stdout = JSON.stringify({ data: "quotes\" and slashes\\ and emoji😀\n".repeat(3_000), tail: "OUTSIDE_WINDOW" });
+  const nativeResult = { exitCode: 0, success: true, stdout, stderr: "", stdoutTruncated: false, stderrTruncated: false };
+  const original = evidence.toolResultContentForModel(nativeResult);
+  const content = modelToolReceipt.runtimeV2ToolModelContent({ context: {
+    runtimeRunIntent: "execute", runtimeContextBudget: { readWindowChars: 16_000 },
+  } }, "run_command", nativeResult, { parallelReadCount: 2 });
+  assert.ok(content.length <= 8_000, "serialized partial envelope must fit its shared allocation");
+  const window = JSON.parse(content);
+  assert.equal(window.type, "tool.result_window");
+  assert.equal(window.truncated, true);
+  assert.equal(window.contentFormat, "partial_text", "the prefix is not advertised as a complete JSON document");
+  assert.equal(window.totalChars, original.length);
+  assert.deepEqual(window.returnedRange, { startChar: 0, endChar: window.returnedChars });
+  assert.equal(window.content, original.slice(0, window.returnedChars));
+  assert.equal(window.content.length, window.returnedChars);
+  assert.equal(window.continuationAvailable, false, "no cursor or retained output is promised");
+  assert.equal(/[\uD800-\uDBFF]$/.test(window.content), false, "the result never splits a surrogate pair");
+  assert.doesNotMatch(window.content, /OUTSIDE_WINDOW/);
+  assert.ok(content.length > window.content.length, "escaping and metadata consume the same allocation");
+});
+
+test("command output has a bounded null-budget fallback and preserves empty and lossless source contracts", () => {
+  const text = "x".repeat(20_000);
+  const fallback = executionText.boundedRuntimeV2ToolContent("run_command", text, null);
+  assert.ok(fallback.length <= 12_000);
+  const partial = JSON.parse(fallback);
+  assert.equal(partial.totalChars, text.length);
+  assert.equal(partial.content, text.slice(0, partial.returnedRange.endChar));
+  for (const value of [null, undefined]) {
+    assert.equal(executionText.boundedRuntimeV2ToolContent("run_command", value, { readWindowChars: 64_000 }), "");
+  }
+  for (const name of ["read_file", "load_skill"]) {
+    const lossless = `  ${text}\n`;
+    assert.equal(executionText.boundedRuntimeV2ToolContent(name, lossless, { readWindowChars: 1_000 }, { parallelReadCount: 3 }), lossless);
+  }
 });
 
 test("read_file model context preserves source text without command-result decoding or trimming", () => {
@@ -3134,7 +3190,8 @@ test("source evidence never closes the ordinary inspect-edit surface by batch co
     hasMaterializedSourceEvidence: true,
     sourceOnlyFrontier: true,
   });
-  assert.match(prompt, /submit the mutation now/i);
+  assert.match(prompt, /advance the user's complete objective/i);
+  assert.match(prompt, /do not select the implementation targets or require a repair to the files already read/i);
   assert.doesNotMatch(prompt, /observation branch is closed/i);
   assert.doesNotMatch(prompt, /call record_execution_contract now/i);
 });
@@ -3189,14 +3246,14 @@ test("structured native recovery uses generic required without a named-tool lock
   );
 });
 
-test("provider request failure enters structured recovery while tools remain", () => {
+test("provider transport failure preserves optional tools and reasoning rather than requiring an action", () => {
   assert.equal(
     providerRequest.runtimeV2RecoveryRequiresStructuredAction({
       reason: "provider_request_failed",
       occurrence: 1,
       stage: "reconsider",
     }),
-    true,
+    false,
   );
   assert.equal(
     providerRequest.runtimeV2RecoveryRequiresStructuredAction(null),
@@ -3901,7 +3958,8 @@ function command(phase) {
   };
 }
 
-test("an empty Execute provider surface quarantines a wire tool call without proving its transport", async () => {
+for (const wireFormat of ["native", "xml"]) {
+test(`an empty Execute provider surface quarantines a ${wireFormat} tool call without proving its transport`, async () => {
   const live = executionTypes.createRuntimeV2LiveExecutionState();
   live.providerLaneProfile = {
     schemaVersion: "provider-lane.v1",
@@ -3942,14 +4000,14 @@ test("an empty Execute provider surface quarantines a wire tool call without pro
     });
     return runtime.normalizeProviderResponseV1({
       visibleText: "I will inspect the source.",
-      tool_calls: [{
+      ...(wireFormat === "xml" ? { content: 'I will inspect the source.\n<tool_call>{"name":"read_file","arguments":{"path":"src/main.js"}}</tool_call>' } : { tool_calls: [{
         id: "wire-hidden-read",
         type: "function",
         function: {
           name: "read_file",
           arguments: JSON.stringify({ path: "src/main.js" }),
         },
-      }],
+      }] }),
     });
   };
 
@@ -4015,6 +4073,7 @@ test("an empty Execute provider surface quarantines a wire tool call without pro
     }
   }
 });
+}
 
 test("Observe, Act, and Validate share one safe inspect-edit-verify surface", () => {
   const available = [
@@ -4469,130 +4528,6 @@ test("an unavailable native tool becomes one causal rejected action instead of a
   );
 });
 
-test("validation mode rejects source-search shell commands before they can bypass validation evidence", () => {
-  const live = executionTypes.createRuntimeV2LiveExecutionState();
-  const logs = [];
-  let id = 0;
-  const ports = {
-    live,
-    nextId: () => `validation-rejected-${++id}`,
-    logStoreEvent: (event, data) => logs.push({ event, data }),
-  };
-  const validationCommand = {
-    ...command("validating"),
-    payload: {
-      ...command("validating").payload,
-      mode: "validate",
-    },
-  };
-  const input = {
-    ports,
-    command: validationCommand,
-    tools: [definition("run_command"), definition("browser_evaluate")],
-    result: {
-      visibleText: "I will inspect the handler.",
-      toolCalls: [{
-        id: "provider-grep",
-        name: "run_command",
-        arguments: { command: "grep -n handleOpenFile src/main.js" },
-      }],
-      diagnostics: [],
-    },
-  };
-  const rejected = providerSurfaceRejection
-    .rejectRuntimeV2InvalidValidationCommand(input);
-  assert.deepEqual(rejected.toolCalls, []);
-  assert.equal(rejected.visibleText, "");
-  assert.match(live.messages.at(-1).content, /VALIDATION_COMMAND_REJECTED/);
-  assert.match(live.messages.at(-1).content, /npm run build/);
-  assert.ok(logs.some((entry) =>
-    entry.event === "runtime_v2_provider_action_rejected" &&
-    entry.data.reason === "validation_command_not_finite"
-  ));
-
-  assert.equal(
-    providerSurfaceRejection.rejectRuntimeV2InvalidValidationCommand({
-      ...input,
-      result: {
-        ...input.result,
-        toolCalls: [{
-          id: "provider-test",
-          name: "run_command",
-          arguments: { command: "npm test" },
-        }],
-      },
-    }),
-    null,
-    "a real finite validation remains executable",
-  );
-});
-
-test("a rejected validation wrapper locks the next native command to its finite validator", () => {
-  const live = executionTypes.createRuntimeV2LiveExecutionState();
-  const logs = [];
-  let id = 0;
-  const ports = {
-    live,
-    now: () => 1,
-    lifecycleDeadlineAt: 200_000,
-    nextId: () => `validation-wrapper-${++id}`,
-    logStoreEvent: (event, data) => logs.push({ event, data }),
-  };
-  const validationCommand = {
-    ...command("validating"),
-    payload: {
-      ...command("validating").payload,
-      mode: "validate",
-    },
-  };
-  const rejected = providerSurfaceRejection
-    .rejectRuntimeV2InvalidValidationCommand({
-      ports,
-      command: validationCommand,
-      tools: [definition("run_command"), definition("browser_evaluate")],
-      result: {
-        visibleText: "",
-        toolCalls: [{
-          id: "provider-wrapped-build",
-          name: "run_command",
-          arguments: {
-            command:
-              "cd /workspace && npm run build 2>&1; echo EXIT_CODE=$?",
-          },
-        }],
-        diagnostics: [],
-      },
-    });
-
-  assert.deepEqual(rejected.toolCalls, []);
-  assert.equal(live.correctiveValidationCommand, "npm run build");
-  assert.match(live.messages.at(-1).content, /exactly "npm run build"/);
-  assert.ok(logs.some((entry) =>
-    entry.event === "runtime_v2_provider_action_rejected" &&
-    entry.data.correctiveCommand === "npm run build"
-  ));
-
-  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
-    ports,
-    command: validationCommand,
-    available: [
-      definition("run_command"),
-      definition("browser_evaluate"),
-      definition("read_file"),
-    ],
-    actionWindow: "closed_recovery",
-    correctiveValidationCommand: live.correctiveValidationCommand,
-  });
-  const runCommand = selected.find((tool) =>
-    tool.function.name === "run_command"
-  );
-  assert.deepEqual(
-    runCommand.function.parameters.properties.command.enum,
-    ["npm run build"],
-  );
-  assert.match(runCommand.function.description, /no redirection/i);
-});
-
 test("corrective action pressure reuses materialized target source without a freshness ritual", () => {
   const commandWithPressure = {
     payload: {
@@ -4845,7 +4780,7 @@ test("three uncommitted corrective mutation failures close the recovery cycle", 
   );
 });
 
-test("the first proven repeated action enters recovery mutation decoding", () => {
+test("a rejected repeated action does not create an Execute file-mutation obligation", () => {
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
       command: {
@@ -4866,11 +4801,11 @@ test("the first proven repeated action enters recovery mutation decoding", () =>
         complete: true,
       }],
     }),
-    "closed_recovery",
+    null,
   );
 });
 
-test("a repeated semantic observation enters recovery mutation decoding immediately", () => {
+test("equivalent observations leave Execute inspection and command capabilities open", () => {
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
       command: {
@@ -4890,7 +4825,7 @@ test("a repeated semantic observation enters recovery mutation decoding immediat
         complete: true,
       }],
     }),
-    "closed_recovery",
+    null,
   );
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
@@ -4910,7 +4845,7 @@ test("a repeated semantic observation enters recovery mutation decoding immediat
   );
 });
 
-test("the first cache re-materialization restores source then closes inspection", () => {
+test("cache re-materialization restores source without creating an Execute mutation obligation", () => {
   const input = {
     command: {
       payload: {
@@ -4932,8 +4867,8 @@ test("the first cache re-materialization restores source then closes inspection"
   };
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor(input),
-    "closed_recovery",
-    "the replay has already restored exact source, so the next decision must act instead of reading again",
+    null,
+    "restored source supports the next action but does not require a file edit",
   );
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
@@ -6808,7 +6743,7 @@ test("a missing-source rejection reuses unchanged materialized target source for
   );
 });
 
-test("preferred collaboration strongly suggests bounded parallel work without becoming a stage gate", () => {
+test("preferred collaboration keeps the user's deliverable authoritative instead of filling child capacity", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {
       mode: "execute",
@@ -6826,7 +6761,9 @@ test("preferred collaboration strongly suggests bounded parallel work without be
 
   assert.match(prompt, /explicitly prefers collaboration/i);
   assert.match(prompt, /2 new child slot/i);
-  assert.match(prompt, /up to 2 spawn_subagent calls/i);
+  assert.match(prompt, /requested deliverable and depth/i);
+  assert.match(prompt, /independent result.*benefit/i);
+  assert.doesNotMatch(prompt, /prioritize issuing|up to 2 spawn_subagent calls|as many/i);
   assert.match(prompt, /continue non-dependent parent work in parallel/i);
   assert.match(prompt, /not a mandatory lifecycle stage/i);
   assert.match(prompt, /simple or linear task, proceed directly/i);
@@ -6864,13 +6801,14 @@ test("execution prompt stops asking for the same source after versioned evidence
     },
   }, "", surface);
 
-  assert.match(missing, /Read the exact existing file before changing it/);
-  assert.match(present, /Exact versioned source is visible/);
+  assert.match(missing, /Read the exact current target before modifying an existing file/);
+  assert.match(present, /For modifications to an existing file, use only its exact current source visible in this decision request/);
   assert.doesNotMatch(
     present,
-    /Read the exact existing file before changing it/,
+    /No existing-file source is visible yet/,
   );
-  assert.match(cachedOnly, /runtime cache but is not visible/);
+  assert.match(cachedOnly, /source is cached but is not visible/);
+  assert.match(cachedOnly, /does not authorize edits to those files/);
   assert.match(cachedOnly, /replay it without another disk read/);
 });
 
@@ -6905,9 +6843,9 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
     }],
   });
 
-  assert.match(prompt, /no committed workspace effect/i);
-  assert.match(prompt, /submit the mutation now/i);
-  assert.match(prompt, /missing path, range, or fact/i);
+  assert.match(prompt, /no recorded file mutation/i);
+  assert.match(prompt, /advance the user's complete objective/i);
+  assert.match(prompt, /specific missing fact that blocks the next authorized action/i);
   assert.match(prompt, /Safe reads remain available/i);
   assert.match(prompt, /editable_source/i);
   assert.match(prompt, /src\/main\.js/);
@@ -6918,6 +6856,30 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
   assert.doesNotMatch(prompt, /write_file/);
   assert.doesNotMatch(prompt, /prefix|tail/);
   assert.doesNotMatch(prompt, /round|attempt|Gemma|Qwen/i);
+});
+
+test("ordinary reasoning preserves its configuration without a recovery boundary", () => {
+  for (const configured of ["auto", "explicit", "off", undefined]) {
+    for (const providerSupportsReasoningToggle of [false, true]) {
+      assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+        configured,
+        providerSupportsReasoningToggle,
+        structuredActionRequired: false,
+      }), configured);
+    }
+  }
+  assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+    configured: "auto", providerSupportsReasoningToggle: true,
+    structuredActionRequired: true,
+  }), "auto", "action selection does not prove a reasoning decoder failure");
+  assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+    configured: "explicit", providerSupportsReasoningToggle: true,
+    recoveringFromRejectedAction: true,
+  }), "explicit", "semantic rejection preserves configured reasoning");
+  assert.equal(providerRequest.runtimeV2ExecutionReasoningRequest({
+    configured: "auto", providerSupportsReasoningToggle: false,
+    structuredActionRequired: true,
+  }), "auto", "an adapter without a toggle cannot override the configuration");
 });
 
 test("corrective action window closes observation but not the Run", () => {
@@ -6955,8 +6917,6 @@ test("corrective action window closes observation but not the Run", () => {
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
-      sourceOnlyFrontier: true,
-      hasMutationTool: true,
       providerSupportsReasoningToggle: true,
       actionWindow: "corrective_mutation",
     }),
@@ -7004,6 +6964,23 @@ test("execution prompt keeps positive source authority without reprinting reject
   assert.match(prompt, /replace_in_file/);
   assert.doesNotMatch(prompt, /start_line/);
   assert.doesNotMatch(prompt, /currently ineligible/i);
+});
+
+test("Execute prompt permits a complete command report while retaining authorization and file validation debt", () => {
+  const prompt = providerRequest.providerModeInstruction({
+    payload: { mode: "execute", toolExpectation: "auto" },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: false,
+    hasWaitSubagents: false,
+  });
+  assert.match(prompt, /workspace change only when the user's current request authorizes that effect/i);
+  assert.match(prompt, /command or external-operation task/i);
+  assert.match(prompt, /actual successful receipts cover the user's full request/i);
+  assert.match(prompt, /successful intermediate action does not require you to stop/i);
+  assert.match(prompt, /file mutations still require subsequent matching validation/i);
+  assert.doesNotMatch(prompt, /A no-tool reply does not itself complete the Run/);
 });
 
 test("validation prompt asks for evidence instead of another mutation", () => {
@@ -7353,6 +7330,24 @@ test("child retains the complete admitted read window", () => {
   );
 });
 
+test("child command receipts share the parent Run window without cropping Skill or source envelopes", () => {
+  const budget = { readWindowChars: 18_000 };
+  const calls = ["read_file", "load_skill", "run_command", "run_command"].map((name) => ({ name }));
+  const count = executionText.runtimeV2ParallelReadCount(calls);
+  assert.equal(count, 4);
+  const options = { parallelReadCount: count };
+  for (const name of ["read_file", "load_skill"]) {
+    const source = `  ${"s".repeat(4_000)}\n`;
+    assert.equal(subagentRunner.runtimeV2ChildToolOutputContent(name, source, budget, options), source);
+  }
+  const content = subagentRunner.runtimeV2ChildToolOutputContent("run_command", "x".repeat(9_000), budget, options);
+  assert.ok(content.length <= 4_500);
+  const partial = JSON.parse(content);
+  assert.equal(partial.totalChars, 9_000);
+  assert.equal(partial.returnedRange.endChar, partial.content.length);
+  assert.equal(subagentRunner.runtimeV2ChildToolOutputContent("run_command", "complete", budget, options), "complete");
+});
+
 test("rejected collaboration calls close their standard tool transcript", async () => {
   const turn = {
     workspaceKey: "/fixture",
@@ -7468,6 +7463,7 @@ test("rejected collaboration calls close their standard tool transcript", async 
 });
 
 test("joined child evidence gets a delivery receipt only after entering the canonical parent transcript", async () => {
+  const childSummary = `${"Evidence-backed project findings. ".repeat(170)}COMPLETE_CHILD_REPORT_TAIL`;
   const run = {
     sessionKey: "session",
     sessionEpoch: "epoch",
@@ -7513,7 +7509,7 @@ test("joined child evidence gets a delivery receipt only after entering the cano
   live.childRuns.set(job.id, Promise.resolve({
     job,
     status: "degraded",
-    summary: "The child found one evidence-backed owner for parent review.",
+    summary: childSummary,
     report: null,
     inheritedEvidence: [],
     evidence: [{
@@ -7572,6 +7568,8 @@ test("joined child evidence gets a delivery receipt only after entering the cano
     )
   );
   assert.ok(context);
+  assert.ok(String(context.content).includes(childSummary));
+  assert.ok(String(live.messages.at(-1)?.content || "").includes(childSummary));
   assert.match(String(context.content), /Evidence ids: child-main-owner/);
   assert.match(
     String(context.content),
@@ -9102,6 +9100,9 @@ test("rejected actions retain one bounded causal anchor without executable templ
     ]),
     failedValidationToolCallIds: new Set(["validation-current"]),
   };
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  options.inputBudget = trim.estimateMessagesTokens(providerHistory.buildRuntimeV2DecisionView(buildMessages(50), effects));
+  assert.ok(trim.estimateMessagesTokens(buildMessages(50)) > options.inputBudget, "causal workset eviction requires actual pressure");
   const afterFifty =
     providerHistory.boundRuntimeV2ProviderConversation(
       buildMessages(50),
@@ -9859,24 +9860,7 @@ test("finite validation rejects observers and services but accepts a real test",
       .reasonCode,
     "finite_validation_contract_required",
   );
-  assert.equal(
-    authorization.correctiveFiniteValidationCommand(
-      "cd /workspace && npx vite build 2>&1 | tail -20",
-    ),
-    "npx vite build",
-  );
-  assert.equal(
-    authorization.correctiveFiniteValidationCommand(
-      "cd /workspace && npm run build 2>&1; echo EXIT_CODE=$?",
-    ),
-    "npm run build",
-  );
-  assert.equal(
-    authorization.correctiveFiniteValidationCommand(
-      "grep -n handler src/main.js",
-    ),
-    null,
-  );
+
 });
 
 test("child scope remains read-only and relative to its declared paths", () => {
@@ -10056,6 +10040,78 @@ test("child handoff keeps complete canonical source windows when the run budget 
   assert.match(capsule, /source:src\/main\.js:main-v1/);
   assert.match(capsule, /COMPLETE_PARENT_WINDOW_TAIL/);
   assert.doesNotMatch(capsule, /parent-context-truncated/);
+});
+
+function admittedBaselineFixture(workspace) {
+  return {
+    kind: "project_baseline_context", schemaVersion: 1, parserVersion: 1,
+    workspace: { canonicalPath: workspace, identity: `owner:${workspace}`, vcs: null },
+    limits: {}, anchors: [], topology: [{ path: "src", kind: "directory" }],
+    facts: {
+      languages: [{ name: "TypeScript", provenance: { path: "src/main.ts", selector: "file_extension", contentHash: "path-sha256-main" } }],
+      packageManagers: [], runtimes: [], scripts: [],
+    },
+    omissions: [], diagnostics: [],
+    truncated: { anchors: false, topology: false, scripts: false },
+    fingerprints: { anchors: "anchors", topology: "topology", facts: "facts", overall: "project-baseline-sha256-fixture" },
+  };
+}
+
+test("child baseline orientation replaces only a duplicate overview while retaining source and task authority", () => {
+  const source = "COMPLETE_SOURCE_FOR_CHILD";
+  const messages = [{
+    role: "system", content: "[runtime-v2 context: workspace-overview]\nUNRELATED_ENTIRE_PROJECT_TREE",
+  }, {
+    role: "system", content: "[runtime-v2 context: approved-work-plan]\nAPPROVED_PARENT_SCOPE",
+  }, {
+    role: "assistant", content: "", tool_calls: [{
+      id: "read-child-source", type: "function",
+      function: { name: "read_file", arguments: JSON.stringify({ path: "src/main.ts" }) },
+    }],
+  }, {
+    role: "tool", tool_call_id: "read-child-source",
+    content: `READ_FILE_RESULT\npath: src/main.ts\ncontentVersion: main-v1\ntruncated: false\ntotalLines: 1\ntotalChars: ${source.length}\nreturnedLines: 1-1\nreturnedChars: ${source.length}\n---CONTENT START---\n${source}\n---CONTENT END---`,
+  }];
+  for (const baselineWorkspace of [null, "/fixture/", "/another-workspace"]) {
+    const capsule = subagentContext.buildRuntimeV2SubagentContextCapsule({
+      aggregate: {
+        phase: "observing", objective: { text: "Explain the current project", acceptanceCriteria: ["Only the requested overview"], acceptanceCriterionIds: ["overview"] },
+        workPlan: null, sealedWorkPlan: null,
+        evidence: [{ id: "E-source", kind: "source", target: "src/main.ts", version: "main-v1" }],
+      },
+      job: { taskKind: "explore", allowedPaths: ["src"] },
+      messages, workspace: "/fixture",
+      projectBaselineContext: baselineWorkspace ? admittedBaselineFixture(baselineWorkspace) : null,
+      effectFacts: {
+        committedMutationTargetsByToolCallId: new Map(), replayedToolCallIds: new Set(),
+        sourceReadVersionsByToolCallId: new Map([["read-child-source", { target: "src/main.ts", version: "main-v1" }]]),
+        failedValidationToolCallIds: new Set(), rejectedActionIdentities: new Set(),
+      },
+    });
+    assert.match(capsule, /Explain the current project/);
+    assert.match(capsule, /Only the requested overview/);
+    assert.match(capsule, /APPROVED_PARENT_SCOPE/);
+    assert.match(capsule, /COMPLETE_SOURCE_FOR_CHILD/);
+    assert.match(capsule, /E-source/);
+    if (baselineWorkspace === "/fixture/") assert.doesNotMatch(capsule, /UNRELATED_ENTIRE_PROJECT_TREE/);
+    else assert.match(capsule, /UNRELATED_ENTIRE_PROJECT_TREE/, "missing or foreign baseline cannot replace current orientation");
+  }
+});
+
+test("read-only production history uses only the captured workspace baseline and preserves the user's scope", () => {
+  const userPrompt = "Explain the project purpose; leave the design review for later.";
+  for (const baselineWorkspace of ["/fixture/", "/another-workspace"]) {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    const request = providerHistory.providerHistory(live, {
+      get: () => ({ config: {}, conversationTurns: [{ id: "turn", userPrompt }], agentMessages: [{ role: "user", runtimeTurnId: "turn", content: userPrompt }] }),
+      context: { turnId: "turn", runWorkspace: "/fixture", phaseLanguage: "en", runtimeRunIntent: "summarize", projectBaselineContext: admittedBaselineFixture(baselineWorkspace) },
+      live,
+    });
+    assert.equal(request.messages.find(message => message.role === "user")?.content, userPrompt);
+    assert.match(request.messages[0].content, /requested deliverable and depth/i);
+    if (baselineWorkspace === "/fixture/") assert.match(request.messages[0].content, /PROJECT BASELINE FACTS/);
+    else assert.doesNotMatch(request.messages[0].content, /PROJECT BASELINE FACTS/);
+  }
 });
 
 test("browser validation requires passed assertions and no page errors", () => {
@@ -10278,4 +10334,725 @@ test("ordinary child text matches exact evidence ids at citation delimiters", ()
     punctuationReport.findings[0].evidenceIds,
     ["child:review-1:E1"],
   );
+});
+
+test("requestRuntimeV2ProviderOnce appends prompt frontier conclude instruction when mode is conclude", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  let capturedMessages = [];
+  streaming.streamChatCompletion = async (messages) => {
+    capturedMessages = messages;
+    return {
+      content: "Final markdown answer.",
+      semanticContent: "Final markdown answer.",
+      visibleText: "Final markdown answer.",
+      finishReason: "stop",
+      toolCalls: [],
+      reasoning: null,
+      usage: null,
+      diagnostics: [],
+    };
+  };
+
+  try {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    live.messages = [
+      { role: "system", content: "[MAIN RUNTIME V2] instructions" },
+      { role: "user", content: "What is the analysis?" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "File content here" },
+    ];
+    const command = {
+      kind: "request_model",
+      phase: "finalizing",
+      run: { turnId: "t1", runId: "r1" },
+      payload: { mode: "conclude", conclusionKind: "read_only" },
+    };
+    const ports = {
+      get: () => ({
+        agentMessages: [],
+        conversationTurns: [],
+        config: {
+          activeProfile: "local",
+          local: {
+            endpoint: "http://localhost:11434",
+            apiKey: "",
+            model: "test-model",
+            contextLimit: 32000,
+            provider: "ollama",
+            toolProtocol: "native",
+          },
+        },
+      }),
+      context: {
+        turnId: "t1",
+        runtimeContextBudget: null,
+        runWorkspace: "/fixture",
+        phaseLanguage: "en",
+      },
+      live,
+      logStoreEvent: () => {},
+    };
+
+    try {
+      await providerRequest.requestRuntimeV2ProviderOnce({
+        live,
+        ports,
+        command,
+        tools: [],
+        textEnvelope: false,
+        toolChoice: null,
+        signal: new AbortController().signal,
+      });
+    } catch (err) {
+      throw new Error("CAUGHT: " + (err && err.stack ? err.stack : String(err)));
+    }
+
+    const lastMsg = capturedMessages[capturedMessages.length - 1];
+    assert.equal(lastMsg.role, "user");
+    assert.equal(
+      lastMsg.content,
+      "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags."
+    );
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+  }
+});
+
+test("requestRuntimeV2ProviderOnce in conclude mode with context budget preserves user conversation and appends frontier conclude instruction", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  let capturedMessages = [];
+  streaming.streamChatCompletion = async (messages) => {
+    capturedMessages = messages;
+    return {
+      content: "Final markdown answer.",
+      semanticContent: "Final markdown answer.",
+      visibleText: "Final markdown answer.",
+      finishReason: "stop",
+      toolCalls: [],
+      reasoning: null,
+      usage: null,
+      diagnostics: [],
+    };
+  };
+
+  try {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    live.messages = [
+      { role: "system", content: "[MAIN RUNTIME V2] instructions" },
+      { role: "user", content: "Old question from turn 1" },
+      { role: "assistant", content: "Old answer from turn 1" },
+      { role: "user", content: "What is the analysis for fund 020629?" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", content: "Receipt data ".repeat(150) },
+    ];
+    const command = {
+      kind: "request_model",
+      phase: "finalizing",
+      run: { turnId: "t1", runId: "r1" },
+      payload: { mode: "conclude", conclusionKind: "read_only" },
+    };
+    const ports = {
+      get: () => ({
+        agentMessages: [],
+        conversationTurns: [],
+        config: {
+          activeProfile: "local",
+          local: {
+            endpoint: "http://localhost:11434",
+            apiKey: "",
+            model: "test-model",
+            contextLimit: 32000,
+            provider: "ollama",
+            toolProtocol: "native",
+          },
+        },
+      }),
+      context: {
+        turnId: "t1",
+        runtimeContextBudget: {
+          contextLimit: 16000,
+          maxOutputTokens: 2000,
+        },
+        runWorkspace: "/fixture",
+        phaseLanguage: "en",
+      },
+      live,
+      logStoreEvent: () => {},
+    };
+
+    await providerRequest.requestRuntimeV2ProviderOnce({
+      live,
+      ports,
+      command,
+      tools: [],
+      textEnvelope: false,
+      toolChoice: null,
+      signal: new AbortController().signal,
+    });
+
+    // The user's original query MUST NOT have been evicted by the conclude instruction!
+    const userQueries = capturedMessages.filter((msg) => msg.role === "user" && msg.content.includes("020629"));
+    assert.equal(userQueries.length, 1, "original user query must remain in context");
+
+    // The last message must be the prompt frontier conclude instruction
+    const lastMsg = capturedMessages[capturedMessages.length - 1];
+    assert.equal(lastMsg.role, "user");
+    assert.equal(
+      lastMsg.content,
+      "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags."
+    );
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+  }
+});
+
+function twoBatchCommandHistory() {
+  const batch = (prefix, commands, outputs) => [{
+    role: "assistant", content: `${prefix} command batch`, reasoning_content: `${prefix} reasoning`,
+    tool_calls: commands.map((command, index) => ({
+      id: `${prefix}-${index}`, type: "function",
+      function: { name: "run_command", arguments: JSON.stringify({ command }) },
+    })),
+  }, ...outputs.map((content, index) => ({ role: "tool", tool_call_id: `${prefix}-${index}`, content }))];
+  return [
+    { role: "system", content: "[MAIN RUNTIME V2] Keep original command output." },
+    { role: "user", runtimeTurnId: "t1", content: "Run the four commands and report their original output." },
+    ...batch("first", ["example --version", "example status --format json"], [
+      "exitCode: 0\n1.0.0-beta.13\n",
+      'exitCode: 0\n{"success":true,"data":{"count":1,"instances":[{"state":"ready"}]}}\n',
+    ]),
+    ...batch("second", ["example editor status", "example scene hierarchy"], [
+      'exitCode: 0\n{"compiling":false,"playMode":"stopped"}',
+      'exitCode: 0\n{"scene":"SampleScene","objects":["Main Camera"]}',
+    ]),
+  ];
+}
+
+test("provider conversation keeps every original command batch while the Run input allowance fits", () => {
+  const messages = twoBatchCommandHistory();
+  const bounded = providerHistory.boundRuntimeV2ProviderConversation(messages, {
+    contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget: 98_304,
+  });
+  assert.deepEqual(bounded, messages, "prior command facts and reasoning are canonical input, not pressure garbage");
+});
+
+test("provider conversation applies semantic workset only after its explicit input allowance is exceeded", () => {
+  const messages = twoBatchCommandHistory();
+  messages[3] = { ...messages[3], content: `${messages[3].content}${"old-output ".repeat(1_000)}` };
+  const bounded = providerHistory.boundRuntimeV2ProviderConversation(messages, {
+    contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget: 1_000,
+  });
+  assert.ok(!bounded.some((message) => message.tool_call_id === "first-0"));
+  assert.ok(bounded.some((message) => message.tool_call_id === "second-0"));
+  assert.ok(bounded.some((message) => message.role === "user" && message.runtimeTurnId === "t1"));
+  for (const message of bounded.filter((item) => item.role === "tool")) {
+    assert.ok(bounded.some((item) => item.tool_calls?.some((call) => call.id === message.tool_call_id)));
+  }
+});
+
+test("Execute request budgets the full wire shape before compacting canonical command receipts", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const captures = [];
+  let truncateNext = false;
+  streaming.streamChatCompletion = async (messages) => {
+    captures.push(messages);
+    if (truncateNext) {
+      truncateNext = false;
+      return { content: "Unfinished draft", semanticContent: "Unfinished draft", visibleText: "Unfinished draft", finishReason: "length", toolCalls: [], reasoningContent: "Incomplete internal reasoning", usage: null, diagnostics: [] };
+    }
+    return { content: "Reported.", semanticContent: "Reported.", visibleText: "Reported.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  try {
+    const tools = [{ type: "function", function: { name: "run_command", description: "A command tool. ".repeat(160), parameters: { type: "object", properties: { command: { type: "string" } } } } }];
+    const original = twoBatchCommandHistory();
+    const invoke = async (inputBudget, recover = false) => {
+      truncateNext = recover;
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = structuredClone(original);
+      const events = [];
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://localhost:11434", apiKey: "", model: "test-model", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" },
+        live, logStoreEvent: (name, data) => events.push({ name, data }),
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "executing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute" } }, tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages.slice(0, original.length), original, "request projection never mutates canonical receipts");
+      return { messages: captures.at(-1), event: events.find((event) => event.name === "runtime_v2_context_prepared")?.data };
+    };
+    const roomy = await invoke(98_304);
+    assert.deepEqual(roomy.messages.slice(0, original.length), original);
+    assert.equal(roomy.event.removedDecisionMessages, 0);
+    const fullTokens = trim.estimateMessagesTokens(roomy.messages) + trim.estimateTokens(JSON.stringify(tools));
+    const conversationTokens = trim.estimateMessagesTokens(original);
+    const limitedBudget = fullTokens - 50;
+    assert.ok(conversationTokens < limitedBudget, "only the complete wire shape creates pressure");
+    const limited = await invoke(limitedBudget);
+    assert.ok(trim.estimateMessagesTokens(limited.messages) + trim.estimateTokens(JSON.stringify(tools)) <= limitedBudget);
+    assert.ok(!limited.messages.some((message) => message.tool_call_id === "first-0"));
+    assert.ok(limited.messages.some((message) => message.tool_call_id === "second-0"));
+    const recoveredBudget = fullTokens + 50;
+    const recovered = await invoke(recoveredBudget, true);
+    assert.ok(trim.estimateMessagesTokens(recovered.messages) + trim.estimateTokens(JSON.stringify(tools)) <= recoveredBudget, "same-request truncation recovery shares the complete Run allowance");
+    assert.match(recovered.messages.map((message) => message.content).join("\n"), /ACTION_OUTPUT_BUDGET_EXHAUSTED/);
+    for (const message of recovered.messages.filter((item) => item.role === "tool")) {
+      const canonical = original.find((item) => item.tool_call_id === message.tool_call_id);
+      assert.equal(message.content, canonical.content, "recovery pressure never crops retained receipts");
+    }
+  } finally { streaming.streamChatCompletion = originalStream; }
+});
+
+test("ordinary reference requests retain reasoning across source windows and input pressure", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const laneSettings = loadTs(path.join(workspaceRoot, "src/lib/providerLaneSettings.ts"));
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalSettings = laneSettings.deriveBudgetedStreamSettings;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  const target = "references/verification-loop.md";
+  const facts = { ...originalFacts(null), sourceReadVersionsByToolCallId: new Map([["reference", { target, version: "reference-v1" }]]) };
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => facts;
+  let configured = "auto";
+  laneSettings.deriveBudgetedStreamSettings = (...args) => ({ ...originalSettings(...args), reasoningRequest: configured });
+  let wire;
+  streaming.streamChatCompletion = async (messages, settings, _callbacks, _signal, tools, _maxOutput, options) => {
+    wire = { messages, settings, tools, options };
+    return { content: "Continue from the verified reference.", semanticContent: "Continue from the verified reference.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  const tools = ["read_file", "run_command", "replace_in_file"].map((name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {} } } }));
+  const source = "# Verification\nUse real observations before reporting success.\n";
+  try {
+    const invoke = async (windowKind, inputBudget, recovery = false) => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = [
+        { role: "system", content: "[MAIN RUNTIME V2] workspace authority" },
+        { role: "user", runtimeTurnId: "t1", content: "Use the reference to perform the requested external operation." },
+        { role: "assistant", content: "Earlier planning context. ".repeat(1_000) },
+        ...(windowKind === "none" ? [] : [
+          { role: "assistant", content: "Read the workflow reference.", tool_calls: [{ id: "reference", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: target }) } }] },
+          { role: "tool", tool_call_id: "reference", content: loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts")).formatReadFileWindowPayloadForModel(target, {
+            content: source, contentVersion: "reference-v1", startLine: 1, endLine: 2,
+            totalLines: windowKind === "partial" ? 8 : 2,
+            totalChars: windowKind === "partial" ? source.length * 4 : source.length,
+            returnedChars: source.length, truncated: windowKind === "partial",
+            ...(windowKind === "partial" ? { nextStartLine: 3 } : {}),
+          }) },
+        ]),
+      ];
+      const canonical = structuredClone(live.messages);
+      const events = [];
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid", apiKey: "", model: "fixture", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live,
+        logStoreEvent: (name, data) => events.push({ name, data }),
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "observing", run: { turnId: "t1", runId: "r1" }, payload: {
+        mode: "execute", effectPressure: { reason: "source_only_frontier" },
+        ...(recovery ? { recoveryPressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason: "tool_execution_failed", occurrence: 1, stage: "reconsider" } } : {}),
+      } }, tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages, canonical);
+      return { ...wire, coverage: live.latestProviderRequestSourceCoverage, event: events.find((entry) => entry.name === "runtime_v2_context_prepared")?.data };
+    };
+    for (configured of ["auto", "explicit", "off"]) {
+      for (const windowKind of ["none", "complete", "partial"]) {
+        const roomy = await invoke(windowKind, 111_412);
+        const fullTokens = trim.estimateMessagesTokens(roomy.messages) + trim.estimateTokens(JSON.stringify(roomy.tools));
+        const pressured = await invoke(windowKind, fullTokens - 100);
+        for (const result of [roomy, pressured]) {
+          assert.equal(result.settings.reasoningRequest, configured, `${windowKind}: source visibility is not a decoding boundary`);
+          assert.equal(result.event.structuredActionRequired, false);
+          assert.equal(result.event.effectPressureActionDecoding, false);
+          assert.equal(result.options.toolChoice, undefined);
+          assert.equal(result.options.reasoningOnlyCharLimit, null, "ordinary progress uses the provider token budget without an implicit client character guard");
+          assert.equal(result.coverage.length > 0, windowKind !== "none");
+        }
+        assert.equal(roomy.event.decisionViewApplied, false);
+        assert.equal(pressured.event.decisionViewApplied, true, "the fixture must exercise real full-request pressure");
+      }
+    }
+    configured = "auto";
+    const recovery = await invoke("complete", 111_412, true);
+    assert.equal(recovery.settings.reasoningRequest, "auto");
+    assert.equal(recovery.event.structuredActionRequired, false);
+    assert.equal(recovery.options.toolChoice, undefined);
+    assert.equal(recovery.options.reasoningOnlyCharLimit, null, "semantic recovery allows a blocker report with normal reasoning");
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    laneSettings.deriveBudgetedStreamSettings = originalSettings;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
+});
+
+test("recovery requests preserve canonical command and source receipts before real budget pressure", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  const facts = { ...originalFacts(null), sourceReadVersionsByToolCallId: new Map([["source", { target: "a.ts", version: "source-v1" }]]) };
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => facts;
+  const source = "export const value = 1;\r\n".repeat(20);
+  const sourceReceipt = loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts")).formatReadFileWindowPayloadForModel("a.ts", {
+    content: source, contentVersion: "source-v1", startLine: 1, endLine: 20, totalLines: 20, totalChars: source.length, returnedChars: source.length, truncated: false,
+  });
+  const history = twoBatchCommandHistory();
+  history[1] = { ...history[1], runtimeVisualImageParts: 0, runtimeVisualPayloadDigest: "original-user-metadata" };
+  const original = [
+    ...history.slice(0, 2),
+    { role: "assistant", content: "Inspect current source.", tool_calls: [{ id: "source", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] },
+    { role: "tool", tool_call_id: "source", runtimeTurnId: "t1", content: sourceReceipt },
+    ...history.slice(2),
+    { role: "assistant", content: "", tool_calls: [{ id: "rejected", type: "function", function: { name: "run_command", arguments: '{"command":"tool check --exact-target a.ts","cwd":".","description":"Check current target"}' } }] },
+    { role: "tool", tool_call_id: "rejected", content: "ACTION_NOT_EXECUTED: inspect the failed command before choosing a different action." },
+    { role: "assistant", content: "The previous attempt needs correction." },
+    { role: "system", content: "[runtime-v2 provider feedback: tool_execution_failed]\nThe command did not execute; retain the failed arguments and original receipts." },
+  ];
+  let wire;
+  streaming.streamChatCompletion = async (messages, settings, callbacks, _signal, tools, _maxOutput, options) => {
+    wire = { messages, settings, tools, options };
+    callbacks.onLifecycle?.({ phase: "model_progress" });
+    callbacks.onToken("Recovery response.");
+    callbacks.onDone();
+    return { content: "Recovery response.", semanticContent: "Recovery response.", visibleText: "Recovery response.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  try {
+    const tools = ["read_file", "run_command", "replace_in_file"].map((name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {} } } }));
+    const invoke = async (inputBudget, textEnvelope, reason) => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = structuredClone(original);
+      const events = [];
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid", apiKey: "", model: "fixture", contextLimit: 122_880, provider: "omlx", toolProtocol: textEnvelope ? "xml" : "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live,
+        logStoreEvent: (name, data) => events.push({ name, data }),
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "observing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute", recoveryPressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason, occurrence: 1, stage: "reconsider" } } }, tools, textEnvelope, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages, original, "recovery never mutates the canonical transcript");
+      return { ...wire, coverage: live.latestProviderRequestSourceCoverage, event: events.find((entry) => entry.name === "runtime_v2_context_prepared")?.data };
+    };
+    for (const reason of ["tool_execution_failed", "repeated_action_rejected"]) {
+      for (const textEnvelope of [false, true]) {
+        const roomy = await invoke(111_412, textEnvelope, reason);
+        assert.deepEqual(roomy.messages.slice(0, original.length), original, `${reason}: source, commands, tool ids, metadata and feedback must retain their original roles and bytes`);
+        assert.equal(roomy.event.removedDecisionMessages, 0);
+        assert.equal(roomy.event.decisionViewApplied, false);
+        assert.equal(roomy.coverage[0]?.windows[0]?.content, source);
+        assert.equal(roomy.coverage[0]?.version, "source-v1");
+        assert.equal(roomy.options.contextOwnership, "caller");
+        assert.equal(roomy.options.actionOnlyCharLimit, 3_000, "semantic recovery uses ordinary reply decoding");
+        assert.equal(roomy.options.toolChoice, undefined);
+        assert.doesNotMatch(roomy.messages.map((message) => message.content).join("\n"), /committed_source_snapshot_v1|committed_observation_receipts_v1/);
+      }
+    }
+    const full = await invoke(111_412, false, "tool_execution_failed");
+    const fullTokens = trim.estimateMessagesTokens(full.messages) + trim.estimateTokens(JSON.stringify(full.tools));
+    const limitedBudget = fullTokens - 50;
+    const limited = await invoke(limitedBudget, false, "tool_execution_failed");
+    assert.ok(trim.estimateMessagesTokens(limited.messages) + trim.estimateTokens(JSON.stringify(limited.tools)) <= limitedBudget);
+    assert.ok(limited.event.removedDecisionMessages > 0, "only actual full-request pressure can evict history");
+    for (const message of limited.messages.filter((entry) => entry.role === "tool")) {
+      assert.ok(limited.messages.some((entry) => entry.tool_calls?.some((call) => call.id === message.tool_call_id)), "no orphaned tool result survives pressure");
+      assert.deepEqual(message, original.find((entry) => entry.tool_call_id === message.tool_call_id), "a retained receipt keeps its exact metadata and content");
+    }
+    for (const message of limited.messages.filter((entry) => entry.tool_calls?.length)) {
+      assert.ok(message.tool_calls.every((call) => limited.messages.some((entry) => entry.role === "tool" && entry.tool_call_id === call.id)), "parallel call groups retain every matching receipt");
+    }
+    if (!limited.messages.some((message) => message.tool_call_id === "source")) assert.equal(limited.coverage.length, 0);
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
+});
+
+test("Execute pressure removes raw source authority with its whole receipt while forced decisions retain surviving pairs", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  const facts = { ...originalFacts(null), sourceReadVersionsByToolCallId: new Map([["source", { target: "a.ts", version: "original-version" }]]) };
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => facts;
+  let captured = [];
+  streaming.streamChatCompletion = async (messages) => {
+    captured = messages;
+    return { content: "Reported.", semanticContent: "Reported.", visibleText: "Reported.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  const source = "const a = 1;\r\n".repeat(1_200);
+  const original = [
+    { role: "system", content: "[MAIN RUNTIME V2] workspace authority" },
+    { role: "user", runtimeTurnId: "t1", content: "Inspect a.ts, run the command, then fix only with current source." },
+    { role: "assistant", content: "read source", tool_calls: [{ id: "source", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] },
+    { role: "tool", tool_call_id: "source", content: source },
+    ...twoBatchCommandHistory().slice(-3),
+  ];
+  try {
+    const invoke = async (inputBudget, forced = false, envelope = false) => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.messages = structuredClone(original);
+      if (envelope) live.messages[3].content = loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts")).formatReadFileWindowPayloadForModel("a.ts", {
+        content: source, contentVersion: "original-version", startLine: 1, endLine: 1_200, totalLines: 1_200, totalChars: source.length, returnedChars: source.length, truncated: false,
+      });
+      const canonical = structuredClone(live.messages);
+      if (forced) live.latestProviderActionWindow = "corrective_mutation";
+      const ports = {
+        get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://localhost:11434", apiKey: "", model: "test-model", contextLimit: 122_880, provider: "ollama", toolProtocol: "native" } } }),
+        context: { turnId: "t1", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live, logStoreEvent: () => {},
+      };
+      await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "executing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute" } }, tools: ["read_file", "replace_in_file", "run_command"].map((name) => ({ type: "function", function: { name, description: name, parameters: { type: "object", properties: {} } } })), textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+      assert.deepEqual(live.messages, canonical);
+      return { messages: captured, coverage: live.latestProviderRequestSourceCoverage, canonical };
+    };
+    const roomy = await invoke(98_304);
+    assert.equal(roomy.coverage[0]?.version, "original-version");
+    assert.equal(roomy.coverage[0]?.windows[0]?.content, source);
+    const limited = await invoke(2_000);
+    assert.equal(limited.coverage.length, 0);
+    assert.ok(!limited.messages.some((message) => message.tool_call_id === "source"));
+    assert.doesNotMatch(limited.messages.map((message) => message.content).join("\n"), /editable_source_v1|original-version/);
+    const forced = await invoke(98_304, true, true);
+    assert.equal(forced.coverage[0]?.version, "original-version", "only the transmitted original source pair retains its lease");
+    assert.deepEqual(forced.messages.slice(0, forced.canonical.length), forced.canonical);
+    assert.doesNotMatch(forced.messages.map((message) => message.content).join("\n"), /committed_source_snapshot_v1/);
+    assert.match(forced.messages.map((message) => message.content).join("\n"), /editable_source_v1/);
+    facts.invalidatedSourceReadToolCallIds.add("source");
+    const invalidated = await invoke(98_304);
+    assert.ok(invalidated.messages.some((message) => message.tool_call_id === "source"), "fits preserves historical source text");
+    assert.equal(invalidated.coverage.length, 0, "historical text cannot revive a ledger-invalidated write lease");
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
+});
+
+test("successful command receipts with equal output cannot turn prior source reads into a forced file edit", async () => {
+  const source = '{"service":"ready"}\n';
+  const outputs = ['exitCode: 0\n{"currentVersion":"1.0-beta.1","latestVersion":"1.0-beta.2"}', 'exitCode: 0\n{"currentVersion":"1.0-beta.1","latestVersion":"1.0-beta.2"}'];
+  const calls = [
+    { id: "config", name: "read_file", arguments: { path: "config.json" }, content: source, evidence: { id: "source", kind: "source", target: "config.json", version: "config-v1" } },
+    ...["service-cli update --check", "service-cli update"].map((command, index) => ({ id: `command-${index}`, name: "run_command", arguments: { command }, content: outputs[index], evidence: { id: `command-evidence-${index}`, kind: "tool", target: command, version: "identical-result-version" } })),
+  ];
+  const events = calls.flatMap((call, index) => [{
+    type: "command.scheduled", sequence: index * 2, command: { idempotencyKey: call.id, kind: "execute_tool", payload: { toolCallId: call.id, toolName: call.name, arguments: call.arguments } },
+  }, {
+    type: "tool.completed", sequence: index * 2 + 1, idempotencyKey: call.id, status: "succeeded", evidence: [call.evidence], presentation: { observationSummary: call.content },
+  }]);
+  const effects = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({ events });
+  assert.deepEqual([...effects.repeatedObservationToolNames], ["run_command"], "equivalent receipt detection remains truthful without controlling task obligations");
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.messages = [{ role: "system", content: "[MAIN RUNTIME V2] workspace authority" }, { role: "user", runtimeTurnId: "t1", content: "Inspect the CLI environment; install only missing dependencies and report the connection state." }, ...calls.flatMap((call) => [
+    { role: "assistant", content: "", tool_calls: [{ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] },
+    { role: "tool", tool_call_id: call.id, content: call.content },
+  ])];
+  const canonical = structuredClone(live.messages);
+  const requestCommand = { kind: "request_model", phase: "observing", run: { turnId: "t1", runId: "r1" }, payload: { mode: "execute", effectPressure: { reason: "source_only_frontier" } } };
+  const coverage = executionContext.materializedRuntimeV2SourceCoverage(live.messages, "/fixture", effects);
+  assert.equal(coverage.length, 1);
+  const actionWindow = providerActionWindow.runtimeV2ProviderActionWindowFor({ command: requestCommand, effects, sourceCoverage: coverage });
+  assert.equal(actionWindow, null, "reading config plus equal successful command results cannot require replace/apply/delete");
+  live.latestProviderActionWindow = actionWindow;
+  const ports = {
+    get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid", apiKey: "", model: "fixture", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+    context: { turnId: "t1", runtimeRunIntent: "execute", runtimeContextBudget: { contextLimit: 122_880, inputBudget: 98_304, outputBudget: 24_576 }, runWorkspace: "/fixture", phaseLanguage: "en" }, live, logStoreEvent() {},
+  };
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({ ports, command: requestCommand, actionWindow,
+    available: ["read_file", "run_command", "replace_in_file", "apply_patch", "delete_workspace_path"].map(definition) });
+  assert.ok(selected.some((tool) => tool.function.name === "read_file"));
+  assert.ok(selected.some((tool) => tool.function.name === "run_command"));
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => effects;
+  let wire;
+  streaming.streamChatCompletion = async (messages, _settings, _callbacks, _signal, tools, _maxOutput, options) => {
+    wire = { messages, tools, options };
+    return { content: "The existing installation is connected; no project file changes were needed.", semanticContent: "The existing installation is connected; no project file changes were needed.", finishReason: "stop", toolCalls: [], usage: null };
+  };
+  try {
+    const result = await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: requestCommand, tools: selected, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+    assert.deepEqual(wire.messages.slice(0, canonical.length), canonical, "fits keeps the original source and successful command pairs");
+    assert.notEqual(wire.options.toolChoice, "required", "a complete evidence report remains a permitted response");
+    assert.equal(result.diagnostics.length, 0);
+    assert.equal(result.toolCalls.length, 0);
+    assert.match(result.visibleText, /connected/);
+    assert.deepEqual(live.messages, canonical);
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
+});
+
+
+test("mixed observation shell batches retain every ordered proposal", () => {
+  const calls = [
+    { id: "skill", name: "load_skill", arguments: { skill_id: "s:fixture" } },
+    { id: "shell", name: "run_command", arguments: { command: "example --version" } },
+    { id: "project", name: "read_file", arguments: { path: "ProjectSettings/ProjectVersion.txt" } },
+    { id: "reference", name: "read_file", arguments: { path: "references/workflow.md" } },
+  ];
+  const selected = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set(), new Set(), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(selected.accepted, calls);
+  assert.deepEqual(selected.discarded, []);
+  assert.equal(selected.selection, "sequential_shell_batch");
+  assert.deepEqual(selected.freshReadCalls, calls.slice(2));
+});
+
+test("mixed observation shell freshness follows retained shell positions, not whole batch identities", () => {
+  const before = { id: "before", name: "read_file", arguments: { path: "state.json" } };
+  const shell = { id: "shell", name: "run_command", arguments: { command: "example refresh" } };
+  const after = { ...before, id: "after" };
+  const readIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity(before);
+  const shellIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity(shell);
+  const calls = [before, shell, after];
+  const cached = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set([readIdentity]), new Set(), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(cached.accepted, calls, "the pre-command cached companion and fresh later read are distinct observations");
+  assert.deepEqual(cached.freshReadCalls, [after]);
+  const closed = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set([readIdentity]), new Set([readIdentity]), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(closed.accepted, [shell, after], "a closed pre-command read cannot suppress the post-command observation");
+  assert.deepEqual(closed.freshReadCalls, [after]);
+  const repeatedShell = providerToolSurface.boundRuntimeV2ProviderToolCalls(calls, new Set([readIdentity, shellIdentity]), new Set([readIdentity]), { allowMixedObservationShellBatch: true });
+  assert.deepEqual(repeatedShell.accepted, [], "a discarded old shell cannot reopen a closed read");
+  assert.deepEqual(repeatedShell.freshReadCalls || [], []);
+  const write = { id: "write", name: "replace_in_file", arguments: { path: "state.json", search_text: "old", replace_text: "new" } };
+  assert.deepEqual(providerToolSurface.boundRuntimeV2ProviderToolCalls([before, shell, write], new Set(), new Set(), { allowMixedObservationShellBatch: true }).accepted, [before], "same-batch source reads never authorize a proposed source edit");
+});
+
+test("mixed observation shell provider admission replays only the pre-command read and executes the later read fresh", async () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.providerLaneProfile = { schemaVersion: "provider-lane.v1", nativeTools: true, requiredToolChoice: false, streaming: true, textToolEnvelope: true, reasoning: false, imageInput: false, toolResultRole: "tool" };
+  const oldContent = "{\"value\":\"old\"}\n";
+  const newContent = "{\"value\":\"fresh\"}\n";
+  live.messages = [
+    { role: "system", content: "[MAIN RUNTIME V2] fixture" },
+    { role: "user", content: "Inspect, refresh and inspect the current state." },
+    { role: "assistant", content: "Prior inspection.", tool_calls: [{ id: "old-read", type: "function", function: { name: "read_file", arguments: '{"path":"state.json"}' } }] },
+    { role: "tool", tool_call_id: "old-read", content: oldContent },
+  ];
+  const calls = [
+    { id: "wire-repeat", name: "read_file", arguments: { path: "state.json" } },
+    { id: "wire-shell", name: "run_command", arguments: { command: "example refresh", description: "Refresh state" } },
+    { id: "wire-after", name: "read_file", arguments: { path: "state.json" } },
+  ];
+  const definitions = [
+    { ...definition("read_file"), function: { ...definition("read_file").function, parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } },
+    { ...definition("run_command"), function: { ...definition("run_command").function, parameters: { type: "object", properties: { command: { type: "string" }, description: { type: "string" } }, required: ["command"] } } },
+  ];
+  const originalSurface = Object.getOwnPropertyDescriptor(executionContext, "providerToolDefinitionsForCommand");
+  const originalRequest = providerRequest.requestRuntimeV2ProviderOnce;
+  const toolExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+  const originalExecute = toolExecutor.executeTool;
+  const originalAuthorize = authorization.authorizeToolForCurrentTurn;
+  let counter = 0;
+  let refreshed = false;
+  const executions = [];
+  Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", { configurable: true, enumerable: true, value: () => definitions });
+  providerRequest.requestRuntimeV2ProviderOnce = async () => runtime.normalizeProviderResponseV1({ tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+  authorization.authorizeToolForCurrentTurn = async () => ({ allowed: true, reason: null });
+  toolExecutor.executeTool = async (name) => {
+    executions.push(name);
+    if (name === "run_command") { refreshed = true; return "exitCode: 0\nrefreshed"; }
+    assert.equal(refreshed, true, "the post-command observation executes after the command");
+    return newContent;
+  };
+  const ports = { get: () => ({}), context: { turnId: "turn", runWorkspace: "/tmp/mixed-observation-fixture", runSessionKey: "session", phaseLanguage: "en" }, live, nextId: (scope) => `${scope}-${++counter}`, now: () => 100, logStoreEvent() {} };
+  try {
+    const selected = await providerPort.createRuntimeV2ProviderPort(ports).request({ command: command("acting"), signal: new AbortController().signal });
+    assert.deepEqual(selected.toolCalls.map((call) => call.name), ["read_file", "run_command", "read_file"]);
+    assert.equal(new Set(selected.toolCalls.map((call) => call.id)).size, 3, "each admitted proposal retains a unique Runtime-scoped correlation id");
+    assert.deepEqual(selected.toolCalls.map((call) => call.arguments), calls.map((call) => call.arguments));
+    assert.deepEqual(live.messages.at(-1).tool_calls.map((call) => call.id), selected.toolCalls.map((call) => call.id));
+    assert.equal(live.coveredReadToolResults.get(selected.toolCalls[0].id), oldContent);
+    assert.equal(live.coveredReadToolResults.has(selected.toolCalls[2].id), false, "pre-command cache is not installed for a later observation of the same path");
+    const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+    const receipts = [];
+    for (const [index, call] of selected.toolCalls.entries()) {
+      receipts.push(await toolPort.execute({ command: { ...command("acting"), idempotencyKey: `mixed-${index}`, kind: "execute_tool", payload: { toolCallId: call.id, toolName: call.name, arguments: call.arguments } }, signal: new AbortController().signal }));
+    }
+    assert.equal(receipts[0].receiptOrigin, "replayed");
+    assert.equal(receipts[1].status, "succeeded");
+    assert.equal(receipts[2].status, "succeeded");
+    assert.notEqual(receipts[2].receiptOrigin, "replayed");
+    assert.match(live.messages.at(-1).content, /fresh/);
+    assert.doesNotMatch(live.messages.at(-1).content, /"old"/);
+    assert.deepEqual(executions, ["run_command", "read_file", "read_file"], "source versioning rereads fresh bytes, while the first cached read does not cross IPC");
+  } finally {
+    providerRequest.requestRuntimeV2ProviderOnce = originalRequest;
+    Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", originalSurface);
+    toolExecutor.executeTool = originalExecute;
+    authorization.authorizeToolForCurrentTurn = originalAuthorize;
+  }
+});
+
+test("real ProviderPort and ToolPort share one Run window across CLI and mixed observation batches", async (t) => {
+  for (const names of [["run_command", "run_command", "run_command"], ["read_file", "load_skill", "run_command"]]) {
+    await t.test(names.join(" + "), async () => {
+      const live = executionTypes.createRuntimeV2LiveExecutionState();
+      live.providerLaneProfile = { schemaVersion: "provider-lane.v1", nativeTools: true, requiredToolChoice: false, streaming: true, textToolEnvelope: true, reasoning: false, imageInput: false, toolResultRole: "tool" };
+      live.messages = [{ role: "system", content: "[MAIN RUNTIME V2] budget fixture" }, { role: "user", content: "Inspect the requested data." }];
+      const calls = names.map((name, index) => ({ id: `wire-${index}`, name, arguments: name === "run_command"
+        ? { command: `example inspect-${index}` }
+        : name === "load_skill" ? { skill_id: "s:fixture" } : { path: "state.json" } }));
+      const definitions = [...new Set(names)].map((name) => ({ ...definition(name), function: { ...definition(name).function,
+        parameters: { type: "object", properties: { command: { type: "string" }, path: { type: "string" }, skill_id: { type: "string" } }, required: [name === "run_command" ? "command" : name === "load_skill" ? "skill_id" : "path"] },
+      } }));
+      const originalSurface = Object.getOwnPropertyDescriptor(executionContext, "providerToolDefinitionsForCommand");
+      const originalRequest = providerRequest.requestRuntimeV2ProviderOnce;
+      const toolExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+      const originalExecute = toolExecutor.executeTool;
+      const originalAuthorize = authorization.authorizeToolForCurrentTurn;
+      const actualExecutions = [];
+      const source = "s".repeat(500);
+      const skill = "SKILL_GUIDANCE_ONLY\n" + "g".repeat(500);
+      let counter = 0;
+      Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", { configurable: true, enumerable: true, value: () => definitions });
+      providerRequest.requestRuntimeV2ProviderOnce = async () => runtime.normalizeProviderResponseV1({ tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+      authorization.authorizeToolForCurrentTurn = async () => ({ allowed: true, reason: null });
+      toolExecutor.executeTool = async (name, args) => {
+        actualExecutions.push({ name, args });
+        if (name === "read_file") return source;
+        if (name === "load_skill") return skill;
+        return { exitCode: 0, success: true, stdout: JSON.stringify({ data: "q\"\\😀".repeat(8_000) }), stderr: "", stdoutTruncated: false, stderrTruncated: false };
+      };
+      const budget = { readWindowChars: 64_000, contextLimit: 122_880, inputBudget: 101_581, outputBudget: 4_096 };
+      const skillCatalog = { entries: [{ id: "fixture", name: "Fixture", description: "Read guidance", source: "panel", content: skill, entryPath: null, basePath: null, version: "fixture-v1", allowImplicitInvocation: true, supportingFiles: [] }], explicitSkillIds: [], warnings: [], loadedAt: 1 };
+      const ports = { get: () => ({}), context: { turnId: "turn", runtimeRunIntent: "execute", runtimeContextBudget: budget, skillCatalog, runWorkspace: "/tmp/command-budget-fixture", runSessionKey: "session", phaseLanguage: "en" }, live, nextId: (scope) => `${scope}-${++counter}`, now: () => 100, logStoreEvent() {} };
+      try {
+        const selected = await providerPort.createRuntimeV2ProviderPort(ports).request({ command: command("acting"), signal: new AbortController().signal });
+        assert.deepEqual(selected.toolCalls.map((call) => call.name), names);
+        const shared = Math.floor(budget.readWindowChars / names.length);
+        assert.deepEqual([...live.parallelReadCountByToolCallId.values()], names.map(() => names.length));
+        const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+        const receipts = [];
+        for (const [index, call] of selected.toolCalls.entries()) {
+          receipts.push(await toolPort.execute({ command: { ...command("acting"), idempotencyKey: `budget-${index}`, kind: "execute_tool", payload: { toolCallId: call.id, toolName: call.name, arguments: call.arguments } }, signal: new AbortController().signal }));
+        }
+        assert.ok(receipts.every((receipt) => receipt.type === "tool.completed" && receipt.status === "succeeded"), JSON.stringify(receipts.map((receipt) => ({ type: receipt.type, status: receipt.status, failureKind: receipt.failureKind, message: receipt.presentation?.message.slice(0, 200) }))));
+        const results = live.messages.filter((message) => message.role === "tool");
+        assert.equal(results.length, names.length);
+        assert.ok(results.reduce((total, message) => total + message.content.length, 0) <= budget.readWindowChars);
+        for (const [index, name] of names.entries()) {
+          if (name === "run_command") {
+            assert.ok(results[index].content.length <= shared);
+            const partial = JSON.parse(results[index].content);
+            assert.equal(partial.truncated, true);
+            assert.equal(partial.content.length, partial.returnedRange.endChar);
+          } else {
+            const execution = actualExecutions.find((entry) => entry.name === name && entry.args.__raw !== true);
+            assert.ok(execution.args.max_chars > 0 && execution.args.max_chars <= shared, "each source contract receives the same allocation once");
+            if (name === "load_skill") {
+              assert.equal(results[index].content, skill);
+              assert.ok(receipts[index].evidence.every((item) => item.kind === "tool"), "Skill guidance grants no source lease or mutation evidence");
+            } else assert.ok(results[index].content.includes(source), "the versioned source envelope is not cropped again");
+          }
+        }
+        assert.equal(live.hasExecutedMutationEffect, false);
+        assert.equal(live.parallelReadCountByToolCallId.size, 0);
+        assert.equal(actualExecutions.filter((entry) => entry.name === "run_command").length, names.filter((name) => name === "run_command").length);
+      } finally {
+        providerRequest.requestRuntimeV2ProviderOnce = originalRequest;
+        Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", originalSurface);
+        toolExecutor.executeTool = originalExecute;
+        authorization.authorizeToolForCurrentTurn = originalAuthorize;
+      }
+    });
+  }
 });

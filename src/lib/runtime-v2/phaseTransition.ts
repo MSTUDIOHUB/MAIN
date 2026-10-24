@@ -4,7 +4,9 @@ import type {
   RuntimeV2Command,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
 import { analyzeValidationCommand } from "../validationContract";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
 import { workspacePathsReferToSameFile } from "../workspacePaths";
 import {
@@ -230,9 +232,9 @@ function validationAuthorityWasAdmitted(
     );
 }
 
-export function runtimeV2DirectExecuteReadyForConclusion(
+function currentDirectExecuteValidationPasses(
   state: TurnAggregateV1,
-): boolean {
+): Extract<RuntimeV2Event, { type: "validation.completed" }>[] {
   const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
   const latestMutationSequence = state.events.reduce(
     (latest, event) =>
@@ -251,9 +253,9 @@ export function runtimeV2DirectExecuteReadyForConclusion(
         : latest,
     -1,
   );
-  if (latestMutationSequence < 0) return false;
+  if (latestMutationSequence < 0) return [];
   const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
-  if (criterionIds.length === 0 || mutationTargets.length === 0) return false;
+  if (criterionIds.length === 0 || mutationTargets.length === 0) return [];
   const expectedDigest = runtimeV2DirectExecuteAuthorityDigest({
     turnId: state.turn.turnId,
     objective: state.objective,
@@ -261,7 +263,7 @@ export function runtimeV2DirectExecuteReadyForConclusion(
   const validations = state.events.filter((
     event,
   ): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
-    event.type === "validation.completed" &&
+    isRuntimeV2ValidationAttempt(event) &&
     event.sequence > latestMutationSequence
   );
   const validPasses = validations.filter((event) => {
@@ -289,7 +291,7 @@ export function runtimeV2DirectExecuteReadyForConclusion(
         validatedMutationVersions: event.validatedMutationVersions,
       });
   });
-  if (validPasses.length === 0) return false;
+  if (validPasses.length === 0) return [];
   const latestPassSequence = Math.max(
     ...validPasses.map((event) => event.sequence),
   );
@@ -298,8 +300,26 @@ export function runtimeV2DirectExecuteReadyForConclusion(
       event.sequence > latestPassSequence && !event.passed
     )
   ) {
-    return false;
+    return [];
   }
+  return validPasses;
+}
+
+export function runtimeV2DirectExecuteContractCoverage(state: TurnAggregateV1) {
+  return deriveRuntimeV2ExecutionContractCoverage(state, currentDirectExecuteValidationPasses(state));
+}
+
+/** The latest admitted real pass at the current mutation boundary. Earlier
+ * failed attempts may be superseded by this final workspace validation. */
+export function latestRuntimeV2DirectExecuteValidationSequence(state: TurnAggregateV1): number {
+  return latestSequence(currentDirectExecuteValidationPasses(state).map((event) => event.sequence));
+}
+
+export function runtimeV2DirectExecuteReadyForConclusion(state: TurnAggregateV1): boolean {
+  const validPasses = currentDirectExecuteValidationPasses(state);
+  if (!validPasses.length) return false;
+  const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
   const requirements = state.objective.acceptanceEvidenceRequirements || [];
   const allCriteriaCovered = criterionIds.every((criterionId, index) =>
     validPasses.some((event) =>
@@ -314,7 +334,8 @@ export function runtimeV2DirectExecuteReadyForConclusion(
       )
     )
   );
-  return allCriteriaCovered && allMutationTargetsCovered;
+  return allCriteriaCovered && allMutationTargetsCovered &&
+    deriveRuntimeV2ExecutionContractCoverage(state, validPasses).complete;
 }
 
 function validationFailureFingerprint(
@@ -340,7 +361,7 @@ function failedValidationSummarySinceLastPass(
   let countingStalled = true;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
-    if (event.type !== "validation.completed") continue;
+    if (!isRuntimeV2ValidationAttempt(event)) continue;
     if (event.passed) break;
     count += 1;
     const fingerprint = validationFailureFingerprint(event);
@@ -414,7 +435,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
     mutationCount:
       committedMutationSequences(state.events, input.isMutationToolName).length,
     passedValidationCount: state.events.filter((event) =>
-      event.type === "validation.completed" &&
+      isRuntimeV2ValidationAttempt(event) &&
       event.passed &&
       event.sequence > latestMutationSequence
     ).length,
@@ -422,7 +443,7 @@ export function summarizeRuntimeV2ExecuteEvidence(
     stalledValidationCount: failedValidations.stalled,
     failedOperationCount: state.events.filter((event) =>
       (event.type === "tool.completed" && event.status !== "succeeded") ||
-      (event.type === "validation.completed" && !event.passed)
+      (isRuntimeV2ValidationAttempt(event) && !event.passed)
     ).length,
     failedProviderRequestCount: failedProviderDecisionKeys.size,
   };
@@ -433,7 +454,7 @@ function latestValidation(
 ): Extract<RuntimeV2Event, { type: "validation.completed" }> | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
-    if (event.type === "validation.completed") return event;
+    if (isRuntimeV2ValidationAttempt(event)) return event;
   }
   return null;
 }
@@ -524,7 +545,7 @@ export function decideRuntimeV2ExecutePhaseTransition(
     );
     const latestValidationSequence = latestSequence(
       state.events
-        .filter((event) => event.type === "validation.completed")
+        .filter(isRuntimeV2ValidationAttempt)
         .map((event) => event.sequence),
     );
     if (

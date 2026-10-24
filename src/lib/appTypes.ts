@@ -33,7 +33,11 @@ export interface Skill {
   type?: "instruction" | "tool" | "package";
   toolParameters?: string;
   packagePath?: string;
+  /** Immutable app-managed payload; never an arbitrary file-system root. */
+  packageStorage?: { kind: "global"; packageId: string };
   entryPoint?: string;
+  /** All Skill entries owned by one imported archive. */
+  entryPoints?: string[];
   workspaceScope?: string | null;
   /** False keeps the Skill available for explicit activation while hiding it
    * from model-driven matching. Mirrors agents/openai.yaml semantics. */

@@ -37,6 +37,7 @@ import {
   type ProtocolChatMessage,
   type ReasoningRequestMode,
 } from "./cloudProtocol";
+import { applyStreamResponseFormat, isUnsupportedStreamResponseFormat } from "./streamResponseFormat";
 import { computeContextBudgets } from "./contextTrim";
 import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
@@ -143,8 +144,10 @@ export interface StreamRequestOptions {
   timeoutMs?: number;
   /** Optional per-request guard for reasoning-only output before any semantic
    * text or tool call. This bounds one decision, not the task or stream wall
-   * clock, and lets action-oriented runtimes recover with a tighter prompt. */
-  reasoningOnlyCharLimit?: number;
+   * clock, and lets action-oriented runtimes recover with a tighter prompt.
+   * null explicitly delegates active reasoning to the provider token budget;
+   * undefined retains the legacy adapter character guard. */
+  reasoningOnlyCharLimit?: number | null;
   /** Cancel a decision that emits excessive visible/hidden prose before any
    * structured action. Tool arguments are unaffected once a call begins. */
   actionOnlyCharLimit?: number;
@@ -171,6 +174,8 @@ export interface StreamResult {
   semanticContent?: string;
   toolCalls: StreamedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
+  /** A client character guard is distinct from a provider finish_reason. */
+  clientStopReason?: "reasoning_char_limit" | "action_char_limit";
   reasoningContent?: string;
   reasoningField?: "reasoning_content" | "reasoning";
   /** Provider returned a terminal response that violated the requested tool protocol. */
@@ -398,13 +403,24 @@ export function isLocalProfile(settings: StreamSettings): boolean {
   return url.includes("localhost") || url.includes("127.0.0.1") || url.includes("::1") || url.includes("ollama") || url.includes(":11434");
 }
 
+/** Provider capacity and client output guards share recovery, not provenance. */
+export function isStreamOutputLimited(input: {
+  readonly finishReason?: string | null;
+  readonly clientStopReason?: StreamResult["clientStopReason"];
+}): boolean {
+  return input.finishReason === "length" ||
+    input.clientStopReason === "reasoning_char_limit" ||
+    input.clientStopReason === "action_char_limit";
+}
+
 export function shouldStopReasoningOnlyStream(input: {
   reasoningChars: number;
   visibleChars: number;
   toolCallCount: number;
   settings?: StreamSettings;
-  reasoningOnlyCharLimit?: number;
+  reasoningOnlyCharLimit?: number | null;
 }): boolean {
+  if (input.reasoningOnlyCharLimit === null) return false;
   const requestedLimit = Math.floor(
     Number(input.reasoningOnlyCharLimit) || 0,
   );
@@ -1388,9 +1404,15 @@ async function requestOpenAiNonStreaming(
             reasoningEffort: settings.reasoningEffort ?? "none",
             nativeTools: candidateTools.length,
           });
+          const explicitOutputCap = Math.floor(Number(maxTokensOverride));
+          const formattedBody = applyStreamResponseFormat({
+            ...candidate.body,
+            ...(Number.isFinite(explicitOutputCap) && explicitOutputCap > 0
+              ? { max_output_tokens: explicitOutputCap } : {}),
+          }, "openai_responses", options.responseFormat);
           const candidateBody = settings.authMode === "openai_chatgpt_oauth"
-            ? ensureOpenAiChatGptCodexRequestBody(candidate.body)
-            : candidate.body;
+            ? ensureOpenAiChatGptCodexRequestBody(formattedBody)
+            : formattedBody;
           const candidatePayload = await postJsonRequest(
             apiUrl,
             headers,
@@ -1431,6 +1453,7 @@ async function requestOpenAiNonStreaming(
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           lastCompatibilityError = err instanceof Error ? err : new Error(errMsg);
+          if (options.responseFormat && /response_format|text\.format|json_schema|schema/i.test(errMsg)) throw lastCompatibilityError;
           if (responseTools.length > 0 && candidate.mode !== "transcript_text" && isNativeToolCompatibilityErrorMessage(errMsg)) {
             throw lastCompatibilityError;
           }
@@ -1497,7 +1520,7 @@ async function requestOpenAiNonStreaming(
         throw lastCompatibilityError ?? new Error("Responses request failed without a compatibility fallback result.");
       }
     } else {
-      const chatBody: Record<string, unknown> = {
+      let chatBody: Record<string, unknown> = {
         model: settings.model,
         messages: messages.map((message) => {
           const mapped = mapMessageForApi(message, false, {
@@ -1520,6 +1543,7 @@ async function requestOpenAiNonStreaming(
             )
           : {}),
       };
+      chatBody = applyStreamResponseFormat(chatBody, "openai_chat", options.responseFormat);
       applyOpenAiToolChoice(chatBody, settings, tools, options.toolChoice, minimalCompatibilityMode);
       payload = await postJsonRequest(
         apiUrl,
@@ -1668,7 +1692,7 @@ async function streamViaRustProxy(
 
   // Build the request body (same logic as streamChatCompletion)
   const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
-  const body: Record<string, unknown> = isOllama
+  let body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
         messages: messages.map((m) => mapMessageForApi(m, true, {
@@ -1703,6 +1727,8 @@ async function streamViaRustProxy(
             maxTokens,
           ),
         };
+
+  body = applyStreamResponseFormat(body, isOllama ? "ollama" : isAnthropic || isGemini ? "unsupported" : "openai_chat", options.responseFormat);
 
   if (tools && tools.length > 0 && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
@@ -1783,6 +1809,7 @@ async function streamViaRustProxy(
   let firstToolAt: number | null = null;
   let emittedMirrorSemanticContent = "";
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
+  let clientStopReason: StreamResult["clientStopReason"];
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
   let unlistenChunk: UnlistenFn | null = null;
@@ -1868,6 +1895,7 @@ async function streamViaRustProxy(
     semanticContent: semanticProgress.semanticContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    ...(clientStopReason ? { clientStopReason } : {}),
     streamDiagnostics: buildSemanticDiagnostics(),
     ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
@@ -1879,7 +1907,7 @@ async function streamViaRustProxy(
   }, messages, body, visualProtocol, options.visualTransportBinding);
 
   const stopReasoningOnlyRunaway = () => {
-    if (resolved || anthropicProcessor) return false;
+    if (resolved || anthropicProcessor || finishReason !== null) return false;
     if (!shouldStopReasoningOnlyStream({
       reasoningChars: providerReasoningContent.length,
       visibleChars: semanticProgress.semanticVisibleChars,
@@ -1891,7 +1919,7 @@ async function streamViaRustProxy(
     }
 
     resolved = true;
-    finishReason = "length";
+    clientStopReason = "reasoning_char_limit";
     closeReasoningBlock();
     reasoningBuffer = "";
     const dynamicLimit = Math.floor(
@@ -1921,7 +1949,7 @@ async function streamViaRustProxy(
   };
 
   const stopActionlessRunaway = () => {
-    if (resolved || anthropicProcessor) return false;
+    if (resolved || anthropicProcessor || finishReason !== null) return false;
     if (!shouldStopActionlessStream({
       reasoningChars: providerReasoningContent.length,
       visibleChars: semanticProgress.semanticVisibleChars,
@@ -1931,7 +1959,7 @@ async function streamViaRustProxy(
       return false;
     }
     resolved = true;
-    finishReason = "length";
+    clientStopReason = "action_char_limit";
     closeReasoningBlock();
     reasoningBuffer = "";
     const dynamicLimit = Math.max(
@@ -2381,6 +2409,9 @@ async function streamViaRustProxy(
   }).catch(err => {
     if (resolved) return;
     resolved = true;
+    // An IPC acknowledgement can fail after Rust has dispatched the request.
+    // Release that exact backend lease before abandoning its event listeners.
+    invoke("cancel_chat_stream", { streamId }).catch(() => {});
     const error = toError(err, "Failed to start the cloud stream.");
     onError(error);
     rejectResult?.(error);
@@ -2390,8 +2421,53 @@ async function streamViaRustProxy(
   return resultPromise;
 }
 
+/** JSON mode support belongs to the adapter, not semantic routing. */
+export function resolveJsonObjectOutputOptions(settings: StreamSettings): Pick<StreamRequestOptions, "responseFormat"> {
+  return isAnthropicProvider(settings) || isGeminiProvider(settings)
+    ? {} : { responseFormat: { type: "json_object" } };
+}
+
 // ── Main streaming function ─────────────────────────────────────────
 export async function streamChatCompletion(
+  messages: ChatMessage[], settings: StreamSettings, callbacks: StreamCallbacks,
+  signal?: AbortSignal, tools?: ToolDefinition[], maxTokensOverride?: number,
+  options: StreamRequestOptions = {},
+): Promise<StreamResult> {
+  if (!options.responseFormat || isAnthropicProvider(settings) || isGeminiProvider(settings)) {
+    return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, options);
+  }
+  let outputStarted = false;
+  const terminalLifecycle: Parameters<NonNullable<StreamCallbacks["onLifecycle"]>>[0][] = [];
+  const guarded: StreamCallbacks = {
+    ...callbacks,
+    onToken(token) { if (token) outputStarted = true; callbacks.onToken(token); },
+    onDone() {},
+    onError() {},
+    onLifecycle(event) {
+      if (["first_chunk", "chunk_progress", "model_progress"].includes(event.phase)) outputStarted = true;
+      if (["stream_error", "stream_done", "stream_cancelled"].includes(event.phase)) terminalLifecycle.push(event);
+      else callbacks.onLifecycle?.(event);
+    },
+  };
+  let result: StreamResult;
+  try {
+    result = await streamChatCompletionAttempt(messages, settings, guarded, signal, tools, maxTokensOverride, options);
+  } catch (error) {
+    if (!signal?.aborted && !outputStarted && isUnsupportedStreamResponseFormat(error instanceof Error ? error.message : String(error))) {
+      emitStreamingConsole("streaming", "info", "optional response format unsupported; retrying the same request without that field");
+      const { responseFormat: _format, ...remaining } = options;
+      return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, remaining);
+    }
+    terminalLifecycle.forEach((event) => callbacks.onLifecycle?.(event));
+    callbacks.onError(toError(error, "Structured output request failed."));
+    throw error;
+  }
+  terminalLifecycle.forEach((event) => callbacks.onLifecycle?.(event));
+  callbacks.onDone(result);
+  return result;
+}
+
+async function streamChatCompletionAttempt(
   messages: ChatMessage[],
   settings: StreamSettings,
   callbacks: StreamCallbacks,
@@ -2437,7 +2513,7 @@ export async function streamChatCompletion(
 
   // Build the request body based on provider
   const geminiRequest = isGemini ? buildGeminiRuntimeRequest(settings, messages, maxTokens) : null;
-  const body: Record<string, unknown> = isOllama
+  let body: Record<string, unknown> = isOllama
     ? {
         model: settings.model,
         messages: messages.map((m) => mapMessageForApi(m, true, {
@@ -2446,7 +2522,6 @@ export async function streamChatCompletion(
         })),
         stream: true,
         options: buildOllamaOptions(settings, maxTokens),
-        ...(options.responseFormat ? { format: options.responseFormat } : {}),
       }
     : isAnthropic
       ? buildAnthropicRequestBody({
@@ -2468,7 +2543,6 @@ export async function streamChatCompletion(
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
-          ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
           ...buildOpenAiCompatibleReasoningRequestExtras(
             settings,
             maxTokens,
@@ -2477,6 +2551,8 @@ export async function streamChatCompletion(
 
   // Native tool catalogs share one OpenAI-compatible function schema,
   // including Ollama's /api/chat transport.
+  body = applyStreamResponseFormat(body, isOllama ? "ollama" : isAnthropic || isGemini ? "unsupported" : "openai_chat", options.responseFormat);
+
   if (tools && tools.length > 0 && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
     body.tools = normalizeToolDefinitions(tools);
   }
@@ -2602,6 +2678,7 @@ export async function streamChatCompletion(
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
+  let clientStopReason: StreamResult["clientStopReason"];
 
   // Track reasoning phase for thinking models (e.g., Qwen3.5 with reasoning_content)
   let reasoningActive = false;
@@ -2674,6 +2751,7 @@ export async function streamChatCompletion(
     semanticContent: semanticProgress.semanticContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    ...(clientStopReason ? { clientStopReason } : {}),
     streamDiagnostics: buildSemanticDiagnostics(),
     ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
@@ -2838,14 +2916,14 @@ export async function streamChatCompletion(
                 status: "streaming",
               });
             }
-            if (shouldStopReasoningOnlyStream({
+            if (finishReason === null && shouldStopReasoningOnlyStream({
               reasoningChars: providerReasoningContent.length,
               visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               settings,
               reasoningOnlyCharLimit: options.reasoningOnlyCharLimit,
             })) {
-              finishReason = "length";
+              clientStopReason = "reasoning_char_limit";
               closeReasoningBlock();
               reasoningBuffer = "";
               const dynamicLimit = Math.floor(
@@ -2863,13 +2941,13 @@ export async function streamChatCompletion(
               onDone(result);
               return result;
             }
-            if (shouldStopActionlessStream({
+            if (finishReason === null && shouldStopActionlessStream({
               reasoningChars: providerReasoningContent.length,
               visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               actionOnlyCharLimit: options.actionOnlyCharLimit,
             })) {
-              finishReason = "length";
+              clientStopReason = "action_char_limit";
               closeReasoningBlock();
               reasoningBuffer = "";
               const dynamicLimit = Math.max(

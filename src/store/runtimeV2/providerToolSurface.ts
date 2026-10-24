@@ -66,24 +66,30 @@ export function unexpectedRuntimeV2ProviderToolNames(
   )];
 }
 
-/** Runtime v2 preserves a bounded provider-selected batch when every call is
- * side-effect-free. Effects remain fenced one at a time, so a mutation,
- * command, validation, or collaboration action can never share a committed
- * batch with reads. */
+/** Independent reads and child scheduling may share a provider decision.
+ * Opted-in reads mixed with shell decisions are consumed in order, with their
+ * own durable fences and approvals; they are never parallel reads.
+ * Other workspace effects (including joins) remain isolated. */
 export function boundRuntimeV2ProviderToolCalls(
   calls: readonly RuntimeV2NormalizedToolCall[],
   attemptedIdentities: ReadonlySet<string> = new Set(),
   rejectedIdentities: ReadonlySet<string> = new Set(),
   options: {
     readonly maxSpawnSubagents?: number;
+    /** The caller owns ordered execution, per-call fences and fresh reads. */
+    readonly allowMixedObservationShellBatch?: boolean;
   } = {},
 ): {
   readonly accepted: RuntimeV2NormalizedToolCall[];
   readonly discarded: RuntimeV2NormalizedToolCall[];
+  /** Batch-local call references, not durable source authority. A retained
+   * shell may change external state, so later reads must execute afresh. */
+  readonly freshReadCalls?: readonly RuntimeV2NormalizedToolCall[];
   readonly selection:
     | "empty"
     | "first"
     | "safe_batch"
+    | "sequential_shell_batch"
     | "collaboration_batch"
     | "first_novel_after_attempt"
     | "first_novel_after_rejection"
@@ -107,6 +113,58 @@ export function boundRuntimeV2ProviderToolCalls(
       accepted: [],
       discarded: [...calls],
       selection: "all_rejected",
+    };
+  }
+  if (
+    calls.every((call) => call.name === "run_command") ||
+    (options.allowMixedObservationShellBatch === true &&
+      calls.some((call) => call.name === "run_command") &&
+      calls.every((call) =>
+        call.name === "run_command" || isRuntimeV2ReadOnlyToolName(call.name)
+      ))
+  ) {
+    const seenShells = new Set<string>();
+    const acceptedIndices: number[] = [];
+    const freshReadCalls: RuntimeV2NormalizedToolCall[] = [];
+    let retainedShell = false;
+    let hasNovelAction = false;
+    calls.forEach((call, index) => {
+      const identity = runtimeV2ProviderToolCallIdentity(call);
+      if (call.name === "run_command") {
+        if (
+          rejectedIdentities.has(identity) ||
+          attemptedIdentities.has(identity) || seenShells.has(identity)
+        ) return;
+        seenShells.add(identity);
+        retainedShell = true;
+        hasNovelAction = true;
+      } else if (retainedShell) {
+        // Do not collapse same-path reads across a command or reuse the
+        // pre-command attempted/closed frontier for this new observation.
+        freshReadCalls.push(call);
+      } else {
+        if (rejectedIdentities.has(identity)) return;
+        hasNovelAction ||= !attemptedIdentities.has(identity);
+      }
+      acceptedIndices.push(index);
+    });
+    if (!hasNovelAction) {
+      return { accepted: [], discarded: [...calls], selection: "all_attempted" };
+    }
+    const selected = new Set(acceptedIndices);
+    const firstIndex = acceptedIndices[0]!;
+    return {
+      accepted: calls.filter((_, index) => selected.has(index)),
+      discarded: calls.filter((_, index) => !selected.has(index)),
+      freshReadCalls,
+      selection: acceptedIndices.length > 1
+        ? "sequential_shell_batch"
+        : firstIndex === 0
+          ? "first"
+          : calls.slice(0, firstIndex).some((call) =>
+              rejectedIdentities.has(runtimeV2ProviderToolCallIdentity(call)))
+            ? "first_novel_after_rejection"
+            : "first_novel_after_attempt",
     };
   }
   if (calls.every((call) => isRuntimeV2ReadOnlyToolName(call.name))) {
@@ -147,7 +205,9 @@ export function boundRuntimeV2ProviderToolCalls(
           : "first",
     };
   }
-  if (calls.every((call) => call.name === "spawn_subagent")) {
+  if (calls.every((call) =>
+    call.name === "spawn_subagent" || isRuntimeV2ReadOnlyToolName(call.name)
+  )) {
     const maxSpawnSubagents = Math.max(
       0,
       Math.floor(
@@ -168,9 +228,19 @@ export function boundRuntimeV2ProviderToolCalls(
         selection: "all_attempted",
       };
     }
-    const acceptedIndices = novelEligibleIndices.slice(
-      0,
-      maxSpawnSubagents,
+    const selectedSpawns = new Set(novelEligibleIndices.filter(
+      (index) => calls[index]!.name === "spawn_subagent",
+    ).slice(0, maxSpawnSubagents));
+    if (selectedSpawns.size === 0 && !novelEligibleIndices.some(
+      (index) => isRuntimeV2ReadOnlyToolName(calls[index]!.name),
+    )) {
+      return { accepted: [], discarded: [...calls], selection: "all_rejected" };
+    }
+    // As in a pure read batch, retain cached read companions when the
+    // provider selected a novel observation or delegation. The child limit
+    // constrains scheduling only; it must never discard independent reads.
+    const acceptedIndices = eligibleIndices.filter((index) =>
+      isRuntimeV2ReadOnlyToolName(calls[index]!.name) || selectedSpawns.has(index)
     );
     if (acceptedIndices.length === 0) {
       return {
