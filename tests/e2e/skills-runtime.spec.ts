@@ -58,11 +58,24 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") {
         return { total_gb: 32, available_gb: 24 };
       }
-      if (cmd === "discover_personal_agent_skills") return [];
+      if (cmd === "read_debug_log") {
+        return { path: "/tmp/main-skills-ui-debug.log", content: "", truncated: false };
+      }
+      if (cmd === "discover_personal_agent_skills") {
+        const state = (window as any).__SKILLS_RUNTIME_E2E__;
+        state.discoveryCalls = (state.discoveryCalls || 0) + 1;
+        state.discoveryArgs = args;
+        if (state.discoveryError) throw new Error(state.discoveryError);
+        if (state.holdDiscovery) await new Promise<void>((resolve) => { state.releaseDiscovery = resolve; });
+        const entries = state.personalSkills || JSON.parse(sessionStorage.getItem("__EXTERNAL_SKILLS_FIXTURE__") || "[]");
+        return Array.isArray(args?.enabledSources) ? entries.filter((entry: any) =>
+          (args.enabledSources as string[]).includes(["codex", "claude", "gemini"].includes(entry.platformSource) ? entry.platformSource : "custom")) : entries;
+      }
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? "");
       if (cmd === "get_workspace_root") return "/tmp/e2e-cloud-tool-fallback";
       if (cmd === "plugin:dialog|open") return "/tmp/unity-skills.zip";
-      if (cmd === "extract_global_skill_package") {
+      if (cmd === "extract_global_skill_package" || cmd === "fetch_and_install_github_skill_package") {
+        if (cmd === "fetch_and_install_github_skill_package") (window as any).__SKILLS_RUNTIME_E2E__.githubArgs = args;
         const state = (window as any).__SKILLS_RUNTIME_E2E__;
         // Global imports have no workspace argument, including in project chat.
         if (args?.workspace !== undefined) throw new Error("Global import must not bind a workspace");
@@ -75,6 +88,13 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "inspect_global_skill_package") {
         if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
         return globalMeta;
+      }
+      if (cmd === "load_global_skill_package_catalog") {
+        if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
+        return { meta: globalMeta, documents: entryPoints.map((relativePath) => ({
+          relativePath, content: (window as any).__SKILLS_RUNTIME_E2E__.invalidMetadata
+            ? "---\nname: [broken\n---\nInvalid metadata fixture" : packageFiles[`${packageRoot}/${relativePath}`],
+        })) };
       }
       if (cmd === "read_global_skill_package_file") {
         if (args?.packageId !== globalPackageId) throw new Error("Unknown package");
@@ -255,9 +275,9 @@ test("panel Agent Skill persists manual-only admission into the next Turns", asy
   await textInputs.nth(1).fill(SKILL_DESCRIPTION);
   await modal.locator("textarea").first().fill(SKILL_SENTINEL);
 
-  const modelMatching = modal.locator('input[type="checkbox"]');
-  await expect(modelMatching).toBeChecked();
-  await modelMatching.uncheck();
+  const modelMatching = modal.getByRole("switch", { name: "允许模型自动匹配", exact: true });
+  await expect(modelMatching).toHaveAttribute("aria-checked", "true");
+  await modelMatching.click();
   await modal.getByRole("button", { name: "保存技能" }).click();
 
   await expect(modal.getByText(SKILL_NAME, { exact: true })).toBeVisible();
@@ -383,9 +403,64 @@ async function openPackageForm(page: import("@playwright/test").Page) {
   const heading = page.getByRole("heading", { name: "技能与提示词" });
   const modal = heading.locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
   await modal.getByRole("button", { name: "添加技能" }).click();
-  await modal.getByRole("button", { name: "协议包", exact: true }).click();
+  await modal.getByRole("button", { name: "技能包", exact: true }).click();
   return modal;
 }
+
+test("Skills management offers generic package imports without the Gemini extension panel", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await expect(page.getByRole("button", { name: "技能与提示词", exact: true })).toBeVisible();
+  // Retired metadata can exist at the current persist version, so exercise the
+  // real merge path as well as the migration helper's Node contract.
+  await page.evaluate(() => {
+    const persisted = JSON.parse(localStorage.getItem("local-agent-ide") || "{}");
+    persisted.state.geminiExtensions = [{ id: "retired-extension", enabled: true }];
+    persisted.state.extensionMcpDiscovery = { retired: { tools: [{ name: "stale_tool" }] } };
+    localStorage.setItem("local-agent-ide", JSON.stringify(persisted));
+  });
+  await page.reload();
+  expect(await page.evaluate(async () => {
+    // @ts-expect-error Vite browser module URL.
+    const { useAppStore } = await import("/src/store/useAppStore.ts");
+    const state = useAppStore.getState();
+    return [Object.hasOwn(state, "geminiExtensions"), Object.hasOwn(state, "extensionMcpDiscovery")];
+  })).toEqual([false, false]);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  const modal = page.getByRole("heading", { name: "技能与提示词", exact: true }).locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+  await expect(modal.getByText("Gemini CLI 扩展", { exact: true })).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: "导入 Gemini ZIP", exact: true })).toHaveCount(0);
+  await expect(modal.getByRole("button", { name: "本机发现的技能", exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "添加技能", exact: true }).click();
+  await modal.getByRole("button", { name: "技能包", exact: true }).click();
+  await expect(modal.getByRole("button", { name: "上传 ZIP", exact: true })).toBeVisible();
+  await expect(modal.getByRole("button", { name: "从 GitHub 安装", exact: true })).toBeVisible();
+});
+
+test("settings switches preserve keyboard updates across their panels", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await page.getByTestId("model-settings-button").click();
+  await page.getByTestId("settings-tab-general").click();
+  const recording = page.getByTestId("session-recording-switch");
+  await expect(recording).toHaveRole("switch");
+  await expect(recording).toHaveClass(/main-toggle-switch/);
+  const recordingInitial = await recording.isChecked();
+  await recording.press("Space");
+  await expect(recording).toBeChecked({ checked: !recordingInitial });
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("local-agent-ide") || "{}").state.config.sessionRecordingEnabled)).toBe(!recordingInitial);
+  await recording.press("Enter");
+  await expect(recording).toBeChecked({ checked: recordingInitial });
+  await page.getByTestId("settings-tab-debug").click();
+  const fullProcess = page.getByTestId("debug-full-turn-process-switch");
+  await expect(fullProcess).toHaveRole("switch");
+  await expect(fullProcess).toHaveClass(/main-toggle-switch/);
+  const initial = await fullProcess.isChecked();
+  await fullProcess.press("Space");
+  await expect(fullProcess).toBeChecked({ checked: !initial });
+  await fullProcess.press("Enter");
+  await expect(fullProcess).toBeChecked({ checked: initial });
+  await page.getByTestId("settings-tab-general").click();
+  await expect(recording).toBeChecked({ checked: recordingInitial });
+});
 
 test("a Unity skill collection imports all entries and activates the final skill after reload", async ({ page }, testInfo) => {
   await page.goto("/?e2eScenario=cloud-tool-fallback");
@@ -396,7 +471,7 @@ test("a Unity skill collection imports all entries and activates the final skill
   for (const themeMode of ["light", "dark", "black"] as const) {
     await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), themeMode);
     await expect(page.locator("html")).toHaveAttribute("data-theme", themeMode);
-    await modal.screenshot({ path: testInfo.outputPath(`unity-skills-import-${themeMode}.png`) });
+    await modal.screenshot({ path: testInfo.outputPath(`unity-skills-import-${themeMode}.png`), animations: "disabled" });
   }
   await modal.getByRole("button", { name: "保存技能", exact: true }).click();
   await expect.poll(() => page.evaluate(() => {
@@ -468,11 +543,11 @@ test("reimporting identical content preserves the existing registration and manu
   await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
   await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
   await modal.locator('input[type="text"]').first().fill("My Unity Skills");
-  await modal.locator('input[type="checkbox"]').uncheck();
+  await modal.getByRole("switch", { name: "允许模型自动匹配", exact: true }).click();
   await modal.getByRole("button", { name: "保存技能", exact: true }).click();
   const before = await page.evaluate(() => JSON.parse(window.localStorage.getItem("local-agent-ide") || "{}").state.skills.find((skill: any) => skill.name === "My Unity Skills"));
   await modal.getByRole("button", { name: "添加技能", exact: true }).click();
-  await modal.getByRole("button", { name: "协议包", exact: true }).click();
+  await modal.getByRole("button", { name: "技能包", exact: true }).click();
   await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
   await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
   await modal.getByRole("button", { name: "保存技能", exact: true }).click();
@@ -559,4 +634,447 @@ test("invalid SKILL frontmatter is reported in the import preview", async ({ pag
   await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
   await expect(modal.getByRole("alert")).toContainText("部分技能说明无法完整解析或读取");
   await modal.getByRole("button", { name: "取消", exact: true }).click();
+});
+
+
+test("legacy tool descriptions hydrate as custom rules without a pretend executable schema", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await page.evaluate(() => {
+    const persisted = JSON.parse(localStorage.getItem("local-agent-ide") || "{}");
+    persisted.state.skills = [{ id: "legacy-rule", name: "Old workflow", desc: "Release checklist", content: "Keep these instructions.", type: "tool", toolParameters: '{"type":"object"}', active: true, allowImplicitInvocation: false }];
+    localStorage.setItem("local-agent-ide", JSON.stringify(persisted));
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await expect(page.getByText("旧版工具描述", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "编辑技能: Old workflow", exact: true }).click();
+  await expect(page.getByRole("button", { name: "自定义规则", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "技能包", exact: true })).toBeVisible();
+  await expect(page.getByText("OpenAI JSON Schema", { exact: false })).toHaveCount(0);
+  await expect(page.getByPlaceholder("输入给模型的规则和说明（支持 Markdown）...")).toHaveValue("Keep these instructions.");
+  await page.getByRole("button", { name: "更新技能", exact: true }).click();
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem("local-agent-ide") || "{}").state.skills[0]);
+  expect(saved.type).toBe("instruction");
+  expect(saved.toolParameters).toBeUndefined();
+  expect(saved.content).toBe("Keep these instructions.");
+  expect(saved.allowImplicitInvocation).toBe(false);
+});
+
+test("GitHub install previews and registers a global collection with source inputs", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("textbox", { name: "GitHub 仓库或 URL", exact: true }).fill("Unity-Technologies/skills");
+  await modal.getByRole("textbox", { name: "分支（默认 main）", exact: true }).fill("stable");
+  await modal.getByRole("button", { name: "从 GitHub 安装", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.githubArgs)).toEqual({ repoOrUrl: "Unity-Technologies/skills", branch: "stable" });
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  await expect(modal.getByText("全局 · 所有项目", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.deletedPackages)).toEqual([]);
+});
+
+test("discovered external Skills show their platform provenance", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await page.evaluate(() => {
+    (window as any).__SKILLS_RUNTIME_E2E__.personalSkills = ["codex", "claude", "gemini"].map((platformSource) => ({
+      entryPath: `/home/skills/${platformSource}/SKILL.md`, basePath: `/home/skills/${platformSource}`, platformSource,
+      content: `---\nname: ${platformSource}-workflow\ndescription: Workflow from ${platformSource}.\n---\nInstructions.`, openaiYaml: null, supportingFiles: [],
+    }));
+  });
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "本机发现的技能", exact: true })).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "本机发现的技能", exact: true });
+  for (const source of ["codex", "claude", "gemini"]) await expect(dialog.locator(`#discovered-source-${source}`)).toBeVisible();
+});
+
+
+test("GitHub download failures retain the repository and allow retry", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("textbox", { name: "GitHub 仓库或 URL", exact: true }).fill("owner/skills");
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.extractError = "GitHub download failed"; });
+  await modal.getByRole("button", { name: "从 GitHub 安装", exact: true }).click();
+  await expect(modal.getByRole("alert")).toContainText("GitHub download failed");
+  await expect(modal.getByRole("textbox", { name: "GitHub 仓库或 URL", exact: true })).toHaveValue("owner/skills");
+  await expect(modal.getByRole("button", { name: "从 GitHub 安装", exact: true })).toBeEnabled();
+  await expect(modal.getByRole("button", { name: "保存技能", exact: true })).toBeDisabled();
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.extractError = undefined; (window as any).__SKILLS_RUNTIME_E2E__.holdExtraction = true; });
+  await modal.getByRole("button", { name: "从 GitHub 安装", exact: true }).click();
+  await expect(modal.getByRole("button", { name: "从 GitHub 安装", exact: true })).toBeDisabled();
+  await expect(modal.getByRole("button", { name: "解压中...", exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "取消", exact: true }).click();
+  await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.releaseExtraction());
+  await expect.poll(() => page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.extractionSettled)).toBe(true);
+  await expect(modal.getByText("Unity Skills", { exact: true })).toHaveCount(0);
+});
+
+
+const EXTERNAL_SKILL_PATH = "/home/skills/external-review/SKILL.md";
+const EXTERNAL_SKILL_SENTINEL = "EXTERNAL_SELECTED_BODY_SENTINEL";
+
+async function seedExternalSkills(page: import("@playwright/test").Page, options: { manual?: boolean; workspaceOnly?: boolean } = {}) {
+  return page.evaluate(({ manual, workspaceOnly, entryPath, sentinel }) => {
+    const persisted = JSON.parse(localStorage.getItem("local-agent-ide") || "{}").state;
+    const workspace = persisted.currentWorkspace || "";
+    const docs = [{ entryPath, basePath: entryPath.slice(0, -"/SKILL.md".length), platformSource: "codex", scope: workspaceOnly ? "workspace" : "personal",
+      content: `---\nname: external-review\ndescription: Only use for an external review.\n---\n${sentinel}`,
+      openaiYaml: manual ? "policy:\n  allow_implicit_invocation: false\n" : null, supportingFiles: [],
+    }];
+    (window as any).__SKILLS_RUNTIME_E2E__.personalSkills = docs;
+    sessionStorage.setItem("__EXTERNAL_SKILLS_FIXTURE__", JSON.stringify(docs));
+    return workspace;
+  }, { ...options, entryPath: EXTERNAL_SKILL_PATH, sentinel: EXTERNAL_SKILL_SENTINEL });
+}
+
+function externalSkillCard(page: import("@playwright/test").Page) {
+  return page.locator(`[data-external-skill-path="${EXTERNAL_SKILL_PATH}"]`);
+}
+
+async function externalSkillSelections(page: import("@playwright/test").Page) {
+  return page.evaluate(() => JSON.parse(localStorage.getItem("local-agent-ide") || "{}").state.externalSkillSelections || []);
+}
+
+test("external Skills require an explicit Add to MAIN and persist only the selected project reference", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const workspace = await seedExternalSkills(page);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  const discoverButton = page.getByRole("button", { name: "本机发现的技能", exact: true });
+  const addButton = page.getByRole("button", { name: "添加技能", exact: true });
+  await expect(discoverButton).toBeVisible();
+  await expect(addButton).toBeVisible();
+  expect(Math.abs((await discoverButton.boundingBox())!.y - (await addButton.boundingBox())!.y)).toBeLessThan(2);
+  await expect(page.locator("[data-external-skill-path]")).toHaveCount(0);
+  const mainPanel = page.getByRole("heading", { name: "技能与提示词", exact: true }).locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((theme) => (window as any).__CODELY_E2E__?.setThemeMode?.(theme), mode);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", mode);
+    await mainPanel.screenshot({ path: testInfo.outputPath(`local-skills-entry-${mode}.png`), animations: "disabled" });
+  }
+  await discoverButton.click();
+  const card = externalSkillCard(page);
+  await expect(card.getByRole("button", { name: "添加到 MAIN", exact: true })).toBeVisible();
+  const closeDiscovery = page.getByRole("button", { name: "关闭本机技能选择", exact: true });
+  await expect(closeDiscovery).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(card.getByRole("button", { name: "添加到 MAIN", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(closeDiscovery).toBeFocused();
+  await expect(card.getByRole("status")).toContainText("未添加");
+  await expect(card.getByRole("combobox", { name: "external-review: 作用范围", exact: true })).toHaveValue("project");
+  expect(await externalSkillSelections(page)).toEqual([]);
+  await card.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  await expect(card.getByRole("combobox", { name: "external-review: 使用方式", exact: true })).toHaveValue("auto");
+  expect(await externalSkillSelections(page)).toEqual([{ entryPath: EXTERNAL_SKILL_PATH, workspaceScope: workspace, mode: "auto" }]);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("local-agent-ide") || "{}").state.skills.some((skill: any) => skill.content?.includes("EXTERNAL_SELECTED_BODY_SENTINEL")))).toBe(false);
+  const modal = page.getByRole("dialog", { name: "本机发现的技能", exact: true });
+  await expect(modal.getByText("选择供 MAIN 使用的技能，不启动来源 Agent。下次启动执行生效，不影响正在运行的任务。", { exact: true })).toBeVisible();
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((theme) => (window as any).__CODELY_E2E__?.setThemeMode?.(theme), mode);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", mode);
+    await modal.screenshot({ path: testInfo.outputPath(`external-skill-admission-${mode}.png`), animations: "disabled" });
+  }
+  await page.reload();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await expect(externalSkillCard(page).getByRole("combobox", { name: "external-review: 使用方式", exact: true })).toHaveValue("auto");
+  await expect(externalSkillCard(page).getByRole("status")).toContainText("自动匹配");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "本机发现的技能", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "本机发现的技能", exact: true })).toBeFocused();
+  await expect(page.getByRole("heading", { name: "技能与提示词", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await expect(page.getByRole("dialog", { name: "本机发现的技能", exact: true })).toHaveCount(0);
+});
+
+test("local discovery dialog loads only on demand and presents loading, empty, and retryable error states", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const callsBefore = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryCalls || 0);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  const button = page.getByRole("button", { name: "本机发现的技能", exact: true });
+  await expect(button).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryCalls || 0)).toBe(callsBefore);
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.holdDiscovery = true; });
+  await button.click();
+  const dialog = page.getByRole("dialog", { name: "本机发现的技能", exact: true });
+  await expect(dialog).toHaveAttribute("aria-modal", "true");
+  await expect(dialog.getByRole("status")).toContainText("正在扫描本机技能");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(button).toBeFocused();
+  await page.evaluate(() => {
+    const state = (window as any).__SKILLS_RUNTIME_E2E__;
+    state.holdDiscovery = false;
+    state.releaseDiscovery();
+  });
+  await button.click();
+  await expect(dialog.getByRole("status")).toContainText("没有发现本机技能");
+  await dialog.getByRole("button", { name: "关闭本机技能选择", exact: true }).click();
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.discoveryError = "discovery unavailable"; });
+  await button.click();
+  await expect(dialog.getByRole("status")).toContainText("无法读取本机技能");
+  await dialog.getByRole("button", { name: "关闭本机技能选择", exact: true }).click();
+  await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.discoveryError = undefined; });
+  await seedExternalSkills(page);
+  await button.click();
+  await expect(externalSkillCard(page).getByRole("button", { name: "添加到 MAIN", exact: true })).toBeVisible();
+});
+
+test("an external manual selection activates only on mention and Disabled blocks even explicit mention", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  await seedExternalSkills(page);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const card = externalSkillCard(page);
+  await expect(card.getByRole("combobox", { name: "external-review: 作用范围", exact: true })).toHaveValue("global");
+  await card.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  await card.getByRole("combobox", { name: "external-review: 使用方式", exact: true }).selectOption("manual");
+  expect(await externalSkillSelections(page)).toEqual([{ entryPath: EXTERNAL_SKILL_PATH, workspaceScope: null, mode: "manual" }]);
+  await page.getByRole("button", { name: "关闭本机技能选择", exact: true }).click();
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+  await createRuntimeSession(page, false);
+  const request = async (prompt: string) => {
+    const previousTurn = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnId);
+    await page.evaluate(() => { (window as any).__SKILLS_RUNTIME_E2E__.requests.length = 0; });
+    await submitSkillRequest(page, prompt);
+    await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnId)).not.toBe(previousTurn);
+    await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnResultKind)).toBe("success");
+    return page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.map((entry: any) => entry.body).filter((body: string) => body.includes("[MAIN RUNTIME V2]")));
+  };
+  let bodies = await request("请给出一句普通建议。");
+  expect(bodies).toHaveLength(1);
+  expect(bodies[0]).not.toContain("external-review");
+  expect(bodies[0]).not.toContain(EXTERNAL_SKILL_SENTINEL);
+  bodies = await request("请使用 $external-review 给出一句建议。");
+  expect(bodies[0]).toContain("[EXPLICITLY ACTIVATED SKILL");
+  expect(bodies[0]).toContain(EXTERNAL_SKILL_SENTINEL);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await externalSkillCard(page).getByRole("combobox", { name: "external-review: 使用方式", exact: true }).selectOption("disabled");
+  await page.getByRole("button", { name: "关闭本机技能选择", exact: true }).click();
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+  await createRuntimeSession(page, false);
+  bodies = await request("请使用 $external-review 给出一句建议。");
+  expect(bodies[0]).not.toContain("[EXPLICITLY ACTIVATED SKILL");
+  expect(bodies[0]).not.toContain(EXTERNAL_SKILL_SENTINEL);
+  expect(runtimeRequestSummary(bodies[0]).toolNames).not.toContain("load_skill");
+});
+
+test("external source manual-only policy is preserved and workspace Skills cannot be enabled globally", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const workspace = await seedExternalSkills(page, { manual: true, workspaceOnly: true });
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const card = externalSkillCard(page);
+  await expect(card.getByRole("combobox", { name: "external-review: 作用范围", exact: true })).toHaveCount(0);
+  await expect(card.getByText("当前项目", { exact: true })).toBeVisible();
+  await card.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  await expect(card.getByRole("combobox", { name: "external-review: 使用方式", exact: true })).toHaveValue("manual");
+  await expect(card.locator('option[value="auto"]')).toBeDisabled();
+  await expect(card.getByText("来源规则要求仅手动调用。", { exact: true })).toBeVisible();
+  expect(await externalSkillSelections(page)).toEqual([{ entryPath: EXTERNAL_SKILL_PATH, workspaceScope: workspace, mode: "manual" }]);
+});
+
+test("external Skill project settings override a separate global selection", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const workspace = await seedExternalSkills(page);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const card = externalSkillCard(page);
+  const scope = card.getByRole("combobox", { name: "external-review: 作用范围", exact: true });
+  await scope.selectOption("global");
+  await card.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  await expect(card.getByRole("status")).toContainText("自动匹配");
+  await scope.selectOption("project");
+  await card.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  await card.getByRole("combobox", { name: "external-review: 使用方式", exact: true }).selectOption("disabled");
+  await expect(card.getByRole("status")).toContainText("已停用");
+  await scope.selectOption("global");
+  await expect(card.getByRole("combobox", { name: "external-review: 使用方式", exact: true })).toHaveValue("auto");
+  await expect(card.getByRole("status")).toContainText("已停用");
+  expect(await externalSkillSelections(page)).toEqual([
+    { entryPath: EXTERNAL_SKILL_PATH, workspaceScope: null, mode: "auto" },
+    { entryPath: EXTERNAL_SKILL_PATH, workspaceScope: workspace, mode: "disabled" },
+  ]);
+});
+
+
+test("Windows native Skill paths retain editable modes after portable selection persistence", async ({ page }) => {
+  await page.goto("/?e2eScenario=global-chat-tool-scope");
+  await page.evaluate(() => {
+    const entryPath = String.raw`C:\Users\Michael\.claude\skills\windows-review\SKILL.md`;
+    const docs = [{ entryPath, basePath: String.raw`C:\Users\Michael\.claude\skills\windows-review`, platformSource: "claude", scope: "personal", content: "---\nname: windows-review\ndescription: Review Windows workflows.\n---\nInstructions.", openaiYaml: null, supportingFiles: [] }];
+    (window as any).__SKILLS_RUNTIME_E2E__.personalSkills = docs;
+    sessionStorage.setItem("__EXTERNAL_SKILLS_FIXTURE__", JSON.stringify(docs));
+  });
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const card = page.locator("[data-external-skill-path]").filter({ has: page.getByText("windows-review", { exact: true }) });
+  await card.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  const mode = card.getByRole("combobox", { name: "windows-review: 使用方式", exact: true });
+  await expect(mode).toHaveValue("auto");
+  await mode.selectOption("manual");
+  await expect(mode).toHaveValue("manual");
+  expect(await externalSkillSelections(page)).toEqual([{ entryPath: "C:/Users/Michael/.claude/skills/windows-review/SKILL.md", workspaceScope: null, mode: "manual" }]);
+  await page.reload();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await expect(card.getByRole("combobox", { name: "windows-review: 作用范围", exact: true })).toHaveValue("global");
+  await expect(mode).toHaveValue("manual");
+  await mode.selectOption("disabled");
+  await expect(card.getByRole("status")).toContainText("已停用");
+});
+
+async function seedSourceSkills(page: import("@playwright/test").Page, includeCustom = false) {
+  await page.evaluate((includeCustom) => {
+    const docs = ["codex", "claude", "gemini", ...(includeCustom ? ["custom"] : [])].map((platformSource) => ({
+      entryPath: `/home/skills/${platformSource}-flow/SKILL.md`, basePath: `/home/skills/${platformSource}-flow`, platformSource,
+      content: `---\nname: ${platformSource}-flow\ndescription: ${platformSource} workflow instructions.\n---\nExact ${platformSource} body.`,
+      openaiYaml: null, supportingFiles: [], scope: "personal",
+    }));
+    (window as any).__SKILLS_RUNTIME_E2E__.personalSkills = docs;
+    sessionStorage.setItem("__EXTERNAL_SKILLS_FIXTURE__", JSON.stringify(docs));
+  }, includeCustom);
+}
+
+test("Agent source switches show only Codex and restore existing manual choices after reload", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await seedSourceSkills(page);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "本机发现的技能", exact: true });
+  await expect(dialog).toContainText("这些全局开关仅控制本机 Agent 来源。");
+  await expect(dialog).toContainText("独立导入的技能包由主面板的包启用开关控制。");
+  const claudeCard = dialog.locator('[data-external-skill-path="/home/skills/claude-flow/SKILL.md"]');
+  await claudeCard.getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  await claudeCard.getByRole("combobox", { name: "claude-flow: 使用方式", exact: true }).selectOption("manual");
+  const selected = await externalSkillSelections(page);
+  await dialog.getByRole("switch", { name: "Claude Code", exact: true }).click();
+  await dialog.getByRole("switch", { name: "Gemini / Antigravity", exact: true }).click();
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(1);
+  await expect(dialog.getByText("codex-flow", { exact: true })).toBeVisible();
+  await expect(dialog.locator("#discovered-source-claude")).toHaveCount(0);
+  await expect(dialog.locator("#discovered-source-gemini")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "添加到 MAIN", exact: true })).toBeVisible();
+  expect(await externalSkillSelections(page)).toEqual(selected);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryArgs.enabledSources)).toEqual(["codex", "custom"]);
+  for (const theme of ["light", "dark", "black"] as const) {
+    await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), theme);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await dialog.screenshot({ path: testInfo.outputPath(`skill-sources-${theme}.png`), animations: "disabled" });
+  }
+  await page.reload();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await expect(dialog.getByRole("switch", { name: "Claude Code", exact: true })).toHaveAttribute("aria-checked", "false");
+  await expect(dialog.getByRole("switch", { name: "Gemini / Antigravity", exact: true })).toHaveAttribute("aria-checked", "false");
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(1);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("local-agent-ide") || "{}").state.externalSkillSources)).toEqual({ codex: true, claude: false, gemini: false, custom: true });
+  await dialog.getByRole("switch", { name: "Claude Code", exact: true }).click();
+  await expect(claudeCard.getByRole("combobox", { name: "claude-flow: 使用方式", exact: true })).toHaveValue("manual");
+  expect(await externalSkillSelections(page)).toEqual(selected);
+  await expect(dialog.locator('[data-external-skill-path="/home/skills/codex-flow/SKILL.md"]').getByRole("button", { name: "添加到 MAIN", exact: true })).toBeVisible();
+});
+
+test("turning every Agent source off has a persistent empty state without scanning or adding Skills", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  await seedSourceSkills(page, true);
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "本机发现的技能", exact: true });
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(4);
+  for (const source of ["Codex", "Claude Code", "Gemini / Antigravity"]) await dialog.getByRole("switch", { name: source, exact: true }).click();
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(1);
+  const scans = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryCalls);
+  await dialog.getByRole("switch", { name: "其他", exact: true }).click();
+  await expect(dialog.getByRole("status")).toContainText("所有来源均已关闭");
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryCalls)).toBe(scans);
+  expect(await externalSkillSelections(page)).toEqual([]);
+  await page.reload();
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  const scansBeforeOpen = await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryCalls || 0);
+  await page.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await expect(dialog.getByRole("status")).toContainText("所有来源均已关闭");
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.discoveryCalls || 0)).toBe(scansBeforeOpen);
+  await dialog.getByRole("switch", { name: "Codex", exact: true }).click();
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(1);
+  await expect(dialog.getByRole("button", { name: "添加到 MAIN", exact: true })).toBeVisible();
+  expect(await externalSkillSelections(page)).toEqual([]);
+});
+
+test("source and package switches independently control real dollar-menu candidates", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=cloud-tool-fallback");
+  const modal = await openPackageForm(page);
+  await modal.getByRole("button", { name: "上传 ZIP", exact: true }).click();
+  await expect(modal.getByText("发现 2 个技能", { exact: true })).toBeVisible();
+  await modal.getByRole("button", { name: "保存技能", exact: true }).click();
+  await seedSourceSkills(page);
+  await modal.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "本机发现的技能", exact: true });
+  for (const source of ["codex", "claude", "gemini"]) {
+    await dialog.locator(`[data-external-skill-path="/home/skills/${source}-flow/SKILL.md"]`).getByRole("button", { name: "添加到 MAIN", exact: true }).click();
+  }
+  await dialog.getByRole("combobox", { name: "claude-flow: 使用方式", exact: true }).selectOption("manual");
+  const selections = await externalSkillSelections(page);
+  expect(selections).toHaveLength(3);
+  expect(selections).toEqual(expect.arrayContaining([
+    expect.objectContaining({ entryPath: "/home/skills/codex-flow/SKILL.md", mode: "auto" }),
+    expect.objectContaining({ entryPath: "/home/skills/claude-flow/SKILL.md", mode: "manual" }),
+    expect.objectContaining({ entryPath: "/home/skills/gemini-flow/SKILL.md", mode: "auto" }),
+  ]));
+  await dialog.getByRole("switch", { name: "Claude Code", exact: true }).click();
+  await dialog.getByRole("switch", { name: "Gemini / Antigravity", exact: true }).click();
+  await expect(dialog.getByText("codex-flow", { exact: true })).toBeVisible();
+  await expect(dialog.locator("[data-external-skill-path]")).toHaveCount(1);
+  await dialog.getByRole("button", { name: "关闭本机技能选择", exact: true }).click();
+  await modal.getByRole("button", { name: "完成", exact: true }).click();
+
+  const input = page.getByTestId("composer-textarea");
+  const menu = page.getByRole("listbox", { name: "MAIN 技能", exact: true });
+  const openPicker = async () => {
+    await input.fill("");
+    await input.fill("$");
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("option").filter({ hasText: "codex-flow" })).toBeVisible();
+  };
+  await openPicker();
+  for (const name of ["claude-flow", "gemini-flow"]) await expect(menu.getByText(name, { exact: true })).toHaveCount(0);
+  for (const name of ["unity-cli", "zzz-sprite-tool"]) {
+    const option = menu.getByRole("option").filter({ hasText: name });
+    await expect(option).toBeVisible();
+    await expect(option).toContainText(/技能包\s*·\s*Unity Skills/);
+  }
+  for (const theme of ["light", "dark", "black"] as const) {
+    await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), theme);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await menu.screenshot({ path: testInfo.outputPath(`skill-origins-${theme}.png`), animations: "disabled" });
+  }
+  await input.press("Escape");
+
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  const packageSwitch = modal.getByRole("switch", { name: "Unity Skills: 启用", exact: true });
+  await expect(packageSwitch).toHaveAttribute("aria-checked", "true");
+  await packageSwitch.click();
+  await expect(packageSwitch).toHaveAttribute("aria-checked", "false");
+  await modal.getByRole("button", { name: "完成", exact: true }).click();
+  await openPicker();
+  for (const name of ["unity-cli", "zzz-sprite-tool", "claude-flow", "gemini-flow"]) await expect(menu.getByText(name, { exact: true })).toHaveCount(0);
+  await input.press("Escape");
+
+  await page.getByRole("button", { name: "技能与提示词" }).click();
+  await modal.getByRole("button", { name: "本机发现的技能", exact: true }).click();
+  await expect(dialog.getByRole("switch", { name: "Claude Code", exact: true })).toHaveAttribute("aria-checked", "false");
+  await dialog.getByRole("switch", { name: "Claude Code", exact: true }).click();
+  await expect(dialog.getByRole("combobox", { name: "claude-flow: 使用方式", exact: true })).toHaveValue("manual");
+  expect(await externalSkillSelections(page)).toEqual(selections);
+  await dialog.getByRole("button", { name: "关闭本机技能选择", exact: true }).click();
+  await modal.getByRole("button", { name: "完成", exact: true }).click();
+  await openPicker();
+  await expect(menu.getByRole("option").filter({ hasText: "claude-flow" })).toContainText("仅手动");
+  for (const name of ["gemini-flow", "unity-cli", "zzz-sprite-tool"]) await expect(menu.getByText(name, { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__SKILLS_RUNTIME_E2E__.requests.filter((request: any) =>
+    request.body.includes("Interpret MAIN's current user request.") || request.body.includes("[MAIN RUNTIME V2]")).length)).toBe(0);
+  await expect(page.getByTestId("user-message-content")).toHaveCount(0);
 });

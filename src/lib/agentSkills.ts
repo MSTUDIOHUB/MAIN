@@ -4,10 +4,14 @@ import {
   discoverPersonalAgentSkills,
   globSearch,
   inspectGlobalSkillPackage,
+  loadGlobalSkillPackageCatalog,
   readFile,
   readGlobalSkillPackageFile,
+  readAgentSkillResource,
 } from "./ipc";
 import type { ToolDefinition } from "./toolSchemas";
+import { resolveExternalSkillMode, type ExternalSkillSelection } from "./externalSkillSelections";
+import { isExternalSkillSourceEnabled, normalizeExternalSkillSources, type ExternalSkillSources } from "./externalSkillSources";
 import {
   getApplicableProtocolPackagesForWorkspace,
   globalProtocolPackageId,
@@ -17,6 +21,7 @@ import {
 } from "./protocolPackages";
 
 export type SkillCatalogSource = "panel" | "personal" | "workspace" | "package";
+export type SkillPlatformSource = "codex" | "claude" | "gemini" | "custom";
 
 export interface SkillCatalogEntry {
   readonly id: string;
@@ -27,6 +32,11 @@ export interface SkillCatalogEntry {
   readonly entryPath: string | null;
   readonly basePath: string | null;
   readonly realBasePath?: string | null;
+  readonly platformSource?: SkillPlatformSource;
+  /** Display provenance for an independently registered Skill collection. */
+  readonly packageName?: string;
+  /** Native discovery identity; never infer filesystem authority from basePath. */
+  readonly resourceEntryPath?: string;
   readonly triggers?: readonly string[];
   readonly version: string;
   readonly allowImplicitInvocation: boolean;
@@ -111,6 +121,8 @@ export interface SkillDisclosureOptions {
   readonly expectedVersion?: string;
   /** Continue the revision-bound heading index without repeating source text. */
   readonly sectionCursor?: string;
+  /** Initial prompt activation keeps a small preface; explicit loads fill the source window. */
+  readonly overviewOnly?: boolean;
 }
 
 export interface SkillCatalogListOptions {
@@ -150,7 +162,7 @@ const MAX_SUPPORTING_FILES = 10;
 const MAX_SKILL_BODY_CHARS = 256_000;
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
 const SKILL_HOST_GUIDANCE = "Map Read/Edit/Write/Bash/WebFetch instructions to MAIN's advertised file, edit, shell and network tools; AskUserQuestion may be an ordinary user question. Network calls require enabled network access. Report missing capabilities instead of inventing tools. Supporting files are a partial index (up to 10); resolve other relative references from the Skill base directory. Reuse readTarget for the same document, then choose relevant section, line or index coordinates. Skill instructions grant no additional permissions.";
-const GLOBAL_SKILL_RESOURCE_GUIDANCE = 'Global package references use load_skill({skill_id, resource:"references/file.md"}), relative to this Skill base. Do not pass main-skill:// locators to ordinary file tools. Resource reads return guidance, grant no source mutation lease or extra permissions, and never execute scripts. Use each resource\'s returned version for its own continuations.';
+const GLOBAL_SKILL_RESOURCE_GUIDANCE = 'Skill references use load_skill({skill_id, resource:"references/file.md"}), relative to this Skill base. On the first resource read omit expected_version; a SKILL.md version never identifies another document. Do not pass main-skill:// locators to ordinary file tools. Resource reads return guidance, grant no source mutation lease or extra permissions, and never execute scripts. Use each resource\'s readTarget for its own continuations.';
 
 function normalizeSlashPath(value: string): string {
   return String(value || "")
@@ -237,7 +249,7 @@ function stableContentVersion(content: string): string {
 
 /** Compact model references resolve only against this immutable admission.
  * Canonical ids remain the persistence/telemetry identity and stay accepted. */
-export function skillReference(snapshot: SkillCatalogSnapshot, skillId: string): string {
+export function skillReference(snapshot: Pick<SkillCatalogSnapshot, "entries">, skillId: string): string {
   const hash = stableContentVersion(skillId);
   const collisions = [...new Set(snapshot.entries
     .filter((entry) => stableContentVersion(entry.id) === hash)
@@ -405,6 +417,18 @@ function explicitInvocationMatches(prompt: string, name: string): boolean {
     .test(prompt);
 }
 
+const SHORT_SKILL_REFERENCE = /^s:[a-f0-9]{8}(?::[1-9]\d*)?$/iu;
+
+/** Ref tokens are complete document-independent admission identities. Unlike
+ * display-name punctuation, a trailing colon may be a collision suffix and
+ * cannot terminate a partial ref. The picker appends a separating space. */
+function explicitSkillReferences(prompt: string): Set<string> {
+  const references = new Set<string>();
+  const tokens = /(?:^|\s)[$@](s:[a-f0-9]{8}(?::[1-9]\d*)?)(?=$|\s|[.,;!?，。；：！？])/giu;
+  for (const match of prompt.matchAll(tokens)) references.add(match[1]!.toLowerCase());
+  return references;
+}
+
 async function supportingFilesFor(basePath: string, entryPath: string, workspace: string): Promise<string[]> {
   if (!basePath || !workspace) return [];
   const candidates = await globSearch(`${basePath}/**/*`, workspace).catch(() => []);
@@ -425,7 +449,7 @@ async function allowImplicitFor(basePath: string, workspace: string): Promise<bo
   }
 }
 
-function allowImplicitFromConfig(config: string | null | undefined): boolean {
+export function allowImplicitFromConfig(config: string | null | undefined): boolean {
   return !/allow_implicit_invocation\s*:\s*false\b/i.test(String(config || ""));
 }
 
@@ -464,10 +488,16 @@ export async function loadSkillCatalog(input: {
   readonly skills: readonly Skill[];
   readonly userPrompt?: string;
   readonly now?: () => number;
+  readonly externalSkillSelections?: readonly ExternalSkillSelection[];
+  readonly externalSkillSources?: ExternalSkillSources;
 }): Promise<SkillCatalogSnapshot> {
   const workspace = String(input.workspace || "").trim();
   const entries: SkillCatalogEntry[] = [];
   const warnings: string[] = [];
+  const externalSkillSources = normalizeExternalSkillSources(input.externalSkillSources);
+  // Project-owned files cannot be promoted to global availability through a
+  // persisted record. Their admission must name this exact workspace.
+  const projectExternalSkillSelections = input.externalSkillSelections?.filter((selection) => selection.workspaceScope !== null);
 
   const globalPackages = new Set<string>();
   for (const skill of input.skills || []) {
@@ -475,7 +505,16 @@ export async function loadSkillCatalog(input: {
     if (!packageId || globalPackages.has(packageId)) continue;
     globalPackages.add(packageId);
     try {
-      const meta = await inspectGlobalSkillPackage(packageId);
+      const catalog = typeof loadGlobalSkillPackageCatalog === "function"
+        ? await loadGlobalSkillPackageCatalog(packageId) : null;
+      const meta = catalog?.meta ?? await inspectGlobalSkillPackage(packageId);
+      const documents = catalog ? new Map(catalog.documents.map((document) => [document.relativePath, document.content])) : null;
+      const readCatalogDocument = async (path: string): Promise<string> => {
+        if (!documents) return readGlobalSkillPackageFile(packageId, path);
+        const content = documents.get(path);
+        if (content === undefined) throw new Error(`GLOBAL_SKILL_CATALOG_DOCUMENT_MISSING: ${path}`);
+        return content;
+      };
       if (meta.packageId !== packageId) throw new Error("GLOBAL_SKILL_ID_MISMATCH");
       const files = [...new Set(meta.files)];
       if (!files.every(isSafeGlobalSkillRelativePath)) throw new Error("GLOBAL_SKILL_RESOURCE_PATH_INVALID");
@@ -485,7 +524,7 @@ export async function loadSkillCatalog(input: {
           warnings.push(`Global package ${packageId} has an invalid entry path and it was omitted.`);
           continue;
         }
-        const content = await readGlobalSkillPackageFile(packageId, entryPoint);
+        const content = await readCatalogDocument(entryPoint);
         const parsed = parseSkillDocument(content, skill.name || meta.name, skill.desc || "");
         warnings.push(...parsed.warnings.map((warning) => `Skill ${entryPoint}: ${warning}`));
         const name = validEntryName(parsed.name, skill.name || meta.name);
@@ -494,7 +533,7 @@ export async function loadSkillCatalog(input: {
         const base = entryPoint.includes("/") ? entryPoint.slice(0, entryPoint.lastIndexOf("/")) : "";
         const prefix = base ? `${base}/` : "";
         const configPath = `${prefix}agents/openai.yaml`;
-        const config = files.includes(configPath) ? await readGlobalSkillPackageFile(packageId, configPath) : null;
+        const config = files.includes(configPath) ? await readCatalogDocument(configPath) : null;
         const realPayloadDir = typeof meta.payloadDir === "string" && meta.payloadDir.trim()
           ? normalizeSlashPath(meta.payloadDir)
           : "";
@@ -504,6 +543,7 @@ export async function loadSkillCatalog(input: {
         entries.push(freezeEntry({
           id: `global:${packageId}:${entryPoint}`, name,
           description: validEntryDescription(parsed.description, name), source: "package",
+          packageName: validEntryName(skill.name, meta.name),
           content: admittedBody, entryPath: `main-skill://${packageId}/${entryPoint}`,
           basePath: `main-skill://${packageId}${base ? `/${base}` : ""}`,
           ...(realBasePath ? { realBasePath } : {}),
@@ -541,12 +581,15 @@ export async function loadSkillCatalog(input: {
   }
 
   const personalDocuments = typeof discoverPersonalAgentSkills === "function"
-    ? await discoverPersonalAgentSkills().catch(() => [])
+    ? await discoverPersonalAgentSkills(workspace || undefined, Object.keys(externalSkillSources).filter((source) => isExternalSkillSourceEnabled(externalSkillSources, source))).catch(() => [])
     : [];
   for (const document of personalDocuments) {
+    if (!isExternalSkillSourceEnabled(externalSkillSources, document.platformSource)) continue;
     const entryPath = String(document.entryPath || "").trim();
     const basePath = String(document.basePath || "").trim();
     if (!entryPath || !basePath) continue;
+    const mode = resolveExternalSkillMode(document.scope === "workspace" ? projectExternalSkillSelections : input.externalSkillSelections, entryPath, workspace);
+    if (!mode || mode === "disabled") continue;
     const fallbackName = normalizeSlashPath(basePath).split("/").pop() || "personal-skill";
     const parsed = parseSkillDocument(document.content, fallbackName, "");
     warnings.push(...parsed.warnings.map((warning) => `Skill ${entryPath}: ${warning}`));
@@ -554,16 +597,19 @@ export async function loadSkillCatalog(input: {
     const admittedBody = admissibleSkillBody(parsed.body, name, warnings);
     if (!admittedBody) continue;
     entries.push(freezeEntry({
-      id: `personal:${stableContentVersion(entryPath)}`,
+      id: `${document.scope === "workspace" ? "workspace" : "personal"}:${stableContentVersion(entryPath)}`,
       name,
       description: validEntryDescription(parsed.description, name),
-      source: "personal",
+      source: document.scope === "workspace" ? "workspace" : "personal",
       content: admittedBody,
       entryPath,
       basePath,
+      realBasePath: basePath,
+      resourceEntryPath: entryPath,
+      platformSource: document.platformSource || "custom",
       ...(parsed.triggers.length > 0 ? { triggers: parsed.triggers } : {}),
       version: stableContentVersion(admittedBody),
-      allowImplicitInvocation: allowImplicitFromConfig(document.openaiYaml),
+      allowImplicitInvocation: mode === "auto" && allowImplicitFromConfig(document.openaiYaml),
       supportingFiles: [...new Set(
         (document.supportingFiles || []).map((value) => String(value || "").trim()).filter(Boolean),
       )].slice(0, MAX_SUPPORTING_FILES),
@@ -601,6 +647,7 @@ export async function loadSkillCatalog(input: {
             name,
             description: validEntryDescription(parsed.description, name),
             source: "package",
+            packageName: validEntryName(skill.name, skill.id),
             content: admittedBody,
             entryPath,
             basePath,
@@ -619,16 +666,25 @@ export async function loadSkillCatalog(input: {
       }
     }
 
-    const workspaceEntries = await globSearch(
-      ".agents/skills/**/SKILL.md",
-      workspace,
-    ).catch(() => []);
+    const workspaceEntries = (await Promise.all([".agents", ".claude"].filter((root) =>
+      isExternalSkillSourceEnabled(externalSkillSources, root === ".agents" ? "codex" : "claude"),
+    ).map((root) =>
+      globSearch(`${root}/skills/**/SKILL.md`, workspace).catch(() => []),
+    ))).flat();
     for (const rawEntryPath of [...new Set(workspaceEntries)].sort()) {
       const entryPath = normalizeSlashPath(rawEntryPath);
-      if (!entryPath.startsWith(".agents/skills/") || entryPath.includes("/../")) {
-        warnings.push(`Workspace Skill entry ${rawEntryPath} is outside .agents/skills and was omitted.`);
+      if (!/^(?:\.agents|\.claude)\/skills\//.test(entryPath) || entryPath.includes("/../")) {
+        warnings.push(`Workspace Skill entry ${rawEntryPath} is outside the standard Skill roots and was omitted.`);
         continue;
       }
+      const platformSource = entryPath.startsWith(".claude/") ? "claude" : "codex";
+      if (!isExternalSkillSourceEnabled(externalSkillSources, platformSource)) continue;
+      // Native discovery already resolved aliases and admitted this exact entry.
+      if (personalDocuments.some((document) => document.scope === "workspace" &&
+          normalizeSlashPath(document.entryPath).endsWith(`/${entryPath}`))) continue;
+      const absoluteEntryPath = `${normalizeSlashPath(workspace)}/${entryPath}`;
+      const mode = resolveExternalSkillMode(projectExternalSkillSelections, absoluteEntryPath, workspace);
+      if (!mode || mode === "disabled") continue;
       try {
         const content = await readFile(entryPath, workspace);
         const basePath = directoryName(entryPath);
@@ -643,12 +699,13 @@ export async function loadSkillCatalog(input: {
           name,
           description: validEntryDescription(parsed.description, name),
           source: "workspace",
+          platformSource,
           content: admittedBody,
           entryPath,
           basePath,
           ...(parsed.triggers.length > 0 ? { triggers: parsed.triggers } : {}),
           version: stableContentVersion(admittedBody),
-          allowImplicitInvocation: await allowImplicitFor(basePath, workspace),
+          allowImplicitInvocation: mode === "auto" && await allowImplicitFor(basePath, workspace),
           supportingFiles: await supportingFilesFor(basePath, entryPath, workspace),
         }));
       } catch (error) {
@@ -661,7 +718,25 @@ export async function loadSkillCatalog(input: {
     }
   }
 
+  // A workspace override wins over an installed copy. Same-priority entries
+  // remain distinct, so two different packages never alias by display name.
+  const priority = (entry: SkillCatalogEntry): number => entry.source === "workspace" || entry.source === "panel" ? 0
+    : entry.source === "package" ? 1 : entry.platformSource === "codex" ? 2
+      : entry.platformSource === "claude" ? 3 : entry.platformSource === "gemini" ? 4 : 5;
+  const preferred = new Map<string, number>();
+  for (const entry of entries) {
+    const key = entry.name.toLocaleLowerCase();
+    preferred.set(key, Math.min(preferred.get(key) ?? Infinity, priority(entry)));
+  }
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index]!;
+    if (priority(entry) > preferred.get(entry.name.toLocaleLowerCase())!) entries.splice(index, 1);
+  }
   const prompt = String(input.userPrompt || "");
+  const requestedReferences = explicitSkillReferences(prompt);
+  // The entire s: token namespace is reserved for identity references. In
+  // particular, `$s:<ref>` must not also match a display name `s` at its colon.
+  const namePrompt = prompt.replace(/(?:^|\s)[$@]s:\S*/giu, " ");
   const nameCounts = new Map<string, number>();
   for (const entry of entries) {
     const key = entry.name.toLocaleLowerCase();
@@ -669,12 +744,14 @@ export async function loadSkillCatalog(input: {
   }
   const explicitSkillIds = entries
     .filter((entry) =>
-      nameCounts.get(entry.name.toLocaleLowerCase()) === 1 &&
-      explicitInvocationMatches(prompt, entry.name)
+      (requestedReferences.size > 0 && requestedReferences.has(skillReference({ entries }, entry.id))) ||
+      (!SHORT_SKILL_REFERENCE.test(entry.name) &&
+        nameCounts.get(entry.name.toLocaleLowerCase()) === 1 &&
+        explicitInvocationMatches(namePrompt, entry.name))
     )
     .map((entry) => entry.id);
   for (const [name, count] of nameCounts) {
-    if (count > 1 && explicitInvocationMatches(prompt, name)) {
+    if (count > 1 && explicitInvocationMatches(namePrompt, name)) {
       warnings.push(`Explicit Skill name ${name} is ambiguous and was not activated.`);
     }
   }
@@ -807,7 +884,7 @@ function discloseSkillDocument(
 ): LoadedSkillContent {
   if (options.expectedVersion !== undefined && options.expectedVersion !== entry.version) {
     const document = resource === undefined ? "Skill body" : `Skill resource ${JSON.stringify(resource)}`;
-    throw new Error(`SKILL_VERSION_MISMATCH: ${document} at ${JSON.stringify(entry.entryPath || entry.id)}: expected ${options.expectedVersion}; admitted document version ${entry.version}. Use the version returned for this exact document.`);
+    throw new Error(`SKILL_VERSION_MISMATCH: ${document} at ${JSON.stringify(entry.entryPath || entry.id)}: expected ${options.expectedVersion}; admitted document version ${entry.version}. Use the version returned for this exact document.${resource === undefined ? "" : " On a first resource read omit expected_version; a parent SKILL.md version cannot identify a resource. For continuations reuse this resource's readTarget."}`);
   }
   const lines = sourceLines(entry.content);
   const allSections = documentSections(entry.content, lines);
@@ -836,7 +913,7 @@ function discloseSkillDocument(
     throw new Error("SKILL_RANGE_INVALID: startChar must be an absolute offset inside startLine; use the returned continuation.");
   }
   const firstBodySection = allSections.find((candidate) => candidate.level > 1) || allSections.find((candidate) => candidate.startLine > 1);
-  let desiredEnd = overview && firstBodySection
+  let desiredEnd = overview && options.overviewOnly && firstBodySection
     ? lines[firstBodySection.startLine - 1]!.start
     : lines[(section?.endLine ?? lines.length) - 1]?.end ?? 0;
   if (maxLines !== undefined) desiredEnd = Math.min(desiredEnd, lines[Math.min(lines.length, startLine + maxLines - 1) - 1]!.end);
@@ -860,8 +937,8 @@ function discloseSkillDocument(
     ...(entry.realBasePath ? { realBasePath: entry.realBasePath } : {}),
     version: entry.version,
     supportingFiles: Object.freeze(relativeSupportingPaths(entry)),
-    hostGuidance: entry.globalPackageId ? `${SKILL_HOST_GUIDANCE} ${GLOBAL_SKILL_RESOURCE_GUIDANCE}` : SKILL_HOST_GUIDANCE,
-    ...(entry.globalPackageId ? { resourceReadSupported: true } : {}),
+    hostGuidance: entry.globalPackageId || entry.resourceEntryPath ? `${SKILL_HOST_GUIDANCE} ${GLOBAL_SKILL_RESOURCE_GUIDANCE}` : SKILL_HOST_GUIDANCE,
+    ...(entry.globalPackageId || entry.resourceEntryPath ? { resourceReadSupported: true } : {}),
     ...(resource === undefined ? {} : { resource }),
     disclosure: complete ? "full" : overview ? "overview" : "window",
     complete,
@@ -890,6 +967,13 @@ export async function loadSkillResourceContent(
   const id = resolveSkillId(snapshot, skillId);
   const entry = snapshot?.entries.find((candidate) => candidate.id === id);
   if (!entry || !isSkillVisibleToModel(snapshot, skillId)) throw new Error("SKILL_NOT_ADMITTED: resource Skill is not visible in this Turn.");
+  if (!isSafeGlobalSkillRelativePath(resource)) throw new Error("SKILL_RESOURCE_PATH_INVALID: use a relative path within the selected Skill base.");
+  if (entry.resourceEntryPath && (entry.source === "personal" || entry.source === "workspace") &&
+      entry.resourceEntryPath === entry.entryPath && entry.realBasePath === entry.basePath) {
+    const content = await readAgentSkillResource(entry.resourceEntryPath, resource);
+    const resourceEntry = freezeEntry({ ...entry, content, version: stableContentVersion(content), entryPath: `${entry.basePath}/${resource}` });
+    return discloseSkillDocument(resourceEntry, skillReference(snapshot!, entry.id), options, resource);
+  }
   const prefix = `global:${entry.globalPackageId}:`;
   const entryPoint = entry.id.startsWith(prefix) ? entry.id.slice(prefix.length) : "";
   const base = entryPoint.includes("/") ? entryPoint.slice(0, entryPoint.lastIndexOf("/")) : "";
@@ -897,7 +981,7 @@ export async function loadSkillResourceContent(
       !isSafeGlobalSkillRelativePath(entryPoint) || entry.globalResourceBase !== base ||
       entry.entryPath !== `main-skill://${entry.globalPackageId}/${entryPoint}` ||
       !entry.globalResourcePaths?.includes(entryPoint)) {
-    throw new Error("SKILL_RESOURCE_UNAVAILABLE: only admitted global package resources are supported.");
+    throw new Error("SKILL_RESOURCE_UNAVAILABLE: only natively discovered Skills or admitted global package resources are supported.");
   }
   if (!isSafeGlobalSkillRelativePath(resource)) throw new Error("SKILL_RESOURCE_PATH_INVALID: use a relative path within the selected Skill base.");
   const path = entry.globalResourceBase ? `${entry.globalResourceBase}/${resource}` : resource;
@@ -918,7 +1002,7 @@ export function buildLoadSkillToolDefinition(
     function: {
       name: LOAD_SKILL_TOOL_NAME,
       description:
-        "Load an admitted Skill's instructions (default operation=load). Pass skill_id as the skill name, slug, short ref (s:...), or canonical id. Most Skills return their complete SKILL.md in a single call; for partial continuations or resources, reuse readTarget. For global package references, set resource relative to the selected Skill base. operation=list discovers metadata only.",
+        "Load an admitted Skill's instructions (default operation=load). Pass skill_id as the skill name, slug, short ref (s:...), or canonical id. Most Skills return their complete SKILL.md in a single call; for partial continuations or resources, reuse readTarget. For references, set resource relative to the selected Skill base. operation=list discovers metadata only.",
       parameters: {
         type: "object",
         properties: {
@@ -931,7 +1015,7 @@ export function buildLoadSkillToolDefinition(
             type: "string",
             description: "Required for load: skill name, slug, short ref (s:...) from the catalog, or canonical id.",
           },
-          resource: { type: "string", description: "Optional global package reference path relative to this Skill base, e.g. references/setup.md. Repeat on every continuation by reusing that resource's readTarget; omit for SKILL.md. Rejects absolute paths, traversal and unknown resources. Guidance only; never executes scripts or grants project/source/write permissions." },
+          resource: { type: "string", description: "Optional reference path relative to this discovered Skill or global package base, e.g. references/setup.md. Repeat on every continuation by reusing that resource's readTarget; omit for SKILL.md. Rejects absolute paths, traversal and unavailable resources. Guidance only; never executes scripts or grants project/source/write permissions." },
           section: { type: "string", description: "Optional exact section id from the Skill index, such as L15. Returns original source, never a generated summary." },
           start_line: { type: "integer", description: "Optional one-based source line. Use nextStartLine for continuation; with section, it must stay within that section." },
           max_lines: { type: "integer", description: "Optional positive source line window. The Run source budget also bounds the returned content." },
@@ -961,7 +1045,7 @@ export function renderExplicitSkillActivationContext(
   let remaining = positiveSourceInteger(options.maxChars, "maxChars");
   const activated = snapshot.explicitSkillIds.map((id, index) => {
     const share = remaining === undefined ? undefined : Math.floor(remaining / (snapshot.explicitSkillIds.length - index));
-    const source = loadSkillContent(snapshot, id, { maxChars: share === 0 ? 1 : share });
+    const source = loadSkillContent(snapshot, id, { maxChars: share === 0 ? 1 : share, overviewOnly: true });
     const loaded = share === 0 ? {
       ...source, content: "", complete: false, partial: true,
       returnedRange: { startLine: 1, endLine: 0, startChar: 0, endChar: 0 },

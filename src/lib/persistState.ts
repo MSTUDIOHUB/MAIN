@@ -1,3 +1,7 @@
+import { normalizeExternalSkillSelections } from "./externalSkillSelections";
+import { normalizeExternalSkillSources } from "./externalSkillSources";
+import { normalizeGithubSkillSource } from "./githubSkillSource";
+
 export const LOCAL_PERSIST_SCHEMA_VERSION = 2;
 
 export const LEGACY_RUNTIME_PERSIST_KEYS = [
@@ -29,6 +33,22 @@ export const LEGACY_CONFIG_PERSIST_KEYS = [
   "thinkingPolicy",
   "thoughtDisplayMode",
 ] as const;
+
+/** Legacy tool schemas never had an executable binding. Preserve their
+ * instructions and user policy while presenting them as ordinary Skills. */
+export function normalizePersistedSkills<T>(skills: T): T {
+  if (!Array.isArray(skills)) return skills;
+  return skills.map((skill) => {
+    if (!skill || typeof skill !== "object") return skill;
+    const { githubSource: _source, ...rest } = skill;
+    const githubSource = skill.type === "package" && skill.packageStorage?.kind === "global"
+      ? normalizeGithubSkillSource(skill.githubSource) : undefined;
+    const record = _source === undefined ? skill : { ...rest, ...(githubSource ? { githubSource } : {}) };
+    if (skill.type !== "tool") return record;
+    const { toolParameters: _schema, ...instruction } = record;
+    return { ...instruction, type: "instruction" };
+  }) as T;
+}
 
 /**
  * Goal is a one-message composer choice, so a historical persisted value must
@@ -78,6 +98,10 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
 ): Record<string, unknown> {
   if (!persistedState || typeof persistedState !== "object") return {};
   const nextState = { ...persistedState } as Record<string, unknown>;
+  // Retired Gemini ZIP installation metadata must not rehydrate hidden Skills
+  // or MCP capabilities. Existing package files are left untouched on disk.
+  delete nextState.geminiExtensions;
+  delete nextState.extensionMcpDiscovery;
   for (const key of LEGACY_RUNTIME_PERSIST_KEYS) {
     if (Object.prototype.hasOwnProperty.call(nextState, key)) {
       delete nextState[key];
@@ -96,14 +120,18 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
   if (nextState.config) {
     nextState.config = stripLegacyConfigFields(nextState.config);
   }
+  if (nextState.skills) nextState.skills = normalizePersistedSkills(nextState.skills);
+  nextState.externalSkillSelections = normalizeExternalSkillSelections(nextState.externalSkillSelections);
+  nextState.externalSkillSources = normalizeExternalSkillSources(nextState.externalSkillSources);
   return nextState;
 }
 
 export function buildPersistedAppState(state: Record<string, any>): Record<string, unknown> {
   return {
     config: stripLegacyConfigFields(state.config),
-    skills: state.skills,
-    geminiExtensions: state.geminiExtensions,
+    skills: normalizePersistedSkills(state.skills),
+    externalSkillSelections: normalizeExternalSkillSelections(state.externalSkillSelections),
+    externalSkillSources: normalizeExternalSkillSources(state.externalSkillSources),
     knowledgeBases: state.knowledgeBases,
     sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
     workspaces: state.workspaces,

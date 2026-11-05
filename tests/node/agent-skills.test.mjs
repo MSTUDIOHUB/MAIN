@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import ts from "typescript";
 
 const workspaceRoot = process.cwd();
+const externalSelection = (entryPath, mode = "auto", workspaceScope = null) => ({ entryPath, workspaceScope, mode });
 
 async function loadAgentSkillsModule(ipcStubs) {
   const sourcePath = path.join(workspaceRoot, "src/lib/agentSkills.ts");
@@ -26,11 +27,25 @@ async function loadAgentSkillsModule(ipcStubs) {
   }).outputText;
   const protocolModule = { exports: {} };
   new Function("exports", "module", protocolOutput)(protocolModule.exports, protocolModule);
+  const selectionSource = await fs.readFile(path.join(workspaceRoot, "src/lib/externalSkillSelections.ts"), "utf8");
+  const selectionOutput = ts.transpileModule(selectionSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  }).outputText;
+  const selectionModule = { exports: {} };
+  new Function("exports", "module", selectionOutput)(selectionModule.exports, selectionModule);
+  const sourcesSource = await fs.readFile(path.join(workspaceRoot, "src/lib/externalSkillSources.ts"), "utf8");
+  const sourcesOutput = ts.transpileModule(sourcesSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  }).outputText;
+  const sourcesModule = { exports: {} };
+  new Function("exports", "module", sourcesOutput)(sourcesModule.exports, sourcesModule);
   const module = { exports: {} };
   const localRequire = (specifier) => {
     if (specifier === "yaml") return createRequire(import.meta.url)(specifier);
     if (specifier === "./ipc") return ipcStubs;
     if (specifier === "./protocolPackages") return protocolModule.exports;
+    if (specifier === "./externalSkillSelections") return selectionModule.exports;
+    if (specifier === "./externalSkillSources") return sourcesModule.exports;
     throw new Error(`Unexpected require in test: ${specifier}`);
   };
   new Function("exports", "module", "require", transpiled)(
@@ -67,6 +82,7 @@ test("registered global packages load once across project and global Turns witho
     assert.equal(snapshot.entries.length, 1);
     const entry = snapshot.entries[0];
     assert.equal(entry.id, `global:${GLOBAL_PACKAGE_ID}:skills/workflow/SKILL.md`);
+    assert.equal(entry.packageName, "Global bundle");
     assert.equal(entry.entryPath, `main-skill://${GLOBAL_PACKAGE_ID}/skills/workflow/SKILL.md`);
     assert.equal(entry.basePath, `main-skill://${GLOBAL_PACKAGE_ID}/skills/workflow`);
     assert.doesNotMatch(api.renderSkillCatalogContext(snapshot), /BODY_ONLY_ON_LOAD/);
@@ -137,6 +153,10 @@ test("global package identity never aliases a new payload, malformed record or s
   const both = await api.loadSkillCatalog({ workspace: "", userPrompt: "Use $global-workflow", skills: [globalPackageRecord(), globalPackageRecord({ id: "different-payload", packageStorage: { kind: "global", packageId: secondId } })] });
   assert.equal(both.entries.length, 2);
   assert.deepEqual(both.explicitSkillIds, [], "same display name does not merge different resources or guess which workflow was selected");
+  const selectedId = both.entries[1].id;
+  const selectedRef = api.skillReference(both, selectedId);
+  const selected = await api.loadSkillCatalog({ workspace: "", userPrompt: `Use $${selectedRef}`, skills: [globalPackageRecord(), globalPackageRecord({ id: "different-payload", packageStorage: { kind: "global", packageId: secondId } })] });
+  assert.deepEqual(selected.explicitSkillIds, [selectedId], "a short ref selects exactly one same-name installed package");
   const before = inspections;
   const malformed = await api.loadSkillCatalog({ workspace: "/A", skills: [globalPackageRecord({ packagePath: ".protocols/legacy", workspaceScope: "/A", packageStorage: { kind: "global", packageId: "../outside" } })] });
   assert.equal(malformed.entries.length, 0);
@@ -181,6 +201,7 @@ test("Skill admission exposes metadata first and loads exact content on demand",
   const snapshot = await loadSkillCatalog({
     workspace: "/repo",
     userPrompt: "Please use $personal-review for this task",
+    externalSkillSelections: [externalSelection("/repo/.agents/skills/release/SKILL.md", "auto", "/repo")],
     skills: [
       {
         id: "personal-1",
@@ -339,6 +360,7 @@ test("personal $HOME/.agents/skills documents are admitted in global and workspa
   const globalSnapshot = await loadSkillCatalog({
     workspace: "",
     skills: [],
+    externalSkillSelections: [externalSelection("/Users/test/.agents/skills/personal/SKILL.md")],
   });
   assert.deepEqual(
     globalSnapshot.entries.map((entry) => entry.name),
@@ -372,7 +394,7 @@ test("Skill YAML scalars preserve folded paragraphs, literal lines, quoting and 
   const { loadSkillCatalog, loadSkillContent } = await loadAgentSkillsModule({
     discoverPersonalAgentSkills: async () => documents,
   });
-  const snapshot = await loadSkillCatalog({ workspace: "", skills: [] });
+  const snapshot = await loadSkillCatalog({ workspace: "", skills: [], externalSkillSelections: documents.map((document) => externalSelection(document.entryPath)) });
   for (const [index, [name, , expected]] of cases.entries()) {
     const entry = snapshot.entries.find((candidate) => candidate.name === name);
     assert.equal(entry.description, expected, name);
@@ -401,7 +423,7 @@ test("Skill frontmatter accepts BOM and reports invalid YAML or non-scalar metad
   const aliases = parseSkillDocument("---\nname: &label scalar\ndescription: *label\n---\nBODY\n", "fallback", "fallback description");
   assert.equal(aliases.description, "fallback description");
   assert.ok(aliases.warnings.length > 0);
-  const snapshot = await loadSkillCatalog({ workspace: "", skills: [] });
+  const snapshot = await loadSkillCatalog({ workspace: "", skills: [], externalSkillSelections: [externalSelection("/skills/invalid/SKILL.md")] });
   assert.equal(snapshot.entries[0].name, "invalid");
   assert.match(snapshot.warnings[0], /Invalid YAML frontmatter/);
   assert.equal(snapshot.entries[0].content, "---\nname: [broken\n---\nUNCHANGED\n");
@@ -519,7 +541,9 @@ test("explicit long Skills disclose their exact preface and section index withou
   assert.equal(loaded.complete, false);
   assert.equal(loaded.partial, true);
   assert.equal(loaded.totalLines, 632);
-  assert.equal(loaded.content, lines.slice(0, 4).join("\r\n") + "\r\n");
+  assert.equal(loaded.content, content.slice(0, loaded.returnedRange.endChar));
+  assert.ok(loaded.content.includes("## Inspect"), "explicit loading uses the available window beyond the preface");
+  assert.ok(loaded.content.length + JSON.stringify(loaded.sections).length <= 300);
   assert.ok(!loaded.sections.some((section) => section.title.includes("THIS_IS_CODE")));
   const indexed = [...loaded.sections];
   let sectionCursor = loaded.nextSectionCursor;
@@ -620,7 +644,7 @@ test("Skill model projections show supporting paths relative to their declared b
       supportingFiles: ["/personal/workflow/references/deep.md", "/personal/workflow/scripts/check.js"],
     }],
   });
-  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [], userPrompt: "Use $path-workflow" });
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [], userPrompt: "Use $path-workflow", externalSkillSelections: [externalSelection("/personal/workflow/SKILL.md")] });
   const activation = api.renderExplicitSkillActivationContext(snapshot);
   assert.match(activation, /Base directory: \/personal\/workflow/);
   assert.match(activation, /references\/deep.md/);
@@ -671,4 +695,349 @@ test("short Skill reference collisions resolve deterministically and explicit se
   assert.equal((activation.match(/Z/g) || []).length, 50);
   const tiny = api.renderExplicitSkillActivationContext(snapshot, { maxChars: 1 });
   assert.equal((tiny.match(/Z/g) || []).length, 1);
+});
+
+test("a budgeted explicit load uses available source space after a short preface", async () => {
+  const api = await loadAgentSkillsModule({});
+  const content = "# Workflow\nShort preface.\n\n## Inspect\n" + "Exact instructions.\n".repeat(100);
+  const snapshot = await api.loadSkillCatalog({ workspace: "", skills: [{ id: "window", name: "window", content, active: true }] });
+  const loaded = api.loadSkillContent(snapshot, "panel:window", { maxChars: 600 });
+  assert.ok(loaded.content.length > 400, "short prefaces cannot strand the rest of the Run-owned window");
+  assert.equal(loaded.content, content.slice(0, loaded.returnedRange.endChar));
+  assert.ok(loaded.content.length + JSON.stringify(loaded.sections).length <= 600);
+  assert.equal(loaded.complete, false);
+});
+
+test("discovered Skill resources keep their captured identity, independent versions and exact bytes", async () => {
+  const reads = [];
+  let resource = "# Reference\r\n" + "x".repeat(300) + "\r\nEND\r\n";
+  const api = await loadAgentSkillsModule({
+    globSearch: async () => [],
+    discoverPersonalAgentSkills: async (workspace) => {
+      assert.equal(workspace, "/project");
+      return [{ entryPath: "/home/.claude/skills/review/SKILL.md", basePath: "/home/.claude/skills/review", platformSource: "claude", content: "# Review\nRead references/check.md", supportingFiles: [] }];
+    },
+    readAgentSkillResource: async (entryPath, path) => { reads.push([entryPath, path]); return resource; },
+  });
+  const catalog = await api.loadSkillCatalog({ workspace: "/project", skills: [], externalSkillSelections: [externalSelection("/home/.claude/skills/review/SKILL.md")] });
+  const entry = catalog.entries[0];
+  assert.equal(entry.platformSource, "claude");
+  assert.equal(entry.realBasePath, entry.basePath);
+  let loaded = await api.loadSkillResourceContent(catalog, entry.id, "references/check.md", { maxChars: 67 });
+  let reconstructed = loaded.content;
+  while (loaded.nextRead) {
+    loaded = await api.loadSkillResourceContent(catalog, entry.id, "references/check.md", {
+      maxChars: 67, expectedVersion: loaded.version, startLine: loaded.nextStartLine, startChar: loaded.nextStartChar,
+    });
+    reconstructed += loaded.content;
+  }
+  assert.equal(reconstructed, resource);
+  assert.deepEqual(reads[0], [entry.entryPath, "references/check.md"]);
+  for (const path of ["../outside", "/outside", "file:///outside", "references//check.md", "C:\\outside", "x\0"]) {
+    await assert.rejects(() => api.loadSkillResourceContent(catalog, entry.id, path), /PATH/);
+  }
+  await assert.rejects(() => api.loadSkillResourceContent(catalog, entry.id, "references/check.md", { expectedVersion: entry.version }), /VERSION.*first resource read.*omit/i);
+  resource = "Changed";
+  await assert.rejects(() => api.loadSkillResourceContent(catalog, entry.id, "references/check.md", { expectedVersion: loaded.version }), /VERSION/);
+});
+
+test("cross-platform duplicates prefer workspace, packages and Codex while same-priority ambiguity stays explicit", async () => {
+  const docs = [
+    { platformSource: "gemini", basePath: "/home/.gemini/plugin/skills/review" },
+    { platformSource: "claude", basePath: "/home/.claude/skills/review" },
+    { platformSource: "codex", basePath: "/home/.agents/skills/review" },
+  ].map((entry) => ({ ...entry, entryPath: `${entry.basePath}/SKILL.md`, content: "---\nname: review\n---\nReview.", supportingFiles: [] }));
+  const api = await loadAgentSkillsModule({ globSearch: async () => [], discoverPersonalAgentSkills: async () => docs });
+  const catalog = await api.loadSkillCatalog({ workspace: "/project", skills: [], userPrompt: "Use $review", externalSkillSelections: docs.map((document) => externalSelection(document.entryPath)) });
+  assert.equal(catalog.entries.length, 1);
+  assert.equal(catalog.entries[0].platformSource, "codex");
+  assert.deepEqual(catalog.explicitSkillIds, [catalog.entries[0].id]);
+});
+
+test("global catalog admission consumes one verified batch instead of revalidating each document", async () => {
+  let requests = 0;
+  const meta = { packageId: GLOBAL_PACKAGE_ID, name: "bundle", entryPoint: "a/SKILL.md", entryPoints: ["a/SKILL.md", "b/SKILL.md"], files: ["a/SKILL.md", "b/SKILL.md", "b/agents/openai.yaml"], payloadDir: "/app/skill-packages/payload" };
+  const api = await loadAgentSkillsModule({
+    globSearch: async () => [],
+    inspectGlobalSkillPackage: async () => { throw new Error("redundant package verification"); },
+    readGlobalSkillPackageFile: async () => { throw new Error("redundant document verification"); },
+    loadGlobalSkillPackageCatalog: async (id) => {
+      assert.equal(id, GLOBAL_PACKAGE_ID);
+      requests++;
+      return { meta, documents: [
+        { relativePath: "a/SKILL.md", content: "---\nname: one\n---\n# One\n" },
+        { relativePath: "b/SKILL.md", content: "---\nname: two\n---\n# Two\n" },
+        { relativePath: "b/agents/openai.yaml", content: "policy:\n  allow_implicit_invocation: false\n" },
+      ] };
+    },
+  });
+  const catalog = await api.loadSkillCatalog({ workspace: "/repo", skills: [globalPackageRecord()] });
+  assert.equal(requests, 1);
+  assert.deepEqual(catalog.entries.map((entry) => entry.name), ["one", "two"]);
+  assert.deepEqual(api.listSkillCatalog(catalog).entries.map((entry) => entry.name), ["one"]);
+});
+
+test("native workspace discovery overrides home copies without duplicate frontend admission", async () => {
+  const api = await loadAgentSkillsModule({
+    discoverPersonalAgentSkills: async () => [
+      { entryPath: "/repo/.claude/skills/review/SKILL.md", basePath: "/repo/.claude/skills/review", content: "---\nname: review\n---\nWorkspace", scope: "workspace", platformSource: "claude", supportingFiles: [] },
+      { entryPath: "/home/.agents/skills/review/SKILL.md", basePath: "/home/.agents/skills/review", content: "---\nname: review\n---\nHome", scope: "personal", platformSource: "codex", supportingFiles: [] },
+    ],
+    globSearch: async (pattern) => pattern === ".claude/skills/**/SKILL.md" ? [".claude/skills/review/SKILL.md"] : [],
+    readFile: async () => { throw new Error("already admitted by native discovery"); },
+  });
+  const catalog = await api.loadSkillCatalog({ workspace: "/repo", skills: [], userPrompt: "Use $review", externalSkillSelections: [
+    externalSelection("/repo/.claude/skills/review/SKILL.md", "auto", "/repo"), externalSelection("/home/.agents/skills/review/SKILL.md"),
+  ] });
+  assert.equal(catalog.entries.length, 1);
+  assert.equal(catalog.entries[0].source, "workspace");
+  assert.equal(catalog.entries[0].content, "---\nname: review\n---\nWorkspace");
+  assert.equal(catalog.entries[0].resourceEntryPath, "/repo/.claude/skills/review/SKILL.md");
+  assert.deepEqual(catalog.explicitSkillIds, [catalog.entries[0].id]);
+});
+
+test("external discovery is not admission and explicit names cannot bypass missing or disabled selections", async () => {
+  const entryPath = "/home/.codex/skills/review/SKILL.md";
+  const api = await loadAgentSkillsModule({
+    globSearch: async () => [],
+    discoverPersonalAgentSkills: async () => [{ entryPath, basePath: "/home/.codex/skills/review", content: "---\nname: review\n---\nBODY", supportingFiles: [] }],
+  });
+  for (const externalSkillSelections of [undefined, [], [{ entryPath, workspaceScope: null, mode: "disabled" }]]) {
+    const catalog = await api.loadSkillCatalog({ workspace: "/repo", skills: [], userPrompt: "Use $review", externalSkillSelections });
+    assert.equal(catalog.entries.length, 0);
+    assert.deepEqual(catalog.explicitSkillIds, []);
+    assert.equal(api.buildLoadSkillToolDefinition(catalog), null);
+    await assert.rejects(() => api.loadSkillResourceContent(catalog, "review", "references/check.md"), /NOT_ADMITTED/);
+  }
+});
+
+test("external manual selections require explicit use and auto preserves source invocation policy", async () => {
+  const docs = [
+    { entryPath: "/skills/manual/SKILL.md", basePath: "/skills/manual", content: "---\nname: manual\n---\nMANUAL", supportingFiles: [] },
+    { entryPath: "/skills/source-manual/SKILL.md", basePath: "/skills/source-manual", content: "---\nname: source-manual\n---\nSOURCE", openaiYaml: "policy:\n  allow_implicit_invocation: false\n", supportingFiles: [] },
+  ];
+  const api = await loadAgentSkillsModule({ globSearch: async () => [], discoverPersonalAgentSkills: async () => docs });
+  const externalSkillSelections = [
+    { entryPath: docs[0].entryPath, workspaceScope: null, mode: "manual" },
+    { entryPath: docs[1].entryPath, workspaceScope: null, mode: "auto" },
+  ];
+  const hidden = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections });
+  assert.equal(api.listSkillCatalog(hidden).total, 0);
+  assert.equal(hidden.entries.length, 2);
+  const explicit = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections, userPrompt: "Use $manual and $source-manual" });
+  assert.equal(api.listSkillCatalog(explicit).total, 2);
+});
+
+test("workspace fallback cannot admit unselected files or override an admitted same-name package", async () => {
+  const api = await loadAgentSkillsModule({
+    globSearch: async (pattern) => pattern === ".agents/skills/**/SKILL.md" ? [".agents/skills/review/SKILL.md"] : [],
+    readFile: async () => { throw new Error("unselected external files must not be loaded"); },
+  });
+  const catalog = await api.loadSkillCatalog({ workspace: "/repo", skills: [{ id: "panel", name: "review", content: "PANEL", active: true }], userPrompt: "Use $review" });
+  assert.deepEqual(catalog.entries.map((entry) => entry.id), ["panel:panel"]);
+  assert.deepEqual(catalog.warnings, []);
+});
+
+test("project selection overrides global admission before same-name precedence is evaluated", async () => {
+  const documents = [
+    { entryPath: "/repo/.claude/skills/review/SKILL.md", basePath: "/repo/.claude/skills/review", scope: "workspace", platformSource: "claude" },
+    { entryPath: "/home/.codex/skills/review/SKILL.md", basePath: "/home/.codex/skills/review", scope: "personal", platformSource: "codex" },
+  ].map((entry) => ({ ...entry, content: "---\nname: review\n---\nBODY", supportingFiles: [] }));
+  const api = await loadAgentSkillsModule({ globSearch: async () => [], discoverPersonalAgentSkills: async () => documents });
+  const externalSkillSelections = [
+    externalSelection(documents[0].entryPath, "disabled", "/repo"),
+    externalSelection(documents[1].entryPath),
+    externalSelection(documents[1].entryPath, "manual", "/repo"),
+  ];
+  const hidden = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections });
+  assert.equal(hidden.entries.length, 1);
+  assert.equal(hidden.entries[0].source, "personal", "a disabled workspace copy cannot suppress an admitted personal copy");
+  assert.equal(api.listSkillCatalog(hidden).total, 0, "the project's manual override wins over global auto");
+  const explicit = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections, userPrompt: "Use $review" });
+  assert.equal(api.listSkillCatalog(explicit).total, 1);
+  const other = await api.loadSkillCatalog({ workspace: "/other", skills: [], externalSkillSelections });
+  assert.equal(api.listSkillCatalog(other).total, 1);
+  assert.equal(other.entries[0].source, "personal");
+});
+
+test("workspace fallback applies manual selections through its absolute entry identity", async () => {
+  const entryPath = "/repo/.claude/skills/check/SKILL.md";
+  const api = await loadAgentSkillsModule({
+    globSearch: async (pattern) => pattern === ".claude/skills/**/SKILL.md" ? [".claude/skills/check/SKILL.md"] : [],
+    readFile: async (target) => target.endsWith("SKILL.md") ? "---\nname: check\n---\nCHECK" : "",
+  });
+  const externalSkillSelections = [externalSelection(entryPath, "manual", "/repo")];
+  const hidden = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections });
+  assert.equal(hidden.entries.length, 1);
+  assert.equal(api.listSkillCatalog(hidden).total, 0);
+  const explicit = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections, userPrompt: "Use $check" });
+  assert.equal(api.listSkillCatalog(explicit).total, 1);
+  assert.deepEqual(explicit.explicitSkillIds, ["workspace:.claude/skills/check/SKILL.md"]);
+  const relative = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections: [externalSelection(".claude/skills/check/SKILL.md")], userPrompt: "Use $check" });
+  assert.equal(relative.entries.length, 0, "a relative selection cannot invent an absolute identity");
+});
+
+test("project-discovered Skills ignore global selections on native and fallback discovery paths", async () => {
+  const entryPath = "/repo/.claude/skills/check/SKILL.md";
+  const document = { entryPath, basePath: "/repo/.claude/skills/check", scope: "workspace", content: "---\nname: check\n---\nCHECK", supportingFiles: [] };
+  for (const surface of ["native", "fallback"]) {
+    const api = await loadAgentSkillsModule({
+      discoverPersonalAgentSkills: async () => surface === "native" ? [document] : [],
+      globSearch: async (pattern) => pattern === ".claude/skills/**/SKILL.md" ? [".claude/skills/check/SKILL.md"] : [],
+      readFile: async (path) => path.endsWith("SKILL.md") ? document.content : "",
+    });
+    for (const mode of ["auto", "manual"]) {
+      const hidden = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections: [externalSelection(entryPath, mode)], userPrompt: "Use $check" });
+      assert.equal(hidden.entries.length, 0, `${surface} must require exact project-scope admission`);
+    }
+    const admitted = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections: [externalSelection(entryPath, "auto", "/repo")], userPrompt: "Use $check" });
+    assert.equal(admitted.entries.length, 1);
+  }
+});
+
+test("explicit short references select one admitted manual Skill despite an ambiguous display name", async () => {
+  const api = await loadAgentSkillsModule({});
+  const skills = [
+    { id: "one", name: "duplicate", content: "FIRST", active: true, allowImplicitInvocation: false },
+    { id: "two", name: "duplicate", content: "SECOND", active: true, allowImplicitInvocation: false },
+  ];
+  const before = await api.loadSkillCatalog({ workspace: "", skills });
+  const ref = api.skillReference(before, "panel:two");
+  const selected = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: `Use $${ref} for this task.` });
+  assert.deepEqual(selected.explicitSkillIds, ["panel:two"]);
+  assert.deepEqual(api.listSkillCatalog(selected).entries.map((entry) => entry.id), ["panel:two"]);
+  assert.equal(api.loadSkillContent(selected, ref).content, "SECOND");
+  const byName = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: "Use $duplicate" });
+  assert.deepEqual(byName.explicitSkillIds, []);
+  assert.match(byName.warnings.join(" "), /ambiguous/);
+  for (const userPrompt of [`Use $${ref}:99`, `Use $${ref}tail`]) {
+    assert.deepEqual((await api.loadSkillCatalog({ workspace: "", skills, userPrompt })).explicitSkillIds, []);
+  }
+});
+
+test("an explicit external short reference cannot resurrect a missing or disabled selection", async () => {
+  const entryPath = "/home/.codex/skills/review/SKILL.md";
+  const api = await loadAgentSkillsModule({
+    discoverPersonalAgentSkills: async () => [{ entryPath, basePath: "/home/.codex/skills/review", content: "---\nname: review\n---\nBODY", supportingFiles: [] }],
+  });
+  const skills = [];
+  const admitted = await api.loadSkillCatalog({ workspace: "", skills, externalSkillSelections: [externalSelection(entryPath, "manual")] });
+  const ref = api.skillReference(admitted, admitted.entries[0].id);
+  for (const externalSkillSelections of [[], [externalSelection(entryPath, "disabled")]]) {
+    const hidden = await api.loadSkillCatalog({ workspace: "", skills, externalSkillSelections, userPrompt: `Use $${ref}` });
+    assert.equal(hidden.entries.length, 0);
+    assert.deepEqual(hidden.explicitSkillIds, []);
+  }
+  const selected = await api.loadSkillCatalog({ workspace: "", skills, externalSkillSelections: [externalSelection(entryPath, "manual")], userPrompt: `Use $${ref}` });
+  assert.deepEqual(selected.explicitSkillIds, [admitted.entries[0].id]);
+});
+
+test("collision-suffixed explicit references select the same identity after catalog reordering", async () => {
+  const api = await loadAgentSkillsModule({});
+  const skills = ["1t9y1uh", "1jton3x"].map((id) => ({ id, name: "duplicate", content: id, active: true, allowImplicitInvocation: false }));
+  const before = await api.loadSkillCatalog({ workspace: "", skills });
+  const id = before.entries[1].id;
+  const ref = api.skillReference(before, id);
+  assert.match(ref, /^s:507f6898:[12]$/);
+  for (const ordered of [skills, [...skills].reverse()]) {
+    const selected = await api.loadSkillCatalog({ workspace: "", skills: ordered, userPrompt: `Use $${ref}.` });
+    assert.deepEqual(selected.explicitSkillIds, [id]);
+    assert.equal(api.listSkillCatalog(selected).entries.length, 1);
+  }
+  for (const token of ["s:507f6898", "s:507f6898:3", `${ref}:2`, `${ref}extra`]) {
+    const invalid = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: `Use $${token}` });
+    assert.deepEqual(invalid.explicitSkillIds, []);
+  }
+});
+
+test("the short-reference namespace cannot also activate a different Skill's display name", async () => {
+  const api = await loadAgentSkillsModule({});
+  const first = { id: "first", name: "original", content: "FIRST", active: true, allowImplicitInvocation: false };
+  const before = await api.loadSkillCatalog({ workspace: "", skills: [first] });
+  const ref = api.skillReference(before, "panel:first");
+  const other = { id: "other", name: ref, content: "OTHER", active: true, allowImplicitInvocation: false };
+  const selected = await api.loadSkillCatalog({ workspace: "", skills: [first, other], userPrompt: `Use $${ref}` });
+  assert.deepEqual(selected.explicitSkillIds, ["panel:first"]);
+  const otherRef = api.skillReference(selected, "panel:other");
+  const selectedOther = await api.loadSkillCatalog({ workspace: "", skills: [first, other], userPrompt: `Use $${otherRef}` });
+  assert.deepEqual(selectedOther.explicitSkillIds, ["panel:other"]);
+});
+
+test("short-reference tokens cannot also activate a Skill named s through its colon boundary", async () => {
+  const api = await loadAgentSkillsModule({});
+  const skills = [
+    { id: "plain-s", name: "s", content: "PLAIN", active: true, allowImplicitInvocation: false },
+    { id: "chosen", name: "chosen", content: "CHOSEN", active: true, allowImplicitInvocation: false },
+  ];
+  const before = await api.loadSkillCatalog({ workspace: "", skills });
+  const ref = api.skillReference(before, "panel:chosen");
+  const selected = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: `Use $${ref}` });
+  assert.deepEqual(selected.explicitSkillIds, ["panel:chosen"]);
+  const invalid = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: "Use $s:00000000:99" });
+  assert.deepEqual(invalid.explicitSkillIds, [], "an unknown ref is not an invocation of the name s");
+  const plain = await api.loadSkillCatalog({ workspace: "", skills, userPrompt: "Use $s" });
+  assert.deepEqual(plain.explicitSkillIds, ["panel:plain-s"]);
+});
+
+test("source switches gate discovery before per-Skill selection and retain selections for re-enabling", async () => {
+  const sources = ["codex", "claude", "gemini", "custom"];
+  const documents = sources.map((platformSource) => ({ platformSource, entryPath: `/home/${platformSource}/review/SKILL.md`, basePath: `/home/${platformSource}/review`, content: `---\nname: ${platformSource}-review\n---\nBODY`, supportingFiles: [] }));
+  const requests = [];
+  const api = await loadAgentSkillsModule({
+    globSearch: async () => [],
+    discoverPersonalAgentSkills: async (_workspace, enabledSources) => { requests.push(enabledSources); return documents; },
+  });
+  const externalSkillSelections = documents.map((document) => externalSelection(document.entryPath));
+  const savedSelections = JSON.stringify(externalSkillSelections);
+  const onlyCodex = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections, externalSkillSources: { codex: true, claude: false, gemini: false, custom: false } });
+  assert.deepEqual(onlyCodex.entries.map((entry) => entry.platformSource), ["codex"]);
+  assert.deepEqual(requests[0], ["codex"], "disabled roots must be excluded before native discovery");
+  assert.equal(JSON.stringify(externalSkillSelections), savedSelections);
+  const restored = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections });
+  assert.equal(restored.entries.length, 4, "re-enabling a source reuses the preserved per-Skill selections");
+});
+
+test("disabled source cannot be reactivated by an explicit name or short reference", async () => {
+  const document = { platformSource: "claude", entryPath: "/home/.claude/skills/review/SKILL.md", basePath: "/home/.claude/skills/review", content: "---\nname: review\n---\nBODY", supportingFiles: [] };
+  const api = await loadAgentSkillsModule({ discoverPersonalAgentSkills: async () => [document] });
+  const externalSkillSelections = [externalSelection(document.entryPath, "manual")];
+  const before = await api.loadSkillCatalog({ workspace: "", skills: [], externalSkillSelections });
+  const ref = api.skillReference(before, before.entries[0].id);
+  const disabled = await api.loadSkillCatalog({ workspace: "", skills: [], externalSkillSelections, externalSkillSources: { claude: false }, userPrompt: `Use $review and $${ref}` });
+  assert.deepEqual(disabled.entries, []);
+  assert.deepEqual(disabled.explicitSkillIds, []);
+});
+
+test("workspace fallback respects source switches before glob and file reads", async () => {
+  const searches = [];
+  const api = await loadAgentSkillsModule({
+    globSearch: async (pattern) => { searches.push(pattern); return [pattern.replace("**/SKILL.md", "review/SKILL.md")]; },
+    readFile: async (target) => target.endsWith("SKILL.md") ? "---\nname: review\n---\nBODY" : "",
+  });
+  const externalSkillSelections = [
+    externalSelection("/repo/.agents/skills/review/SKILL.md", "auto", "/repo"),
+    externalSelection("/repo/.claude/skills/review/SKILL.md", "auto", "/repo"),
+  ];
+  const catalog = await api.loadSkillCatalog({ workspace: "/repo", skills: [], externalSkillSelections, externalSkillSources: { claude: false, gemini: false } });
+  assert.equal(catalog.entries.length, 1);
+  assert.equal(catalog.entries[0].entryPath, ".agents/skills/review/SKILL.md");
+  assert.equal(catalog.entries[0].platformSource, "codex");
+  assert.ok(!searches.some((pattern) => pattern.startsWith(".claude/")));
+});
+
+test("local source switches leave registered global packages and panel rules active", async () => {
+  const requests = [];
+  const api = await loadAgentSkillsModule(globalPackageIpc({ discoverPersonalAgentSkills: async (_workspace, enabled) => { requests.push(enabled); return []; } }));
+  const catalog = await api.loadSkillCatalog({ workspace: "", skills: [globalPackageRecord(), { id: "panel", name: "panel", content: "PANEL", active: true }], externalSkillSources: { codex: false, claude: false, gemini: false, custom: false } });
+  assert.deepEqual(catalog.entries.map((entry) => entry.source), ["package", "panel"]);
+  assert.deepEqual(requests, [[]]);
+});
+
+test("a disabled higher-priority source cannot hide an admitted same-name enabled source", async () => {
+  const documents = ["codex", "claude"].map((platformSource) => ({ platformSource, entryPath: `/home/${platformSource}/review/SKILL.md`, basePath: `/home/${platformSource}/review`, content: "---\nname: review\n---\nBODY", supportingFiles: [] }));
+  const api = await loadAgentSkillsModule({ discoverPersonalAgentSkills: async () => documents });
+  const catalog = await api.loadSkillCatalog({ workspace: "", skills: [], externalSkillSelections: documents.map((document) => externalSelection(document.entryPath)), externalSkillSources: { codex: false }, userPrompt: "Use $review" });
+  assert.equal(catalog.entries.length, 1);
+  assert.equal(catalog.entries[0].platformSource, "claude");
+  assert.deepEqual(catalog.explicitSkillIds, [catalog.entries[0].id]);
 });

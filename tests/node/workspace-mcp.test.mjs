@@ -29,109 +29,80 @@ function loadTs(file) {
 }
 
 const mcp = loadTs("src/lib/workspaceMcp.ts");
-const install = (overrides = {}) => ({
-  id: "one", name: "Fixture", version: "1", description: "", workspaceScope: "/a",
-  packagePath: ".protocols/fixture", packageHash: "hash-one", manifestPath: "gemini-extension.json",
-  sourcePath: "/fixture.zip", installedAt: 1, enabled: true, skillEntryPoints: [], unsupportedFeatures: [],
-  mcpServers: [{ key: "tools", url: "http://127.0.0.1:54321/mcp", supported: true, status: "supported", enabled: true, reasons: [] }],
-  ...overrides,
+const server = (name, enabled = true) => ({ name, type: "http", url: `http://localhost/${name}/mcp`, enabled });
+const tool = (name, source) => ({
+  name, description: name, inputSchema: { type: "object", properties: { target: { type: "string" } } },
+  _mainMcpOrigin: { serverName: source.name, serverUrl: source.url, remoteName: name },
+});
+const snapshot = (overrides = {}) => mcp.resolveWorkspaceMcpView({
+  workspace: "/a", manualServers: [], manualTools: [], manualToolServerMap: {}, ...overrides,
 });
 
 test("workspace normalization preserves filesystem roots", () => {
-  assert.equal(mcp.normalizeExtensionWorkspace("/"), "/");
-  assert.equal(mcp.normalizeExtensionWorkspace("C:\\"), "C:/");
-  assert.equal(mcp.normalizeExtensionWorkspace("/repo/"), "/repo");
+  assert.equal(mcp.normalizeMcpWorkspace("/"), "/");
+  assert.equal(mcp.normalizeMcpWorkspace("C:\\"), "C:/");
+  assert.equal(mcp.normalizeMcpWorkspace("/repo/"), "/repo");
 });
 
-test("extension MCP view is workspace-scoped and preserves manual configuration", () => {
-  const extension = install();
-  const servers = mcp.extensionMcpServers(extension);
-  const tool = { name: "ping", description: "Ping", inputSchema: { type: "object" }, _mainMcpOrigin: { serverName: servers[0].name, serverUrl: servers[0].url, remoteName: "ping" } };
-  const discovery = { [mcp.extensionMcpDiscoveryKey(extension)]: { tools: [tool], toolServerMap: { ping: servers[0].url }, serverStatuses: [] } };
-  const input = { workspace: "/a", manualServers: [{ name: "manual", type: "http", url: "http://localhost:8080/mcp" }], manualTools: [], manualToolServerMap: {}, installations: [extension], discoveries: discovery };
-  const view = mcp.resolveWorkspaceMcpView(input);
-  assert.equal(view.mcpServers.length, 2);
-  assert.equal(view.mcpDiscoveredTools.length, 1);
-  assert.equal(mcp.resolveWorkspaceMcpView({ ...input, workspace: "/b" }).mcpDiscoveredTools.length, 0);
-  assert.equal(mcp.resolveWorkspaceMcpView({ ...input, workspace: "/b" }).mcpServers.length, 1);
-  tool.inputSchema.type = "string";
-  assert.equal(view.mcpDiscoveredTools[0].inputSchema.type, "object");
+test("manual MCP snapshots exclude disabled and unregistered discovery results", () => {
+  const enabled = server("enabled");
+  delete enabled.enabled; // Existing manual configurations default to enabled.
+  const disabled = server("disabled", false);
+  const foreign = server("foreign");
+  const view = snapshot({
+    manualServers: [enabled, disabled],
+    manualTools: [tool("ping", enabled), tool("disabled", disabled), tool("foreign", foreign), { name: "unknown" }],
+  });
+  assert.deepEqual(view.mcpServers, [enabled, disabled], "configured server state remains available to the existing permission owner");
+  assert.deepEqual(view.mcpDiscoveredTools.map((entry) => entry.name), ["ping"]);
+  assert.deepEqual(view.mcpToolServerMap, { ping: enabled.url });
 });
 
-test("blocked, disabled and stale extension discoveries are never admitted", () => {
-  assert.deepEqual(mcp.extensionMcpServers(install({ enabled: false })), []);
-  assert.deepEqual(mcp.extensionMcpServers(install({ mcpServers: [{ key: "bad", url: "http://localhost/mcp", supported: false, status: "blocked", enabled: true }] })), []);
-  const first = install();
-  const next = install({ packageHash: "hash-two" });
-  assert.notEqual(mcp.extensionMcpDiscoveryKey(first), mcp.extensionMcpDiscoveryKey(next));
-  const view = mcp.resolveWorkspaceMcpView({ workspace: "/a", manualServers: [], manualTools: [], manualToolServerMap: {}, installations: [next], discoveries: { [mcp.extensionMcpDiscoveryKey(first)]: { tools: [{ name: "old" }], toolServerMap: {}, serverStatuses: [] } } });
-  assert.deepEqual(view.mcpDiscoveredTools, []);
+test("attached MCP provenance takes precedence over a legacy server map", () => {
+  const enabled = server("enabled");
+  const disabled = server("disabled", false);
+  const ping = tool("ping", enabled);
+  const legacy = { name: "legacy", description: "Legacy", inputSchema: { type: "object" } };
+  const view = snapshot({
+    manualServers: [enabled, disabled], manualTools: [ping, legacy, tool("blocked", disabled)],
+    manualToolServerMap: { ping: disabled.url, legacy: enabled.url, blocked: enabled.url, missing: enabled.url },
+  });
+  assert.deepEqual(view.mcpDiscoveredTools, [ping, legacy]);
+  assert.deepEqual(view.mcpDiscoveredTools[0]._mainMcpOrigin, ping._mainMcpOrigin);
+  assert.deepEqual(view.mcpToolServerMap, { ping: enabled.url, legacy: enabled.url },
+    "a fallback map cannot revive disabled attached provenance or add an undiscovered tool");
 });
 
-test("an extension at the same endpoint cannot revive disabled manual tools", () => {
-  const extension = install();
-  const view = mcp.resolveWorkspaceMcpView({ workspace: "/a", manualServers: [{ name: "manual", type: "http", url: extension.mcpServers[0].url, enabled: false }], manualTools: [{ name: "disabled_manual" }], manualToolServerMap: { disabled_manual: extension.mcpServers[0].url }, installations: [extension], discoveries: {} });
-  assert.deepEqual(view.mcpDiscoveredTools, []);
+test("duplicate remote tool names retain each configured server's exact provenance", () => {
+  const first = server("first");
+  const second = server("second");
+  const tools = [tool("ping", first), tool("ping", second)];
+  const view = snapshot({ manualServers: [first, second], manualTools: tools });
+  assert.deepEqual(view.mcpDiscoveredTools, tools);
+  assert.notEqual(view.mcpDiscoveredTools[0]._mainMcpOrigin.serverUrl, view.mcpDiscoveredTools[1]._mainMcpOrigin.serverUrl);
 });
 
-test("extension management detects unfinished turns in foreground, background and persisted sessions", () => {
-  const base = { currentWorkspace: "/b", conversationTurns: [], runtimeBySessionKey: {}, sessionsByWorkspace: {} };
-  assert.equal(mcp.workspaceHasUnfinishedTurns(base, "/a"), false);
-  assert.equal(mcp.workspaceHasUnfinishedTurns({ ...base, sessionsByWorkspace: { "/a": [{ runtimeSnapshot: { conversationTurns: [{ status: "paused", runtimeOutcome: { status: "paused" } }] } }] } }, "/a"), true);
-  assert.equal(mcp.workspaceHasUnfinishedTurns({ ...base, runtimeBySessionKey: { "/a:123": { conversationTurns: [{ status: "running" }] } } }, "/a"), true);
-  assert.equal(mcp.workspaceHasUnfinishedTurns({ ...base, currentWorkspace: "/a", conversationTurns: [{ status: "completed", runtimeOutcome: { status: "completed" } }] }, "/a"), false);
+test("new Run MCP snapshots cannot mutate or acquire capabilities from another Run's inputs", () => {
+  const configured = server("manual");
+  const ping = tool("ping", configured);
+  const input = { manualServers: [configured], manualTools: [ping], manualToolServerMap: { ping: configured.url } };
+  const first = snapshot({ ...input, workspace: "/a/" });
+  assert.equal(first.workspace, "/a");
+  for (const value of [first, first.mcpServers, first.mcpDiscoveredTools, first.mcpToolServerMap]) assert.ok(Object.isFrozen(value));
+  configured.enabled = false;
+  ping.inputSchema.properties.target.type = "number";
+  ping._mainMcpOrigin.remoteName = "changed";
+  input.manualToolServerMap.ping = "http://unrelated/mcp";
+  const second = snapshot({ ...input, workspace: "/b" });
+  assert.equal(second.workspace, "/b");
+  assert.deepEqual(second.mcpDiscoveredTools, []);
+  assert.equal(first.mcpServers[0].enabled, true);
+  assert.equal(first.mcpDiscoveredTools[0].inputSchema.properties.target.type, "string");
+  assert.equal(first.mcpDiscoveredTools[0]._mainMcpOrigin.remoteName, "ping");
+  assert.deepEqual(first.mcpToolServerMap, { ping: configured.url });
 });
 
-function serializedReviewCheckpoint(strategy, terminal = false) {
-  const runtime = loadTs("src/lib/runtime-v2/index.ts");
-  const turn = { workspaceKey: "/a", sessionKey: "/a:123", sessionEpoch: "epoch-fixture", clientSubmissionId: `submission-${strategy}`, turnId: `turn-${strategy}` };
-  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId, runId: `run-${strategy}`, parentRunId: null, attemptId: "attempt-one" };
-  let aggregate = null;
-  const append = (type, fields) => {
-    aggregate = runtime.transition(aggregate, {
-      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
-      sequence: aggregate?.nextSequence || 0,
-      eventId: `event-${strategy}-${aggregate?.nextSequence || 0}`,
-      at: (aggregate?.updatedAt || 0) + 1,
-      type,
-      ...fields,
-    });
-  };
-  append("turn.admitted", { turn, strategy, objective: "Fixture review", constraints: [], acceptanceCriteria: [] });
-  append("run.started", { run, phase: "planning" });
-  append("phase.changed", { run, phase: "reviewing", reason: "fixture_review_wait" });
-  if (terminal) {
-    append("phase.changed", { run, phase: "finalizing", reason: "fixture_complete" });
-    const projection = runtime.buildRuntimeV2FinalProjection(aggregate, "fixture-final", "error", "fixture_closed", "Fixture closed.");
-    const outcome = { resultKind: "error", reason: "fixture_closed", completedAt: aggregate.updatedAt + 1, finalProjectionId: projection.id };
-    append("run.completed", { run, outcome, finalProjection: projection });
-    append("projection.published", { run, audience: "final", projectionId: projection.id, projection });
-    append("turn.completed", { turn, runId: run.runId, outcome });
-  }
-  const checkpoint = runtime.createRuntimeV2Checkpoint({ revision: aggregate.events.length, aggregate, updatedAt: aggregate.updatedAt });
-  const serialized = JSON.parse(JSON.stringify(runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: checkpoint })));
-  assert.equal(serialized[turn.turnId].schemaVersion, "turn-runtime-checkpoint.v5");
-  assert.equal(Object.hasOwn(serialized[turn.turnId], "aggregate"), false);
-  return { turn, serialized };
-}
-
-test("extension management replays serialized v5 Plan and Goal ledgers even when transcript pages are absent", () => {
-  for (const strategy of ["plan", "goal"]) {
-    const { serialized } = serializedReviewCheckpoint(strategy);
-    const snapshot = { runtimeV2Checkpoints: serialized, conversationTurns: [] };
-    const base = { currentWorkspace: "/b", sessionsByWorkspace: { "/a": [{ runtimeSnapshot: snapshot }] } };
-    assert.equal(mcp.workspaceHasUnfinishedTurns(base, "/a"), true, strategy);
-    assert.equal(mcp.workspaceHasUnfinishedTurns({ currentWorkspace: "/a", ...snapshot }, "/a"), true, strategy);
-    assert.equal(mcp.workspaceHasUnfinishedTurns({ currentWorkspace: "/b", ...snapshot }, "/b"), false, "foreign workspace checkpoint is not an owner");
-  }
-});
-
-test("a replay-closed v5 ledger outranks stale paused conversation projection", () => {
-  const { serialized, turn } = serializedReviewCheckpoint("plan", true);
-  assert.equal(mcp.workspaceHasUnfinishedTurns({ currentWorkspace: "/a", runtimeV2Checkpoints: serialized, conversationTurns: [{ id: turn.turnId, status: "paused", runtimeOutcome: { status: "paused" } }] }, "/a"), false);
-});
-
-test("an imported anonymous HTTP binding discovers and calls tools over a real HTTP connection", async () => {
+test("a manually configured HTTP server discovers and calls tools over a real HTTP connection", async () => {
   const client = loadTs("src/lib/mcpClient.ts");
   const methods = [];
   const server = createServer(async (request, response) => {
@@ -147,10 +118,10 @@ test("an imported anonymous HTTP binding discovers and calls tools over a real H
       return;
     }
     const result = rpc.method === "initialize"
-      ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "extension-fixture", version: "1" } }
+      ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "manual-fixture", version: "1" } }
       : rpc.method === "tools/list"
-        ? { tools: [{ name: "extension_ping", description: "Read a fixture value", inputSchema: { type: "object", properties: {} } }] }
-        : { content: [{ type: "text", text: "extension-http-ok" }] };
+        ? { tools: [{ name: "manual_ping", description: "Read a fixture value", inputSchema: { type: "object", properties: {} } }] }
+        : { content: [{ type: "text", text: "manual-http-ok" }] };
     if (rpc.method !== "initialize") assert.equal(request.headers["mcp-session-id"], "fixture-session");
     response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }));
   });
@@ -162,12 +133,13 @@ test("an imported anonymous HTTP binding discovers and calls tools over a real H
   });
   try {
     const url = `http://127.0.0.1:${server.address().port}/mcp`;
-    const installation = install({ mcpServers: [{ key: "fixture", url, supported: true, status: "supported", enabled: true, reasons: [] }] });
-    const discovery = await client.discoverAllMcpTools(mcp.extensionMcpServers(installation));
+    const configured = { name: "manual-fixture", type: "http", url, enabled: true };
+    const discovery = await client.discoverAllMcpTools([configured]);
     assert.equal(discovery.serverStatuses[0].status, "connected");
-    const view = mcp.resolveWorkspaceMcpView({ workspace: "/a", manualServers: [], manualTools: [], manualToolServerMap: {}, installations: [installation], discoveries: { [mcp.extensionMcpDiscoveryKey(installation)]: discovery } });
-    assert.equal(view.mcpDiscoveredTools[0].name, "extension_ping");
-    assert.match(await client.executeMcpTool(url, "extension_ping", {}), /extension-http-ok/);
+    const view = snapshot({ manualServers: [configured], manualTools: discovery.tools, manualToolServerMap: discovery.toolServerMap });
+    assert.equal(view.mcpDiscoveredTools[0].name, "manual_ping");
+    assert.equal(view.mcpDiscoveredTools[0]._mainMcpOrigin.serverName, configured.name);
+    assert.match(await client.executeMcpTool(url, "manual_ping", {}), /manual-http-ok/);
     assert.deepEqual(methods, ["initialize", "notifications/initialized", "tools/list", "tools/call"]);
   } finally {
     client.__setMcpInvokeForTests(null);

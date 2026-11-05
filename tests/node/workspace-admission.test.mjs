@@ -314,6 +314,32 @@ test("instruction and baseline failures are isolated instead of erasing the succ
   ]);
 });
 
+test("workspace admission captures external Skill selections before async work and forwards them to instructions", async () => {
+  const { snapshot: fixture } = await buildFixtureSnapshot();
+  const selections = [{ entryPath: "/home/user/.agents/skills/review/SKILL.md", workspaceScope: "/fixture/repo", mode: "manual" }];
+  const sources = { codex: true, claude: false, gemini: false, custom: true };
+  const io = createMemoryIo({});
+  io.canonicalizeWorkspace = async () => {
+    selections[0].mode = "disabled";
+    sources.claude = true;
+    return "/fixture/repo";
+  };
+  let captured;
+  let capturedSources;
+  await admission.resolveWorkspaceAdmissionSnapshot({
+    workspace: "/fixture/repo", skills: [], externalSkillSelections: selections, externalSkillSources: sources, io,
+    loaders: {
+      loadResolvedInstructions: async (...args) => { captured = args[5]; capturedSources = args[6]; return fixture.instructions; },
+      buildProjectBaselineContext: async () => fixture.baseline,
+    },
+  });
+  assert.deepEqual(captured, [{ ...selections[0], mode: "manual" }]);
+  assert.notEqual(captured, selections);
+  assert.notEqual(captured[0], selections[0]);
+  assert.deepEqual(capturedSources, { ...sources, claude: false });
+  assert.notEqual(capturedSources, sources);
+});
+
 test("a defensive rule-anchor mismatch retains instructions and discards only baseline", async () => {
   const { snapshot: fixture } = await buildFixtureSnapshot();
   const originalSource = fixture.instructions.sources.find(

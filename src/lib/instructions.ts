@@ -4,6 +4,8 @@ import {
   type SkillCatalogSnapshot,
 } from "./agentSkills";
 import { sha256Hex } from "./sha256";
+import type { ExternalSkillSelection } from "./externalSkillSelections";
+import type { ExternalSkillSources } from "./externalSkillSources";
 
 export type InstructionSourceKind =
   | "legacy"
@@ -282,6 +284,8 @@ export async function loadResolvedInstructions(
   associatedPaths: string[] = [],
   userPrompt = "",
   io: ResolvedInstructionIo = { readFile, globSearch },
+  externalSkillSelections: readonly ExternalSkillSelection[] = [],
+  externalSkillSources?: ExternalSkillSources,
 ): Promise<ResolvedInstructionSet> {
   const immutableWorkspace = workspace.trim();
   const normalizedAssociated = associatedPaths.map(normalizePath).filter(Boolean);
@@ -465,6 +469,8 @@ export async function loadResolvedInstructions(
     workspace: immutableWorkspace,
     skills,
     userPrompt,
+    externalSkillSelections,
+    externalSkillSources,
   });
 
   const loadedAt = Date.now();

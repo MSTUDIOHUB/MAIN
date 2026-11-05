@@ -84,9 +84,14 @@ export function runtimeV2ContextBoundToolArguments(
   if (toolName === "load_skill" && args.operation !== "list") {
     const parallelReadCount = Math.max(1, Math.floor(Number(options.parallelReadCount) || 1));
     const defaultWindow = Math.max(32_000, skillCatalogContextCharBudget(budget?.contextLimit));
-    const sharedWindow = budget
-      ? Math.max(32_000, Math.floor((Number(budget.readWindowChars) || 32_000) / parallelReadCount))
-      : defaultWindow;
+    const admittedWindow = Number(budget?.readWindowChars);
+    // The catalog's preferred default cannot raise a Run's read allowance.
+    // Execute, Plan and children share this allocation, including small models
+    // and batches mixing source, command output and Skill references.
+    const sharedWindow = Math.max(1, Math.floor(
+      (Number.isFinite(admittedWindow) && admittedWindow > 0 ? admittedWindow : defaultWindow)
+        / parallelReadCount,
+    ));
     const requested = Number(args.max_chars);
     return {
       ...args,

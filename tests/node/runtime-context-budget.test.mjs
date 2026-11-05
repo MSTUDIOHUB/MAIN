@@ -528,6 +528,24 @@ test("Skill reference windows share the Run read budget and support explicit con
   assert.ok(providerManaged.max_chars > 0);
 });
 
+test("small and parallel Skill reads cannot exceed the admitted Run window", () => {
+  const resolved = budget.computeRuntimeContextBudget({ configuredContextLimit: 4_096 });
+  for (const count of [1, 2, 4]) {
+    const max = Math.floor(resolved.readWindowChars / count);
+    for (const args of [{ skill_id: "workflow" }, { skill_id: "workflow", max_chars: 100_000 },
+      { skill_id: "workflow", resource: "references/check.md", max_chars: 100_000, expected_version: "resource-v1", start_line: 2 }]) {
+      const actual = executionText.runtimeV2ContextBoundToolArguments("load_skill", args, resolved, { parallelReadCount: count });
+      assert.ok(actual.max_chars <= max, `${count} reads: ${actual.max_chars} exceeds ${max}`);
+      assert.ok(actual.max_chars > 0);
+      for (const key of ["resource", "expected_version", "start_line"]) assert.equal(actual[key], args[key]);
+    }
+  }
+  const requested = executionText.runtimeV2ContextBoundToolArguments("load_skill", { max_chars: 17 }, resolved);
+  assert.equal(requested.max_chars, 17);
+  const listing = { operation: "list", limit: 2 };
+  assert.deepEqual(executionText.runtimeV2ContextBoundToolArguments("load_skill", listing, resolved), listing);
+});
+
 test("Runtime v2 preserves a complete admitted read window instead of truncating it again", () => {
   const resolved = budget.computeRuntimeContextBudget({
     configuredContextLimit: 32_768,

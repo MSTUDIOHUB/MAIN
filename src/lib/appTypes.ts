@@ -9,6 +9,7 @@ import type {
 } from "./toolCapabilities";
 import type { EventStreamMode, ToolFeedbackFormat } from "./turnEvents";
 import type { ResponseLanguagePolicy } from "./workflowModels";
+import type { GithubSkillSource } from "./githubSkillSource";
 
 export type Lang = "en" | "zh";
 
@@ -35,6 +36,8 @@ export interface Skill {
   packagePath?: string;
   /** Immutable app-managed payload; never an arbitrary file-system root. */
   packageStorage?: { kind: "global"; packageId: string };
+  /** Verified public repository/ref used for explicit manual update checks. */
+  githubSource?: GithubSkillSource;
   entryPoint?: string;
   /** All Skill entries owned by one imported archive. */
   entryPoints?: string[];

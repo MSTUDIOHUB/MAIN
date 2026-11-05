@@ -318,7 +318,9 @@ test("production load_skill returns bounded, versioned disclosure and loads an e
   assert.equal(overview.complete, false);
   assert.equal(overview.version, "cafe1234");
   assert.ok(overview.sections.some((section) => section.title === "Inspect"));
-  assert.doesNotMatch(overview.content, /UNRELATED_REFERENCE_BODY/);
+  assert.equal(overview.content, catalog.entries[0].content.slice(0, overview.returnedRange.endChar));
+  assert.ok(overview.content.length + JSON.stringify(overview.sections).length <= 2_000);
+  assert.match(overview.content, /Inspect the actual result before claiming completion/);
   const section = overview.sections.find((entry) => entry.title === "Inspect");
   const loaded = JSON.parse(await skillExecutor.executeTool("load_skill", {
     skill_id: catalog.entries[0].id, section: section.id,

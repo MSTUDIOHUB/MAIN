@@ -1,0 +1,80 @@
+.main-toggle-switch {
+  --switch-thumb: #fff;
+  box-sizing: border-box;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  appearance: none;
+  flex-shrink: 0;
+  width: 44px;
+  height: 24px;
+  padding: 2px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  box-shadow: none;
+  cursor: pointer;
+  vertical-align: middle;
+  transition: background-color 200ms, border-color 200ms, box-shadow 200ms;
+}
+
+.main-toggle-switch[aria-checked="true"] {
+  border-color: transparent;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent-subtle);
+}
+
+.main-toggle-switch:hover:not(:disabled) {
+  border-color: var(--surface-text-subtle);
+}
+
+.main-toggle-switch[aria-checked="true"]:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+}
+
+.main-toggle-switch:active {
+  background: var(--surface-2);
+}
+
+.main-toggle-switch[aria-checked="true"]:active {
+  background: var(--accent);
+}
+
+.main-toggle-switch__thumb {
+  display: block;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--switch-thumb);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 20%);
+  transform: translateX(0);
+  transition: transform 200ms;
+}
+
+.main-toggle-switch[aria-checked="true"] .main-toggle-switch__thumb {
+  transform: translateX(20px);
+}
+
+.main-toggle-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.main-toggle-switch:disabled {
+  border-color: var(--surface-border);
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.main-toggle-switch[aria-checked="true"]:disabled {
+  border-color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .main-toggle-switch,
+  .main-toggle-switch__thumb {
+    transition: none;
+  }
+}

@@ -2,6 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { GithubSkillSource } from "./githubSkillSource";
 import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
 import {
   createProjectSessionMutationCoordinator,
@@ -1017,6 +1018,8 @@ export function readFile(path: string, workspace?: string): Promise<string> {
   return invoke<string>("read_file", { path, workspace });
 }
 
+export type { GithubSkillSource } from "./githubSkillSource";
+
 export interface GlobalSkillPackageMeta {
   packageId: string;
   name: string;
@@ -1025,10 +1028,16 @@ export interface GlobalSkillPackageMeta {
   files: string[];
   reused: boolean;
   payloadDir?: string;
+  /** Fetch-result provenance; stored with a registration, never a shared blob. */
+  githubSource?: GithubSkillSource;
 }
 
 export function extractGlobalSkillPackage(zipPath: string): Promise<GlobalSkillPackageMeta> {
   return invoke<GlobalSkillPackageMeta>("extract_global_skill_package", { zipPath });
+}
+
+export function fetchAndInstallGithubSkillPackage(repoOrUrl: string, branch?: string): Promise<GlobalSkillPackageMeta> {
+  return invoke<GlobalSkillPackageMeta>("fetch_and_install_github_skill_package", { repoOrUrl, branch });
 }
 
 export function promoteLegacySkillPackage(workspace: string, localPath: string): Promise<GlobalSkillPackageMeta> {
@@ -1037,6 +1046,14 @@ export function promoteLegacySkillPackage(workspace: string, localPath: string):
 
 export function inspectGlobalSkillPackage(packageId: string): Promise<GlobalSkillPackageMeta> {
   return invoke<GlobalSkillPackageMeta>("inspect_global_skill_package", { packageId });
+}
+
+/** One native request verifies the immutable package once and reads its catalog. */
+export function loadGlobalSkillPackageCatalog(packageId: string): Promise<{
+  meta: GlobalSkillPackageMeta;
+  documents: { relativePath: string; content: string }[];
+}> {
+  return invoke("load_global_skill_package_catalog", { packageId });
 }
 
 /** Read verified UTF-8 guidance from an immutable package, never a workspace. */
@@ -1050,12 +1067,14 @@ export interface DiscoveredPersonalAgentSkill {
   content: string;
   openaiYaml: string | null;
   supportingFiles: string[];
+  platformSource?: "codex" | "claude" | "gemini" | "custom";
+  scope?: "personal" | "workspace";
 }
 
-/** Read only the standard $HOME/.agents/skills root. The Rust side resolves
- * symlinks and containment before returning any content. */
-export async function discoverPersonalAgentSkills(): Promise<DiscoveredPersonalAgentSkill[]> {
-  const result = await invoke<unknown>("discover_personal_agent_skills");
+/** Discover standard Codex, Claude and Gemini roots. Native discovery captures
+ * the canonical entry identity used by subsequent read-only resource calls. */
+export async function discoverPersonalAgentSkills(workspace?: string, enabledSources?: readonly string[]): Promise<DiscoveredPersonalAgentSkill[]> {
+  const result = await invoke<unknown>("discover_personal_agent_skills", { workspace, enabledSources });
   return Array.isArray(result)
     ? result.filter((entry): entry is DiscoveredPersonalAgentSkill =>
         !!entry && typeof entry === "object" &&
@@ -1063,6 +1082,12 @@ export async function discoverPersonalAgentSkills(): Promise<DiscoveredPersonalA
         typeof (entry as DiscoveredPersonalAgentSkill).content === "string"
       )
     : [];
+}
+
+/** Native discovery must already have admitted this entry; arbitrary bases
+ * cannot authorize a filesystem read. */
+export function readAgentSkillResource(entryPath: string, relativePath: string): Promise<string> {
+  return invoke<string>("read_agent_skill_resource", { entryPath, relativePath });
 }
 
 export function readFileWindow(

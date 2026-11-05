@@ -73,6 +73,41 @@ function fixture() {
   return { state, input, live, catalog, content, wires, logs, request, execute, pressure, setArgs: args => { nextArgs = args; }, args: () => structuredClone(nextArgs), restore: () => { streaming.streamChatCompletion = originalStream; } };
 }
 
+test('Unity incident shape: explicit loading advances beyond the 14-line preface within the Run budget', async () => {
+  // The incident receipt contained 662 characters/14 lines from a 50,520
+  // character/632-line document. Reproduce the shape with synthetic guidance.
+  const lines = ['# Workflow', ...Array(12).fill('Preface instruction.')];
+  const firstThirteen = lines.join('\n') + '\n';
+  lines.push('p'.repeat(662 - firstThirteen.length - 1), '## Drive the editor', ...Array(617).fill('Use exact instructions.'));
+  let body = lines.join('\n') + '\n';
+  lines[lines.length - 1] += 'x'.repeat(50_520 - body.length);
+  body = lines.join('\n') + '\n';
+  assert.equal(body.length, 50_520);
+  assert.equal(lines.length, 632);
+  const f = fixture();
+  f.catalog.entries[0].content = body;
+  f.setArgs({ skill_id: f.catalog.entries[0].id });
+  try {
+    const first = await f.request();
+    const receipt = await f.execute(first.toolCalls[0]);
+    assert.equal(receipt.status, 'succeeded');
+    const loaded = JSON.parse(receipt.modelContent);
+    assert.match(loaded.content, /## Drive the editor/);
+    assert.ok(loaded.content.length > 662);
+    assert.ok(loaded.content.length + JSON.stringify(loaded.sections).length <= 24_000);
+    assert.equal(loaded.content, body.slice(0, loaded.returnedRange.endChar));
+    assert.equal(loaded.complete, false, 'the larger document still requires truthful continuation');
+    f.setArgs(loaded.nextRead.arguments);
+    const next = await f.request();
+    const continuation = JSON.parse((await f.execute(next.toolCalls[0])).modelContent);
+    assert.equal(continuation.returnedRange.startChar, loaded.returnedRange.endChar);
+    assert.equal(loaded.content + continuation.content, body.slice(0, continuation.returnedRange.endChar));
+    assert.deepEqual(f.live.latestProviderRequestSourceCoverage, []);
+    assert.equal(f.live.hasExecutedMutationEffect, false);
+    assert.deepEqual(f.state.approvedShellPermissionRules, []);
+  } finally { f.restore(); }
+});
+
 test('real ProviderPort and ToolPort allow the same exact Skill read after its body is evicted, but close a currently visible duplicate', async () => {
   const f = fixture();
   try {

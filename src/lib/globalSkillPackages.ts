@@ -1,5 +1,6 @@
 import type { Skill } from "./appTypes";
 import type { GlobalSkillPackageMeta } from "./ipc";
+import { normalizeGithubSkillSource } from "./githubSkillSource";
 
 export const SKILL_PACKAGE_BACKUP_KEY = "main-skill-package-migration-backup-v1";
 
@@ -33,7 +34,17 @@ export function globalSkillRegistration(skill: Skill, rawMeta: GlobalSkillPackag
 /** Importing cached bytes is not a request to reset the existing user's policy. */
 export function upsertGlobalSkillRegistration(skills: Skill[], incoming: Skill): Skill[] {
   const packageId = globalSkillPackageId(incoming);
-  if (packageId && skills.some((skill) => globalSkillPackageId(skill) === packageId)) return skills;
+  const existing = packageId ? skills.find((skill) => globalSkillPackageId(skill) === packageId) : undefined;
+  if (existing) {
+    // An explicit GitHub reimport can attach provenance to an older ZIP-only
+    // registration. Identical bytes cannot overwrite an existing update source
+    // or reset the user's name, enabled state, or invocation policy.
+    const source = normalizeGithubSkillSource(incoming.githubSource);
+    if (source && !normalizeGithubSkillSource(existing.githubSource)) {
+      return skills.map((skill) => skill === existing ? { ...skill, githubSource: source } : skill);
+    }
+    return skills;
+  }
   return [...skills, incoming];
 }
 

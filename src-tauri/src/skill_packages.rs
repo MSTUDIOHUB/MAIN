@@ -13,6 +13,105 @@ const MAX_ENTRIES: usize = 2_048;
 const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TEXT_BYTES: u64 = 256_000;
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static PACKAGE_VERIFICATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Installation provenance belongs to a registration, not to shared content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubSkillSource {
+    pub repository: String,
+    pub branch: String,
+}
+
+impl GithubSkillSource {
+    fn archive_url(&self) -> url::Url {
+        let mut url = url::Url::parse("https://codeload.github.com").unwrap();
+        url.path_segments_mut()
+            .unwrap()
+            .extend(self.repository.split('/'))
+            .extend(["zip", "refs", "heads"])
+            .extend(self.branch.split('/'));
+        url
+    }
+}
+
+/// Accept repository identities, never arbitrary download hosts or credentials.
+fn github_skill_source(
+    repo_or_url: &str,
+    branch: Option<&str>,
+) -> Result<GithubSkillSource, String> {
+    let input = repo_or_url.trim();
+    let (repository, url_branch) = if input.starts_with("https://") {
+        let parsed = url::Url::parse(input).map_err(|_| "Invalid GitHub repository URL")?;
+        if parsed.host_str() != Some("github.com")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err("Use a public https://github.com/owner/repo URL".into());
+        }
+        let parts = parsed
+            .path()
+            .trim_matches('/')
+            .split('/')
+            .collect::<Vec<_>>();
+        if parts.len() < 2 || (parts.len() > 2 && (parts.len() < 4 || parts[2] != "tree")) {
+            return Err("Use owner/repo or a GitHub repository/tree URL".into());
+        }
+        (
+            format!("{}/{}", parts[0], parts[1].trim_end_matches(".git")),
+            (parts.len() > 2).then(|| parts[3..].join("/")),
+        )
+    } else {
+        (input.trim_end_matches(".git").to_string(), None)
+    };
+    let parts = repository.split('/').collect::<Vec<_>>();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || part.len() > 100
+                || *part == "."
+                || *part == ".."
+                || !part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
+    {
+        return Err("Invalid GitHub owner/repository".into());
+    }
+    let selected_branch = branch
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(url_branch.as_deref())
+        .unwrap_or("main");
+    if selected_branch.len() > 256
+        || selected_branch
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || selected_branch.contains("..")
+        || !selected_branch
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b))
+    {
+        return Err("Invalid GitHub branch; specify a branch name, without URL escapes".into());
+    }
+    Ok(GithubSkillSource {
+        repository: format!("{}/{}", parts[0], parts[1]),
+        branch: selected_branch.to_string(),
+    })
+}
+
+#[cfg(test)]
+fn github_archive_url(repo_or_url: &str, branch: Option<&str>) -> Result<url::Url, String> {
+    github_skill_source(repo_or_url, branch).map(|source| source.archive_url())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,6 +141,22 @@ pub struct GlobalSkillPackageMeta {
     pub files: Vec<String>,
     pub reused: bool,
     pub payload_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_source: Option<GithubSkillSource>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalSkillCatalogDocument {
+    pub relative_path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalSkillPackageCatalog {
+    pub meta: GlobalSkillPackageMeta,
+    pub documents: Vec<GlobalSkillCatalogDocument>,
 }
 
 fn is_package_id(value: &str) -> bool {
@@ -248,6 +363,7 @@ fn metadata(manifest: &PackageManifest, payload: &Path, reused: bool) -> GlobalS
             .collect(),
         reused,
         payload_dir: payload.to_string_lossy().into_owned(),
+        github_source: None,
     }
 }
 
@@ -270,6 +386,8 @@ fn inspect_at_store(store: &Path, package_id: &str) -> Result<(PackageManifest, 
     if payload.parent() != Some(blob.as_path()) {
         return Err("Skill payload escaped its package".into());
     }
+    #[cfg(test)]
+    PACKAGE_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
     let observed = build_manifest(&payload, manifest.name.clone())?;
     if observed != manifest {
         return Err("Skill package contents do not match their immutable manifest".into());
@@ -406,7 +524,8 @@ pub fn inspect_global_skill_package_at(
     package_id: &str,
 ) -> Result<GlobalSkillPackageMeta, String> {
     let store = store_root(app_data, false)?;
-    inspect_at_store(&store, package_id).map(|(manifest, payload)| metadata(&manifest, &payload, true))
+    inspect_at_store(&store, package_id)
+        .map(|(manifest, payload)| metadata(&manifest, &payload, true))
 }
 
 pub fn read_global_skill_package_file_at(
@@ -417,18 +536,64 @@ pub fn read_global_skill_package_file_at(
     relative_path(relative)?;
     let store = store_root(app_data, false)?;
     let (manifest, payload) = inspect_at_store(&store, package_id)?;
+    read_verified_manifest_file(&manifest, &payload, relative)
+}
+
+fn read_verified_manifest_file(
+    manifest: &PackageManifest,
+    payload: &Path,
+    relative: &str,
+) -> Result<String, String> {
     let record = manifest
         .files
         .iter()
         .find(|file| file.path == relative)
         .ok_or("Skill resource is not in the package manifest")?;
-    let bytes = read_regular(&resource_path(&payload, relative)?, MAX_TEXT_BYTES)?;
+    let bytes = read_regular(&resource_path(payload, relative)?, MAX_TEXT_BYTES)?;
     if bytes.len() as u64 != record.size_bytes
         || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
     {
         return Err("Skill resource changed after verification".into());
     }
     String::from_utf8(bytes).map_err(|_| "Skill resource is not UTF-8 text".into())
+}
+
+/// Load the entry points and their optional host configuration as one catalog.
+/// References and scripts remain lazy resources, outside this response.
+pub fn load_global_skill_package_catalog_at(
+    app_data: &Path,
+    package_id: &str,
+) -> Result<GlobalSkillPackageCatalog, String> {
+    // Verify the entire immutable tree once for this request. Do not cache the
+    // result across requests: any entry, reference, manifest or link change
+    // must invalidate the next admission, including unselected resources.
+    let store = store_root(app_data, false)?;
+    let (manifest, payload) = inspect_at_store(&store, package_id)?;
+    let meta = metadata(&manifest, &payload, true);
+    let mut paths = meta.entry_points.clone();
+    for entry in &meta.entry_points {
+        let base = entry.rsplit_once('/').map(|(base, _)| base);
+        let config = base.map_or_else(
+            || "agents/openai.yaml".to_string(),
+            |base| format!("{base}/agents/openai.yaml"),
+        );
+        if meta.files.contains(&config) && !paths.contains(&config) {
+            paths.push(config);
+        }
+    }
+    let documents = paths
+        .into_iter()
+        .map(|relative_path| {
+            // Recheck each returned document against this exact manifest after
+            // opening it, preserving the execution-adjacent TOCTOU guard.
+            let content = read_verified_manifest_file(&manifest, &payload, &relative_path)?;
+            Ok(GlobalSkillCatalogDocument {
+                relative_path,
+                content,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(GlobalSkillPackageCatalog { meta, documents })
 }
 
 fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
@@ -443,6 +608,87 @@ async fn package_io<T: Send + 'static>(
     tauri::async_runtime::spawn_blocking(operation)
         .await
         .map_err(|error| format!("Skill package worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub async fn fetch_and_install_github_skill_package(
+    app: AppHandle,
+    repo_or_url: String,
+    branch: Option<String>,
+) -> Result<GlobalSkillPackageMeta, String> {
+    let root = app_data(&app)?;
+    fetch_and_install_github_skill_package_at(&root, &repo_or_url, branch.as_deref()).await
+}
+
+/// The command and opt-in network smoke test share the exact download and
+/// extraction path. Callers choose an app-data root, never a workspace root.
+pub async fn fetch_and_install_github_skill_package_at(
+    app_data: &Path,
+    repo_or_url: &str,
+    branch: Option<&str>,
+) -> Result<GlobalSkillPackageMeta, String> {
+    use tokio::io::AsyncWriteExt;
+    let source = github_skill_source(repo_or_url, branch)?;
+    let url = source.archive_url();
+    let root = app_data.to_path_buf();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|error| format!("Cannot create Skill download client: {error}"))?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("Cannot download GitHub Skill package: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub Skill download returned HTTP {}; check the public repository and branch",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_DOWNLOAD_BYTES)
+    {
+        return Err("GitHub Skill archive exceeds the 128 MiB download limit".into());
+    }
+    let archive = tempfile::Builder::new()
+        .prefix("main-github-skills-")
+        .suffix(".zip")
+        .tempfile()
+        .map_err(|error| format!("Cannot create Skill download file: {error}"))?;
+    let mut file = tokio::fs::File::from_std(archive.reopen().map_err(|error| error.to_string())?);
+    let mut total = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Skill archive download interrupted: {error}"))?
+    {
+        total = total.saturating_add(chunk.len() as u64);
+        if total > MAX_DOWNLOAD_BYTES {
+            return Err("GitHub Skill archive exceeds the 128 MiB download limit".into());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("Cannot save Skill download: {error}"))?;
+    }
+    file.flush().await.map_err(|error| error.to_string())?;
+    drop(file);
+    package_io(move || install_github_skill_archive_at(&root, archive.path(), source)).await
+}
+
+/// The download candidate carries its own provenance even when immutable bytes
+/// are reused. Inspection and ordinary ZIP installation never inherit it.
+fn install_github_skill_archive_at(
+    app_data: &Path,
+    archive: &Path,
+    source: GithubSkillSource,
+) -> Result<GlobalSkillPackageMeta, String> {
+    let mut meta = extract_global_skill_package_at(app_data, archive)?;
+    meta.github_source = Some(source);
+    Ok(meta)
 }
 
 #[tauri::command]
@@ -475,6 +721,15 @@ pub async fn inspect_global_skill_package(
 }
 
 #[tauri::command]
+pub async fn load_global_skill_package_catalog(
+    app: AppHandle,
+    package_id: String,
+) -> Result<GlobalSkillPackageCatalog, String> {
+    let root = app_data(&app)?;
+    package_io(move || load_global_skill_package_catalog_at(&root, &package_id)).await
+}
+
+#[tauri::command]
 pub async fn read_global_skill_package_file(
     app: AppHandle,
     package_id: String,
@@ -488,6 +743,179 @@ pub async fn read_global_skill_package_file(
 mod tests {
     use super::*;
     use std::{fs, io::Write};
+
+    #[test]
+    #[ignore = "public network: downloads the current Unity-Technologies/skills main branch"]
+    fn public_github_unity_skills_install_smoke() {
+        let app_data = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let meta = runtime
+            .block_on(fetch_and_install_github_skill_package_at(
+                app_data.path(),
+                "Unity-Technologies/skills",
+                Some("main"),
+            ))
+            .expect("public GitHub download and verified extraction should succeed");
+        let inspected = inspect_global_skill_package_at(app_data.path(), &meta.package_id).unwrap();
+        assert_eq!(
+            meta.github_source,
+            Some(GithubSkillSource {
+                repository: "Unity-Technologies/skills".into(),
+                branch: "main".into(),
+            })
+        );
+        assert!(inspected.github_source.is_none());
+        assert_eq!(meta.entry_points, inspected.entry_points);
+        assert!(!meta.entry_points.is_empty());
+        let has_cli = meta
+            .entry_points
+            .iter()
+            .any(|path| path.ends_with("/unity-cli/SKILL.md"));
+        let has_pipeline = meta
+            .entry_points
+            .iter()
+            .any(|path| path.ends_with("/unity-pipeline/SKILL.md"));
+        assert!(
+            has_cli,
+            "the current Unity official package must include unity-cli"
+        );
+        eprintln!(
+            "Public Unity skills install: entries={} files={} unity-cli={} unity-pipeline={} package_id={}",
+            meta.entry_points.len(), meta.files.len(), has_cli, has_pipeline, meta.package_id,
+        );
+    }
+
+    #[test]
+    fn github_skill_sources_use_only_public_codeload_with_validated_refs() {
+        for source in [
+            "Unity-Technologies/skills",
+            "https://github.com/Unity-Technologies/skills.git/",
+        ] {
+            assert_eq!(
+                github_archive_url(source, None).unwrap().as_str(),
+                "https://codeload.github.com/Unity-Technologies/skills/zip/refs/heads/main"
+            );
+        }
+        assert_eq!(
+            github_archive_url("https://github.com/owner/repo/tree/feature/skills", None)
+                .unwrap()
+                .as_str(),
+            "https://codeload.github.com/owner/repo/zip/refs/heads/feature/skills"
+        );
+        assert!(github_archive_url("owner/repo", Some("release-v1"))
+            .unwrap()
+            .path()
+            .ends_with("/release-v1"));
+        for source in [
+            "http://github.com/o/r",
+            "https://github.com.evil/o/r",
+            "https://user:secret@github.com/o/r",
+            "https://github.com:8443/o/r",
+            "https://github.com/o/r?token=x",
+            "https://github.com/o/r#x",
+            "o/../r",
+            "o/r/more",
+            "https://github.com/o/r/blob/main/SKILL.md",
+            "o/%2fetc",
+        ] {
+            assert!(
+                github_archive_url(source, None).is_err(),
+                "accepted {source}"
+            );
+        }
+        for branch in [
+            "../main", "/main", "main/", "a//b", "a%2fb", "main?x", "main#x", "a\\b",
+        ] {
+            assert!(
+                github_archive_url("o/r", Some(branch)).is_err(),
+                "accepted {branch}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_source_metadata_normalizes_repository_and_resolves_the_download_ref() {
+        for (input, branch, repository, selected_branch) in [
+            (
+                " Unity-Technologies/skills ",
+                None,
+                "Unity-Technologies/skills",
+                "main",
+            ),
+            (
+                "https://github.com/Unity-Technologies/skills.git/",
+                None,
+                "Unity-Technologies/skills",
+                "main",
+            ),
+            (
+                "https://github.com/owner/skills/tree/feature/tools",
+                None,
+                "owner/skills",
+                "feature/tools",
+            ),
+            (
+                "https://github.com/owner/skills/tree/old/ref",
+                Some(" release/v2 "),
+                "owner/skills",
+                "release/v2",
+            ),
+            ("owner/skills.git", Some(" "), "owner/skills", "main"),
+        ] {
+            let source = github_skill_source(input, branch).unwrap();
+            assert_eq!(source.repository, repository);
+            assert_eq!(source.branch, selected_branch);
+            assert_eq!(
+                source.archive_url(),
+                github_archive_url(input, branch).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn github_download_candidate_keeps_provenance_outside_the_shared_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let zip = root.path().join("download.zip");
+        archive(&zip, &[("skill/SKILL.md", b"# Instructions\n")]);
+        let first_source = github_skill_source("owner/skills", Some("release/v1")).unwrap();
+        let first =
+            install_github_skill_archive_at(root.path(), &zip, first_source.clone()).unwrap();
+        assert_eq!(first.github_source, Some(first_source));
+        let value = serde_json::to_value(&first).unwrap();
+        assert_eq!(value["githubSource"]["repository"], "owner/skills");
+        assert_eq!(value["githubSource"]["branch"], "release/v1");
+
+        let second_source = github_skill_source("fork/skills", None).unwrap();
+        let second =
+            install_github_skill_archive_at(root.path(), &zip, second_source.clone()).unwrap();
+        assert_eq!(first.package_id, second.package_id);
+        assert!(second.reused);
+        assert_eq!(second.github_source, Some(second_source));
+
+        let inspected = inspect_global_skill_package_at(root.path(), &first.package_id).unwrap();
+        let ordinary_zip = extract_global_skill_package_at(root.path(), &zip).unwrap();
+        let catalog = load_global_skill_package_catalog_at(root.path(), &first.package_id).unwrap();
+        for meta in [inspected, ordinary_zip, catalog.meta] {
+            assert!(meta.github_source.is_none());
+            assert!(serde_json::to_value(meta)
+                .unwrap()
+                .get("githubSource")
+                .is_none());
+        }
+        let manifest = fs::read_to_string(
+            root.path()
+                .join("skill-packages")
+                .join(&first.package_id)
+                .join("manifest.json"),
+        )
+        .unwrap();
+        assert!(!manifest.contains("githubSource"));
+        assert!(!manifest.contains("repository"));
+        assert!(!manifest.contains("release/v1"));
+    }
 
     fn archive(path: &Path, entries: &[(&str, &[u8])]) {
         let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
@@ -511,6 +939,83 @@ mod tests {
             ],
         );
         extract_global_skill_package_at(root, &zip).unwrap()
+    }
+
+    #[test]
+    fn global_skill_catalog_verifies_the_package_once_per_request_and_keeps_exact_documents() {
+        let root = tempfile::tempdir().unwrap();
+        let zip = root.path().join("catalog.zip");
+        archive(
+            &zip,
+            &[
+                ("a/SKILL.md", b"# alpha\r\n"),
+                (
+                    "a/agents/openai.yaml",
+                    b"policy:\n  allow_implicit_invocation: false\n",
+                ),
+                ("a/refs/detail.md", b"details\r\n"),
+                ("b/SKILL.md", b"# beta"),
+            ],
+        );
+        let package = extract_global_skill_package_at(root.path(), &zip).unwrap();
+        PACKAGE_VERIFICATION_COUNT.with(|count| count.set(0));
+        let catalog =
+            load_global_skill_package_catalog_at(root.path(), &package.package_id).unwrap();
+        assert_eq!(catalog.meta.package_id, package.package_id);
+        assert_eq!(catalog.documents.len(), 3);
+        assert_eq!(catalog.documents[0].relative_path, "a/SKILL.md");
+        assert_eq!(catalog.documents[0].content, "# alpha\r\n");
+        assert_eq!(catalog.documents[1].relative_path, "b/SKILL.md");
+        assert!(catalog
+            .documents
+            .iter()
+            .any(|doc| doc.relative_path == "a/agents/openai.yaml"
+                && doc.content.ends_with("false\n")));
+        assert!(catalog
+            .documents
+            .iter()
+            .all(|doc| !doc.relative_path.contains("refs/")));
+        PACKAGE_VERIFICATION_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "catalog admission must not re-hash the full package for every entry"
+            )
+        });
+    }
+
+    #[test]
+    fn global_skill_catalog_revalidates_unselected_resources_on_every_request() {
+        let root = tempfile::tempdir().unwrap();
+        let package = import_fixture(root.path());
+        PACKAGE_VERIFICATION_COUNT.with(|count| count.set(0));
+        for _ in 0..2 {
+            load_global_skill_package_catalog_at(root.path(), &package.package_id).unwrap();
+        }
+        PACKAGE_VERIFICATION_COUNT.with(|count| assert_eq!(count.get(), 2));
+        let reference = root
+            .path()
+            .join("skill-packages")
+            .join(&package.package_id)
+            .join("payload/a/refs/detail.md");
+        fs::write(reference, "changed\r\n").unwrap();
+        assert!(
+            load_global_skill_package_catalog_at(root.path(), &package.package_id).is_err(),
+            "even a resource outside the returned catalog invalidates immutable package admission"
+        );
+    }
+
+    #[test]
+    fn global_skill_catalog_returned_bytes_must_still_match_the_verified_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let package = import_fixture(root.path());
+        let store = store_root(root.path(), false).unwrap();
+        let (manifest, payload) = inspect_at_store(&store, &package.package_id).unwrap();
+        fs::write(payload.join("a/SKILL.md"), "# other\n").unwrap();
+        assert!(
+            read_verified_manifest_file(&manifest, &payload, "a/SKILL.md").is_err(),
+            "an equal-length document change after inspection cannot enter the returned batch"
+        );
     }
 
     #[test]

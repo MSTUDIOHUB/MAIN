@@ -578,7 +578,12 @@ fn parse_segment_words_and_redirections(
                 Some(source_fd.unwrap_or(1))
             } else {
                 validate_workspace_path_token(&target, segment, true, None)?;
-                words.push(target.clone());
+                // Ordinary redirection paths also participate in the later
+                // workspace checks. The OS null device is not an argv path
+                // and has already been admitted specifically as a redirect.
+                if !is_null_device_redirection(&target) {
+                    words.push(target.clone());
+                }
                 source_fd
             };
             redirections.push(ShellRedirection {
@@ -776,6 +781,9 @@ fn validate_workspace_path_token(
     redirection: bool,
     workspace_root: Option<&Path>,
 ) -> Result<(), ShellValidationError> {
+    if redirection && is_null_device_redirection(word) {
+        return Ok(());
+    }
     let Some(candidate) = normalized_workspace_path_candidate(word) else {
         return Ok(());
     };
@@ -825,6 +833,17 @@ fn validate_workspace_path_token(
         ));
     }
     Ok(())
+}
+
+/// Only the current shell platform's exact null-device spelling is exempt
+/// from workspace containment. On Unix `NUL` is an ordinary workspace file;
+/// treating it as a device would bypass canonical checks on a symlink.
+fn is_null_device_redirection(target: &str) -> bool {
+    if cfg!(windows) {
+        target.eq_ignore_ascii_case("nul")
+    } else {
+        target == "/dev/null"
+    }
 }
 
 fn normalized_workspace_path_candidate(word: &str) -> Option<String> {
@@ -1186,7 +1205,9 @@ pub fn prepare_trusted_shell_execution(
             }
         }
         for redirection in &segment.redirections {
-            if redirection.kind == ShellRedirectionKind::StdioDuplication {
+            if redirection.kind == ShellRedirectionKind::StdioDuplication
+                || is_null_device_redirection(&redirection.target)
+            {
                 continue;
             }
             resolve_workspace_path(
@@ -1443,6 +1464,83 @@ mod tests {
         }
         inspect_shell_command("printf ok > reports/out.txt")
             .expect("workspace-relative redirection should remain inspectable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirection_dev_null_is_an_os_sink_at_both_shell_boundaries() {
+        let root = workspace();
+        let guard = crate::harness::permissions::PermissionGuard::from_workspace(root.path())
+            .expect("workspace permission policy");
+        assert_eq!(
+            guard.inspect("which unity 2>/dev/null").decision,
+            crate::harness::permissions::PermissionDecisionKind::Allow,
+            "the production permission gate must see the same null-device exception"
+        );
+        for command in [
+            "which unity 2>/dev/null",
+            "printf ok >/dev/null",
+            "printf ok >>/dev/null",
+            "cat </dev/null",
+        ] {
+            inspect_shell_command(command).expect(command);
+            prepare_trusted_shell_execution(root.path(), root.path(), command).expect(command);
+        }
+        for command in [
+            "printf ok >/dev/null/other",
+            "printf ok >/dev/zero",
+            "printf ok >/dev/../dev/null",
+            "cat /dev/null",
+        ] {
+            prepare_trusted_shell_execution(root.path(), root.path(), command).expect_err(command);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirection_dev_null_executes_without_creating_a_workspace_file() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = workspace();
+        let result = runtime
+            .block_on(execute_trusted_shell(
+                root.path(),
+                root.path(),
+                "printf ok >/dev/null && printf err 1>&2 2>/dev/null && cat </dev/null",
+                Duration::from_secs(2),
+                None,
+            ))
+            .expect("native shell accepts the platform null sink");
+        assert!(result.success);
+        assert!(result.stdout.is_empty());
+        // Redirections are applied left to right: stdout still names the
+        // original stderr after the following stderr redirection.
+        assert_eq!(result.stderr, "err");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_nul_redirection_remains_a_workspace_path() {
+        let root = workspace();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("NUL")).unwrap();
+        prepare_trusted_shell_execution(root.path(), root.path(), "printf ok >NUL")
+            .expect_err("Unix NUL is a file, not an operating-system sink");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn redirection_nul_is_a_windows_os_sink() {
+        let root = workspace();
+        for command in ["where unity 2>NUL", "echo ok >nul", "type <NuL"] {
+            inspect_shell_command(command).expect(command);
+            prepare_trusted_shell_execution(root.path(), root.path(), command).expect(command);
+        }
+        prepare_trusted_shell_execution(root.path(), root.path(), "echo ok >/dev/null")
+            .expect_err("POSIX sink spelling is not a Windows null device");
     }
 
     #[test]

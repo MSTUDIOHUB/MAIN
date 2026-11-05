@@ -88,7 +88,7 @@ function tool(name, description = "") {
 test("MCP permissions retain each attached server identity when endpoints overlap", () => {
   const url = "http://127.0.0.1:9100/mcp";
   const manual = { name: "Browser", type: "http", url, enabled: true };
-  const extension = { name: "gemini:fixture:research", type: "http", url, enabled: true };
+  const research = { name: "Research", type: "http", url, enabled: true };
   const registered = (name, serverName) => ({
     name,
     description: "Inspect",
@@ -96,16 +96,16 @@ test("MCP permissions retain each attached server identity when endpoints overla
     _mainMcpOrigin: { serverName, serverUrl: url, remoteName: "query" },
   });
   const registry = buildToolCapabilityRegistry({
-    toolDefinitions: [tool("manual_query", "Inspect"), tool("extension_query", "Inspect")],
-    mcpTools: [registered("manual_query", manual.name), registered("extension_query", extension.name)],
-    mcpServers: [manual, extension],
+    toolDefinitions: [tool("manual_query", "Inspect"), tool("research_query", "Inspect")],
+    mcpTools: [registered("manual_query", manual.name), registered("research_query", research.name)],
+    mcpServers: [manual, research],
   });
   assert.equal(registry.tools.manual_query.serverName, "Browser");
   assert.equal(registry.tools.manual_query.risk, "browser_control");
   assert.equal(registry.tools.manual_query.autoExecutable, false);
-  assert.equal(registry.tools.extension_query.serverName, extension.name);
-  assert.equal(registry.tools.extension_query.risk, "external_read");
-  assert.equal(registry.tools.extension_query.autoExecutable, true);
+  assert.equal(registry.tools.research_query.serverName, research.name);
+  assert.equal(registry.tools.research_query.risk, "external_read");
+  assert.equal(registry.tools.research_query.autoExecutable, true);
 });
 
 test("attached MCP identities cannot borrow an enabled server at the same URL", () => {

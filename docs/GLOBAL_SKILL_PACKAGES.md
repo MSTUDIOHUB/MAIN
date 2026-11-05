@@ -1,6 +1,6 @@
 # Global Skill packages
 
-Imported Skill ZIPs are reusable user installations. Their storage identity is
+Imported Skill packages are reusable user installations. Their storage identity is
 separate from the workspace where a Turn executes. This follows the public
 [Codex Skill scopes](https://developers.openai.com/codex/skills): user Skills
 apply across repositories, while repository Skills retain a project scope.
@@ -43,6 +43,26 @@ registration is removed. This avoids deleting shared content or resources held
 by an admitted Turn. Removing registration excludes it from future catalogs;
 cache presence does not reinstall it.
 
+## Manual GitHub updates
+
+Public `githubSource` provenance (repository and branch) belongs to the user
+registration, not the immutable manifest. A manual check downloads and verifies
+a candidate snapshot without changing the installed reference. Applying replaces
+only that registration's payload and entry metadata, preserving its ID, display
+fields, enabled state, and invocation policy. Running catalogs retain the old
+immutable payload; later admissions use the new reference.
+
+Apply uses an exact registration-object compare-and-swap. Deletion, replacement,
+policy edits, another update, or a changed source invalidate an older candidate.
+A target version registered separately is an explicit conflict, never a silent
+merge that could change another registration's policy. Failed synchronous
+persistence rolls back only the exact update it committed in memory.
+
+Reimporting identical content from GitHub can attach verified provenance to a
+source-less registration while keeping its policy. It cannot overwrite an
+already registered source. Ordinary ZIP imports never clear a known source.
+No background auto-check or auto-update is scheduled.
+
 ## Read authority
 
 Global references use the selected Skill's captured package ID and relative
@@ -57,9 +77,10 @@ create an editable-source lease, change the Run workspace, or enable generic
 external reads. Reading a script does not execute it. Script execution and
 Unity CLI operations still use normal tools and independent authorization.
 
-Repository `.agents/skills`, personal `.agents/skills`, and Gemini extensions
-keep their existing scopes. A Skill package import does not install or activate
-the MCP, command, hook, or authentication settings of another extension format.
+Repository and personal Skills keep their existing scopes and source controls.
+A Skill package import does not install or activate MCP, command, hook, or
+authentication settings from an extension manifest. Configure MCP separately
+through MAIN's MCP settings.
 
 ## Verification
 

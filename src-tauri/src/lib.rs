@@ -37,6 +37,7 @@ use std::os::raw::c_int;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+mod agent_skills;
 pub mod code_ast;
 pub mod critic;
 pub mod eval;
@@ -11415,101 +11416,9 @@ fn extract_property_signature(line: &str, access: &str, name: &str) -> String {
 
 // region: Protocol Package 管理
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscoveredPersonalAgentSkill {
-    entry_path: String,
-    base_path: String,
-    content: String,
-    openai_yaml: Option<String>,
-    supporting_files: Vec<String>,
-}
-
-fn discover_agent_skills_in_root(root: &Path) -> Result<Vec<DiscoveredPersonalAgentSkill>, String> {
-    const MAX_DISCOVERED_SKILLS: usize = 512;
-    const MAX_SKILL_CONTENT_BYTES: u64 = 256_000;
-    const MAX_OPENAI_YAML_BYTES: u64 = 32_000;
-    const MAX_SUPPORTING_FILES: usize = 10;
-
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|error| format!("无法解析个人 Skill 目录: {error}"))?;
-    if !canonical_root.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries = WalkDir::new(&canonical_root)
-        .min_depth(2)
-        .max_depth(8)
-        // Match Codex/OpenCode discovery: a user may keep a Skill in another
-        // repository and symlink its directory into ~/.agents/skills.
-        .follow_links(true)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case("SKILL.md")
-        })
-        .take(MAX_DISCOVERED_SKILLS)
-        .filter_map(|entry| {
-            let entry_path = entry.path().canonicalize().ok()?;
-            let metadata = fs::metadata(&entry_path).ok()?;
-            if metadata.len() == 0 || metadata.len() > MAX_SKILL_CONTENT_BYTES {
-                return None;
-            }
-            let base_path = entry_path.parent()?.canonicalize().ok()?;
-            let content = fs::read_to_string(&entry_path).ok()?;
-
-            let openai_yaml_path = base_path.join("agents").join("openai.yaml");
-            let openai_yaml = fs::metadata(&openai_yaml_path)
-                .ok()
-                .filter(|metadata| metadata.is_file() && metadata.len() <= MAX_OPENAI_YAML_BYTES)
-                .and_then(|_| openai_yaml_path.canonicalize().ok())
-                .filter(|path| path.starts_with(&base_path))
-                .and_then(|path| fs::read_to_string(path).ok());
-
-            let mut supporting_files = WalkDir::new(&base_path)
-                .min_depth(1)
-                .max_depth(5)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|support| support.file_type().is_file())
-                .filter_map(|support| support.path().canonicalize().ok())
-                .filter(|path| {
-                    path.starts_with(&base_path) && path != &entry_path && path != &openai_yaml_path
-                })
-                .map(|path| path.to_string_lossy().to_string())
-                .take(MAX_SUPPORTING_FILES)
-                .collect::<Vec<_>>();
-            supporting_files.sort();
-
-            Some(DiscoveredPersonalAgentSkill {
-                entry_path: entry_path.to_string_lossy().to_string(),
-                base_path: base_path.to_string_lossy().to_string(),
-                content,
-                openai_yaml,
-                supporting_files,
-            })
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.entry_path.cmp(&right.entry_path));
-    Ok(entries)
-}
-
-#[tauri::command]
-fn discover_personal_agent_skills() -> Result<Vec<DiscoveredPersonalAgentSkill>, String> {
-    let Some(home) = user_home_dir() else {
-        return Ok(Vec::new());
-    };
-    discover_agent_skills_in_root(&home.join(".agents").join("skills"))
-}
+use agent_skills::{discover_personal_agent_skills, read_agent_skill_resource};
+#[cfg(test)]
+use agent_skills::discover_agent_skills_in_root;
 
 #[derive(serde::Serialize)]
 pub struct ProtocolPackageMeta {
@@ -11722,125 +11631,6 @@ fn extract_package_archive_in_workspace(
         target_dir,
         local_path,
     })
-}
-
-#[derive(Serialize)]
-struct GeminiExtensionArchiveMeta {
-    manifest_json: String,
-    manifest_path: String,
-    files: Vec<String>,
-    entry_points: Vec<String>,
-    package_hash: String,
-    local_path: String,
-    workspace: String,
-}
-
-#[tauri::command]
-fn extract_gemini_extension(
-    state: State<WorkspaceState>,
-    zip_path: String,
-    workspace: Option<String>,
-) -> Result<GeminiExtensionArchiveMeta, String> {
-    let _lock = get_workspace_write_lock().lock().unwrap();
-    let workspace = resolve_workspace_root(&state, workspace)?;
-    extract_gemini_extension_in_workspace(&workspace, Path::new(&zip_path))
-}
-
-fn extract_gemini_extension_in_workspace(
-    workspace: &Path,
-    zip: &Path,
-) -> Result<GeminiExtensionArchiveMeta, String> {
-    let extracted = extract_package_archive_in_workspace(workspace, zip)?;
-    let result = (|| -> Result<GeminiExtensionArchiveMeta, String> {
-        let mut files = WalkDir::new(&extracted.target_dir)
-            .min_depth(1)
-            .follow_links(false)
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("无法检查扩展文件: {e}"))?
-            .into_iter()
-            .filter(|entry| entry.file_type().is_file())
-            .map(|entry| {
-                entry
-                    .path()
-                    .strip_prefix(&extracted.target_dir)
-                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-                    .map_err(|e| format!("扩展文件路径越界: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        files.sort();
-        let manifests = files
-            .iter()
-            .filter(|relative| {
-                let parts = relative.split('/').collect::<Vec<_>>();
-                parts.len() <= 2 && parts.last() == Some(&"gemini-extension.json")
-            })
-            .collect::<Vec<_>>();
-        if manifests.len() != 1 {
-            return Err(
-                "扩展 ZIP 必须在根目录或单层仓库目录中包含唯一 gemini-extension.json".to_string(),
-            );
-        }
-        let manifest_path = manifests[0].to_string();
-        let manifest_file = extracted.target_dir.join(&manifest_path);
-        let manifest_size = fs::metadata(&manifest_file)
-            .map_err(|e| format!("无法检查扩展清单: {e}"))?
-            .len();
-        if manifest_size == 0 || manifest_size > 1024 * 1024 {
-            return Err("扩展清单必须为非空且不超过 1 MiB 的 UTF-8 JSON 文件".to_string());
-        }
-        let manifest_json =
-            fs::read_to_string(&manifest_file).map_err(|e| format!("无法读取扩展清单: {e}"))?;
-        let manifest: Value = serde_json::from_str(&manifest_json)
-            .map_err(|_| "扩展清单不是有效 JSON".to_string())?;
-        if !manifest.is_object()
-            || !manifest
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.trim().is_empty())
-            || !manifest
-                .get("version")
-                .and_then(Value::as_str)
-                .is_some_and(|version| !version.trim().is_empty())
-        {
-            return Err("扩展清单缺少有效 name 或 version".to_string());
-        }
-        let root = manifest_path
-            .strip_suffix("gemini-extension.json")
-            .unwrap_or("");
-        let skills_prefix = format!("{root}skills/");
-        let entry_points = files
-            .iter()
-            .filter(|relative| {
-                relative.strip_prefix(&skills_prefix).is_some_and(|suffix| {
-                    suffix.ends_with("/SKILL.md") && suffix.split('/').count() >= 2
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut hasher = Sha256::new();
-        for relative in &files {
-            let bytes = fs::read(extracted.target_dir.join(relative))
-                .map_err(|e| format!("无法计算扩展文件摘要: {e}"))?;
-            hasher.update((relative.len() as u64).to_be_bytes());
-            hasher.update(relative.as_bytes());
-            hasher.update((bytes.len() as u64).to_be_bytes());
-            hasher.update(bytes);
-        }
-        Ok(GeminiExtensionArchiveMeta {
-            manifest_json,
-            manifest_path,
-            files,
-            entry_points,
-            package_hash: format!("sha256-{:x}", hasher.finalize()),
-            local_path: extracted.local_path.clone(),
-            workspace: workspace.to_string_lossy().replace('\\', "/"),
-        })
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&extracted.target_dir);
-    }
-    result
 }
 
 /// Discover every Skill entry, including those in repository ZIP wrappers.
@@ -13533,12 +13323,14 @@ pub fn run() {
             knowledge_search,
             knowledge_get_excerpt,
             discover_personal_agent_skills,
+            read_agent_skill_resource,
             skill_packages::extract_global_skill_package,
+            skill_packages::fetch_and_install_github_skill_package,
             skill_packages::promote_legacy_skill_package,
             skill_packages::inspect_global_skill_package,
+            skill_packages::load_global_skill_package_catalog,
             skill_packages::read_global_skill_package_file,
             extract_protocol_package,
-            extract_gemini_extension,
             delete_protocol_package,
             write_chat_temp_file,
             write_chat_temp_file_create_new,
@@ -13582,7 +13374,7 @@ mod tests {
         browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
         commit_project_init_in_workspace, compare_file_nodes, delete_path_within_workspace,
         delete_plan_files_in_dir, delete_protocol_package_at, discover_agent_skills_in_root,
-        dispatch_chat_stream_worker, extract_gemini_extension_in_workspace,
+        dispatch_chat_stream_worker,
         extract_protocol_package_in_workspace, find_entry_points, get_proxy_request_registry,
         get_stream_registry, glob_search_in_workspace, inspect_project_init_target_in_workspace,
         is_safe_cross_origin_proxy_header, is_sensitive_cross_origin_header,
@@ -14642,154 +14434,6 @@ mod tests {
             archive.write_all(content.as_bytes()).unwrap();
         }
         archive.finish().unwrap();
-    }
-
-    #[test]
-    fn gemini_extension_zip_scopes_skills_to_manifest_root_and_preserves_resources() {
-        let workspace = make_temp_workspace("gemini-extension-skills");
-        let archive = workspace.join("extension.zip");
-        write_protocol_zip(
-            &archive,
-            &[
-                (
-                    "repo-main/gemini-extension.json",
-                    r#"{"name":"example","version":"1.0.0"}"#,
-                ),
-                (
-                    "repo-main/skills/review/SKILL.md",
-                    "---\nname: review\n---\nUse references/check.md",
-                ),
-                (
-                    "repo-main/skills/review/references/check.md",
-                    "Check exactly",
-                ),
-                ("repo-main/vendor/other/SKILL.md", "Do not register"),
-                ("SKILL.md", "Do not register either"),
-            ],
-        );
-        let imported = extract_gemini_extension_in_workspace(&workspace, &archive).unwrap();
-        assert_eq!(
-            imported.entry_points,
-            vec!["repo-main/skills/review/SKILL.md"]
-        );
-        assert_eq!(imported.manifest_path, "repo-main/gemini-extension.json");
-        assert_eq!(
-            fs::read_to_string(
-                workspace
-                    .join(&imported.local_path)
-                    .join("repo-main/skills/review/references/check.md")
-            )
-            .unwrap(),
-            "Check exactly"
-        );
-        assert!(imported
-            .files
-            .contains(&"repo-main/vendor/other/SKILL.md".to_string()));
-        let repeated = extract_gemini_extension_in_workspace(&workspace, &archive).unwrap();
-        assert_ne!(imported.local_path, repeated.local_path);
-        assert_eq!(imported.package_hash, repeated.package_hash);
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
-    fn gemini_extension_zip_accepts_mcp_only_and_rolls_back_invalid_manifests() {
-        let workspace = make_temp_workspace("gemini-extension-mcp-only");
-        let archive = workspace.join("extension.zip");
-        write_protocol_zip(
-            &archive,
-            &[(
-                "gemini-extension.json",
-                r#"{"name":"example","version":"1","mcpServers":{"demo":{"httpUrl":"http://127.0.0.1:9000/mcp"}}}"#,
-            )],
-        );
-        let imported = extract_gemini_extension_in_workspace(&workspace, &archive).unwrap();
-        assert!(imported.entry_points.is_empty());
-        assert_eq!(imported.files, vec!["gemini-extension.json"]);
-        let before = fs::read_dir(workspace.join(".protocols")).unwrap().count();
-        for entries in [
-            vec![("README.md", "no manifest")],
-            vec![("gemini-extension.json", "not JSON")],
-            vec![("gemini-extension.json", r#"{"name":"example"}"#)],
-            vec![
-                (
-                    "gemini-extension.json",
-                    r#"{"name":"example","version":"1"}"#,
-                ),
-                (
-                    "other/gemini-extension.json",
-                    r#"{"name":"other","version":"1"}"#,
-                ),
-            ],
-            vec![(
-                "nested/deep/gemini-extension.json",
-                r#"{"name":"example","version":"1"}"#,
-            )],
-        ] {
-            write_protocol_zip(&archive, &entries);
-            assert!(extract_gemini_extension_in_workspace(&workspace, &archive).is_err());
-            assert_eq!(
-                fs::read_dir(workspace.join(".protocols")).unwrap().count(),
-                before
-            );
-        }
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
-    fn gemini_extension_zip_rejects_duplicate_and_escape_paths() {
-        let workspace = make_temp_workspace("gemini-extension-unsafe");
-        let archive = workspace.join("extension.zip");
-        for entries in [
-            vec![("gemini-extension.json", "{}"), ("../outside", "no")],
-            vec![
-                ("gemini-extension.json", "{}"),
-                ("GEMINI-EXTENSION.JSON", "{}"),
-            ],
-            vec![
-                ("gemini-extension.json", "{}"),
-                ("skills\\evil\\SKILL.md", "no"),
-            ],
-        ] {
-            write_protocol_zip(&archive, &entries);
-            assert!(extract_gemini_extension_in_workspace(&workspace, &archive).is_err());
-            assert_eq!(
-                fs::read_dir(workspace.join(".protocols")).unwrap().count(),
-                0
-            );
-        }
-        fs::remove_dir_all(workspace).unwrap();
-    }
-
-    #[test]
-    fn gemini_extension_zip_rejects_symbolic_links() {
-        use std::io::Write;
-        let workspace = make_temp_workspace("gemini-extension-link");
-        let archive_path = workspace.join("extension.zip");
-        let file = fs::File::create(&archive_path).unwrap();
-        let mut archive = zip::ZipWriter::new(file);
-        archive
-            .start_file(
-                "gemini-extension.json",
-                zip::write::SimpleFileOptions::default(),
-            )
-            .unwrap();
-        archive
-            .write_all(br#"{"name":"example","version":"1"}"#)
-            .unwrap();
-        archive
-            .add_symlink(
-                "skills/link",
-                "/outside",
-                zip::write::SimpleFileOptions::default(),
-            )
-            .unwrap();
-        archive.finish().unwrap();
-        assert!(extract_gemini_extension_in_workspace(&workspace, &archive_path).is_err());
-        assert_eq!(
-            fs::read_dir(workspace.join(".protocols")).unwrap().count(),
-            0
-        );
-        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

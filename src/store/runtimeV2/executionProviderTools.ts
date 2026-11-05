@@ -55,13 +55,9 @@ function collaborationToolNames(input: {
 }
 
 /**
- * Inspired by gg-framework / ggcoder:
- * 1. Expose the compact core toolset (read_file, write_file, replace_in_file,
- *    grep_search, glob_search, run_command, load_skill, tool_search) plus any
- *    tools unlocked via `tool_search` in the current session.
- * 2. Never mutate tool descriptions or parameter enums per step, and never
- *    confiscate core inspection/edit tools in punitive recovery windows. This
- *    keeps the `tools` prefix 100% static for local model KV Cache reuse.
+ * Expose the compact core and session-unlocked tools while preserving the
+ * collaboration tools admitted by the Run. Discovery must not hide an enabled
+ * spawn capability, and cannot override capacity or phase restrictions.
  */
 export function selectRuntimeV2ProviderToolDefinitions(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -134,9 +130,9 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     return filterToCoreAndUnlockedTools(readCandidates, {
       sessionKey,
       prompt: objectiveText,
-      alwaysInclude: collaboration.has("wait_subagents")
-        ? ["wait_subagents"]
-        : [],
+      // Runtime admission already checked collaboration, capacity and runway.
+      // Tool discovery must not hide that admitted capability from this request.
+      alwaysInclude: collaboration,
     });
   }
 
@@ -161,9 +157,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   return filterToCoreAndUnlockedTools(executeCandidates, {
     sessionKey,
     prompt: objectiveText,
-    alwaysInclude: collaboration.has("wait_subagents")
-      ? ["wait_subagents"]
-      : [],
+    alwaysInclude: collaboration,
   });
 }
 

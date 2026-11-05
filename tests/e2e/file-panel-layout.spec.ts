@@ -319,3 +319,32 @@ test("selected deleted file shows an error and can return to tree", async ({ pag
   await expect(page.getByText("README.md")).toHaveCount(0);
   await expect(page.getByTestId("file-panel").getByRole("button", { name: "src" })).toBeVisible();
 });
+
+test("file viewer wrap switch supports Space and Enter while changing long-line layout", async ({ page }) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.locator('button[aria-label="文件"]').click();
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.addRootFile("wrap-check.txt", "long line text ".repeat(180)));
+  await page.getByRole("button", { name: /wrap-check\.txt/ }).click();
+  const panel = page.getByTestId("file-panel");
+  const toggle = panel.getByRole("switch", { name: "自动换行", exact: true });
+  // FileViewer uses SyntaxHighlighter's PreTag="div". Its code element
+  // identifies the source block without assuming a native <pre> wrapper.
+  const code = panel.locator("code").filter({ hasText: "long line text" }).first();
+  const content = code.locator("..");
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await expect(toggle).toHaveClass(/main-toggle-switch/);
+  await expect(content).toHaveCSS("white-space", "pre");
+  await expect(code).toHaveCSS("white-space", "pre");
+  const unwrappedHeight = (await content.boundingBox())!.height;
+  await toggle.focus();
+  await toggle.press("Space");
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
+  await expect(content).toHaveCSS("white-space", "pre-wrap");
+  await expect(code).toHaveCSS("white-space", "pre-wrap");
+  await expect.poll(async () => (await content.boundingBox())!.height).toBeGreaterThan(unwrappedHeight + 20);
+  await toggle.press("Enter");
+  await expect(toggle).toHaveAttribute("aria-checked", "false");
+  await expect(content).toHaveCSS("white-space", "pre");
+  await expect(code).toHaveCSS("white-space", "pre");
+  await expect.poll(async () => (await content.boundingBox())!.height).toBeLessThanOrEqual(unwrappedHeight + 1);
+});

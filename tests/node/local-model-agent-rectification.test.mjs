@@ -350,6 +350,9 @@ test("Phase 5: resolveSkillId resolves human-readable name/slug without hash and
   const catalog = await loadSkillCatalog({
     workspace: "",
     skills: [],
+    externalSkillSelections: [{
+      entryPath: "/Users/test/.agents/skills/unity-2d-physics/SKILL.md", workspaceScope: null, mode: "auto",
+    }],
   });
 
   assert.equal(catalog.entries.length, 1);

@@ -208,6 +208,94 @@ test("the shared child runway includes the exact two-minute boundary", () => {
   }), false);
 });
 
+function collaborationSurfaceFixture(mode, payload = {}, options = {}) {
+  const turn = {
+    workspaceKey: "/fixture", sessionKey: `collaboration-${mode}`, sessionEpoch: "epoch",
+    clientSubmissionId: `submission-${mode}`, turnId: `turn-collaboration-${mode}`,
+  };
+  const aggregate = runtime.transition(null, {
+    schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0,
+    eventId: `admit-${mode}`, at: 1, type: "turn.admitted", turn,
+    strategy: "execute",
+    objective: "在当前 Unity 场景创建一个持续弹跳的粉色球，并核对运行结果。",
+    constraints: [], acceptanceCriteria: ["The requested scene is verified."],
+    acceptanceCriterionIds: ["criterion-user-objective"],
+  });
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ revision: 1, aggregate, updatedAt: 1 });
+  const sessionKey = `surface-${mode}-${JSON.stringify(payload)}-${JSON.stringify(options)}`;
+  const toolSearch = loadTs(path.join(workspaceRoot, "src/lib/toolSearch.ts"));
+  toolSearch.clearUnlockedToolsForSession(sessionKey);
+  const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
+    ports: {
+      get: () => ({ runtimeV2Checkpoints: { [turn.turnId]: checkpoint } }),
+      context: {
+        turnId: turn.turnId, runSessionKey: sessionKey,
+        runWorkspace: options.workspace ?? "/fixture",
+        runtimeRunIntent: mode === "analyze" || mode === "chat" ? "analyze" : "execute",
+        turnInputContextSignals: { attachedFilePaths: options.attachedFilePaths || [] },
+      },
+      now: () => 1,
+      lifecycleDeadlineAt: options.deadlineAt ?? 200_000,
+    },
+    command: {
+      ...command("observing"),
+      payload: {
+        mode, collaborationAllowed: true, collaborationPreferred: true,
+        collaborationRequestMode: "parallel", remainingSubagentCapacity: 1, ...payload,
+      },
+    },
+    available: [
+      "glob_search", "grep_search", "read_file", "replace_in_file", "write_file",
+      "run_command", "tool_search", "load_skill", "spawn_subagent", "wait_subagents",
+      "browser_evaluate", "read_document",
+    ].map(definition),
+  });
+  assert.deepEqual([...toolSearch.getUnlockedToolsForSession(sessionKey)], [],
+    "a collaboration toggle must work without prompt keywords or a prior tool_search unlock");
+  return selected.map((tool) => tool.function.name);
+}
+
+test("admitted collaboration survives the compact tool surface without prompt keywords", () => {
+  for (const mode of ["execute", "validate", "analyze"]) {
+    const selected = collaborationSurfaceFixture(mode);
+    assert.ok(selected.includes("spawn_subagent"), `${mode} must retain the admitted child capability`);
+    assert.ok(!selected.includes("wait_subagents"), "no join is advertised without an active child");
+    assert.ok(!selected.includes("browser_evaluate"), "ordinary extensions still require discovery");
+    assert.ok(selected.includes("read_file"));
+    assert.equal(selected.includes("write_file"), mode !== "analyze", "analysis remains read-only");
+  }
+});
+
+test("compact collaboration tools retain capacity, runway and mode boundaries", () => {
+  for (const mode of ["execute", "validate", "analyze"]) {
+    for (const [payload, options] of [
+      [{ collaborationAllowed: false }, {}],
+      [{ remainingSubagentCapacity: 0 }, {}],
+      [{}, { deadlineAt: 120_000 }],
+    ]) {
+      assert.ok(!collaborationSurfaceFixture(mode, payload, options).includes("spawn_subagent"),
+        `${mode} cannot bypass collaboration admission: ${JSON.stringify({ payload, options })}`);
+    }
+    const waiting = collaborationSurfaceFixture(mode, {
+      remainingSubagentCapacity: 0, activeSubagents: [{ id: "active-child" }],
+    });
+    assert.ok(waiting.includes("wait_subagents"), `${mode} preserves the join while capacity is exhausted`);
+    assert.ok(!waiting.includes("spawn_subagent"));
+  }
+  for (const [mode, options] of [
+    ["chat", { workspace: "" }],
+    ["analyze", { workspace: "", attachedFilePaths: ["/fixture/report.csv"] }],
+  ]) {
+    const selected = collaborationSurfaceFixture(mode, {}, options);
+    assert.ok(!selected.includes("spawn_subagent"), "global chat and attachment-only analysis do not gain workspace delegation");
+    assert.ok(!selected.includes("write_file"));
+  }
+  assert.deepEqual(collaborationSurfaceFixture("conclude", { activeSubagents: [{ id: "active-child" }] }), ["wait_subagents"]);
+  assert.deepEqual(collaborationSurfaceFixture("conclude", {
+    conclusionKind: "read_only", activeSubagents: [{ id: "active-child" }],
+  }), []);
+});
+
 test("an explicit zero child budget cannot fall back to later active capacity", () => {
   assert.equal(
     subagentCandidate.runtimeV2SubagentTotalBudgetFromCommand({

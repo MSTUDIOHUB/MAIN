@@ -26,7 +26,6 @@ import {
   getProjectSkeleton,
   ingestAttachmentFile,
   listDirectory,
-  loadProjectSessionMeta,
   readChatTempFile,
   readDocument,
   readFile,
@@ -57,11 +56,12 @@ import {
   type HarnessRunMarker,
 } from "../lib/harnessCrashTelemetry";
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
-import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool, type MCPServerStatusSnapshot } from "../lib/mcpClient";
-import { normalizeGeminiExtensionInstallations, type GeminiExtensionInstallation } from "../lib/geminiExtensions";
+import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { inspectGlobalSkillPackage, promoteLegacySkillPackage } from "../lib/ipc";
 import { globalSkillPackageId, migrateLegacySkillRegistrations, upsertGlobalSkillRegistration } from "../lib/globalSkillPackages";
-import { extensionMcpDiscoveryKey, extensionMcpServers, normalizeExtensionWorkspace, resolveWorkspaceMcpView, workspaceExtensionSkills, workspaceHasUnfinishedTurns, type ExtensionMcpDiscovery } from "../lib/workspaceMcp";
+import { applyGithubSkillPackageCandidate, type GithubSkillUpdateCandidate, type GithubSkillUpdateResult } from "../lib/githubSkillUpdates";
+import { normalizeGithubSkillSource } from "../lib/githubSkillSource";
+import { resolveWorkspaceMcpView } from "../lib/workspaceMcp";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
@@ -280,6 +280,8 @@ import {
   stripRestoredUserChoiceControlText,
 } from "../lib/actionRequestRestore";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
+import { normalizeExternalSkillSelections, type ExternalSkillSelection } from "../lib/externalSkillSelections";
+import { normalizeExternalSkillSources, type ExternalSkillSource, type ExternalSkillSources } from "../lib/externalSkillSources";
 import {
   sanitizeUserContextItemsForPersist,
 } from "../lib/userContextItems";
@@ -287,6 +289,7 @@ import { resolveSessionTranscriptPageMetadata } from "../lib/sessionTranscriptPa
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
+  normalizePersistedSkills,
   sanitizeHydratedLockedComposerIntent,
   stripLegacyConfigFields,
   stripLegacyRuntimeFieldsFromPersistedState,
@@ -1395,12 +1398,7 @@ export interface AppState {
   addMcpServer: (server: MCPServer) => void;
   removeMcpServer: (name: string) => void;
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
-  geminiExtensions: GeminiExtensionInstallation[];
-  extensionMcpDiscovery: Record<string, ExtensionMcpDiscovery>;
-  installGeminiExtension: (installation: GeminiExtensionInstallation, replacingId?: string) => Promise<string>;
-  setGeminiExtensionEnabled: (id: string, enabled: boolean) => Promise<void>;
-  removeGeminiExtension: (id: string) => Promise<void>;
-  scanGeminiExtensionMcp: (id: string) => Promise<MCPServerStatusSnapshot[]>;
+
 
   // IM Adapters
   feishuAdapterStatus: FeishuAdapterRuntimeStatus;
@@ -1430,11 +1428,16 @@ export interface AppState {
 
   // Skills CRUD
   skills: Skill[];
+  externalSkillSelections: ExternalSkillSelection[];
+  externalSkillSources: ExternalSkillSources;
+  setExternalSkillSource: (source: ExternalSkillSource, enabled: boolean) => void;
+  setExternalSkillSelection: (selection: ExternalSkillSelection) => void;
   setSkills: (v: Skill[]) => void;
   toggleSkill: (id: string) => void;
   deleteSkill: (id: string) => void;
   addSkill: (skill: Omit<Skill, "id" | "active" | "isBuiltIn">) => void;
   updateSkill: (id: string, patch: Partial<Omit<Skill, "id" | "isBuiltIn">>) => void;
+  applyGithubSkillUpdate: (candidate: GithubSkillUpdateCandidate) => GithubSkillUpdateResult;
   migrateLegacySkillPackages: () => Promise<void>;
 
   // Knowledge bases
@@ -1893,27 +1896,7 @@ export function normalizeProviderCompatibilityByRuntimeKey(
 
 const defaultSkills: Skill[] = [];
 const defaultKnowledgeBases: KnowledgeBase[] = [];
-const extensionRemovalLocks = new Set<string>();
 let legacySkillPackageMigration: Promise<void> | null = null;
-
-async function assertExtensionWorkspaceMutable(getState: () => any, workspace: string): Promise<void> {
-  const state = getState();
-  const message = "Finish or cancel this workspace's active and paused tasks before changing its extension.";
-  if (workspaceHasUnfinishedTurns(state, workspace)) throw new Error(message);
-  const normalized = normalizeExtensionWorkspace(workspace);
-  const sessions = state.sessionsByWorkspace?.[workspace] || state.sessionsByWorkspace?.[normalized] || [];
-  for (const session of sessions) {
-    const latest = getState();
-    if (session.runtimeSnapshot || session.storageStatus === "missing" || session.storageStatus === "temporary" ||
-      (normalizeExtensionWorkspace(latest.currentWorkspace) === normalized && latest.currentSessionId === session.id) ||
-      latest.runtimeBySessionKey?.[`${workspace}:${session.id}`]) continue;
-    const persisted = await loadProjectSessionMeta(workspace, session.id);
-    if (workspaceHasUnfinishedTurns({ currentWorkspace: workspace, ...persisted?.runtimeSnapshot }, workspace)) {
-      throw new Error(message);
-    }
-  }
-  if (workspaceHasUnfinishedTurns(getState(), workspace)) throw new Error(message);
-}
 
 const DEFAULT_MCP_SERVERS: MCPServer[] = [
   { name: "unityMCP", type: "http", url: "http://localhost:8080/mcp", enabled: true },
@@ -10233,126 +10216,6 @@ export const useAppStore = create<AppState>()(
     setMcpToolServerMap(filtered.toolServerMap);
     set({ mcpDiscoveredTools: filtered.tools, mcpToolServerMap: filtered.toolServerMap });
   },
-  geminiExtensions: [],
-  extensionMcpDiscovery: {},
-  installGeminiExtension: async (incoming, replacingId) => {
-    const installation = normalizeGeminiExtensionInstallations([incoming])[0];
-    if (!installation) throw new Error("Invalid Gemini extension installation.");
-    const state = get();
-    const previous = replacingId ? state.geminiExtensions.find((item) => item.id === replacingId) : undefined;
-    if (replacingId && extensionRemovalLocks.has(replacingId)) throw new Error("The extension is being removed.");
-    if (replacingId && !previous) throw new Error("The extension to update no longer exists.");
-    if (previous && normalizeExtensionWorkspace(previous.workspaceScope) !== normalizeExtensionWorkspace(installation.workspaceScope)) {
-      throw new Error("An extension update must stay in its original workspace.");
-    }
-    if (previous && workspaceHasUnfinishedTurns(state, previous.workspaceScope)) {
-      throw new Error("Finish or cancel this workspace's active and paused tasks before updating its extension.");
-    }
-    if (previous) {
-      await assertExtensionWorkspaceMutable(get, previous.workspaceScope);
-      if (get().geminiExtensions.find((item) => item.id === previous.id) !== previous) {
-        throw new Error("The extension changed while the update was being checked. Try again.");
-      }
-      if (extensionRemovalLocks.has(previous.id) || workspaceHasUnfinishedTurns(get(), previous.workspaceScope)) {
-        throw new Error("Finish or cancel this workspace's active and paused tasks before updating its extension.");
-      }
-    }
-    const latestState = get();
-    const duplicate = latestState.geminiExtensions.find((item) =>
-      item.id !== replacingId && item.packageHash === installation.packageHash &&
-      normalizeExtensionWorkspace(item.workspaceScope) === normalizeExtensionWorkspace(installation.workspaceScope));
-    if (duplicate) return duplicate.id;
-    if (!previous && latestState.geminiExtensions.some((item) => item.id === installation.id)) {
-      throw new Error("The extension installation ID is already in use.");
-    }
-    const installed = { ...installation, id: previous?.id || installation.id };
-    set((current) => {
-      const discovery = { ...current.extensionMcpDiscovery };
-      if (previous) delete discovery[extensionMcpDiscoveryKey(previous)];
-      return {
-        geminiExtensions: previous
-          ? current.geminiExtensions.map((item) => item.id === previous.id ? installed : item)
-          : [...current.geminiExtensions, installed],
-        extensionMcpDiscovery: discovery,
-      };
-    });
-    if (previous && previous.packagePath !== installed.packagePath) {
-      try {
-        await invoke("delete_protocol_package", { localPath: previous.packagePath, workspace: previous.workspaceScope });
-      } catch (error) {
-        console.error("Extension updated; old package cleanup could not complete.", error);
-      }
-    }
-    return installed.id;
-  },
-  setGeminiExtensionEnabled: async (id, enabled) => {
-    const state = get();
-    const installation = state.geminiExtensions.find((item) => item.id === id);
-    if (extensionRemovalLocks.has(id)) throw new Error("The extension is being removed.");
-    if (!installation || installation.enabled === enabled) return;
-    if (workspaceHasUnfinishedTurns(state, installation.workspaceScope)) {
-      throw new Error("Finish or cancel this workspace's active and paused tasks before changing its extension.");
-    }
-    await assertExtensionWorkspaceMutable(get, installation.workspaceScope);
-    if (get().geminiExtensions.find((item) => item.id === id) !== installation) {
-      throw new Error("The extension changed while it was being checked. Try again.");
-    }
-    if (extensionRemovalLocks.has(id) || workspaceHasUnfinishedTurns(get(), installation.workspaceScope)) {
-      throw new Error("Finish or cancel this workspace's active and paused tasks before changing its extension.");
-    }
-    set((current) => {
-      const discovery = { ...current.extensionMcpDiscovery };
-      delete discovery[extensionMcpDiscoveryKey(installation)];
-      return { geminiExtensions: current.geminiExtensions.map((item) => item.id === id ? { ...item, enabled } : item), extensionMcpDiscovery: discovery };
-    });
-  },
-  removeGeminiExtension: async (id) => {
-    if (extensionRemovalLocks.has(id)) throw new Error("The extension is being removed.");
-    const state = get();
-    const installation = state.geminiExtensions.find((item) => item.id === id);
-    if (!installation) return;
-    if (workspaceHasUnfinishedTurns(state, installation.workspaceScope)) {
-      throw new Error("Finish or cancel this workspace's active and paused tasks before removing its extension.");
-    }
-    await assertExtensionWorkspaceMutable(get, installation.workspaceScope);
-    if (get().geminiExtensions.find((item) => item.id === id) !== installation) {
-      throw new Error("The extension changed while it was being checked. Try again.");
-    }
-    if (extensionRemovalLocks.has(id) || workspaceHasUnfinishedTurns(get(), installation.workspaceScope)) {
-      throw new Error("Finish or cancel this workspace's active and paused tasks before removing its extension.");
-    }
-    extensionRemovalLocks.add(id);
-    // Disable synchronously before filesystem I/O so a newly admitted Turn
-    // cannot capture a package while deletion is in flight.
-    set((current) => ({ geminiExtensions: current.geminiExtensions.map((item) => item.id === id ? { ...item, enabled: false } : item) }));
-    try {
-      await invoke("delete_protocol_package", { localPath: installation.packagePath, workspace: installation.workspaceScope });
-    } catch (error) {
-      set((current) => ({ geminiExtensions: current.geminiExtensions.map((item) => item.id === id && item.packagePath === installation.packagePath ? installation : item) }));
-      extensionRemovalLocks.delete(id);
-      throw error;
-    }
-    set((current) => {
-      const discovery = { ...current.extensionMcpDiscovery };
-      delete discovery[extensionMcpDiscoveryKey(installation)];
-      return { geminiExtensions: current.geminiExtensions.filter((item) => item.id !== id), extensionMcpDiscovery: discovery };
-    });
-    extensionRemovalLocks.delete(id);
-  },
-  scanGeminiExtensionMcp: async (id) => {
-    const installation = get().geminiExtensions.find((item) => item.id === id);
-    if (!installation) throw new Error("The extension no longer exists.");
-    const servers = extensionMcpServers(installation);
-    const discovery = await discoverAllMcpTools(servers, { forceRefresh: true });
-    const key = extensionMcpDiscoveryKey(installation);
-    set((current) => {
-      const currentInstallation = current.geminiExtensions.find((item) => item.id === id);
-      if (!currentInstallation || !currentInstallation.enabled || extensionMcpDiscoveryKey(currentInstallation) !== key) return {};
-      return { extensionMcpDiscovery: { ...current.extensionMcpDiscovery, [key]: discovery } };
-    });
-    return discovery.serverStatuses;
-  },
-
   // IM adapters
   feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
   feishuPairingRequests: [],
@@ -10445,6 +10308,14 @@ export const useAppStore = create<AppState>()(
   setFeishuLinkedSession: (sessionId, context) => set({ feishuLinkedSessionId: sessionId, feishuLinkedContext: context }),
 
   skills: defaultSkills,
+  externalSkillSelections: [],
+  externalSkillSources: normalizeExternalSkillSources(undefined),
+  setExternalSkillSource: (source, enabled) => set((state) => ({
+    externalSkillSources: normalizeExternalSkillSources({ ...state.externalSkillSources, [source]: enabled }),
+  })),
+  setExternalSkillSelection: (selection) => set((state) => ({
+    externalSkillSelections: normalizeExternalSkillSelections([...state.externalSkillSelections, selection]),
+  })),
   setSkills: (v) => set({ skills: v }),
   toggleSkill: (id) =>
     set((s) => ({ skills: s.skills.map((sk) => (sk.id === id ? { ...sk, active: !sk.active } : sk)) })),
@@ -10470,12 +10341,13 @@ export const useAppStore = create<AppState>()(
     }
     removeRecord();
   },
-  addSkill: ({ name, desc, content, type, toolParameters, packagePath, packageStorage, entryPoint, entryPoints, workspaceScope, allowImplicitInvocation }) =>
+  addSkill: ({ name, desc, content, type, toolParameters, packagePath, packageStorage, githubSource, entryPoint, entryPoints, workspaceScope, allowImplicitInvocation }) =>
     set((s) => ({
       skills: upsertGlobalSkillRegistration(s.skills, {
         id: packageStorage?.kind === "global" ? `global-skill:${packageStorage.packageId}` : Date.now().toString(),
         name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false,
         type: type || "instruction", toolParameters, entryPoint, entryPoints, allowImplicitInvocation,
+        ...(type === "package" && packageStorage ? { githubSource: normalizeGithubSkillSource(githubSource) } : {}),
         ...(packageStorage ? { packageStorage } : { packagePath, workspaceScope }),
       }),
     })),
@@ -10498,9 +10370,31 @@ export const useAppStore = create<AppState>()(
           delete updated.packagePath;
           delete updated.workspaceScope;
         }
+        if (updated.type === "package" && globalSkillPackageId(updated)) {
+          updated.githubSource = normalizeGithubSkillSource(updated.githubSource);
+        } else {
+          delete updated.githubSource;
+        }
         return updated;
       }) };
     }),
+  applyGithubSkillUpdate: (candidate) => {
+    const before = get().skills;
+    const result = applyGithubSkillPackageCandidate(before, candidate);
+    if (result.status === "updated") {
+      try {
+        set({ skills: result.skills });
+      } catch (error) {
+        // Synchronous persistence follows the memory commit. Restore only this
+        // exact update, preserving any later user action from storage callbacks.
+        if (get().skills === result.skills) {
+          try { set({ skills: before }); } catch { /* Memory is already restored. */ }
+        }
+        throw error;
+      }
+    }
+    return { status: result.status, ...(result.conflictId ? { conflictId: result.conflictId } : {}) };
+  },
   migrateLegacySkillPackages: () => {
     if (legacySkillPackageMigration) return legacySkillPackageMigration;
     legacySkillPackageMigration = migrateLegacySkillRegistrations({
@@ -10559,9 +10453,12 @@ export const useAppStore = create<AppState>()(
     if (!requestedWorkspace) {
       const resolved = await loadResolvedInstructions(
         "",
-        workspaceExtensionSkills(state.skills, state.geminiExtensions, requestedWorkspace),
+        state.skills,
         associatedPaths,
         options.userPrompt || "",
+        undefined,
+        state.externalSkillSelections,
+        state.externalSkillSources,
       );
       if (
         workspaceInstructionProjectionOwner.canCommit(
@@ -10583,10 +10480,12 @@ export const useAppStore = create<AppState>()(
     const [resolved, hooksConfig] = await Promise.all([
       loadResolvedInstructions(
         requestedWorkspace,
-        workspaceExtensionSkills(state.skills, state.geminiExtensions, requestedWorkspace),
+        state.skills,
         associatedPaths,
         options.userPrompt || "",
         options.instructionIo,
+        state.externalSkillSelections,
+        state.externalSkillSources,
       ),
       loadHooksConfig(requestedWorkspace),
     ]);
@@ -12136,8 +12035,8 @@ export const useAppStore = create<AppState>()(
     set({
       config: defaultConfig,
       skills: defaultSkills,
-      geminiExtensions: [],
-      extensionMcpDiscovery: {},
+      externalSkillSelections: [],
+      externalSkillSources: normalizeExternalSkillSources(undefined),
       knowledgeBases: defaultKnowledgeBases,
       mcpServers: DEFAULT_MCP_SERVERS,
       mcpDiscoveredTools: [],
@@ -18749,8 +18648,6 @@ export const useAppStore = create<AppState>()(
           manualServers: admissionState.mcpServers,
           manualTools: admissionState.mcpDiscoveredTools,
           manualToolServerMap: admissionState.mcpToolServerMap,
-          installations: admissionState.geminiExtensions,
-          discoveries: admissionState.extensionMcpDiscovery,
         });
         const associatedPaths = [
           ...turnInputContextSignals.mentionedFilePaths,
@@ -18769,7 +18666,9 @@ export const useAppStore = create<AppState>()(
         }
         const snapshot = await resolveWorkspaceAdmissionSnapshot({
           workspace,
-          skills: workspaceExtensionSkills(admissionState.skills, admissionState.geminiExtensions, workspace),
+          skills: admissionState.skills,
+          externalSkillSelections: admissionState.externalSkillSelections,
+          externalSkillSources: admissionState.externalSkillSources,
           associatedPaths,
           userPrompt,
           io: workspaceAdmissionIpcIo,
@@ -18959,6 +18858,8 @@ export const useAppStore = create<AppState>()(
         showTaskCenterPanel?: unknown;
         taskCenter?: unknown;
         taskCenterActiveTaskId?: unknown;
+        geminiExtensions?: unknown;
+        extensionMcpDiscovery?: unknown;
       }) || {};
       const {
         showTaskCenterPanel: _legacyShowTaskCenterPanel,
@@ -18969,6 +18870,8 @@ export const useAppStore = create<AppState>()(
         activeStudioAgentKey: _legacyActiveStudioAgentKey,
         gameStudioInitialized: _legacyGameStudioInitialized,
         pendingSlashCommand: _legacyPendingSlashCommand,
+        geminiExtensions: _retiredGeminiExtensions,
+        extensionMcpDiscovery: _retiredExtensionMcpDiscovery,
         ...persistedStateWithoutTaskCenter
       } = persistedState;
       const persistedConfig = stripLegacyConfigFields(persistedState.config) ?? {};
@@ -19034,6 +18937,9 @@ export const useAppStore = create<AppState>()(
       return {
         ...current,
         ...persistedStateWithoutTaskCenter,
+        skills: normalizePersistedSkills(persistedState.skills ?? current.skills),
+        externalSkillSelections: normalizeExternalSkillSelections(persistedState.externalSkillSelections),
+        externalSkillSources: normalizeExternalSkillSources(persistedState.externalSkillSources),
         config: {
           ...current.config,
           ...(persistedConfig as any),
@@ -19069,8 +18975,6 @@ export const useAppStore = create<AppState>()(
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,
         mcpServers: normalizeMcpServers(persistedState.mcpServers),
-        geminiExtensions: normalizeGeminiExtensionInstallations(persistedState.geminiExtensions),
-        extensionMcpDiscovery: {},
         mcpDiscoveredTools: [],
         mcpToolServerMap: {},
         runtimeBySessionKey: {},
