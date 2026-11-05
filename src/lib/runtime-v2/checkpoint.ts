@@ -672,11 +672,16 @@ export function commitRuntimeV2EmergencyTerminalEnvelope(input: {
         !sameOwner(checkpoint.owner, input.owner) ||
         checkpoint.revision !== input.expectedRevision ||
         checkpointIsFullyTerminal ||
-        !checkpoint.aggregate.run ||
-        !sameRuntimeV2EmergencyTerminalRun(
-          checkpoint.aggregate.run.identity,
-          input.run,
-        )
+        (checkpoint.aggregate.run
+          ? !sameRuntimeV2EmergencyTerminalRun(
+              checkpoint.aggregate.run.identity,
+              input.run,
+            )
+          // Stop can exhaust the size budget while appending run.started to
+          // an admitted Turn. Only this canceled envelope may establish its
+          // first Run identity; normalization already binds it to the owner.
+          : envelope.resultKind !== "canceled" ||
+            envelope.reasonCode !== "checkpoint_size_budget_exceeded")
       )
     )
   ) {

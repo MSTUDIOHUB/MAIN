@@ -70,10 +70,14 @@ import {
 import { runGitDiffTool, runGitStatusTool } from "./gitTools";
 import {
   LOAD_SKILL_TOOL_NAME,
-  isSkillVisibleToModel,
-  loadSkillContent,
   type SkillCatalogSnapshot,
 } from "./agentSkills";
+import { executeAgentSkillTool } from "./agentSkillExecutor";
+import {
+  TOOL_SEARCH_TOOL_NAME,
+  executeToolSearch,
+  unlockToolsForSession,
+} from "./toolSearch";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -264,6 +268,8 @@ function buildChatTempSuccessMessage(
 }
 
 export interface ToolExecutionOptions {
+  /** Internal Runtime preparation fact; model arguments never supply this. */
+  writeFileTarget?: import("./workspaceMutationPreflight").WorkspaceWriteFileTargetFact;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
@@ -376,19 +382,15 @@ export async function executeTool(
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
   if (executionName === LOAD_SKILL_TOOL_NAME) {
-    const skillId = String(args.skill_id || "").trim();
-    if (!options.skillCatalog) {
-      throw new Error("SKILL_CATALOG_UNAVAILABLE: no Skill catalog was admitted for this Turn.");
-    }
-    if (!isSkillVisibleToModel(options.skillCatalog, skillId)) {
-      throw new Error(`SKILL_NOT_AUTHORIZED: ${skillId || "missing skill id"}`);
-    }
-    return JSON.stringify({
-      type: "skill.loaded",
-      ...loadSkillContent(options.skillCatalog, skillId),
-      effect: "instructions_loaded_no_additional_permissions",
+    return executeAgentSkillTool(options.skillCatalog, args);
+  }
+  if (executionName === TOOL_SEARCH_TOOL_NAME) {
+    return executeToolSearch(args, {
+      sessionKey,
+      toolCatalog: options.toolCatalog,
     });
   }
+  unlockToolsForSession(sessionKey, [executionName]);
 
   // ── MCP tool routing ────────────────────────────────────────
   // If the tool was discovered from an MCP server, forward the call
@@ -963,6 +965,24 @@ export async function executeTool(
       const writePath = (args.path as string) || "";
       const writeContent = (args.content as string) || "";
       if (!writePath) throw new Error("Missing required parameter 'path'.");
+      if (options.writeFileTarget) {
+        const reviewed = options.writeFileTarget;
+        const temporary = shouldUseChatTempStorage(workspace, sessionKey);
+        if (reviewed.path !== writePath) throw new Error("WRITE_FILE_TARGET_FACT_MISMATCH");
+        let temporaryPath: string | undefined;
+        if (!reviewed.exists) {
+          if (temporary) temporaryPath = await writeChatTempFileCreateNew(sessionKey!, writePath, writeContent);
+          else await writeFileCreateNew(writePath, writeContent, workspace);
+        } else {
+          const current = temporary ? await readChatTempFile(sessionKey!, writePath) : await readFile(writePath, workspace);
+          if (current !== reviewed.content) throw new Error("WRITE_FILE_SOURCE_STALE: target changed after mutation preparation");
+          if (temporary) temporaryPath = await writeChatTempFile(sessionKey!, writePath, writeContent);
+          else await writeFile(writePath, writeContent, workspace);
+        }
+        return temporaryPath
+          ? buildChatTempSuccessMessage("written", writePath, temporaryPath)
+          : JSON.stringify({ success: true, changedPaths: [writePath], message: `File ${writePath} written successfully.` });
+      }
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
         try {
           const original = await readChatTempFile(sessionKey!, writePath);

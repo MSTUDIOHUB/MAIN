@@ -294,10 +294,7 @@ export function boundRuntimeMessagesToContext(
     1_024,
     Math.min(Math.floor(input.reservedOutputTokens), contextLimit),
   );
-  const inputBudget = computeContextBudgets(
-    contextLimit,
-    reservedOutputTokens,
-  ).inputBudget;
+  const inputBudget = computeContextBudgets(contextLimit, reservedOutputTokens).inputBudget;
   if (
     estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget
   ) {
@@ -356,6 +353,60 @@ export function boundRuntimeMessagesToContext(
     ...(compacted.messages as AgentMessage[]),
     ...trailingInstructions,
   ];
+}
+
+/** Lossless pressure eviction. Tool calls and their receipts are atomic;
+ * source bytes are either on the wire unchanged or absent, never cropped. */
+export function boundRuntimeMessageGroupsToInputBudget(
+  messages: readonly AgentMessage[],
+  inputBudget: number,
+  options: { readonly priorityToolCallIds?: ReadonlySet<string> } = {},
+): AgentMessage[] {
+  const budget = Math.max(0, Math.floor(inputBudget));
+  const receiptIndices = new Map<string, number[]>();
+  messages.forEach((message, index) => {
+    if (message.role !== "tool" || !message.tool_call_id) return;
+    receiptIndices.set(message.tool_call_id, [...(receiptIndices.get(message.tool_call_id) || []), index]);
+  });
+  const consumedIndices = new Set<number>();
+  const groups: AgentMessage[][] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    if (consumedIndices.has(index)) continue;
+    const message = messages[index]!;
+    const group = [message];
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const ownedReceipts = message.tool_calls.flatMap((call) => receiptIndices.get(call.id) || [])
+        .filter((receiptIndex) => receiptIndex > index).sort((left, right) => left - right);
+      for (const receiptIndex of ownedReceipts) {
+        group.push(messages[receiptIndex]!);
+        consumedIndices.add(receiptIndex);
+      }
+    }
+    groups.push(group);
+  }
+  const protectedGroups = new Set(groups.filter((group) => group[0]?.role === "system"));
+  for (const group of groups.filter((item) => item[0]?.role === "user").slice(-2)) protectedGroups.add(group);
+  const latestToolGroup = [...groups].reverse().find((group) => group[0]?.tool_calls?.length);
+  if (latestToolGroup) protectedGroups.add(latestToolGroup);
+  const latestContentGroup = [...groups].reverse().find((group) => group[0]?.role !== "system");
+  if (latestContentGroup) protectedGroups.add(latestContentGroup);
+  let result = [...messages];
+  // Read guidance remains useful across ordinary tool observations. Prefer
+  // evicting other historical groups first; the same hard token bound still
+  // applies, and callers must disclose any guidance that cannot fit.
+  const evictionOrder = [...groups].sort((left, right) =>
+    Number(left[0]?.tool_calls?.some((call) => options.priorityToolCallIds?.has(call.id)) || false) -
+    Number(right[0]?.tool_calls?.some((call) => options.priorityToolCallIds?.has(call.id)) || false));
+  for (const group of evictionOrder) {
+    if (estimateMessagesTokens(result as TrimMessage[]) <= budget) return result;
+    if (protectedGroups.has(group)) continue;
+    const removed = new Set(group);
+    result = result.filter((message) => !removed.has(message));
+  }
+  if (estimateMessagesTokens(result as TrimMessage[]) > budget) {
+    throw new Error("RUNTIME_CONTEXT_BUDGET_EXCEEDED: current objective, evidence and authority do not fit the Run input budget");
+  }
+  return result;
 }
 
 function normalizedOpenAiBase(endpoint: string): string {

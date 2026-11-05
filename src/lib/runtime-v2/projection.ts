@@ -7,6 +7,7 @@ import type {
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { countDistinctRuntimeV2EvidenceFacts } from "./evidenceFacts";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 
 function markdownCode(value: unknown): string {
   const text = String(value || "").trim().replace(/`/g, "");
@@ -304,7 +305,7 @@ export function buildRuntimeV2FinalProjection(
     .map((evidence) => evidence.target)
     .filter(Boolean))];
   const validations = aggregate.events.filter(
-    (event) => event.type === "validation.completed",
+    isRuntimeV2ValidationAttempt,
   );
   const passedValidations = validations.filter((event) => event.passed).length;
   const failedValidations = validations.length - passedValidations;
@@ -330,7 +331,7 @@ export function buildRuntimeV2FinalProjection(
       mutationLine,
       validationLine,
       evidenceLine,
-      `- ${reason}`,
+      /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
     ].filter(Boolean).join("\n\n"),
     "final",
     `final:${resultKind}:${reason}`,

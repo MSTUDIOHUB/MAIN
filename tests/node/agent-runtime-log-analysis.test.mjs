@@ -9,6 +9,21 @@ import {
   parseAgentRuntimeLog,
 } from "../../scripts/analyze-agent-runtime-log.mjs";
 
+test("v2 validation counts require a typed validation command and cancellation comes from one final fact", () => {
+  const entries = [
+    ["tool_execution_started", { toolName: "run_command" }],
+    ["tool_execution_started", { toolName: "run_command", commandKind: "execute_tool" }],
+    ["tool_execution_started", { toolName: "run_command", commandKind: "execute_validation" }],
+    ...[1, 2].map(() => ["projection_published", { audience: "final", storeDisposition: "projected", resultKind: "canceled", reason: "user_cancelled", finalProjectionId: "same-final" }]),
+  ];
+  const events = parseAgentRuntimeLog(entries.map(([name, payload], index) =>
+    `[1792669700.${index}00] [info] [store.runtime_v2_${name}] ${JSON.stringify({ turnId: "t", runId: "r", ...payload })}`).join("\n"));
+  const run = analyzeAgentRuntimeEvents(events).runs[0];
+  assert.equal(run.validationToolCalls, 1);
+  assert.equal(run.terminalResultKind, "canceled");
+  assert.equal(run.projections["final:projected"], 1);
+});
+
 test("runtime log analysis groups runs and reports efficiency signals", async (t) => {
   const fixtureDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "main-runtime-log-"));
   const fixturePath = path.join(fixtureDirectory, "main-debug.log");

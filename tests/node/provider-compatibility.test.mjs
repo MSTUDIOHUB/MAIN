@@ -55,6 +55,8 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const providerCompatibility = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/providerCompatibility.ts"));
 const toolFeedbackEnvelope = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
+const { normalizeProviderResponseV1 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtime-v2/providerLane.ts"));
+const { runtimeV2ProviderToolArgumentViolation } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderToolSchema.ts"));
 
 const {
   NATIVE_TOOL_HISTORY_RESULT_BUDGET_CHARS,
@@ -262,7 +264,19 @@ test("provider compatibility prompt derives its XML catalog from the active edit
   assert.equal(message.role, "system");
   assert.match(message.content, /protocol=xml-text/);
   assert.match(message.content, /write_file\(path: string, content: string\)/);
-  assert.match(message.content, /<tool>write_file<\/tool>/);
+  // The preferred text transport is a JSON tool_call, not the historical
+  // parameter-tag dialect. Prove that the actual advertised example crosses
+  // production response ingress and the active argument schema unchanged.
+  const example = message.content.match(/^<tool_call>[\s\S]*?^<\/tool_call>/m)?.[0];
+  assert.ok(example);
+  const parsed = normalizeProviderResponseV1({ content: example });
+  assert.deepEqual(parsed.toolCalls.map(({ name, arguments: args }) => ({ name, arguments: args })), [{
+    name: "write_file", arguments: { path: "src/example.ts", content: "value" },
+  }]);
+  assert.equal(runtimeV2ProviderToolArgumentViolation(parsed.toolCalls, [writeFileTool]), null);
+  assert.equal(parsed.diagnostics.some((diagnostic) => diagnostic.retryable), false);
+  const legacy = normalizeProviderResponseV1({ content: '<tool_use><tool>write_file</tool><parameter name="path">src/example.ts</parameter><parameter name="content">value</parameter></tool_use>' });
+  assert.deepEqual(legacy.toolCalls.map(({ name, arguments: args }) => ({ name, arguments: args })), parsed.toolCalls.map(({ name, arguments: args }) => ({ name, arguments: args })));
   assert.doesNotMatch(message.content, /replace_in_file|run_command|browser_evaluate|read_file/);
 });
 

@@ -15,6 +15,7 @@ import { runSubmitRuntimeV2Goal } from "./runtimeV2/goalProductionRunner";
 import { runSubmitRuntimeV2Plan } from "./runtimeV2/planRunner";
 import { runSubmitRuntimeV2WorkspaceRead } from "./runtimeV2/workspaceReadRunner";
 import { withRuntimeV2ContextBudget } from "./runtimeV2/submissionContext";
+import { handleRuntimeV2IntentClarification } from "./runtimeV2/intentClarification";
 
 type SubmitRuntimeStoreGet = () => any;
 type SubmitRuntimeStoreSet = any;
@@ -57,6 +58,8 @@ export async function runSubmitRuntime(
     });
     throw new Error("RUNTIME_V2_TURN_ADMISSION_REQUIRED");
   }
+  const clarification = await handleRuntimeV2IntentClarification({ ...input, persistSessionRecord: input.persistSessionRecord || saveProjectSession }, runtimeV2RunnerKind);
+  if (clarification) return clarification;
   const runtimeContextBudget = await resolveRuntimeContextBudget(
     input.get().config || {},
   );

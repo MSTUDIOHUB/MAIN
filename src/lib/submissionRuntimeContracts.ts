@@ -49,7 +49,11 @@ export interface SubmissionRuntimeStorePorts {
     sessionKey: string;
     source: "workflow_fallback";
   }) => void;
-  persistSessionRecord: (workspace: string, session: unknown) => Promise<unknown>;
+  persistSessionRecord: (
+    workspace: string,
+    session: unknown,
+    options?: import("./projectSessionMutationCoordinator").ProjectSessionSaveOptions,
+  ) => Promise<unknown>;
   logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 
@@ -59,11 +63,16 @@ export interface SubmissionRuntimeContext {
   uiDisplayTurnId: string;
   runWorkspace: string | undefined;
   runSessionKey: string;
+  runSessionEpoch?: string;
   runSessionId: number | null | undefined;
   runScopeKey: string;
   phaseLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
+  capabilityRestrictions?: readonly import("./turnCapabilities").TurnCapability[];
+  approvalRequiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
+  requiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
+  intentClarification?: import("./turnClarification").TurnClarification;
   goalCreationAuthorization: GoalCreationAuthorization | null;
   goalContinuationAuthorization: GoalContinuationAuthorization | null;
   effectiveCommandDirective: CommandDirective | null;
@@ -80,6 +89,7 @@ export interface SubmissionRuntimeContext {
   /** Exact Skill catalog frozen at Turn admission. Full bodies remain outside
    * provider context until explicit activation or load_skill. */
   skillCatalog?: SkillCatalogSnapshot | null;
+  workspaceMcpSnapshot?: import("./workspaceMcp").WorkspaceMcpSnapshot | null;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   abortCtrl: AbortController;
   timerInterval: any;

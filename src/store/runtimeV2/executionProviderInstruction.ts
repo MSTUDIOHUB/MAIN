@@ -1,9 +1,6 @@
 import type { RuntimeV2Command } from "../../lib/runtime-v2";
 import type { RuntimeV2ProviderActionWindow } from "./executionContext";
-import {
-  runtimeV2ExecutionContractAnchor,
-  type RuntimeV2ExecutionContract,
-} from "./executionContract";
+import type { RuntimeV2ExecutionContract } from "./executionContract";
 function mergedVisibleLineRanges(
   windows: readonly {
     readonly startLine: number;
@@ -69,6 +66,7 @@ export function providerModeInstruction(
   toolSurface: {
     readonly hasReadFile: boolean;
     readonly hasMutation: boolean;
+    readonly hasCreateFile?: boolean;
     readonly hasSpawnSubagent: boolean;
     readonly hasWaitSubagents: boolean;
     readonly hasMaterializedSourceEvidence?: boolean;
@@ -155,7 +153,7 @@ export function providerModeInstruction(
     toolSurface.hasSpawnSubagent
       ? [
           command.payload.collaborationPreferred === true
-            ? `The user explicitly prefers collaboration and ${remainingSubagentCapacity} new child slot(s) are available. If this objective contains at least two genuinely independent bounded work packages, prioritize issuing up to ${remainingSubagentCapacity} spawn_subagent calls in this decision and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
+            ? `The user explicitly prefers collaboration and ${remainingSubagentCapacity} new child slot(s) are available. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
             : "Delegation is optional.",
           "Use read-only children for parallel investigation. Use implement/write only after the parent has an evidence-backed solution: provide an explicit operation, implementation_plan, success criteria, and every exact non-overlapping file target; never grant a directory and let the child choose writes. The child stages one transaction and Runtime commits it at join; the parent still owns cross-file integration and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
         ].join(" ")
@@ -172,204 +170,87 @@ export function providerModeInstruction(
     Math.floor(Number(recoveryPressure?.occurrence) || 0),
   );
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const recoveringCompleteReply = recoveryPressure?.reason === "non_actionable_response";
   const recoveryGuidance = recoveryPressure
-    ? [
-        `RECOVERY_PIVOT ${recoveryOccurrence}: the previous provider decision produced no executable progress (${String(recoveryPressure.reason || "non_actionable_response")}).`,
-        recoveryStage === "reconsider"
-          ? "Re-read the latest structured failure feedback and submit an action whose normalized tool arguments are materially different from the closed action."
-          : recoveryStage === "reframe"
-            ? "Change strategy now and use one materially different action from CURRENT_TOOL_SURFACE. Do not resubmit the same patch or read."
-            : "The current approach is stalled. Use one genuinely different action from CURRENT_TOOL_SURFACE; the closed action will not execute.",
-      ].join(" ")
-    : "";
-  const editableSourceGuidance =
-    toolSurface.hasMutation &&
-      toolSurface.hasMaterializedSourceEvidence
-      ? runtimeV2EditableSourceAnchor(
-          toolSurface.materializedSourceCoverage || [],
-        )
-      : "";
-  const executionContractGuidance = toolSurface.executionContract
-    ? [
-        runtimeV2ExecutionContractAnchor(toolSurface.executionContract),
-        "The active execution contract is the current parent solution boundary. Advance one listed change or validation at a time, preserve its stated boundaries, and do not broaden into cleanup or redesign. To add or change a target, first obtain the missing exact evidence and explicitly revise record_execution_contract with revision_reason; a parent or implementation child mutation outside the contract will be rejected.",
-      ].join(" ")
-    : "";
-  const executionContractAdvanceGuidance =
-    toolSurface.executionContractAdvanceRequired
-      ? [
-          "EXECUTION_CONTRACT_ADVANCE_REQUIRED: a contracted workspace mutation has committed, so open-ended investigation is closed until the newest implementation is advanced or checked.",
-          `Already mutated targets: ${JSON.stringify(toolSurface.executionContractCommittedTargets || [])}. Contract targets not yet mutated: ${JSON.stringify(toolSurface.executionContractPendingTargets || [])}.`,
-          toolSurface.executionContractSourceReviewAvailable
-            ? `One bounded post-mutation self-review read batch is available only for the just-mutated targets ${JSON.stringify(toolSurface.executionContractSourceReviewTargets || [])}. Use it now only if an exact changed range must be confirmed; issue every independent changed-target read together. After this batch, reading closes and you must mutate or validate.`
-            : "The bounded post-mutation self-review batch is already consumed or was not requested; reading remains closed for this mutation boundary.",
-          toolSurface.executionContractSourceReviewAvailable
-            ? (toolSurface.executionContractPendingTargets || []).length > 0
-              ? "Use only the advertised target-locked read_file for an exact post-edit self-check, or skip it and submit one remaining concrete contracted mutation. Validation is intentionally unavailable until every contracted target has a committed mutation."
-              : "Use only the advertised target-locked read_file for an exact post-edit self-check, or skip it and submit the finite/behavioral validation. Search, manifests, presentation files, and collaboration are not part of this review."
-            : (toolSurface.executionContractPendingTargets || []).length > 0
-              ? "Submit one concrete mutation for a not-yet-mutated contract target now. Validation and further reading are intentionally unavailable until every contracted target has a committed mutation. If current evidence changes the solution, revise the contract instead of skipping the target."
-              : "Run the advertised finite/behavioral validation against the newest workspace. Do not read, search, inspect manifests/presentation files, or spawn another child merely to reconsider the completed edit. A real failed validation will reopen evidence-backed correction.",
-        ].join(" ")
-      : "";
-  const validationCorrectionGuidance = toolSurface.validationCommandUnavailable
-    ? toolSurface.replacementValidationExhausted
-      ? [
-          "VALIDATION_REPLACEMENT_EXHAUSTED: the sealed validator and one materially different bounded replacement both failed before yielding a source diagnostic.",
-          "Do not retry either command, inspect unrelated source, or change code merely to make the environment executable. Return a concise incomplete report with the actual edits and manual verification steps.",
-        ].join(" ")
-      : [
-          "VALIDATION_COMMAND_UNAVAILABLE: the sealed finite validator failed operationally without identifying a source location.",
-          toolSurface.failedValidationCommand
-            ? `Do not repeat ${JSON.stringify(toolSurface.failedValidationCommand)}. Choose one materially different finite build, test, lint, typecheck, check, inline assertion, browser, or desktop validation now.`
-            : "Choose one materially different finite build, test, lint, typecheck, check, inline assertion, browser, or desktop validation now.",
-          "This is a validation-authority fallback, not a source-correction window: do not read or mutate the workspace in this decision.",
-        ].join(" ")
-    : toolSurface.validationCorrectionActive
-    ? "VALIDATION_CORRECTION: a real acceptance check failed on the newest mutation. This receipt is newer evidence than the pre-edit implementation outline. Treat its diagnostic paths and lines as the causal starting evidence, use ordinary focused source reads only where exact current text is missing, then repair every supported owner directly with source-backed mutations. Do not rerun the same validation on an unchanged workspace; general no-effect recovery will stop repeated reads or rejected actions."
-    : "";
-  const actionWindowGuidance = toolSurface.actionWindow
-    ? toolSurface.actionWindow === "corrective_source"
-      ? [
-          "CORRECTIVE_SOURCE_WINDOW: the previous workspace mutation changed no files because its exact target source was not visible.",
-          "Use read_file only for the newest failed target. When an acceptance receipt supplied a file and line, choose that nearby range; otherwise choose the smallest range needed for a materially different mutation. Do not start at line 1, request the whole file, or page through successive/overlapping windows.",
-          "As soon as the exact current source needed by a safe alternative is visible, Runtime closes reading and requires the new mutation; it never waits for the rejected patch to be reconstructed.",
-        ].join(" ")
-      : toolSurface.actionWindow === "corrective_mutation"
-      ? [
-          "CORRECTIVE_ACTION_WINDOW: the previous workspace mutation changed no files, and its exact source plus bounded failure diagnostic are already visible.",
-          "The observation branch is closed for this mutation boundary. Submit one materially different, smaller workspace mutation now, or return a concise incomplete report without a tool call. Inspection and validation reopen immediately after a mutation commits.",
-        ].join(" ")
-      : toolSurface.actionWindow === "validation_handoff"
-      ? [
-          "CONTRACT_VALIDATION_HANDOFF: every contracted target already has a committed mutation, and a later optional editor changed no files.",
-          "Do not repair that uncommitted attempt or inspect another range now. Validate the newest committed workspace; a real failed acceptance receipt will reopen an evidence-bounded correction.",
-        ].join(" ")
-      : [
-          "RECOVERY_ACTION_WINDOW: a repeated no-effect action, materially different reads returning the same non-empty observation, or one same-version cache re-materialization has closed the current observation branch while exact source remains visible.",
-          "Submit one workspace mutation against an exact source target already visible in this request, or return a concise incomplete report without a tool call. Collaboration cannot replace this parent action, and creating an unrelated file cannot discharge this existing-source effect debt. If a mutation is rejected because one exact target source is missing, Runtime opens a target-locked source recovery window. Inspection and validation reopen immediately after a mutation commits.",
-        ].join(" ")
+    ? recoveringCompleteReply
+      ? `Previous response had no tool call (${String(recoveryPressure.reason)}). Use the actual prior result: take the next authorized action if work remains, give a complete final report when successful receipts cover the full request, or ask a focused question if user input is required.`
+      : `Previous action made no progress (${String(recoveryPressure.reason || "non_actionable_response")}, attempt ${recoveryOccurrence}, stage ${recoveryStage || "retry"}). Check the latest tool error or file snippet and try a different approach or smaller edit.`
     : "";
   if (mode === "chat" || mode === "analyze" || (mode === "conclude" && command.payload.conclusionKind === "read_only")) {
-    if (mode === "conclude") return "Return one complete Markdown answer now from the conversation and available evidence. Tools are closed. State information gaps explicitly; never invent facts or claim that unavailable checks succeeded.";
+    if (mode === "conclude") {
+      return "Return a clear, complete Markdown answer based on the conversation and gathered evidence. Tools are closed for this final reply.";
+    }
     return [
-      mode === "chat" ? "Answer the user using the supplied conversation. Only exposed Skill and Web context reads are available." : "Analyze the admitted sources with read-only authority.",
-      command.payload.recoveryPressure ? "The last decision added no new evidence. Read again only for a concrete remaining information gap using a materially different source or reading method; otherwise answer now." : "Use a focused read only when a concrete fact is missing, then return a complete Markdown answer.",
+      mode === "chat"
+        ? "Answer the user directly, using available read/search tools only when needed."
+        : "Inspect the relevant files or sources with read-only tools, then provide a complete Markdown answer.",
+      recoveryGuidance,
       mode === "analyze" ? collaborationGuidance : "",
     ].filter(Boolean).join(" ");
   }
   if (mode === "conclude") {
     return [
-      "Return the final evidence report now. State only the confirmed cause, files actually changed, validations actually run, and any remaining limitation. Do not request another workspace action.",
+      "Summarize the completed changes, files modified, validations run, and any remaining caveats. Do not call more tools.",
       collaborationGuidance,
     ].filter(Boolean).join(" ");
   }
+  const sourceGuidance = toolSurface.hasMutation
+    ? [
+        toolSurface.hasMaterializedSourceEvidence
+          ? "For modifications to an existing file, use only its exact current source visible in this decision request. Each existing target needs its own versioned source lease; observing one file does not authorize edits to another."
+          : command.payload.hasVersionedSourceEvidence === true
+            ? "Existing-file source is cached but is not visible in this decision request; this does not authorize edits to those files. Request the exact missing target window so Runtime can replay it without another disk read."
+            : "Read the exact current target before modifying an existing file.",
+        runtimeV2EditableSourceAnchor(toolSurface.materializedSourceCoverage || []),
+      ].filter(Boolean).join(" ")
+    : "";
+  const creationGuidance = toolSurface.hasCreateFile &&
+      !toolSurface.actionWindow && !toolSurface.validationCorrectionActive &&
+      !toolSurface.executionContractAdvanceRequired
+    ? "New files within the user's authorized objective do not require existing-file source; use write_file when creation is needed. The preflight still checks whether the target already exists."
+    : "";
+  const objectiveGuidance = [
+    "Choose the next authorized action to advance the user's complete objective. Make a workspace change only when the user's current request authorizes that effect.",
+    toolSurface.sourceOnlyFrontier
+      ? "There is no recorded file mutation. Source evidence alone does not make its files mandatory edit targets. Safe reads remain available for a specific missing fact that blocks the next authorized action."
+      : "",
+    "Commands and external operations use their own authorization and result evidence, without an unrelated file-source lease or write obligation. For a command or external-operation task, a complete final report is appropriate when actual successful receipts cover the user's full request. A successful intermediate action does not require you to stop; file mutations still require subsequent matching validation.",
+  ].filter(Boolean).join(" ");
+  const validationGuidance = [
+    toolSurface.validationCorrectionActive
+      ? "[VALIDATION_CORRECTION] Use the actual failed validation diagnostics to identify the missing fact or smallest correction; safe reads remain available. Re-verify after the correction."
+      : "",
+    toolSurface.validationCommandUnavailable
+      ? `The previous validation command is unavailable${toolSurface.failedValidationCommand ? `: ${JSON.stringify(toolSurface.failedValidationCommand)}` : ""}. Choose an available finite validator that tests the same required behavior; do not repeat the unavailable command.`
+      : "",
+  ].filter(Boolean).join(" ");
+  const contractGuidance = toolSurface.executionContract
+    ? `[execution_contract_v1] ${JSON.stringify(toolSurface.executionContract)} Follow the recorded exact operations and do not broaden into cleanup or redesign; revise it from new evidence when the solution changes. Safe reads and finite checks remain available; early checks cannot discharge pending contract targets or newer mutation debt.`
+    : "";
   if (mode === "validate") {
-    if (toolSurface.validationCommandUnavailable) {
-      return [
-        recoveryGuidance,
-        executionContractGuidance,
-        validationCorrectionGuidance,
-      ].filter(Boolean).join(" ");
-    }
-    if (toolSurface.actionWindow === "corrective_source") {
-      return [
-        recoveryGuidance,
-        actionWindowGuidance,
-        "The attempted implementation continuation changed no files. Materialize only the exact failed target now; Runtime will reopen its corrective mutation before returning to validation.",
-      ].filter(Boolean).join(" ");
-    }
-    if (toolSurface.actionWindow === "corrective_mutation") {
-      return [
-        recoveryGuidance,
-        actionWindowGuidance,
-        editableSourceGuidance,
-        executionContractGuidance,
-        executionContractAdvanceGuidance,
-        "Submit the bounded corrective mutation now. Validation debt remains attached to the newest committed workspace version.",
-      ].filter(Boolean).join(" ");
-    }
-    if (toolSurface.validationCorrectionActive) {
-      return [
-        recoveryGuidance,
-        executionContractGuidance,
-        executionContractAdvanceGuidance,
-        validationCorrectionGuidance,
-        actionWindowGuidance,
-        editableSourceGuidance,
-        "Correct the failed acceptance condition now. Validation remains withheld until a workspace mutation establishes a newer boundary.",
-        collaborationGuidance,
-      ].filter(Boolean).join(" ");
-    }
-    if (
-      toolSurface.executionContractAdvanceRequired &&
-      (toolSurface.executionContractPendingTargets || []).length > 0
-    ) {
-      return [
-        recoveryGuidance,
-        executionContractGuidance,
-        executionContractAdvanceGuidance,
-        actionWindowGuidance,
-        editableSourceGuidance,
-        "Complete one advertised contracted workspace mutation now. Validation remains unavailable until every pending contract target has a committed mutation.",
-        collaborationGuidance,
-      ].filter(Boolean).join(" ");
-    }
     return [
       recoveryGuidance,
-      executionContractGuidance,
-      executionContractAdvanceGuidance,
-      validationCorrectionGuidance,
-      toolSurface.actionWindow === "validation_handoff"
-        ? actionWindowGuidance
-        : toolSurface.actionWindow
-        ? "VALIDATION_ACTION_WINDOW: repeated inspection or a no-effect attempt has closed the observation branch. Submit one advertised finite validation, or—only when the visible current source proves the implementation is incomplete—one bounded workspace mutation against that source. Collaboration and more inspection cannot replace this parent action."
-        : "",
-      "Validate the latest committed mutation now with a finite test, assertion, build, lint, typecheck, browser, or desktop interaction appropriate to the user's observable acceptance criteria.",
-      toolSurface.executionContractAdvanceRequired
-        ? "If the repair spans more files, continue with one contracted mutation now; otherwise validate. Runtime keeps validation debt attached to the newest commit."
-        : "If the repair spans more files or the visible post-edit source proves work remains, continue with one exact source-backed mutation; Runtime returns to editing and keeps validation debt attached to the newest commit. Do not mutate merely to avoid a failing check. Safe reads remain available when a genuinely missing post-edit fact is required; a read or diff alone is not validation.",
-      "Static checks prove only static properties. User-visible behavior requires a test, browser interaction, or desktop interaction that observes that behavior.",
+      "Verify the latest committed mutation by running a finite validation tool (such as run_command for build/test/lint/typecheck, or browser_evaluate/computer_use for UI verification) before returning your final summary; read_file or prose alone does not satisfy validation. Still-needed authorized external actions remain available. Ordinary shell actions produce tool results and do not discharge file validation debt attached to the newest committed mutation. If verification reveals an issue, fix the code and re-verify.",
+      sourceGuidance,
+      creationGuidance,
+      validationGuidance,
+      contractGuidance,
       preferredValidationCommand
-        ? `A suitable finite workspace validation is ${JSON.stringify(preferredValidationCommand)}.`
+        ? `Preferred validation command: ${JSON.stringify(preferredValidationCommand)}.`
         : "",
       collaborationGuidance,
     ].filter(Boolean).join(" ");
   }
   return [
     recoveryGuidance,
-    "Continue one inspect-edit-verify loop for the user's complete objective.",
-    executionContractGuidance,
-    executionContractAdvanceGuidance,
-    validationCorrectionGuidance,
-    actionWindowGuidance,
-    toolSurface.sourceOnlyFrontier
-      ? toolSurface.actionWindow
-        ? toolSurface.actionWindow === "corrective_source"
-          ? "The next decision must materialize the one exact target named by the mutation-source failure."
-          : "The current mutation boundary already has exact versioned source but no committed workspace effect. The next decision must resolve that effect debt rather than open another observation."
-        : "The current mutation boundary already has exact versioned source but no committed workspace effect. If the visible source supports a safe coherent repair, submit the mutation now. Continue reading only when you can name one missing path, range, or fact required to edit safely; broad exploration does not advance the objective."
-      : "",
-    toolSurface.hasReadFile
-      ? toolSurface.actionWindow === "corrective_source"
-        ? "Only the advertised single target-locked corrective read is available; general safe-reading guidance does not reopen repository inspection at this boundary."
-        : toolSurface.hasMaterializedSourceEvidence
-        ? "Exact versioned source is visible in this decision request. Use only that visible source for a mutation or validation; request a different target or missing range when needed. Safe reads remain available after every edit and failed validation."
-        : command.payload.hasVersionedSourceEvidence === true
-          ? "Versioned source exists in the runtime cache but is not visible in this decision request, so it is not write authority. Request the exact intended path or range again; MAIN may replay it without another disk read."
-          : "No versioned source evidence is committed yet. Read the exact existing file before changing it. Safe reads remain available after every edit and failed validation."
-      : "",
-    toolSurface.hasMutation
-      ? "Make the smallest coherent change that addresses all currently supported gaps, preserving unrelated behavior."
-      : "",
-    editableSourceGuidance,
-    toolSurface.validationCorrectionActive
-      ? "The failed acceptance boundary requires a source-backed workspace mutation before another validation."
-      : "After the latest mutation, run a finite test, build, lint, typecheck, browser, or desktop validation appropriate to the observable claim. Text inspection alone is not validation.",
+    objectiveGuidance,
+    sourceGuidance,
+    creationGuidance,
+    validationGuidance,
+    contractGuidance,
     preferredValidationCommand
-      ? `A suitable finite workspace validation is ${JSON.stringify(preferredValidationCommand)}.`
+      ? `Preferred validation command: ${JSON.stringify(preferredValidationCommand)}.`
       : "",
-    "If work remains, choose one real structured tool action. A response without a tool call ends the Run and will be judged only by committed mutation and validation evidence; return prose only when you are done.",
     collaborationGuidance,
   ].filter(Boolean).join(" ");
 }

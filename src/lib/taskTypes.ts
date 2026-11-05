@@ -116,6 +116,10 @@ export type TaskBlock =
       target: string;
       status: string;
       toolStatus: "pending" | "executed" | "rejected" | "running" | "failed";
+      /** Canonical outcome, distinct from compatibility lifecycle status. */
+      toolOutcome?: "not_executed" | "blocked" | "failed" | "succeeded";
+      /** Original receipt details; visible only after an explicit debug disclosure. */
+      diagnosticDetails?: string;
       toolCallId?: string;
       message?: string;
       diff?: ToolDiffSnapshot;

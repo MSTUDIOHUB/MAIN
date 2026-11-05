@@ -1,5 +1,6 @@
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import {
   deriveRuntimeV2ExecutionContract,
   runtimeV2ExecutionContractMutationTargets,
@@ -77,7 +78,7 @@ export function deriveRuntimeV2ExecutionContractAdvance(
           TurnAggregateV1["events"][number],
           { type: "validation.completed" }
         > =>
-          event.type === "validation.completed" &&
+          isRuntimeV2ValidationAttempt(event) &&
           event.sequence > latestMutationSequence,
       ) || null;
   const suppliesCorrectionEvidence = !!latestValidation &&

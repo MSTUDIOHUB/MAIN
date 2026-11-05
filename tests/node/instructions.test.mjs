@@ -194,12 +194,17 @@ test("instruction admission keeps Agent Skills in a progressive catalog instead 
     active: true,
     type: "instruction",
   };
+  const externalSelections = [{ entryPath: "/home/user/.agents/skills/review/SKILL.md", workspaceScope: "/tmp/workspace", mode: "manual" }];
+  const externalSources = { codex: true, claude: false, gemini: false, custom: true };
 
   const resolved = await loadResolvedInstructions(
     "/tmp/workspace",
     [skill],
     [],
     "Use $review",
+    undefined,
+    externalSelections,
+    externalSources,
   );
 
   assert.equal(resolved.skillCatalog, admittedCatalog);
@@ -210,4 +215,6 @@ test("instruction admission keeps Agent Skills in a progressive catalog instead 
   assert.equal(catalogInput.workspace, "/tmp/workspace");
   assert.equal(catalogInput.userPrompt, "Use $review");
   assert.equal(catalogInput.skills[0], skill);
+  assert.deepEqual(catalogInput.externalSkillSelections, externalSelections);
+  assert.deepEqual(catalogInput.externalSkillSources, externalSources);
 });

@@ -7,13 +7,18 @@ import {
 import { shellPermissionPreflight } from "../../lib/ipc";
 import {
   canApplyShellAutoReview,
+  getShellPermissionCommandForTool,
   resolveShellAutoApproval,
 } from "../../lib/shellAutoApproval";
 import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
+  resolveWorkspaceMutationRequests,
 } from "../../lib/workspaceMutationTools";
-import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import type { WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
+import { normalizeWorkspacePathIdentity } from "../../lib/workspacePaths";
+import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
+import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
@@ -24,33 +29,25 @@ import {
   aggregateForCurrentTurn,
 } from "./executionAggregate";
 import {
-  validateRuntimeV2MutationLease,
-} from "./correctiveMutationPolicy";
-import {
-  runtimeV2MutationLeaseRejectionReason,
-} from "./executionMutationRejection";
-import {
   activeRuntimeV2ChildWriteConflict,
   activeRuntimeV2SubagentJobWriteConflict,
 } from "./executionSubagentWriteScope";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import { finiteValidationCommandRejection } from "./executionValidationCommand";
-import { preferredFiniteValidationCommand } from "./executionProviderContext";
+import { validateRuntimeV2MutationLease } from "./correctiveMutationPolicy";
+import { runtimeV2MutationLeaseRejectionReason } from "./executionMutationRejection";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
-  deriveRuntimeV2ExecutionContract,
-  runtimeV2ExecutionContractAllowsTargets,
-  runtimeV2ExecutionContractMutationTargets,
   validateRuntimeV2ExecutionContractSubmission,
+  deriveRuntimeV2ExecutionContract,
 } from "./executionContract";
-import {
-  deriveRuntimeV2ExecutionContractAdvance,
-} from "./executionContractAdvance";
 import {
   deriveRuntimeV2ValidationCorrectionWindow,
 } from "./executionValidationCorrection";
 import {
   authorizationFor,
+  runtimeV2ToolCapabilityRestriction,
+  runtimeV2ToolApprovalCapability,
   isRuntimeV2EffectRisk,
   isRuntimeV2ObservationRisk,
   runtimeV2CatalogToolSource,
@@ -75,7 +72,6 @@ export {
   runtimeV2ProviderActionWindowFor,
 } from "./executionProviderActionWindow";
 export {
-  correctiveFiniteValidationCommand,
   finiteValidationCommandRejection,
   type RuntimeV2FiniteValidationRejection,
 } from "./executionValidationCommand";
@@ -89,6 +85,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly target: string;
+  readonly writeFileTarget?: WorkspaceWriteFileTargetFact;
 }): RuntimeV2PlanToolAuthorizationResult {
   const aggregate = aggregateForCurrentTurn(input.ports);
   const durableChildWritePending = (aggregate?.subagents || []).some(
@@ -97,9 +94,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
       job.taskKind === "implement" &&
       job.accessMode === "write",
   );
-  const directExecutionContractAdvance = aggregate?.strategy === "execute"
-    ? deriveRuntimeV2ExecutionContractAdvance(aggregate)
-    : null;
   const validationCorrection = aggregate?.strategy === "execute"
     ? deriveRuntimeV2ValidationCorrectionWindow(aggregate)
     : null;
@@ -120,7 +114,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   );
   if (
     (aggregate?.strategy === "chat" || isChatContext(input.ports)) &&
-    (catalogSource !== "built_in" || !["load_skill", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
+    (catalogSource !== "built_in" || !["load_skill", "tool_search", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
   ) {
     return { allowed: false, reason: "Chat 仅允许已接纳的 Skill 与网络读取。", failureKind: "not_authorized", reasonCode: "chat_read_only_authority" };
   }
@@ -169,22 +163,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
   }
   if (
     input.command.kind === "execute_validation" &&
-    directExecutionContractAdvance?.required &&
-    directExecutionContractAdvance.pendingTargets.length > 0
-  ) {
-    return {
-      allowed: false,
-      reason: [
-        "当前 Execute 实施契约仍有尚未提交修改的目标，不能用提前验证跳过实施步骤。",
-        `待实施目标：${directExecutionContractAdvance.pendingTargets.join(", ")}。`,
-        "请先完成这些目标，或依据新证据显式修订执行契约。",
-      ].join(" "),
-      failureKind: "not_authorized",
-      reasonCode: "execution_contract_pending_mutations",
-    };
-  }
-  if (
-    input.command.kind === "execute_validation" &&
     input.toolName === "run_command"
   ) {
     const command = String(
@@ -200,7 +178,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
       };
     }
     if (aggregate?.strategy === "execute") {
-      const preferred = preferredFiniteValidationCommand(input.ports);
       if (
         validationCorrection?.validationCommandUnavailable &&
         command === validationCorrection.failedValidationCommand
@@ -211,19 +188,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
             `有限验证命令 ${JSON.stringify(command)} 已在当前工作区证明无法执行；请选择另一个有限 build、test、lint、typecheck、check 或行为断言。`,
           failureKind: "not_authorized",
           reasonCode: "failed_validation_command_repeated",
-        };
-      }
-      if (
-        !validationCorrection?.validationCommandUnavailable &&
-        preferred &&
-        command !== preferred
-      ) {
-        return {
-          allowed: false,
-          reason:
-            `当前 Execute 验证权威只允许精确命令 ${JSON.stringify(preferred)}；不得改用另一个有限命令。`,
-          failureKind: "not_authorized",
-          reasonCode: "execution_contract_validation_scope",
         };
       }
     }
@@ -262,29 +226,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
     };
   }
   if (
-    aggregate?.strategy === "execute" &&
-    input.command.kind === "execute_tool" &&
-    input.toolName === "read_file" &&
-    directExecutionContractAdvance?.required
-  ) {
-    const target = String(input.args.path || input.target || "").trim();
-    if (
-      !directExecutionContractAdvance.sourceReviewAvailable ||
-      !directExecutionContractAdvance.sourceReviewTargets.some((candidate) =>
-        workspacePathsReferToSameFile(candidate, target)
-      )
-    ) {
-      return {
-        allowed: false,
-        reason: directExecutionContractAdvance.sourceReviewAvailable
-          ? `本轮只允许复查刚修改的目标：${directExecutionContractAdvance.sourceReviewTargets.join(", ")}。`
-          : "本次修改后的单批源码复查已经结束；请继续契约修改或进入验收。",
-        failureKind: "not_authorized",
-        reasonCode: "execution_contract_source_review_scope",
-      };
-    }
-  }
-  if (
     input.command.kind === "execute_tool" &&
     isWorkspaceMutationToolName(input.toolName)
   ) {
@@ -293,28 +234,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
       input.args,
       input.target,
     );
-    if (aggregate?.strategy === "execute") {
-      const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
-      if (
-        executionContract &&
-        !validationCorrection?.active &&
-        !runtimeV2ExecutionContractAllowsTargets({
-          contract: executionContract,
-          targets: requestedTargets,
-        })
-      ) {
-        return {
-          allowed: false,
-          reason: [
-            "修改目标超出当前 Execute 实施契约。",
-            `允许目标：${runtimeV2ExecutionContractMutationTargets(executionContract).join(", ") || "无"}。`,
-            "如新证据确实改变方案，请先读取精确目标并用 record_execution_contract + revision_reason 显式修订；不得在修改动作中临时扩张范围。",
-          ].join(" "),
-          failureKind: "not_authorized",
-          reasonCode: "execution_contract_mutation_scope",
-        };
-      }
-    }
     const childConflict = activeRuntimeV2ChildWriteConflict({
       live: input.ports.live,
       targets: requestedTargets,
@@ -335,31 +254,62 @@ export function validateToolAgainstPhaseAndPlan(input: {
         reasonCode: "active_child_write_scope_conflict",
       };
     }
-    const mutationLease = validateRuntimeV2MutationLease({
-      ports: input.ports,
-      toolCallId: String(input.command.payload.toolCallId || ""),
-      toolName: input.toolName,
-      args: input.args,
-      target: input.target,
+  }
+  const leaseRejection = () => {
+    // write_file is creation-capable, not create-only. Its operation and lease
+    // requirement cannot be decided until trusted preflight observes the target.
+    if (input.toolName === "write_file" && !input.writeFileTarget) return null;
+    const lease = validateRuntimeV2MutationLease({
+      ports: input.ports, toolCallId: String(input.command.payload.toolCallId || ""),
+      toolName: input.toolName, args: input.args, target: input.target,
+      writeFileTarget: input.writeFileTarget,
     });
-    if (mutationLease && !mutationLease.allowed) {
-      return {
-        allowed: false,
-        reason: runtimeV2MutationLeaseRejectionReason({
-          toolName: input.toolName,
-          unexpectedTargets: mutationLease.unexpectedTargets,
-          leaseTargets: mutationLease.leases.map((lease) => lease.target),
-          recoveryExcerpt: mutationLease.recoveryExcerpt,
-        }),
-        failureKind:
-          mutationLease.reasonCode === "mutation_source_text_mismatch"
-            ? "source_mismatch"
-            : "protocol_invalid",
-        reasonCode: mutationLease.reasonCode,
-      };
-    }
+    if (!lease || lease.allowed) return null;
+    return {
+      allowed: false as const,
+      reason: input.writeFileTarget?.exists
+        ? "WRITE_FILE_SOURCE_NOT_CURRENT: Overwriting requires the exact target's complete current-version source in this provider request; internal preflight reads do not grant that lease. Read or replay the complete target before retrying."
+        : runtimeV2MutationLeaseRejectionReason({
+            toolName: input.toolName, unexpectedTargets: lease.unexpectedTargets,
+            leaseTargets: lease.leases.map(entry => entry.target), recoveryExcerpt: lease.recoveryExcerpt,
+          }),
+      failureKind: lease.reasonCode === "mutation_source_text_mismatch" ? "source_mismatch" as const : "protocol_invalid" as const,
+      reasonCode: lease.reasonCode,
+    };
+  };
+  if (input.toolName === "write_file" && input.writeFileTarget) {
+    const rejected = leaseRejection();
+    if (rejected) return rejected;
   }
   if (aggregate?.strategy !== "plan") {
+    if (input.command.kind === "execute_tool" && isWorkspaceMutationToolName(input.toolName)) {
+      const contract = deriveRuntimeV2ExecutionContract(aggregate);
+      if (contract) {
+        const requests = resolveWorkspaceMutationRequests(input.toolName, input.args, input.target);
+        const outsideContract = requests.length === 0 || requests.some(request =>
+          !contract.changes.some(change =>
+            change.operation !== "preserve" &&
+            (input.toolName === "write_file"
+              ? input.writeFileTarget
+                ? change.operation === (input.writeFileTarget.exists ? "modify" : "create")
+                : change.operation === "create" || change.operation === "modify"
+              : change.operation === request.operation) &&
+            change.targets.some(target =>
+              normalizeWorkspacePathIdentity(normalizeRuntimeV2WorkspacePath(target, input.ports.context.runWorkspace || "")) ===
+              normalizeWorkspacePathIdentity(normalizeRuntimeV2WorkspacePath(request.target, input.ports.context.runWorkspace || ""))
+            )
+          )
+        );
+        if (outsideContract) return {
+          allowed: false,
+          reason: "The recorded execution contract does not authorize this exact file operation. Revise the contract from new evidence before broadening its scope.",
+          failureKind: "not_authorized",
+          reasonCode: "execution_contract_mutation_scope",
+        };
+      }
+      const rejected = leaseRejection();
+      if (rejected) return rejected;
+    }
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };
   }
   return validateToolAgainstApprovedPlan({ ...input, aggregate });
@@ -387,6 +337,12 @@ export async function authorizeToolForCurrentTurn(
     };
   }
   const exposedName = catalogResolution.entry.exposedName;
+  const restriction = runtimeV2ToolCapabilityRestriction(input, exposedName, args);
+  if (restriction) return {
+    allowed: false,
+    reason: `TURN_CAPABILITY_RESTRICTED: ${restriction}`,
+    allowExternalLocalRead: false,
+  };
   const localFileReadPath = getLocalFileReadPathForToolCall(
     exposedName,
     args,
@@ -419,26 +375,41 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
+  const approvalRequiredCapability = runtimeV2ToolApprovalCapability(input, exposedName, args);
+  const manualReview = approvalRequiredCapability ? {
+    allowed: false as const,
+    reason: "This Turn requires separate human approval for this action.",
+    allowExternalLocalRead: false,
+    approvalRequired: true,
+    approvalRequiredCapability,
+    risk,
+    ...(localFileReadPath ? { localFileReadPath } : {}),
+  } : null;
+  if (risk === "external_read") {
+    const networkTool = catalogResolution.entry.source === "built_in" && (exposedName === "web_search" || exposedName === "web_fetch");
+    if (networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)) {
+      return { allowed: false, reason: "当前会话未启用网络访问。", allowExternalLocalRead: false };
+    }
+  }
+  const shellCommand = risk === "shell" || getShellPermissionCommandForTool(exposedName, args);
+  if (manualReview && !shellCommand) return manualReview;
   if (risk === "read_only") {
     return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "external_read") {
-    const networkTool = catalogResolution.entry.source === "built_in" &&
-      (exposedName === "web_search" || exposedName === "web_fetch");
-    return networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)
-      ? {
-          allowed: false,
-          reason: "当前会话未启用网络访问。",
-          allowExternalLocalRead: false,
-        }
-      : { allowed: true, reason: null, allowExternalLocalRead: false };
+    return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (risk === "local_file_read") {
-    const approved = !!localFileReadPath &&
-      isLocalFileReadApproved(
-        localFileReadPath,
-        state.approvedLocalFileReadPaths,
-      );
+    const pathApproved = !!localFileReadPath && isLocalFileReadApproved(localFileReadPath, state.approvedLocalFileReadPaths);
+    const sessionApproved = state.autoApproveTools === true && isAllowedBySessionAutoApprove(
+      risk, catalogResolution.entry.source, state.autoApproveToolScopes, authorization.policy,
+    );
+    const approved = pathApproved || sessionApproved;
+    input.logStoreEvent?.("runtime_v2_local_read_authorized", {
+      sessionKey: input.context.runSessionKey, turnId: input.context.turnId, risk, autoApproveTools: state.autoApproveTools === true,
+      scopes: state.autoApproveToolScopes || [], decision: approved ? "allow" : "ask",
+      source: pathApproved ? "exact_path" : sessionApproved ? "session_scope" : "human_required",
+    });
     return approved
       ? { allowed: true, reason: null, allowExternalLocalRead: true }
       : {
@@ -451,38 +422,62 @@ export async function authorizeToolForCurrentTurn(
         };
   }
   const consent = state.currentTurnExecutionConsent;
-  if (consent?.turnId !== input.context.turnId || consent.granted !== true) {
-    return {
-      allowed: false,
-      reason: `执行 ${risk} 工具前需要本轮执行授权。`,
-      allowExternalLocalRead: false,
-    };
-  }
-  if (risk === "workspace_write") {
-    return { allowed: true, reason: null, allowExternalLocalRead: false };
-  }
-  if (risk === "shell") {
+  const hasConsent = consent?.turnId === input.context.turnId && consent.granted === true;
+  // A dangerous shell command is classified as destructive, but still needs
+  // the shell guard's exact decision/approval packet at the execution boundary.
+  if (shellCommand) {
     const shell = await resolveShellAutoApproval({
       toolName: exposedName,
       args,
       workspace: input.context.runWorkspace || "",
       preflight: shellPermissionPreflight,
     });
-    if (!canApplyShellAutoReview(shell)) {
+    if (shell.error || shell.decision?.decision === "deny") {
       return {
         allowed: false,
-        reason: shell.error || "该 Shell 命令需要单独审批，未执行。",
+        reason: shell.error || shell.decision?.reviewReason || "该 Shell 命令已被权限策略拒绝。",
         allowExternalLocalRead: false,
+      };
+    }
+    if (manualReview) return { ...manualReview, ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}) };
+    const autoReviewAllowed = state.autoApproveTools === true &&
+      isAllowedBySessionAutoApprove(
+        risk,
+        catalogResolution.entry.source,
+        state.autoApproveToolScopes,
+        authorization.policy,
+      );
+    // Turn consent authorizes the task, while only the explicit session
+    // Auto Review scope may turn a shell-policy ask into an approval packet.
+    if (!hasConsent || !canApplyShellAutoReview(shell) ||
+      (shell.decision?.decision === "ask" && !autoReviewAllowed)) {
+      return {
+        allowed: false,
+        reason: "该 Shell 命令需要单独审批，未执行。",
+        allowExternalLocalRead: false,
+        approvalRequired: true,
+        risk,
+        ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}),
       };
     }
     return {
       allowed: true,
       reason: null,
       allowExternalLocalRead: false,
-      ...(shell.approval
-        ? { shellPermissionApproval: shell.approval }
-        : {}),
+      ...(shell.approval ? { shellPermissionApproval: shell.approval } : {}),
     };
+  }
+  if (!hasConsent) {
+    return {
+      allowed: false,
+      reason: `执行 ${risk} 工具前需要本轮执行授权。`,
+      allowExternalLocalRead: false,
+      approvalRequired: true,
+      risk,
+    };
+  }
+  if (risk === "workspace_write") {
+    return { allowed: true, reason: null, allowExternalLocalRead: false };
   }
   if (isPerCallOnlyToolRisk(risk)) {
     return {

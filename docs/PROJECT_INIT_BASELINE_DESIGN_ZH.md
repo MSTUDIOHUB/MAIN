@@ -1,11 +1,11 @@
 # `/init` 与项目基线：设计与落地状态
 
-更新时间：2026-09-04
+更新时间：2026-10-21
 状态：已接线
 
 ## 当前决策
 
-`/init` 已实现，但“人维护的项目规则”和“机器可重建的项目事实”仍是两个不同层级：
+`/init` 是可选的“生成／刷新项目说明”入口，用于保存可审阅、可版本化的项目事实快照。MAIN 每轮会自动读取项目规则和实时项目基线，因此它不是模型理解项目的前置步骤，也不调用模型分析源码架构。“人维护的项目规则”和“机器可重建的项目事实”仍是两个不同层级：
 
 1. `/init` 是 Composer 在模型提交前截获的本地工作区命令。它生成根目录 `AGENTS.md` 的确定性托管区块和可审阅 diff；只有用户确认后才写入。
 2. 每个 Workspace Turn admission 会用同一组 read-through 读取同时解析 live instructions 与 typed `projectBaselineContext`。baseline 在本 Run 内冻结并传给 Plan、Execute、Goal 和 child，不进入 Session 持久化，也不授予指令、写入或验收权威。
@@ -23,7 +23,9 @@
 
 人工规则必须写在 marker 外。MAIN 只替换唯一、完整的托管区块，并原样保留区块前后的人工内容。重复、残缺、逆序或版本不明的 marker 会 fail closed，不猜测可覆盖范围。
 
-普通 `/init` 在已有合法托管区块时只报告“已经初始化”。`/init --refresh` 会重新扫描并打开重建预览，但仍需用户确认；它不会直接写文件。初始化扫描排除目标 `AGENTS.md` 自身，防止 fingerprint 自引用导致每次 refresh 都产生新 diff。
+普通 `/init` 在已有合法托管区块时只报告“已有项目说明快照”。`/init --refresh` 会重新扫描并打开更新预览，但仍需用户确认；它不会直接写文件。项目说明扫描排除目标 `AGENTS.md` 自身，防止 fingerprint 自引用导致每次 refresh 都产生新 diff。
+
+现阶段托管区块仍随完整 `AGENTS.md` 进入指令上下文，本轮只澄清命令文案，不改变重复上下文的处理方式。Skills 与 MCP 扩展导入无需执行 `/init`，也不会把扩展说明写入这里。
 
 ## Deterministic baseline
 

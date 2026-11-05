@@ -61,7 +61,8 @@ export function resolveSubmitRunLineage(input: {
 
   return {
     runId: input.runId,
-    parentRunId: isSameTurn ? nonEmptyString(previousMarker?.runId) : null,
+    parentRunId: isSameTurn ? previousMarker?.runId === input.runId
+      ? nonEmptyString(previousMarker.parentRunId) : nonEmptyString(previousMarker?.runId) : null,
     turnStartMessageIndex: inheritedStart,
   };
 }

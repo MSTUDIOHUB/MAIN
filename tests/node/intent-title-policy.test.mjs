@@ -257,3 +257,64 @@ test("intent title parser can use a first-line title and reports failures", () =
   assert.equal(failed.source, "none");
   assert.equal(failed.failureReason, "empty_model_output");
 });
+
+test("intent title parser rejects malformed structured output instead of treating it as a title", () => {
+  const malformedOutputs = [
+    '{"title":"查询 structuredClone transfer',
+    '{"title":"Fix cloning","summary":',
+    '{"title":"Fix cloning",}',
+    '[{"title":"Fix cloning"}]',
+    '"title": "Fix cloning"',
+    '```json\n{"title":"Fix cloning"',
+  ];
+
+  for (const content of malformedOutputs) {
+    const parsed = parseIntentTitleCandidate({ content });
+    assert.equal(parsed.metadata, null, content);
+    assert.equal(parsed.source, "none", content);
+    assert.equal(parsed.failureReason, "unparseable_title_output", content);
+  }
+});
+
+test("intent title parser never promotes reasoning prose or loose reasoning labels to metadata", () => {
+  for (const reasoning of [
+    "我们需要回答用户问题：如果我使用海外的三星 fold8，是否可以配对国行手表？",
+    "We need to answer whether the devices can pair, then choose a concise title.",
+    "まずユーザーの質問を整理して、タイトルを選びます。",
+    "title: Device pairing\nsummary: Check compatibility",
+    'I will return {"title":"Device pairing","summary":"Check compatibility"} after choosing the topic.',
+  ]) {
+    const parsed = parseIntentTitleCandidate({ reasoning });
+    assert.equal(parsed.metadata, null, reasoning);
+    assert.equal(parsed.source, "none", reasoning);
+  }
+});
+
+test("intent title parser excludes hidden reasoning tags including interrupted thinking", () => {
+  for (const content of [
+    '<think>{"title":"Hidden deliberation"}</think>',
+    "<think>We need to choose a title before returning JSON.",
+    "<analysis>まず質問を整理します。",
+  ]) {
+    assert.equal(parseIntentTitleCandidate({ content }).metadata, null, content);
+  }
+
+  const visible = parseIntentTitleCandidate({
+    content: '<think>{"title":"Hidden deliberation"}</think>\n{"title":"Device compatibility","summary":"Verify pairing support"}',
+  });
+  assert.equal(visible.source, "json");
+  assert.equal(visible.metadata.title, "Device compatibility");
+});
+
+test("intent title parser preserves visible plain titles and complete fenced JSON compatibility", () => {
+  const title = parseIntentTitleCandidate({ content: "デバイスの互換性を確認" });
+  assert.equal(title.source, "first_line");
+  assert.equal(title.metadata.title, "デバイスの互換性を確認");
+
+  const json = parseIntentTitleCandidate({
+    content: '```json\n{"title":"Device pairing","summary":"Check compatibility"}\n```',
+    reasoning: "We should select a title.",
+  });
+  assert.equal(json.source, "json");
+  assert.equal(json.metadata.title, "Device pairing");
+});

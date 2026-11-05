@@ -4,6 +4,8 @@ import {
   type CanceledTurnProjectionState,
 } from "../lib/canceledTurnProjection";
 import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
+import type { ProjectSessionSaveOptions } from "../lib/projectSessionMutationCoordinator";
+import { projectRuntimeV2CanceledTurn } from "./runtimeV2/cancelProjection";
 import type {
   SubmitOwnerScopedRuntimeProjectionInput,
   SubmitOwnerScopedRuntimePublicationResult,
@@ -25,7 +27,8 @@ export interface CommitCanceledTurnInput<
   nextTaskId: () => number;
   sessionGet: () => TState;
   getSessionRevisionToken: () => unknown;
-  persistProjection: (state: TState) => Promise<TState>;
+  isCurrent?: () => boolean;
+  persistProjection: (state: TState, options?: ProjectSessionSaveOptions) => Promise<TState>;
   publishProjection: (
     input: SubmitOwnerScopedRuntimeProjectionInput<TState>,
   ) => SubmitOwnerScopedRuntimePublicationResult;
@@ -64,7 +67,62 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
 ): Promise<CommitCanceledTurnResult> {
   const maxAttempts = Math.max(1, Math.min(5, input.maxAttempts ?? 3));
   let stableCancellationRunId = "";
+  let savedStorageRevision: number | null = null;
   const controlPlaneFence = input.controlPlaneFence;
+
+  const rememberStorageReceipt = (state: TState | undefined) => {
+    const record = (state as Record<string, any> | undefined)?.sessionsByWorkspace?.[input.scopeKey]
+      ?.find((candidate: any) => candidate.id === input.sessionId);
+    if (typeof record?.storageRevision === "number") {
+      savedStorageRevision = Math.max(savedStorageRevision ?? 0, record.storageRevision);
+    }
+  };
+  const withStorageReceipt = (state: TState): TState => {
+    const sessions = (state as Record<string, any>).sessionsByWorkspace?.[input.scopeKey];
+    if (savedStorageRevision == null || !Array.isArray(sessions)) return state;
+    return {
+      ...state,
+      sessionsByWorkspace: {
+        ...(state as Record<string, any>).sessionsByWorkspace,
+        [input.scopeKey]: sessions.map((record: any) => record.id === input.sessionId
+          ? { ...record, storageRevision: Math.max(Number(record.storageRevision) || 0, savedStorageRevision!) }
+          : record),
+      },
+    };
+  };
+  const project = async (state: TState) => {
+    const legacy = projectCanceledTurn({
+      state,
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      uiDisplayTurnId: input.uiDisplayTurnId,
+      runId: input.runId,
+      parentRunId: input.parentRunId,
+      cancellationRunId: stableCancellationRunId,
+      reason: input.reason,
+      message: input.message,
+      nextTaskId: input.nextTaskId,
+      nowMs: (input.nowMs || Date.now)(),
+      controlPlaneFence,
+    });
+    if (legacy.disposition === "ownership_lost") return legacy;
+    return await projectRuntimeV2CanceledTurn({
+      state, sessionKey: input.sessionKey, turnId: input.turnId,
+      runId: legacy.cancellationRunId, parentRunId: input.parentRunId,
+      reason: input.reason, message: input.message, nextTaskId: input.nextTaskId,
+      nowMs: input.nowMs || Date.now, log: input.log,
+    }) || legacy;
+  };
+  const persistenceFence = (base: TState): ProjectSessionSaveOptions => {
+    const checkpoint = (base as Record<string, any>).runtimeV2Checkpoints?.[input.turnId];
+    return { isCurrent: () => {
+      if (input.isCurrent && !input.isCurrent()) return false;
+      const latest = input.sessionGet() as Record<string, any>;
+      const current = latest.runtimeV2Checkpoints?.[input.turnId];
+      return !checkpoint || (!!current && current.revision === checkpoint.revision &&
+        current.owner?.sessionEpoch === checkpoint.owner?.sessionEpoch);
+    } };
+  };
 
   const createHarnessSettlement = (
     projectedMarker: HarnessRunMarker | null | undefined,
@@ -92,23 +150,16 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
   };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (input.isCurrent && !input.isCurrent()) {
+      return { committed: false, disposition: "ownership_lost", cancellationRunId: stableCancellationRunId, attempts: attempt };
+    }
     const revisionToken = input.getSessionRevisionToken();
-    const baseState = input.sessionGet();
-    const projection = projectCanceledTurn({
-      state: baseState,
-      sessionKey: input.sessionKey,
-      turnId: input.turnId,
-      uiDisplayTurnId: input.uiDisplayTurnId,
-      runId: input.runId,
-      parentRunId: input.parentRunId,
-      cancellationRunId: stableCancellationRunId,
-      reason: input.reason,
-      message: input.message,
-      nextTaskId: input.nextTaskId,
-      nowMs: (input.nowMs || Date.now)(),
-      controlPlaneFence,
-    });
+    const baseState = withStorageReceipt(input.sessionGet());
+    const projection = await project(baseState);
     stableCancellationRunId = projection.cancellationRunId || stableCancellationRunId;
+    if (input.isCurrent && !input.isCurrent()) {
+      return { committed: false, disposition: "ownership_lost", cancellationRunId: stableCancellationRunId, attempts: attempt };
+    }
 
     if (projection.disposition === "already_closed") {
       if (projection.state === baseState) {
@@ -122,7 +173,8 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
       let durableState: TState | undefined;
       let persistError: unknown = null;
       try {
-        durableState = await input.persistProjection(projection.state);
+        durableState = await input.persistProjection(projection.state, persistenceFence(baseState));
+        rememberStorageReceipt(durableState);
       } catch (error) {
         persistError = error;
         input.log?.("canceled_turn_closed_projection_persist_unavailable", {
@@ -132,6 +184,9 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
           attempt,
           error: error instanceof Error ? error.message : String(error),
         });
+      }
+      if (input.isCurrent && !input.isCurrent()) {
+        return { committed: false, disposition: "ownership_lost", cancellationRunId: stableCancellationRunId, attempts: attempt };
       }
       if (input.getSessionRevisionToken() !== revisionToken) {
         input.log?.("canceled_turn_closed_projection_retry", {
@@ -186,7 +241,8 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
     let durableState: TState | undefined;
     let persistError: unknown = null;
     try {
-      durableState = await input.persistProjection(projection.state);
+      durableState = await input.persistProjection(projection.state, persistenceFence(baseState));
+      rememberStorageReceipt(durableState);
     } catch (error) {
       persistError = error;
       input.log?.("canceled_turn_projection_persist_unavailable", {
@@ -196,6 +252,9 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
         attempt,
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+    if (input.isCurrent && !input.isCurrent()) {
+      return { committed: false, disposition: "ownership_lost", cancellationRunId: stableCancellationRunId, attempts: attempt };
     }
 
     if (input.getSessionRevisionToken() !== revisionToken) {
@@ -240,26 +299,16 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
     };
   }
 
-  // Last-resort memory closure has no async boundary: project from the latest
-  // owner snapshot and publish under that exact token. This avoids leaving a
+  // Last-resort memory closure projects from the latest owner snapshot and
+  // publishes under that exact token. This avoids leaving a
   // Turn open merely because unrelated runtime progress repeatedly raced the
   // durable attempts; the durability downgrade remains explicit in logs.
   const finalRevisionToken = input.getSessionRevisionToken();
-  const finalBaseState = input.sessionGet();
-  const finalProjection = projectCanceledTurn({
-    state: finalBaseState,
-    sessionKey: input.sessionKey,
-    turnId: input.turnId,
-    uiDisplayTurnId: input.uiDisplayTurnId,
-    runId: input.runId,
-    parentRunId: input.parentRunId,
-    cancellationRunId: stableCancellationRunId,
-    reason: input.reason,
-    message: input.message,
-    nextTaskId: input.nextTaskId,
-    nowMs: (input.nowMs || Date.now)(),
-    controlPlaneFence,
-  });
+  const finalBaseState = withStorageReceipt(input.sessionGet());
+  const finalProjection = await project(finalBaseState);
+  if (input.isCurrent && !input.isCurrent()) {
+    return { committed: false, disposition: "ownership_lost", cancellationRunId: stableCancellationRunId, attempts: maxAttempts };
+  }
   if (finalProjection.disposition === "already_closed") {
     if (finalProjection.state === finalBaseState) {
       return {

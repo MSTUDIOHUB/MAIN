@@ -331,9 +331,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          archived_notes="docs/releases/Release_Notes_${VERSION}_ZH.md"
-          if [[ -f "$archived_notes" ]]; then
-            cp "$archived_notes" release-assets/release_notes.md
+          archived_notes_status="$(node --input-type=module <<'JS'
+          import fs from "node:fs/promises";
+          import { readArchivedReleaseNotes } from "./scripts/release_tools.mjs";
+          const notes = await readArchivedReleaseNotes({ rootDir: process.cwd(), version: process.env.VERSION });
+          if (notes !== null) {
+            await fs.writeFile("release-assets/release_notes.md", notes, "utf8");
+            process.stdout.write("authored");
+          }
+          JS
+          )"
+          if [[ "$archived_notes_status" == "authored" ]]; then
             exit 0
           fi
 
@@ -426,7 +434,7 @@ jobs:
 
           manifest = {
               "version": version,
-              "notes": (assets_dir / "release_notes.md").read_text(encoding="utf-8"),
+              "notes": (assets_dir / "release_notes.md").read_bytes().decode("utf-8"),
               "pub_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
               "platforms": {
                   "darwin-x86_64": darwin_x86_64,

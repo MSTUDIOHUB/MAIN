@@ -39,12 +39,37 @@ export interface RuntimeV2EventBase {
 
 export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
+      readonly type: "run.wait_started" | "run.wait_ended";
+      readonly run: RuntimeV2RunIdentity;
+      readonly requestId: string;
+      readonly commandKey: string;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "run.paused";
+      readonly run: RuntimeV2RunIdentity;
+      readonly blocker: import("./contracts").RuntimeV2ExecutionBlocker;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "run.decision_recorded";
+      readonly run: RuntimeV2RunIdentity;
+      readonly requestId: string;
+      readonly choice: "recheck" | "continue" | "stop";
+      readonly reply?: string;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "run.resumed";
+      readonly run: RuntimeV2RunIdentity;
+      readonly requestId: string;
+    })
+  | (RuntimeV2EventBase & {
       readonly type: "turn.admitted";
       readonly networkRead?: import("../networkRead").NetworkReadPolicy;
       readonly turn: RuntimeV2TurnIdentity;
       readonly strategy: RuntimeV2Strategy;
       readonly subagentRequirement?: "optional" | "required";
       readonly objective: string;
+      readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+      readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
       readonly constraints: readonly string[];
       readonly acceptanceCriteria: readonly string[];
       readonly acceptanceCriterionIds?: readonly string[];
@@ -98,6 +123,12 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      /** Actual successful mutation operations determined at the effect boundary.
+       * Historical events without this field retain their static-tool fallback. */
+      readonly mutationRequests?: readonly {
+        readonly target: string;
+        readonly operation: "create" | "modify" | "delete";
+      }[];
       /** A replay closes the provider tool pair with an already committed
        * same-version receipt. It is not a new observation or progress
        * boundary and therefore carries no new evidence. */
@@ -136,8 +167,12 @@ export type RuntimeV2Event =
       readonly failureKind?:
         | "assertion_failed"
         | "execution_failed"
+        | "not_executed"
         | "not_authorized"
         | "protocol_invalid";
+      /** Durable boundary cause; not_executed closes a tool pair without
+       * creating validation evidence, a pass, or a failed-check frontier. */
+      readonly failureReasonCode?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "work_plan.sealed";

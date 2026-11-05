@@ -24,18 +24,20 @@ mutation-adjacent revalidation 能显著缩窄 symlink/rename 竞态窗口，但
 
 ## Shell 结构与权限
 
-`inspect_shell_command()` 在规则匹配前解析整条命令及每个 segment。受信任 Shell 拒绝：
+Shell 在规则匹配前解析整条命令及每个 segment。无工作区上下文的 `inspect_shell_command()` 继续拒绝绝对路径；已绑定工作区的预检与执行通过 `inspect_shell_command_in_workspace()` 复用同一解析器，仅允许经 canonical containment 确认的工作区内绝对 argv 路径，包括根目录本身。命令原文不被重写，这项路径判断也不代替 allow/ask/deny 审批。受信任 Shell 拒绝：
 
 - NUL、多行、未闭合引号或不完整转义；
 - 命令替换、变量展开、后台执行和不支持的控制操作符；
 - 嵌套 shell、`eval` / `source`、命令内 `cd` / `pushd` / `popd`；
-- 绝对路径、home 展开、`..` 路径逃逸；
+- 未绑定或位于工作区外的绝对 argv 路径、home 展开、`..` 路径逃逸；
 - heredoc、文件描述符、process substitution 等危险重定向；
 - 非工作区相对的重定向目标。
 
 结构检查通过后，`PermissionGuard` 再结合 `.MAIN/permissions.yaml`、默认规则和精确 approval 决定 allow、ask 或 deny。策略匹配不能只检查整串文本的第一个命令；每个 pipeline / `&&` / `||` / sequence segment 都需要决策。
 
 内置 `run_command`、普通 Agent PTY 输入、hooks、MCP `git.*` / `terminal.run` 和 runtime verifier 在执行前共享 `prepare_trusted_shell_execution()` / `execute_trusted_shell()`：它们重新解析命令、验证 canonical 工作目录，并对可识别为路径或已经存在的 argv 目标及每个重定向目标做 workspace / symlink containment。该检查只约束 shell/argv 中 MAIN 能识别的路径；它不能证明任意外部程序的全部内部文件访问都留在工作区内。
+
+路径复验保留已解析 argv 中有意义的空格，不能把带尾空格的文件名裁剪成另一路径；原始和 canonical workspace 根拼写使用同一个 resolver。绝对重定向目标继续拒绝。
 
 ## 命令执行结果与回收
 

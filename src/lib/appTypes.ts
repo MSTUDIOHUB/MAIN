@@ -9,6 +9,7 @@ import type {
 } from "./toolCapabilities";
 import type { EventStreamMode, ToolFeedbackFormat } from "./turnEvents";
 import type { ResponseLanguagePolicy } from "./workflowModels";
+import type { GithubSkillSource } from "./githubSkillSource";
 
 export type Lang = "en" | "zh";
 
@@ -33,7 +34,13 @@ export interface Skill {
   type?: "instruction" | "tool" | "package";
   toolParameters?: string;
   packagePath?: string;
+  /** Immutable app-managed payload; never an arbitrary file-system root. */
+  packageStorage?: { kind: "global"; packageId: string };
+  /** Verified public repository/ref used for explicit manual update checks. */
+  githubSource?: GithubSkillSource;
   entryPoint?: string;
+  /** All Skill entries owned by one imported archive. */
+  entryPoints?: string[];
   workspaceScope?: string | null;
   /** False keeps the Skill available for explicit activation while hiding it
    * from model-driven matching. Mirrors agents/openai.yaml semantics. */

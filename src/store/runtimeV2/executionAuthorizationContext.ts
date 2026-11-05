@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2ForbiddenToolCapability } from "./executionCapabilityRestrictions";
 import {
   buildToolCapabilityRegistry,
   getToolRiskLevelForCall,
@@ -50,7 +51,9 @@ export interface RuntimeV2ToolAuthorizationResult {
   readonly reason: string | null;
   readonly allowExternalLocalRead: boolean;
   readonly shellPermissionApproval?: import("../../lib/ipc").ShellPermissionApproval;
+  readonly shellPermissionDecision?: import("../../lib/ipc").ShellPermissionDecision;
   readonly approvalRequired?: boolean;
+  readonly approvalRequiredCapability?: import("../../lib/turnCapabilities").TurnCapability;
   readonly risk?: ToolRiskLevel;
   readonly localFileReadPath?: string;
 }
@@ -265,14 +268,46 @@ export function authorizationFor(
   input: RuntimeV2ExecutionPortsInput,
 ): RuntimeV2ExecutionAuthorization {
   if (!input.live.authorization) {
+    const state = { ...input.get(), ...(input.context.workspaceMcpSnapshot || {}) };
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
       isReadOnlyContext(input)
-        ? { ...input.get(), webSearchEnabled: readOnlyNetworkPolicy(input).enabled }
-        : input.get(),
+        ? { ...state, webSearchEnabled: readOnlyNetworkPolicy(input).enabled }
+        : state,
       input.context.skillCatalog,
     );
   }
   return input.live.authorization;
+}
+
+export function runtimeV2ToolCapabilityRestriction(
+  input: RuntimeV2ExecutionPortsInput, name: string, args: Record<string, unknown> = {},
+) {
+  const authorization = authorizationFor(input);
+  return runtimeV2ForbiddenToolCapability({
+    restrictions: runtimeV2CapabilityRestrictions(input), toolName: name,
+    risk: runtimeV2ToolRiskForCall(authorization, name, args, {
+      workspace: input.context.runWorkspace,
+      approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths,
+    }),
+    source: runtimeV2CatalogToolSource(authorization, name),
+  });
+}
+
+export function runtimeV2ToolApprovalCapability(
+  input: RuntimeV2ExecutionPortsInput, name: string, args: Record<string, unknown> = {},
+) {
+  const authorization = authorizationFor(input);
+  return runtimeV2ForbiddenToolCapability({
+    restrictions: runtimeV2ApprovalRequiredCapabilities(input), toolName: name,
+    risk: runtimeV2ToolRiskForCall(authorization, name, args, { workspace: input.context.runWorkspace, approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths }),
+    source: runtimeV2CatalogToolSource(authorization, name),
+  });
+}
+
+export function filterRuntimeV2CapabilityRestrictedTools(
+  input: RuntimeV2ExecutionPortsInput, tools: readonly ToolDefinition[],
+): ToolDefinition[] {
+  return tools.filter((tool) => !runtimeV2ToolCapabilityRestriction(input, tool.function.name));
 }
 
 export function providerToolDefinitionsForCommand(
@@ -283,7 +318,7 @@ export function providerToolDefinitionsForCommand(
   if (isReadOnlyContext(input)) {
     input.live.latestProviderActionWindow = null;
     const authorization = authorizationFor(input);
-    const available = runtimeV2ProviderToolDefinitionsForPrompt(authorization, aggregate?.objective?.text || "");
+    const available = filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(authorization, aggregate?.objective?.text || ""));
     return selectRuntimeV2ProviderToolDefinitions({ ports: input, command, available, capabilityRegistry: authorization.capabilityRegistry });
   }
   const effects = deriveRuntimeV2ProviderEffectFacts(aggregate);
@@ -325,10 +360,10 @@ export function providerToolDefinitionsForCommand(
   return selectRuntimeV2ProviderToolDefinitions({
     ports: input,
     command,
-    available: runtimeV2ProviderToolDefinitionsForPrompt(
+    available: filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(
       authorization,
       aggregate?.objective?.text || "",
-    ),
+    )),
     capabilityRegistry: authorization.capabilityRegistry,
     actionWindow,
     correctiveSourceTargets,

@@ -13,6 +13,8 @@ import {
   type ProjectBaselineLimits,
 } from "./projectBaseline";
 import { sha256Hex } from "./sha256";
+import type { ExternalSkillSelection } from "./externalSkillSelections";
+import type { ExternalSkillSources } from "./externalSkillSources";
 
 const DEFAULT_BASELINE_RENDER_CHARS = 12_000;
 const MIN_BASELINE_RENDER_CHARS = 512;
@@ -90,6 +92,8 @@ export interface WorkspaceAdmissionSnapshot {
 export interface ResolveWorkspaceAdmissionInput {
   readonly workspace: string;
   readonly skills: readonly InstructionSkillLike[];
+  readonly externalSkillSelections?: readonly ExternalSkillSelection[];
+  readonly externalSkillSources?: ExternalSkillSources;
   readonly associatedPaths?: readonly string[];
   readonly userPrompt?: string;
   readonly io: WorkspaceAdmissionIo;
@@ -332,6 +336,8 @@ function mismatchedRuleAnchorPaths(
 export async function resolveWorkspaceAdmissionSnapshot(
   input: ResolveWorkspaceAdmissionInput,
 ): Promise<WorkspaceAdmissionSnapshot> {
+  const externalSkillSelections = (input.externalSkillSelections || []).map((selection) => ({ ...selection }));
+  const externalSkillSources = input.externalSkillSources ? { ...input.externalSkillSources } : undefined;
   let canonicalWorkspace: string;
   try {
     canonicalWorkspace = normalizedWorkspace(
@@ -368,6 +374,8 @@ export async function resolveWorkspaceAdmissionSnapshot(
       [...(input.associatedPaths || [])],
       input.userPrompt || "",
       shared.instructionIo,
+      externalSkillSelections,
+      externalSkillSources,
     ),
     baselineLoader({
       workspace: canonicalWorkspace,
@@ -427,6 +435,17 @@ function sortedBy<T>(values: readonly T[], key: (value: T) => string): T[] {
     const rightKey = key(right);
     return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
   });
+}
+
+/** Admission facts can replace discovery only for their captured workspace.
+ * A missing or foreign snapshot must never supply another workspace's facts. */
+export function isProjectBaselineForWorkspace(
+  baseline: ProjectBaselineContext | null | undefined,
+  workspace: string,
+): baseline is ProjectBaselineContext {
+  const owner = normalizedWorkspace(workspace);
+  return !!owner && baseline?.kind === "project_baseline_context" &&
+    normalizedWorkspace(baseline.workspace?.canonicalPath || "") === owner;
 }
 
 /**

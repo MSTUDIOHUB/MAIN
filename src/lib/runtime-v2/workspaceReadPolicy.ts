@@ -22,6 +22,7 @@ export const RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES = new Set([
  * prevents a Skill body from satisfying source-version or mutation leases. */
 export const RUNTIME_V2_SKILL_READ_TOOL_NAMES = new Set([
   "load_skill",
+  "tool_search",
 ]);
 
 export const RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES = new Set([

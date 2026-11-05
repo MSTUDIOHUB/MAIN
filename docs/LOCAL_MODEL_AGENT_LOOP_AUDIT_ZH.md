@@ -20,7 +20,7 @@ MAIN 应只有一套与模型和 Provider 无关的执行过程：Turn admission
 
 ### 1. 无工具正文不能冒充完成
 
-弱本地模型常先输出“我将继续检查”之类正文。此前 Execute/Validate 中一条无工具正文可能在恢复策略之前被终态化。现在只有证据已满足并由 Runtime 进入 `conclude` 模式时，无诊断正文才允许成为终结报告；其他正文保留在 transcript 中，并进入现有 recovery pressure。
+弱本地模型常先输出“我将继续检查”之类正文。此前 Execute/Validate 中一条无工具正文可能在恢复策略之前被终态化。普通 Execute 现在保留执行工具，由模型提交自然最终报告时检查真实命令回执或最新修改后的验证证据；中途验证通过不再自动切换 `conclude`。已批准 Plan 和显式实施契约仍使用各自覆盖门控。未满足证据要求的正文保留在 transcript 中，并进入现有 recovery pressure。
 
 ### 2. 未分类验收不能默认为 behavioral
 

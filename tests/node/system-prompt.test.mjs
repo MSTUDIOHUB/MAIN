@@ -181,7 +181,7 @@ test("XML fallback derives exact argument names, optionality, descriptions, and 
   assert.match(card, /replace_in_file\(path: string, search_text: string, replace_text: string\)/);
   assert.match(card, /run_command\(command: string, description: string, cwd\?: string\)/);
   assert.match(card, /REPLACE_SCHEMA_SENTINEL/);
-  assert.match(card, /<parameter name="path">src\/example\.ts<\/parameter>/);
+  assert.match(card, /<tool_call>\s*\{"name":"read_file","arguments":\{"path":"src\/example\.ts"\}\}\s*<\/tool_call>/);
   assert.doesNotMatch(card, /replace_in_file\(path, search, replace\)/);
 });
 

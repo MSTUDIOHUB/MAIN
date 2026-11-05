@@ -9,8 +9,14 @@ import {
 import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerReadReceipts";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
+import { isRuntimeV2UnexecutedToolReceipt } from "../../lib/runtime-v2/toolReceipt";
 
 export interface RuntimeV2ProviderEffectFacts {
+  readonly failedToolCallIds?: ReadonlySet<string>;
+  /** Standard tool pairs closed without executing a canceled dependency.
+   * These are transport completions, never attempted semantic effects. */
+  readonly unexecutedToolCallIds?: ReadonlySet<string>;
   /** Runtime-scoped provider tool-call id -> committed mutation targets.
    *
    * This projection is derived from the durable command/effect ledger. The
@@ -140,15 +146,49 @@ export function deriveRuntimeV2ProviderEffectFacts(
     }
   >();
   const rejectedActionIdentities = new Set<string>();
+  const failedToolCallIds = new Set<string>();
+  const unexecutedToolCallIds = new Set<string>();
   const observationActionsByFingerprint =
     new Map<string, Set<string>>();
   const repeatedObservationToolNames = new Set<string>();
   for (const event of aggregate?.events || []) {
-    if (event.type !== "validation.completed" || event.passed) continue;
+    const skippedTool = isRuntimeV2UnexecutedToolReceipt(event);
+    const skippedValidation = event.type === "validation.completed" &&
+      !isRuntimeV2ValidationAttempt(event);
+    if (skippedTool || skippedValidation) {
+      const toolCallId = toolCallIdsByCommand.get(event.idempotencyKey);
+      if (toolCallId) unexecutedToolCallIds.add(toolCallId);
+    }
+    if (!isRuntimeV2ValidationAttempt(event) || event.passed) continue;
     const toolCallId = toolCallIdsByCommand.get(event.idempotencyKey);
-    if (toolCallId) failedValidationToolCallIds.add(toolCallId);
+    if (toolCallId && !unexecutedToolCallIds.has(toolCallId)) failedValidationToolCallIds.add(toolCallId);
   }
   for (const event of aggregate?.events || []) {
+    if (event.type === "provider.responded") {
+      for (const receipt of event.result.actionReceipts || []) {
+        // A repeated-rejection reflection carries no independent denial.
+        // Reconstruct authority from its original receipt, including after
+        // restoring a checkpoint written by the old unexecuted-action bug.
+        if (receipt.status === "rejected" && receipt.reasonCode !== "already_rejected") rejectedActionIdentities.add(receipt.actionIdentity);
+        else if (receipt.status === "not_executed") unexecutedToolCallIds.add(receipt.call.id);
+      }
+    }
+    if (event.type === "run.resumed") {
+      const paused = aggregate?.events.find(item => item.type === "run.paused" && item.blocker.requestId === event.requestId);
+      if (paused?.type === "run.paused" && paused.blocker.actionIdentity) {
+        const identity = paused.blocker.actionIdentity;
+        // A failed command may already have produced effects. Recheck is not
+        // authority to replay it; pre-execution denials remain recheckable.
+        const executedFailure = aggregate?.events.some(receipt => {
+          if (receipt.type !== "tool.completed" || receipt.sequence >= event.sequence || receipt.status !== "failed" || receipt.failureKind !== "execution_failed") return false;
+          const command = commandsByIdempotencyKey.get(receipt.idempotencyKey);
+          const name = String(command?.payload.toolName || "");
+          return command && (name === "run_command" || isWorkspaceMutationToolName(name) || name === "mcp_call" || name === "computer_use") &&
+            runtimeV2ProviderToolCallIdentity({ name, arguments: command.payload.arguments as Record<string, unknown> || {} }) === identity;
+        });
+        if (!executedFailure) rejectedActionIdentities.delete(identity);
+      }
+    }
     if (
       event.type === "subagent.completed" &&
       event.status === "completed" &&
@@ -166,6 +206,7 @@ export function deriveRuntimeV2ProviderEffectFacts(
       continue;
     }
     if (event.type !== "tool.completed") continue;
+    if (isRuntimeV2UnexecutedToolReceipt(event)) continue;
     const command = commandsByIdempotencyKey.get(
       event.idempotencyKey,
     );
@@ -186,6 +227,7 @@ export function deriveRuntimeV2ProviderEffectFacts(
     const toolName = String(
       command?.payload.toolName || "",
     ).trim();
+    if (toolCallId && event.status !== "succeeded") failedToolCallIds.add(toolCallId);
     const mutationLeaseFailure =
       event.failureReasonCode === "mutation_source_lease_missing" ||
       event.failureReasonCode === "mutation_source_text_mismatch" ||
@@ -232,6 +274,8 @@ export function deriveRuntimeV2ProviderEffectFacts(
       event.status !== "succeeded" &&
       (
         event.failureKind === "protocol_invalid" ||
+        event.failureKind === "not_authorized" ||
+        event.failureKind === "execution_failed" ||
         event.failureKind === "mutation_rejected" ||
         event.failureKind === "source_mismatch" ||
         event.failureKind === "target_invalid"
@@ -303,6 +347,7 @@ export function deriveRuntimeV2ProviderEffectFacts(
     }
   }
   return {
+    unexecutedToolCallIds,
     committedMutationTargetsByToolCallId,
     replayedToolCallIds,
     replayedSourceReceiptCountSinceMutation,
@@ -312,7 +357,7 @@ export function deriveRuntimeV2ProviderEffectFacts(
     correctiveMutationFailureToolCallIds,
     correctiveMutationRequirementsByToolCallId,
     failedValidationToolCallIds,
-    rejectedActionIdentities,
+    rejectedActionIdentities, failedToolCallIds,
     repeatedObservationToolNames,
   };
 }

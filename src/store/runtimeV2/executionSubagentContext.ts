@@ -4,6 +4,8 @@ import type {
   TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
+import type { ProjectBaselineContext } from "../../lib/projectBaseline";
+import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import {
   RUNTIME_V2_CONTEXT_ANCHOR_PREFIX,
 } from "./executionProviderAnchors";
@@ -52,6 +54,7 @@ function messageText(message: AgentMessage): string {
 
 function canonicalContextAnchors(
   messages: readonly AgentMessage[],
+  hasProjectBaseline = false,
 ): RuntimeV2ParentContextEntry[] {
   return messages.flatMap((message) => {
     if (message.role !== "system") return [];
@@ -65,6 +68,9 @@ function canonicalContextAnchors(
     if (key !== "workspace-overview" && key !== "approved-work-plan") {
       return [];
     }
+    // The child system prompt renders its admitted baseline separately. The
+    // parent map is orientation, not exact source, so avoid copying it twice.
+    if (key === "workspace-overview" && hasProjectBaseline) return [];
     return [{
       id: `context:${key}`,
       source: key === "workspace-overview" ? "workspace" : "plan",
@@ -178,6 +184,7 @@ export function buildRuntimeV2SubagentContextCapsule(input: {
   readonly messages: readonly AgentMessage[];
   readonly effectFacts?: RuntimeV2ProviderEffectFacts;
   readonly workspace?: string;
+  readonly projectBaselineContext?: ProjectBaselineContext | null;
   readonly contextBudget?: Pick<RuntimeContextBudget, "inputBudget">;
 }): string {
   const aggregate = input.aggregate;
@@ -188,7 +195,10 @@ export function buildRuntimeV2SubagentContextCapsule(input: {
     )
   );
   const candidates = [
-    ...canonicalContextAnchors(input.messages),
+    ...canonicalContextAnchors(input.messages, isProjectBaselineForWorkspace(
+      input.projectBaselineContext,
+      input.workspace || "",
+    )),
     ...canonicalSourceContext({
       messages: input.messages,
       effectFacts: input.effectFacts,

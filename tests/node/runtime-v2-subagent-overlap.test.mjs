@@ -6,9 +6,11 @@ import { createRequire } from "node:module";
 import ts from "typescript";
 
 const workspaceRoot = process.cwd();
+const modules = new Map();
 
 function loadTs(sourcePath) {
   const normalized = path.resolve(sourcePath);
+  if (modules.has(normalized)) return modules.get(normalized).exports;
   const source = fs.readFileSync(normalized, "utf8");
   const localRequire = createRequire(normalized);
   const output = ts.transpileModule(source, {
@@ -19,10 +21,19 @@ function loadTs(sourcePath) {
     fileName: normalized,
   }).outputText;
   const module = { exports: {} };
+  modules.set(normalized, module);
   new Function("exports", "module", "require", output)(
     module.exports,
     module,
-    localRequire,
+    (specifier) => {
+      if (specifier.startsWith(".")) {
+        const base = path.resolve(path.dirname(normalized), specifier);
+        for (const candidate of [`${base}.ts`, path.join(base, "index.ts")]) {
+          if (fs.existsSync(candidate)) return loadTs(candidate);
+        }
+      }
+      return localRequire(specifier);
+    },
   );
   return module.exports;
 }

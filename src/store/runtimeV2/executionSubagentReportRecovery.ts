@@ -14,9 +14,10 @@ function availableEvidenceIds(input: {
   ].map((entry) => entry.id))];
 }
 
-/** One effect-free report submission surface, created only after Runtime has
- * rejected an uncited ordinary final. The model still has to select real ids;
- * Runtime never promotes all available evidence on its behalf. */
+/** Legacy adapter compatibility schema. The live child loop does not expose
+ * a report-only repair phase: it accepts ordinary cited final text or returns
+ * incomplete work to the parent. Callers of this compatibility surface still
+ * select real ids; Runtime never promotes all available evidence for them. */
 export function runtimeV2ChildReportTool(input: {
   readonly evidence: readonly RuntimeV2EvidenceReference[];
   readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
@@ -62,27 +63,4 @@ export function runtimeV2ChildReportTool(input: {
       },
     },
   };
-}
-
-/**
- * A child ordinary final is not a completed report until it explicitly cites
- * evidence that the child really observed (or inherited as a review child).
- * Runtime returns the exact finite citation surface but never manufactures a
- * citation or silently promotes prose into evidence.
- */
-export function runtimeV2ChildReportRejectedFeedback(input: {
-  readonly evidence: readonly RuntimeV2EvidenceReference[];
-  readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
-}): string {
-  const evidenceIds = availableEvidenceIds(input);
-  return [
-    "CHILD_REPORT_REJECTED: the ordinary final did not form a valid evidence-linked child report.",
-    evidenceIds.length > 0
-      ? `Available exact evidence IDs: ${evidenceIds.join(", ")}.`
-      : "No evidence ID is available yet.",
-    evidenceIds.length > 0
-      ? `The next request exposes only ${SUBMIT_RUNTIME_V2_SUBAGENT_REPORT_TOOL_NAME}. Call it exactly once and select the relevant IDs in findings[].evidence_ids.`
-      : "Make one genuinely new allowed observation before concluding.",
-    "Runtime will not infer or add citations. An invalid report submission closes this child for parent takeover.",
-  ].join(" ");
 }

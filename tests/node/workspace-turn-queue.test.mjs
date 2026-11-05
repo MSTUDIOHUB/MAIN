@@ -48,6 +48,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildWorkspaceTurnQueueEntryIdentity,
   createWorkspaceTurnQueueState,
+  isWorkspaceInstructionDispatchClaimCurrent,
   normalizeWorkspaceInstruction,
   reconcileWorkspaceTurnQueueOnRestore,
   reduceWorkspaceTurnQueue,
@@ -154,6 +155,32 @@ function ownerForEntry(entry, overrides = {}) {
     ...overrides,
   };
 }
+
+test("semantic preflight remains on the same claim and its result consumes the phase once", () => {
+  let state = claim(commit(append(createWorkspaceTurnQueueState({ sessionKey, sessionEpoch }), "preflight", 10), "preflight", 11), "claim-preflight", 12);
+  const transition = (queue, fromPhase, phase, at) => reduceWorkspaceTurnQueue(queue, {
+    type: "set_dispatch_phase", expectedVersion: queue.version, at,
+    claimId: "claim-preflight", sessionKey, sessionEpoch, fromPhase, phase,
+  });
+  state = transition(state, "dispatch", "intent_preflight", 13).state;
+  assert.equal(state.entries[0].claim.phase, "intent_preflight");
+  const finished = transition(state, "intent_preflight", "dispatch", 14);
+  assert.equal(finished.disposition, "applied");
+  assert.equal(transition(finished.state, "intent_preflight", "dispatch", 15).disposition, "rejected");
+  const restored = reconcileWorkspaceTurnQueueOnRestore({ snapshot: JSON.parse(JSON.stringify(state)), sessionKey, sessionEpoch, at: 20 });
+  assert.equal(restored.entries[0].status, "queued");
+  assert.equal(restored.entries[0].claim, null);
+});
+
+test("the shared dispatch owner rejects changed envelopes even when ids are reused", () => {
+  const state = claim(commit(append(createWorkspaceTurnQueueState({ sessionKey, sessionEpoch }), "owner", 10), "owner", 11), "claim-owner", 12);
+  const head = state.entries[0];
+  const options = { adoptExistingTurn: true, turnIdOverride: head.receipt.turnId, admittedUserBlockId: head.receipt.userBlockId,
+    workspaceInstructionClaim: { ...ownerForEntry(head), claimId: "claim-owner", admittedUserBlockId: head.receipt.userBlockId } };
+  assert.equal(isWorkspaceInstructionDispatchClaimCurrent(state, options), true);
+  const changed = { ...state, entries: [{ ...head, instruction: { ...head.instruction, payload: { ...head.instruction.payload, text: "different payload" } } }] };
+  assert.equal(isWorkspaceInstructionDispatchClaimCurrent(changed, options), false);
+});
 
 test("strict FIFO dispatch removes only the terminal head before advancing", () => {
   let state = createWorkspaceTurnQueueState({ sessionKey, sessionEpoch });

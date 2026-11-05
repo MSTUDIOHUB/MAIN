@@ -92,14 +92,14 @@ export function createRuntimeV2PlanCollaboration(input: {
       )];
       const findingContext = event.report.findings.map((finding) =>
         `Finding: ${finding.statement} (evidence: ${finding.evidenceIds.join(", ")})`
-      ).join("\n").slice(0, 4_000);
+      ).join("\n");
       upsertRuntimeV2ContextAnchor(live, {
         key: `child:${event.jobId}`,
         content: [
           `Scope: ${job?.scopeKey || "recovered planning child"} (${job?.allowedPaths.join(", ") || "bounded read scope"})`,
           "Status: completed",
           `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
-          `Report: ${event.report.summary.slice(0, 4_000)}`,
+          `Report: ${event.report.summary}`,
           findingContext,
           "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer.",
         ].filter(Boolean).join("\n"),
@@ -123,7 +123,7 @@ export function createRuntimeV2PlanCollaboration(input: {
             // parent Plan reader may establish source-version authority for
             // modify/delete targets.
             version: null,
-            statement: [...new Set(statements)].join(" ").slice(0, 4_000),
+            statement: [...new Set(statements)].join(" "),
           });
         }
         if (!input.evidenceContents.has(evidence.id)) {
@@ -132,7 +132,7 @@ export function createRuntimeV2PlanCollaboration(input: {
             ...[...new Set(statements)].map((statement) =>
               `Finding: ${statement}`
             ),
-          ].join("\n").slice(0, 10_000));
+          ].join("\n"));
         }
       }
     }

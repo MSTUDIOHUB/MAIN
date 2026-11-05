@@ -101,7 +101,7 @@ npm run release:windows:x64 -- <version>
 - `--draft` / `--prerelease`：设置公开 Release 状态；
 - `--release-repo <owner/repo>` / `--update-repo <owner/repo>`：覆盖默认仓库；
 - `--no-merge-existing-latest`：不合并同版本已存在的另一平台 manifest；
-- `--update-existing-notes` / `--keep-existing-notes`：显式控制已有 Release 文案。
+- `--update-existing-notes` / `--keep-existing-notes`：没有该版本的说明归档时，控制已有 Release 文案。
 
 本地暂存目录为：
 
@@ -110,6 +110,12 @@ release-output/local/v<version>/assets/
 ```
 
 默认会合并同版本现有 `latest.json`，所以 macOS 与 Windows 谁先上传都可以。后执行的平台不得删除另一平台已经存在的 manifest entry。
+
+## 发布说明来源
+
+先编写 `docs/releases/Release_Notes_<version>_ZH.md`。GitHub Actions、本地发布与公开资产暂存均优先使用该文件的完整内容，统一写入 GitHub Release 正文、发布说明资产和 updater `latest.json` 的 `notes`；同版本分平台补传也不能保留与归档不一致的旧文案。空归档会使发布失败；不存在归档时才使用脚本生成说明的兼容路径。
+
+应用“系统设置 → 关于”读取配置的 `MAIN-UpdateFeed/releases/latest/download/latest.json`，展示其中的 `notes`，并链接到对应版本的下载 Release。修改下载仓库的正文不会自动改写已上传的 updater manifest，因此修正文案时必须同步更新说明资产和 `latest.json`。
 
 ## 路径 C：仅生成本机测试包
 

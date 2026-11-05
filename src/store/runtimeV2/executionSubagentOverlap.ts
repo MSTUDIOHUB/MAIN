@@ -3,6 +3,7 @@ import type {
   RuntimeV2SubagentJob,
   TurnAggregateV1,
 } from "../../lib/runtime-v2";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 
 type RuntimeV2Interval = { readonly start: number; readonly end: number };
 
@@ -40,6 +41,7 @@ function parentCommandLifecycleIntervals(
 function eventEvidence(
   event: RuntimeV2Event,
 ): readonly { readonly id: string }[] {
+  if (event.type === "validation.completed" && !isRuntimeV2ValidationAttempt(event)) return [];
   if (
     event.type === "observation.recorded" ||
     event.type === "tool.completed" ||
@@ -78,7 +80,7 @@ function parentEvidenceProgressIntervals(
     const successfulTool = event.type === "tool.completed" &&
       event.status === "succeeded" &&
       event.receiptOrigin !== "replayed";
-    const successfulValidation = event.type === "validation.completed" &&
+    const successfulValidation = isRuntimeV2ValidationAttempt(event) &&
       event.passed;
     if (hasNovelEvidence && (successfulTool || successfulValidation)) {
       const scheduled = scheduledByKey.get(event.idempotencyKey);

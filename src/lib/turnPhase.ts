@@ -13,7 +13,7 @@ export interface TurnRuntimePhase {
 }
 
 const PHASE_TITLES: Record<TurnRuntimePhaseKind, { zh: string; en: string }> = {
-  scope: { zh: "范围归纳", en: "Scope" },
+  scope: { zh: "读取项目概览", en: "Read project overview" },
   context: { zh: "关键上下文", en: "Key Context" },
   diagnosis: { zh: "归因方案", en: "Diagnosis" },
   implementation: { zh: "实施修改", en: "Implementation" },
@@ -21,7 +21,7 @@ const PHASE_TITLES: Record<TurnRuntimePhaseKind, { zh: string; en: string }> = {
 };
 
 const PHASE_SUMMARIES: Record<TurnRuntimePhaseKind, { zh: string; en: string }> = {
-  scope: { zh: "先把任务拆成稳定阶段，锁定相关范围和约束。", en: "Break the task into stable phases and identify the relevant scope." },
+  scope: { zh: "读取实际项目目录与配置，确认本轮所需上下文。", en: "Read project directories and configuration needed by this task." },
   context: { zh: "读取和分析最小必要上下文，为归因和修改提供证据。", en: "Read and analyze the smallest useful context before deciding the fix." },
   diagnosis: { zh: "收束已读证据，形成问题归因、方案取舍和下一步决策。", en: "Condense the evidence into causes, tradeoffs, and the next decision." },
   implementation: { zh: "按已确认的方案实施文件或配置修改。", en: "Apply the confirmed changes to files or configuration." },

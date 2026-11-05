@@ -17,9 +17,9 @@ import {
   type KnowledgeSource,
 } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
+import ToggleSwitch from "./ToggleSwitch";
 import {
   IconBook,
-  IconCheck,
   IconClose,
   IconFile,
   IconPlus,
@@ -40,6 +40,7 @@ const COPY = {
     delete: "删除",
     enabled: "已启用",
     disabled: "未启用",
+    enableBase: "启用知识库",
     sources: "来源",
     noBases: "暂无知识库",
     noSources: "暂无来源文件",
@@ -65,6 +66,7 @@ const COPY = {
     delete: "Delete",
     enabled: "Enabled",
     disabled: "Disabled",
+    enableBase: "Enable knowledge base",
     sources: "Sources",
     noBases: "No knowledge bases yet",
     noSources: "No sources yet",
@@ -441,10 +443,10 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                   <p className="mt-1 text-xs text-[#a1a1aa]">{selectedBase.description || selectedBase.embeddingProfile}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <button onClick={() => toggleBase(selectedBase)} disabled={!!busy} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-[#e4e4e7] hover:bg-[#18181b] disabled:opacity-50">
-                    {selectedBase.enabled && <IconCheck className="h-3.5 w-3.5 text-[#86d9a3]" />}
-                    {selectedBase.enabled ? copy.enabled : copy.disabled}
-                  </button>
+                  <label className="flex items-center gap-2 text-xs text-[#e4e4e7]">
+                    <ToggleSwitch checked={selectedBase.enabled} onCheckedChange={() => void toggleBase(selectedBase)} disabled={!!busy} aria-label={`${copy.enableBase}: ${selectedBase.name}`} />
+                    <span>{selectedBase.enabled ? copy.enabled : copy.disabled}</span>
+                  </label>
                   <div className="relative">
                     <button
                       onClick={() => setShowImportMenu(!showImportMenu)}
@@ -505,11 +507,10 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                     />
                     <div className="flex flex-wrap items-center gap-4 text-xs text-[#a1a1aa] pt-1">
                       <label className="flex items-center gap-2 cursor-pointer hover:text-white transition-colors">
-                        <input
-                          type="checkbox"
+                        <ToggleSwitch
                           checked={recursive}
-                          onChange={(e) => setRecursive(e.target.checked)}
-                          className="rounded border-[#27272a] bg-[#000000] text-[#3b82f6] focus:ring-0 cursor-pointer"
+                          onCheckedChange={setRecursive}
+                          aria-label="递归导入子链接"
                         />
                         递归导入子链接
                       </label>

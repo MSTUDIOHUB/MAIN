@@ -35,6 +35,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildSemanticMetadataContextLines,
+  buildSubagentDelegationGuidance,
   buildTurnIntakeContextBlock,
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
@@ -219,7 +220,7 @@ test("child mutation restrictions do not disable delegation", () => {
   );
 });
 
-test("preferred subagent collaboration prioritizes useful parallel work without a stage gate", () => {
+test("preferred subagent collaboration serves the requested outcome without maximizing child count", () => {
   const block = buildTurnIntakeContextBlock({
     rawUserInput: "修复启动白屏，可以开启多个subagent协同工作",
     signals: {},
@@ -229,8 +230,9 @@ test("preferred subagent collaboration prioritizes useful parallel work without 
 
   assert.match(block, /subagentPreference: preferred/);
   assert.match(block, /明确选择本轮优先使用协作/);
-  assert.match(block, /至少两个边界明确的工作包可以重叠/);
-  assert.match(block, /应优先在公布的容量内启动尽可能多的有用子智能体/);
+  assert.match(block, /用户要求的交付范围与深度/);
+  assert.match(block, /独立结果.*收益/);
+  assert.doesNotMatch(block, /尽可能多|至少两个|本轮必须启动/);
   assert.match(block, /父线程继续推进不依赖子结果的工作/);
   assert.match(block, /读取、修改或验证任一阶段/);
   assert.match(block, /不是强制生命周期阶段/);
@@ -243,6 +245,16 @@ test("preferred subagent collaboration prioritizes useful parallel work without 
   assert.match(block, /汇合时重新校验并提交/);
   assert.match(block, /父线程继续推进不依赖子结果的工作/);
   assert.match(block, /不得只按目录拆分或复用已终止实例/);
+});
+
+test("an explicit delegation requirement stays distinct from a collaboration preference", () => {
+  for (const language of ["zh", "en"]) {
+    const preferred = buildSubagentDelegationGuidance({ preference: "preferred", language });
+    const required = buildSubagentDelegationGuidance({ preference: "preferred", requirement: "required", language });
+    assert.match(required, language === "zh" ? /明确要求.*委派/ : /explicitly requires.*delegation/i);
+    assert.doesNotMatch(preferred, language === "zh" ? /明确要求.*委派/ : /explicitly requires.*delegation/i);
+    assert.match(required, language === "zh" ? /交付范围与深度/ : /requested deliverable and depth/i);
+  }
 });
 
 test("session collaboration switch stays preferred unless user explicitly forbids delegation", () => {

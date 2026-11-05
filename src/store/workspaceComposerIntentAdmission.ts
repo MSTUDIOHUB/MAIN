@@ -111,9 +111,9 @@ export function buildWorkspaceComposerIntentDispatchHints(
 
   return {
     subagentPreference,
-    resolvedIntent,
-    runtimeIntentOverride: resolvedIntent,
-    skipIntentResolution: true,
+    ...(mainModeKey === "main_mode" && !mainDebugShortcut && resolvedIntent !== "goal" && resolvedIntent !== "image_studio"
+      ? { explicitIntent: resolvedIntent }
+      : { resolvedIntent, runtimeIntentOverride: resolvedIntent, skipIntentResolution: true }),
     turnTitle,
     intentSummary,
   };

@@ -4,6 +4,7 @@ import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevr
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import MainOnboardingPanel from "./MainOnboardingPanel";
 import ProjectInitReviewModal from "./ProjectInitReviewModal";
+import ToggleSwitch from "./ToggleSwitch";
 import type { ProjectInitReviewPhase } from "./ProjectInitReviewModal";
 import MainModeSwitcher from "./composer/MainModeSwitcher";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
@@ -34,6 +35,13 @@ import {
 } from "../lib/projectInit";
 import type { ProjectInitPreview } from "../lib/projectInit";
 import { projectInitIpcIo } from "../lib/projectInitIpc";
+import {
+  applySkillPickerSelection,
+  filterSkillPickerCandidates,
+  getSkillPickerSession,
+  loadSkillPickerCandidates,
+  type SkillPickerCandidate,
+} from "../lib/skillPicker";
 
 // ── ContextRing SVG Component ──────────────────────────────────────────
 
@@ -218,6 +226,12 @@ export default function Composer({
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [highlightedSlashIndex, setHighlightedSlashIndex] = useState(0);
+  const [showSkillMenu, setShowSkillMenu] = useState(false);
+  const [skillSession, setSkillSession] = useState<{ anchor: number; query: string } | null>(null);
+  const [skillCandidates, setSkillCandidates] = useState<SkillPickerCandidate[]>([]);
+  const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
+  const [isSkillsLoading, setIsSkillsLoading] = useState(false);
+  const [skillPickerError, setSkillPickerError] = useState(false);
   const [showMainOnboarding, setShowMainOnboarding] = useState(false);
   const [projectInitReview, setProjectInitReview] = useState<{
     phase: ProjectInitReviewPhase;
@@ -237,6 +251,10 @@ export default function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const mentionDropRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
+  const skillMenuRef = useRef<HTMLDivElement>(null);
+  const skillMenuOpenRef = useRef(false);
+  const skillLoadRequestIdRef = useRef(0);
+  const skillLoadOwnerRef = useRef(null);
   const mainFocusPickerRef = useRef<HTMLDivElement>(null);
   const webSearchPanelRef = useRef<HTMLDivElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
@@ -262,10 +280,14 @@ export default function Composer({
   const contextLimit = useAppStore((s) => s.config.local.contextLimit);
   const language = useAppStore((s) => s.config.language);
   const storeInput = useAppStore((s) => s.input);
+  const currentSessionId = useAppStore((s) => s.currentSessionId);
   const setStoreInput = useAppStore((s) => s.setInput);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
   const bumpWorkspaceContentVersion = useAppStore((s) => s.bumpWorkspaceContentVersion);
   const refreshInstructionAndHookState = useAppStore((s) => s.refreshInstructionAndHookState);
+  const skills = useAppStore((s) => s.skills);
+  const externalSkillSelections = useAppStore((s) => s.externalSkillSelections);
+  const externalSkillSources = useAppStore((s) => s.externalSkillSources);
   const isPlanApproved = useAppStore((s) => s.isPlanApproved);
   const planTasks = useAppStore((s) => s.planTasks);
   const planStage = useAppStore((s) => s.planStage);
@@ -676,13 +698,13 @@ export default function Composer({
       kind: "workspace_command" as const,
       key: "workspace:init",
       command: "/init",
-      label: language === "en" ? "Initialize project context" : "初始化项目上下文",
+      label: language === "en" ? "Generate / refresh project notes" : "生成／刷新项目说明",
       description: !currentWorkspace
-        ? (language === "en" ? "Open a workspace before initializing AGENTS.md." : "请先打开工作区，再初始化 AGENTS.md。")
+        ? (language === "en" ? "Open a workspace before generating AGENTS.md project notes." : "请先打开工作区，再生成 AGENTS.md 项目说明。")
         : composerRunActive
           ? (language === "en" ? "Available after the current run stops." : "当前执行结束后可用。")
-          : (language === "en" ? "Review a deterministic AGENTS.md diff; use /init --refresh to rebuild its managed block." : "审阅确定性的 AGENTS.md diff；使用 /init --refresh 可重建托管区块。"),
-      aliases: ["init", "initialize", "agents", "project", "初始化", "项目"],
+          : (language === "en" ? "Optional: generate / refresh project notes in AGENTS.md after review. Use /init --refresh to update an existing snapshot." : "可选：生成／刷新项目说明（AGENTS.md），审阅后写入；已有事实快照时使用 /init --refresh 更新。"),
+      aliases: ["init", "initialize", "agents", "project", "notes", "refresh", "初始化", "项目", "说明", "刷新"],
       disabled: !currentWorkspace || composerRunActive,
     };
     const query = slashQuery.trim().toLowerCase();
@@ -770,6 +792,62 @@ export default function Composer({
     slashAnchorRef.current = -1;
   }, []);
 
+  const closeSkillMenu = useCallback(() => {
+    skillMenuOpenRef.current = false;
+    skillLoadRequestIdRef.current += 1;
+    skillLoadOwnerRef.current = null;
+    setShowSkillMenu(false);
+    setSkillSession(null);
+    setSkillCandidates([]);
+    setIsSkillsLoading(false);
+    setSkillPickerError(false);
+    setHighlightedSkillIndex(0);
+  }, []);
+
+  const isCurrentSkillOwner = useCallback((owner) => {
+    const state = useAppStore.getState();
+    return owner && String(state.currentWorkspace || "").trim() === owner.workspace &&
+      state.currentSessionId === owner.sessionId && state.skills === owner.skills &&
+      state.externalSkillSelections === owner.externalSkillSelections && state.externalSkillSources === owner.externalSkillSources;
+  }, []);
+
+  useEffect(() => {
+    closeSkillMenu();
+    setSkillCandidates([]);
+  }, [activeSessionKey, currentWorkspace, currentSessionId, isImageStudioMode, closeSkillMenu]);
+
+  useEffect(() => {
+    if (!showSkillMenu || !skillMenuOpenRef.current) return;
+    const requestId = ++skillLoadRequestIdRef.current;
+    const owner = {
+      workspace: String(currentWorkspace || "").trim(),
+      sessionId: useAppStore.getState().currentSessionId,
+      skills, externalSkillSelections, externalSkillSources,
+    };
+    skillLoadOwnerRef.current = owner;
+    setSkillCandidates([]);
+    setIsSkillsLoading(true);
+    setSkillPickerError(false);
+    const current = () => skillMenuOpenRef.current && skillLoadRequestIdRef.current === requestId && isCurrentSkillOwner(owner);
+    void loadSkillPickerCandidates(owner).then((candidates) => {
+      if (!current()) return;
+      setSkillCandidates(candidates);
+      setIsSkillsLoading(false);
+    }).catch((error) => {
+      if (!current()) return;
+      console.error("Skill picker catalog could not load:", error);
+      setSkillPickerError(true);
+      setIsSkillsLoading(false);
+    });
+    return () => { if (skillLoadRequestIdRef.current === requestId) skillLoadRequestIdRef.current += 1; };
+  }, [showSkillMenu, currentWorkspace, skills, externalSkillSelections, externalSkillSources, isCurrentSkillOwner]);
+
+  const visibleSkillItems = useMemo(() => filterSkillPickerCandidates(skillCandidates, skillSession?.query || ""), [skillCandidates, skillSession?.query]);
+  useEffect(() => { setHighlightedSkillIndex(0); }, [skillSession?.query, skillCandidates]);
+  useEffect(() => {
+    if (showSkillMenu) skillMenuRef.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
+  }, [showSkillMenu, highlightedSkillIndex]);
+
   // ── Close mention dropdown / slash menu on outside click ──
   useEffect(() => {
     const handleClick = (e: MouseEvent) => {
@@ -785,6 +863,7 @@ export default function Composer({
           slashAnchorRef.current = -1;
         }
       }
+      if (skillMenuRef.current && !skillMenuRef.current.contains(target) && target !== textareaRef.current) closeSkillMenu();
       if (showAgentPicker && mainFocusPickerRef.current && !mainFocusPickerRef.current.contains(target)) {
         setShowAgentPicker(false);
       }
@@ -794,7 +873,7 @@ export default function Composer({
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [closeMentionMenu, closeSlashMenu, setShowAgentPicker, showAgentPicker, showWebSearchPanel]);
+  }, [closeMentionMenu, closeSlashMenu, closeSkillMenu, setShowAgentPicker, showAgentPicker, showWebSearchPanel]);
 
   useEffect(() => {
     if (isMainMode) return;
@@ -810,11 +889,12 @@ export default function Composer({
     if (!isImageStudioMode) return;
     closeMentionMenu();
     closeSlashMenu();
+    closeSkillMenu();
     setShowWebSearchPanel(false);
     setContextMentions([]);
     setAttachedFiles([]);
     setLockedComposerIntent(null);
-  }, [closeMentionMenu, closeSlashMenu, isImageStudioMode, setAttachedFiles, setContextMentions, setLockedComposerIntent]);
+  }, [closeMentionMenu, closeSlashMenu, closeSkillMenu, isImageStudioMode, setAttachedFiles, setContextMentions, setLockedComposerIntent]);
 
   // ── Image paste handler ──
   const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
@@ -1002,6 +1082,7 @@ export default function Composer({
   // ── Insert @ from the @ button click ──
   const handleAtButtonClick = () => {
     if (isImageStudioMode) return;
+    closeSkillMenu();
     const ta = textareaRef.current;
     if (!ta) return;
     ta.focus();
@@ -1035,6 +1116,7 @@ export default function Composer({
   const handleOpenMainGuideSlashCommands = useCallback(() => {
     setShowMainOnboarding(false);
     closeMentionMenu();
+    closeSkillMenu();
     setShowSlashMenu(true);
     setSlashQuery("");
     setHighlightedSlashIndex(0);
@@ -1042,7 +1124,7 @@ export default function Composer({
     setShowAgentPicker(false);
     slashAnchorRef.current = -1;
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [closeMentionMenu, setShowAgentPicker]);
+  }, [closeMentionMenu, closeSkillMenu, setShowAgentPicker]);
 
   const dismissMainOnboarding = useCallback(() => {
     setShowMainOnboarding(false);
@@ -1313,6 +1395,7 @@ export default function Composer({
     submitPendingRef.current = true;
     setIsSubmitPending(true);
     closeSlashMenu();
+    closeSkillMenu();
     try {
       const accepted = await Promise.resolve(onSendMessage(textToSend, imagesToSend, {
         workspaceComposerIntentSnapshot: {
@@ -1378,7 +1461,7 @@ export default function Composer({
       submitPendingRef.current = false;
       setIsSubmitPending(false);
     }
-  }, [attachedFiles, closeSlashMenu, contextMentions, currentWorkspace, draftInput, handleBeginProjectInit, language, lockedComposerIntent, onSendMessage, pendingImages, preferSubagents, selectedMainModeKey, setLockedComposerIntent, setStoreInput]);
+  }, [attachedFiles, closeSlashMenu, closeSkillMenu, contextMentions, currentWorkspace, draftInput, handleBeginProjectInit, language, lockedComposerIntent, onSendMessage, pendingImages, preferSubagents, selectedMainModeKey, setLockedComposerIntent, setStoreInput]);
 
   const handleGuideCurrentRun = useCallback(() => {
     const guidanceText = draftInput.trim();
@@ -1438,6 +1521,21 @@ export default function Composer({
 
     const cursorPos = e.target.selectionStart ?? value.length;
     const textBeforeCursor = value.slice(0, cursorPos);
+    const nextSkillSession = isImageStudioMode ? null : getSkillPickerSession(value, cursorPos);
+    if (nextSkillSession) {
+      if (!skillMenuOpenRef.current) {
+        setSkillCandidates([]);
+        setIsSkillsLoading(true);
+        setSkillPickerError(false);
+      }
+      skillMenuOpenRef.current = true;
+      setSkillSession(nextSkillSession);
+      setShowSkillMenu(true);
+      closeMentionMenu();
+      closeSlashMenu();
+      return;
+    }
+    if (showSkillMenu) closeSkillMenu();
     const slashSession = getSlashSession(value, cursorPos);
 
     if (isMainMode && parseMainDebugShortcut(value)) {
@@ -1474,6 +1572,30 @@ export default function Composer({
 
     // No active @ mention — close if open
     if (showMentionMenu) closeMentionMenu();
+  };
+
+  const handleSelectSkill = (candidate: SkillPickerCandidate) => {
+    const textarea = textareaRef.current;
+    if (!textarea || isImageStudioMode || useAppStore.getState().selectedMainModeKey === "image_studio" ||
+      isComposingRef.current || Date.now() - compositionEndedAtRef.current < 140 ||
+      isSkillsLoading || skillPickerError || !skillMenuOpenRef.current ||
+      !isCurrentSkillOwner(skillLoadOwnerRef.current) || textarea.selectionStart !== textarea.selectionEnd ||
+      !visibleSkillItems.some((item) => item.id === candidate.id && item.insertText === candidate.insertText)) return;
+    const cursor = textarea.selectionStart;
+    const currentSession = getSkillPickerSession(textarea.value, cursor);
+    if (!currentSession || !skillSession || currentSession.anchor !== skillSession.anchor || currentSession.query !== skillSession.query) {
+      closeSkillMenu();
+      return;
+    }
+    const selection = applySkillPickerSelection(textarea.value, cursor, currentSession, candidate);
+    if (!selection) return;
+    setDraftInput(selection.value);
+    setStoreInput(selection.value, { preserveLockedComposerIntent: true });
+    closeSkillMenu();
+    textarea.focus();
+    requestAnimationFrame(() => {
+      if (textareaRef.current === textarea && textarea.value === selection.value) textarea.selectionStart = textarea.selectionEnd = selection.cursor;
+    });
   };
 
   // ── Select a file from the mention menu ──
@@ -1537,6 +1659,7 @@ export default function Composer({
       e.stopPropagation();
       closeMentionMenu();
       closeSlashMenu();
+      closeSkillMenu();
       setDismissedSuggestedIntentKey(null);
       setLockedComposerIntent(lockedComposerIntent === "plan" ? null : "plan");
       requestAnimationFrame(() => textareaRef.current?.focus());
@@ -1547,6 +1670,25 @@ export default function Composer({
       isImeKeyInput
     ) {
       return;
+    }
+
+    if (showSkillMenu && !isImeKeyInput) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setHighlightedSkillIndex((index) => e.key === "ArrowDown"
+          ? Math.min(index + 1, Math.max(0, visibleSkillItems.length - 1)) : Math.max(index - 1, 0));
+        return;
+      }
+      if ((e.key === "Enter" && !e.altKey && !e.shiftKey) || (e.key === "Tab" && !e.shiftKey)) {
+        e.preventDefault();
+        if (!isSkillsLoading && !skillPickerError && visibleSkillItems[highlightedSkillIndex]) handleSelectSkill(visibleSkillItems[highlightedSkillIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeSkillMenu();
+        return;
+      }
     }
 
     if (showMentionMenu) {
@@ -1617,7 +1759,7 @@ export default function Composer({
     }
 
     // Normal send on Enter (no mention menu open)
-    if (e.key === "Enter" && !e.shiftKey && !e.altKey && !showMentionMenu && !showSlashMenu) {
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey && !showMentionMenu && !showSlashMenu && !showSkillMenu) {
       e.preventDefault();
       handleSubmitComposerMessage();
     }
@@ -1702,11 +1844,10 @@ export default function Composer({
             {onToggleAutoApprove && (
               <div className="pt-2 border-t border-[#27272a] flex items-center gap-2 pl-1">
                 <label className="flex items-center gap-2 cursor-pointer select-none group">
-                  <input
-                    type="checkbox"
+                  <ToggleSwitch
                     checked={!!autoApproveTools}
-                    onChange={(e) => onToggleAutoApprove(e.target.checked)}
-                    className="w-3.5 h-3.5 rounded border-[#3f3f46] bg-[#000000] accent-[var(--accent)] cursor-pointer"
+                    onCheckedChange={onToggleAutoApprove}
+                    aria-label={language === "en" ? "Auto-approve all session commands" : "本次会话内自动允许后续所有命令"}
                   />
                   <span className="text-[11px] text-[#71717a] group-hover:text-[#a1a1aa] transition-colors">
                     本次会话内自动允许后续所有命令 (Auto-approve all)
@@ -1915,27 +2056,27 @@ export default function Composer({
               {showImageStudioAdvanced && (
                 <div className="mt-3 grid gap-3 rounded-xl border p-3 md:grid-cols-2" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", backgroundColor: isLightTheme ? "#f8fafc" : "#050507" }}>
                   {isWebFallbackImageEngine ? (
-                    <button
-                      type="button"
-                      onClick={() => setImageStudioConfig({
-                        web: {
-                          ...imageStudio.config.web,
-                          promptRefine: !imageStudio.config.web.promptRefine,
-                        },
-                      })}
-                      className="rounded-lg border px-3 py-3 text-left transition-colors"
+                    <label
+                      className="flex items-center justify-between gap-3 rounded-lg border px-3 py-3 text-left transition-colors"
                       style={{
                         borderColor: imageStudio.config.web.promptRefine ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
                         backgroundColor: imageStudio.config.web.promptRefine ? "var(--accent-subtle)" : "transparent",
                       }}
                     >
-                      <div className="text-[11px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>HiDream Web</div>
-                      <div className="mt-1 text-[10px]" style={imageStudioMutedStyle}>
-                        {language === "en"
-                          ? `Prompt refine ${imageStudio.config.web.promptRefine ? "enabled" : "disabled"}`
-                          : `提示词润色${imageStudio.config.web.promptRefine ? "已开启" : "已关闭"}`}
-                      </div>
-                    </button>
+                      <span>
+                        <span className="block text-[11px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>HiDream Web</span>
+                        <span className="mt-1 block text-[10px]" style={imageStudioMutedStyle}>
+                          {language === "en"
+                            ? `Prompt refine ${imageStudio.config.web.promptRefine ? "enabled" : "disabled"}`
+                            : `提示词润色${imageStudio.config.web.promptRefine ? "已开启" : "已关闭"}`}
+                        </span>
+                      </span>
+                      <ToggleSwitch
+                        checked={imageStudio.config.web.promptRefine}
+                        onCheckedChange={(promptRefine) => setImageStudioConfig({ web: { ...imageStudio.config.web, promptRefine } })}
+                        aria-label={language === "en" ? "Prompt refinement" : "提示词润色"}
+                      />
+                    </label>
                   ) : (
                     <>
                       <label className="min-w-0">
@@ -2024,16 +2165,18 @@ export default function Composer({
             <textarea
               ref={handleTextareaRef}
               data-testid="composer-textarea"
-              role={showSlashMenu ? "combobox" : undefined}
-              aria-haspopup={showSlashMenu ? "listbox" : undefined}
-              aria-controls={showSlashMenu ? "main-slash-command-menu" : undefined}
-              aria-expanded={showSlashMenu}
+              role={showSkillMenu || showSlashMenu ? "combobox" : undefined}
+              aria-haspopup={showSkillMenu || showSlashMenu ? "listbox" : undefined}
+              aria-controls={showSkillMenu ? "main-skill-picker-menu" : showSlashMenu ? "main-slash-command-menu" : undefined}
+              aria-expanded={showSkillMenu || showSlashMenu}
               aria-activedescendant={
-                showSlashMenu && visibleSlashItems[highlightedSlashIndex]
+                showSkillMenu && !isSkillsLoading && visibleSkillItems[highlightedSkillIndex]
+                  ? `main-skill-picker-option-${highlightedSkillIndex}`
+                  : showSlashMenu && visibleSlashItems[highlightedSlashIndex]
                   ? `main-shortcut-option-${visibleSlashItems[highlightedSlashIndex].kind === "workspace_command" ? "init" : visibleSlashItems[highlightedSlashIndex].item.intent}`
                   : undefined
               }
-              aria-autocomplete={showSlashMenu ? "list" : undefined}
+              aria-autocomplete={showSkillMenu || showSlashMenu ? "list" : undefined}
               className="max-h-[36vh] min-h-[3.5rem] w-full bg-transparent border-none outline-none resize-none overflow-hidden text-[#e4e4e7] p-4 text-[13px] leading-relaxed placeholder:text-[#a1a1aa]"
               style={{ fontSize: `${resolvedComposerFontSize}px` }}
               rows={activeDiffTask ? 1 : 2}
@@ -2041,6 +2184,13 @@ export default function Composer({
               value={draftInput}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
+              onSelect={(event) => {
+                if (!showSkillMenu) return;
+                const textarea = event.currentTarget;
+                const session = getSkillPickerSession(textarea.value, textarea.selectionStart);
+                if (!session || textarea.selectionStart !== textarea.selectionEnd || session.anchor !== skillSession?.anchor) closeSkillMenu();
+                else setSkillSession(session);
+              }}
               onCompositionStart={() => {
                 isComposingRef.current = true;
               }}
@@ -2050,6 +2200,59 @@ export default function Composer({
               }}
               onPaste={handlePaste}
             />
+
+            {showSkillMenu && (
+              <div
+                id="main-skill-picker-menu"
+                ref={skillMenuRef}
+                role="listbox"
+                aria-label={language === "en" ? "MAIN Skills" : "MAIN 技能"}
+                data-testid="skill-picker-menu"
+                className="absolute left-4 bottom-full mb-1 w-[min(34rem,calc(100%-2rem))] max-w-[34rem] rounded-lg border overflow-hidden z-50 flex flex-col shadow-lg"
+                style={{ background: "var(--surface-1)", borderColor: "var(--surface-border)", color: "var(--surface-text)" }}
+              >
+                <div className="flex items-center gap-2 border-b px-3 py-2 text-[11px]" style={{ borderColor: "var(--surface-border)", color: "var(--surface-text-muted)" }}>
+                  <span className="font-mono font-bold theme-text">$</span>
+                  <span>{skillSession?.query
+                    ? (language === "en" ? `Search Skills: ${skillSession.query}` : `搜索技能：${skillSession.query}`)
+                    : (language === "en" ? "Choose a Skill" : "选择技能")}</span>
+                </div>
+                <div className="max-h-72 overflow-y-auto p-1.5">
+                  {isSkillsLoading ? <p role="status" className="px-3 py-4 text-[11px]" style={{ color: "var(--surface-text-muted)" }}>{language === "en" ? "Loading available Skills…" : "正在加载可用技能…"}</p>
+                    : skillPickerError ? <p role="status" className="px-3 py-4 text-[11px]" style={{ color: "var(--surface-text-muted)" }}>{language === "en" ? "Could not load Skills. Close this menu and retry." : "无法加载技能，请关闭菜单后重试。"}</p>
+                    : visibleSkillItems.length === 0 ? <p role="status" className="px-3 py-4 text-[11px]" style={{ color: "var(--surface-text-muted)" }}>{skillSession?.query
+                      ? (language === "en" ? "No matching Skills." : "没有匹配的技能。")
+                      : (language === "en" ? "No available Skills. Add Skills in Skills & Prompts first." : "尚无可用技能，请先在“技能与提示词”中添加。")}</p>
+                    : visibleSkillItems.map((candidate, index) => (
+                      <button
+                        key={candidate.id}
+                        id={`main-skill-picker-option-${index}`}
+                        role="option"
+                        aria-selected={index === highlightedSkillIndex}
+                        data-skill-id={candidate.id}
+                        title={candidate.entryPath || candidate.insertText}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onMouseEnter={() => setHighlightedSkillIndex(index)}
+                        onClick={() => handleSelectSkill(candidate)}
+                        className="w-full rounded-md px-3 py-2 text-left transition-colors"
+                        style={{ background: index === highlightedSkillIndex ? "var(--accent-subtle)" : "transparent" }}
+                      >
+                        <span className="flex flex-wrap items-center gap-2">
+                          <span className="text-[12px] font-semibold" style={{ color: "var(--surface-text-strong)" }}>{candidate.name}</span>
+                          <span className="text-[10px]" style={{ color: "var(--surface-text-subtle)" }}>{language === "en"
+                            ? ({ "自定义规则": "Custom Skill", "技能包": "Skill Package", "项目技能": "Project Skill", "本机技能": "Local Skill" }[candidate.sourceLabel] || candidate.sourceLabel)
+                            : candidate.sourceLabel}{candidate.packageName ? ` · ${candidate.packageName}` : ""}</span>
+                          {candidate.manualOnly && <span className="text-[10px]" style={{ color: "var(--surface-text-muted)" }}>{language === "en" ? "Manual only" : "仅手动"}</span>}
+                        </span>
+                        <span className="mt-0.5 block text-[11px] leading-snug" style={{ color: "var(--surface-text-muted)" }}>{candidate.description}</span>
+                      </button>
+                    ))}
+                </div>
+                <div className="flex flex-wrap items-center gap-3 border-t px-3 py-1.5 text-[10px]" style={{ borderColor: "var(--surface-border)", color: "var(--surface-text-subtle)" }}>
+                  <span>{mentionHintUpDown}</span><span>{language === "en" ? "Enter / Tab Select" : "Enter / Tab 选择"}</span><span>{mentionHintEsc}</span>
+                </div>
+              </div>
+            )}
 
             {/* ── @ Mention dropdown ── */}
             {showMentionMenu && (
@@ -2385,20 +2588,23 @@ export default function Composer({
                             );
                           })}
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setWebSearchEnabled(false);
-                            setShowWebSearchPanel(false);
-                          }}
-                          className={`w-full border-t px-3 py-2 text-left text-[12px] transition-colors ${
+                        <label
+                          className={`flex w-full items-center justify-between gap-3 border-t px-3 py-2 text-left text-[12px] ${
                             isLightTheme
-                              ? "border-[#e4e4e7] text-[#71717a] hover:bg-[#f4f4f5]"
-                              : "border-[#27272a] text-[#a1a1aa] hover:bg-[#27272a]"
+                              ? "border-[#e4e4e7] text-[#71717a]"
+                              : "border-[#27272a] text-[#a1a1aa]"
                           }`}
                         >
-                          {language === "en" ? "Turn off web search" : "关闭网络搜索"}
-                        </button>
+                          <span>{language === "en" ? "Web Search" : "网络搜索"}</span>
+                          <ToggleSwitch
+                            checked={webSearchEnabled}
+                            onCheckedChange={(enabled) => {
+                              setWebSearchEnabled(enabled);
+                              if (!enabled) setShowWebSearchPanel(false);
+                            }}
+                            aria-label={language === "en" ? "Web Search" : "网络搜索"}
+                          />
+                        </label>
                       </div>
                     )}
                   </div>

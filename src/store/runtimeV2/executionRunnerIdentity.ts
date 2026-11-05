@@ -11,21 +11,7 @@ import type {
 } from "../../lib/runtime-v2";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
-
-function sessionEpochFor(
-  state: any,
-  context: RuntimeV2SubmissionContext,
-  turn: ConversationTurn,
-): string {
-  const lifecycle = state?.planLifecycle;
-  if (
-    lifecycle?.sessionKey === context.runSessionKey &&
-    String(lifecycle.sessionEpoch || "").trim()
-  ) {
-    return String(lifecycle.sessionEpoch).trim();
-  }
-  return `runtime-v2:${String(turn.clientSubmissionId || turn.id).trim()}`;
-}
+import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 
 export function createRuntimeV2RunnerIdentity(
   state: any,
@@ -35,7 +21,7 @@ export function createRuntimeV2RunnerIdentity(
   turn: RuntimeV2TurnIdentity;
   run: RuntimeV2RunIdentity;
 } {
-  const sessionEpoch = sessionEpochFor(state, context, turn);
+  const sessionEpoch = resolveRuntimeV2SessionEpoch(state, context, turn);
   const workspaceKey = String(context.runWorkspace || "global").trim() || "global";
   const turnIdentity: RuntimeV2TurnIdentity = {
     workspaceKey,

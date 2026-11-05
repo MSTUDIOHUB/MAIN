@@ -1,4 +1,5 @@
 import {
+  getMcpToolOrigin,
   getMcpToolRemoteName,
   getMcpToolServerUrl,
   type MCPServer,
@@ -146,6 +147,7 @@ const READ_ONLY_BUILT_INS = new Set([
   "submit_plan_candidate",
   "record_execution_contract",
   "load_skill",
+  "tool_search",
   "spawn_subagent",
   "wait_subagents",
   "cancel_subagent",
@@ -835,9 +837,18 @@ export function buildToolCapabilityRegistry(params: {
     const serverUrl = mcpTool
       ? getMcpToolServerUrl(mcpTool, params.mcpToolServerMap)
       : params.mcpToolServerMap?.[name];
-    const server = serverUrl ? serverByUrl[serverUrl] : undefined;
+    const origin = mcpTool ? getMcpToolOrigin(mcpTool) : undefined;
+    // Several independently managed registrations can share one endpoint.
+    // An attached identity must keep its own server's permissions; selecting
+    // another registration by URL alone can lower its risk classification.
+    const server = origin
+      ? (params.mcpServers ?? []).find((candidate) =>
+          candidate.name === origin.serverName && candidate.url === origin.serverUrl)
+      : serverUrl ? serverByUrl[serverUrl] : undefined;
     const source: ToolSourceKind = catalogEntry?.source ||
       (mcpTool ? "mcp" : skillToolNames.has(name) ? "skill" : "built_in");
+    const unavailableMcpIdentity = source === "mcp" && Boolean(origin) &&
+      (!server || server.enabled === false);
     const risk =
       source === "mcp" && mcpTool
         ? classifyMcpTool(mcpTool, server)
@@ -851,8 +862,8 @@ export function buildToolCapabilityRegistry(params: {
       source,
       category: deriveToolCategory(name, definition.function.description, risk, source),
       risk,
-      enabled: !policy.disabledRiskLevels.includes(risk),
-      autoExecutable: isRiskAutoExecutable(risk, policy),
+      enabled: !unavailableMcpIdentity && !policy.disabledRiskLevels.includes(risk),
+      autoExecutable: !unavailableMcpIdentity && isRiskAutoExecutable(risk, policy),
       description: definition.function.description,
       serverName: server?.name,
       serverUrl,

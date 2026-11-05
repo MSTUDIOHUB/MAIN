@@ -1,8 +1,10 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
+import { normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from "../../lib/providerLaneSettings";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
-import { streamChatCompletion } from "../../lib/streaming";
+import { isStreamOutputLimited, streamChatCompletion } from "../../lib/streaming";
 import {
   normalizeProviderResponseV1,
   type RuntimeV2NormalizedProviderResult,
@@ -22,6 +24,7 @@ import {
   isPlanProviderRequestTimeout,
   isPlanSubmissionStage,
   planModelTools,
+  planProviderResponseDiagnostics,
   selectPlanModelTools,
   synthesisPlanTranscript,
   type PlanModelStage,
@@ -110,7 +113,11 @@ export async function requestPlanModel(input: {
       ),
     ),
     activeSubagentCount: activeSubagents.length,
-    baseTools: planModelTools(input.context, input.get()),
+    baseTools: planModelTools(input.context, input.get()).filter((tool) =>
+      !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
+        input.ledger.snapshot()?.objective.capabilityRestrictions,
+      ), tool.function.name)
+    ),
   });
   const requiredSpawn = requiredCollaborationPending &&
     planTools.length === 1 &&
@@ -324,6 +331,7 @@ export async function requestPlanModel(input: {
       },
     });
     if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
+    const outputTruncated = isStreamOutputLimited(result);
     const rawVisibleText = result.content || streamedText;
     const structuredCandidate = structuredResponse
       ? decodeExactStructuredPlanResponse(rawVisibleText)
@@ -341,25 +349,13 @@ export async function requestPlanModel(input: {
       visibleText: structuredCandidate ? "" : rawVisibleText,
       toolCalls: adaptedToolCalls,
       usage: result.usage,
-      diagnostics: [
-        ...(result.protocolViolation
-          ? [{ code: result.protocolViolation, message: "Plan tool protocol mismatch", retryable: true }]
-          : []),
-        ...(result.finishReason === "length" && adaptedToolCalls.length === 0
-          ? [{
-              code: "output_truncated",
-              message: "Plan output reached its token limit before a complete structured submission.",
-              retryable: true,
-            }]
-          : []),
-        ...(structuredCandidate
-          ? [{
-              code: "structured_response_adapted",
-              message: "A complete schema-bound response was normalized as the sole Plan submission.",
-              retryable: false,
-            }]
-          : []),
-      ],
+      diagnostics: planProviderResponseDiagnostics({
+        protocolViolation: result.protocolViolation,
+        clientStopReason: result.clientStopReason,
+        outputTruncated,
+        adaptedToolCallCount: adaptedToolCalls.length,
+        structuredResponseAdapted: !!structuredCandidate,
+      }),
     });
     const normalized: RuntimeV2NormalizedProviderResult = {
       ...providerNormalized,
@@ -414,6 +410,8 @@ export async function requestPlanModel(input: {
       stage: input.stage,
       transport,
       finishReason: result.finishReason || null,
+      clientStopReason: result.clientStopReason || null,
+      stopSource: result.clientStopReason ? "client_guard" : outputTruncated ? "provider" : null,
       contentChars: String(rawVisibleText || "").length,
       reasoningChars: String(result.reasoningContent || "").length,
       nativeToolCallCount: result.toolCalls.length,

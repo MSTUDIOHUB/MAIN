@@ -163,7 +163,7 @@ export function startSubmitRunLease<TAbortController>(
   }
   input.setHarnessRunMarker(harnessRunMarker);
 
-  input.appendAgentMessage(agentUserMessage);
+  if (runtimeBeforeMessage.harnessRunMarker?.runId !== runId) input.appendAgentMessage(agentUserMessage);
 
   const abortController = input.createAbortController();
   input.setAbortController(abortController);

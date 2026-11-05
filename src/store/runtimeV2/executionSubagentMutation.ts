@@ -1,6 +1,7 @@
 import {
   checkSourceSyntax,
   findSymbolReferences,
+  getFileMetadata,
 } from "../../lib/ipc";
 import { sha256Hex } from "../../lib/sha256";
 import { executeTool } from "../../lib/toolExecutor";
@@ -10,7 +11,7 @@ import {
   resolveWorkspaceMutationRequests,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
-import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
+import { preflightWorkspaceMutation, type WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
 import {
   resolveRuntimeV2PlanMutationScope,
   type RuntimeV2Command,
@@ -110,7 +111,7 @@ async function mutationPreflight(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly baseVersions: Record<string, string | null>;
-}): Promise<{ readonly ok: boolean; readonly message: string }> {
+}): Promise<{ readonly ok: boolean; readonly message: string; readonly writeFileTarget?: WorkspaceWriteFileTargetFact }> {
   const preflight = await preflightWorkspaceMutation({
     toolName: input.toolName,
     args: input.args,
@@ -122,14 +123,26 @@ async function mutationPreflight(input: {
         sha256Hex(content);
       return content;
     },
+    probeFileAvailability: async path => {
+      try {
+        await getFileMetadata(path, input.ports.context.runWorkspace || "");
+        return "exists";
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || "");
+        return message.startsWith("FILE_METADATA_NOT_FOUND:") ? "absent" : "unknown";
+      }
+    },
     checkSyntax: checkSourceSyntax,
     findReferences: (symbol) => findSymbolReferences({
       symbol,
       maxResults: 80,
     }, input.ports.context.runWorkspace || ""),
   });
+  if (input.toolName === "write_file" && preflight.writeFileTarget?.exists) {
+    return { ok: false, message: "CHILD_MUTATION_REJECTED: a create transaction cannot overwrite an existing target." };
+  }
   return preflight.ok
-    ? { ok: true, message: "" }
+    ? { ok: true, message: "", writeFileTarget: preflight.writeFileTarget }
     : {
         ok: false,
         message: preflight.message ||
@@ -281,6 +294,7 @@ async function authorizeStagedMutation(input: {
       args: { ...input.staged.arguments },
       target,
       risk: authorization.risk,
+      approvalRequiredCapability: authorization.approvalRequiredCapability,
       permissionTarget: target,
       signal: input.signal,
     });
@@ -419,6 +433,7 @@ export async function commitRuntimeV2StagedChildMutation(input: {
     {
       toolCatalog: authorizationFor(input.ports).toolCatalog,
       skillCatalog: input.ports.context.skillCatalog,
+      writeFileTarget: preflight.writeFileTarget,
     },
   );
   const evidence: RuntimeV2EvidenceReference[] = [];

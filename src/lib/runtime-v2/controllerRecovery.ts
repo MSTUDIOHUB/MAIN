@@ -1,4 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { isRuntimeV2UnexecutedToolReceipt } from "./toolReceipt";
 import type {
   RuntimeV2Command,
   RuntimeV2Projection,
@@ -79,22 +80,25 @@ export function shouldRecordRuntimeV2SoftSignal(input: {
   );
 }
 
-/** Presentation updates are replayable but semantically identical updates in
- * one phase carry no new lifecycle fact. Coalescing them keeps checkpoint
- * capacity for commands, evidence and terminal receipts. */
+/** Coalesce identical presentation only at the same canonical frontier.
+ * A command or receipt can change status while public text stays identical;
+ * it must reach the projection adapter's reconciliation. Presentation events
+ * alone do not advance that frontier. */
 export function repeatsRuntimeV2ProjectionInCurrentPhase(input: {
   readonly aggregate: TurnAggregateV1;
   readonly projection: RuntimeV2Projection;
 }): boolean {
   if (input.projection.audience === "final") return false;
-  return input.aggregate.events
-    .slice(currentPhaseBoundary(input.aggregate))
-    .some((event) =>
-      event.type === "projection.published" &&
+  for (let index = input.aggregate.events.length - 1; index >= 0; index -= 1) {
+    const event = input.aggregate.events[index]!;
+    if (event.type !== "projection.published") return false;
+    if (
       event.audience === input.projection.audience &&
       event.projection.kind === input.projection.kind &&
       event.projection.markdown === input.projection.markdown
-    );
+    ) return true;
+  }
+  return false;
 }
 
 export type RuntimeV2FailureRecoveryDecision =
@@ -212,6 +216,7 @@ export function decideRuntimeV2SemanticFailureRecovery(input: {
 }): Exclude<RuntimeV2FailureRecoveryDecision, {
   readonly kind: "continue" | "hard_stop" | "lifecycle_boundary";
 }> | null {
+  if (isRuntimeV2UnexecutedToolReceipt(input.event)) return null;
   const toolFailed =
     input.event.type === "tool.completed" &&
     input.event.status !== "succeeded";

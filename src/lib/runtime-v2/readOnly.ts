@@ -12,6 +12,8 @@ export interface RuntimeV2ReadOnlyLoopInput {
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
   readonly objective: string;
+  readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly signal: AbortSignal;
   readonly initial?: RuntimeV2ControllerSnapshot;
   readonly now: () => number;
@@ -35,8 +37,10 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
   const controller = new RuntimeV2Controller(input.ports, input.initial, { abortSignal: input.signal });
   if (!input.initial) await controller.admit({
     turn: input.turn, run: input.run, strategy: input.strategy || "chat", objective: input.objective,
+    capabilityRestrictions: input.capabilityRestrictions,
+    approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     networkRead: input.networkRead, constraints: ["read_only", "no_external_side_effects"],
-    acceptanceCriteria: ["one_visible_provider_reply"], initialPhase: input.collectWorkspace ? "preparing" : "observing",
+    acceptanceCriteria: ["current_complete_answer_without_unexecuted_actions"], initialPhase: input.collectWorkspace ? "preparing" : "observing",
   });
   const startedAt = controller.snapshot().aggregate?.events.find((event) => event.type === "run.started")?.at ?? input.now();
   if (input.initial?.aggregate?.terminalOutcome || input.initial?.aggregate?.phase === "finalizing") await controller.resumeTerminalProjection();
@@ -58,8 +62,10 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
     }
     if (state.scheduledCommands.length) { await controller.resumeScheduled(); continue; }
     // Inspect a slow request's result BEFORE considering elapsed recovery time.
-    const answer = latestReadOnlyAnswer(state);
-    if (answer && !state.subagents.some((job) => job.status === "queued" || job.status === "running")) {
+    const answer = latestReadOnlyAnswer(state, { allowPendingChildJoin: true });
+    if (answer) {
+      // The controller joins this Run's active children before finalization.
+      // A new handoff invalidates this draft and requires parent synthesis.
       await controller.driveOnce({ resultKind: "success", resultReason: "已基于本轮对话与实际证据完成答复。", finalMarkdown: answer });
       continue;
     }
@@ -68,11 +74,8 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
       await controller.driveOnce({ resultKind: "error", resultReason: "连续无语义进展的恢复租约已耗尽，未生成可发布的回答。" });
       continue;
     }
-    const lastRequest = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "request_model");
-    if (lastRequest?.type === "command.scheduled" && lastRequest.command.payload.conclusionKind === "read_only" && !state.pendingToolCalls.length) {
-      await controller.driveOnce({ resultKind: "error", resultReason: "总结请求未产生完整、可发布的模型回答。" });
-      continue;
-    }
+    // A malformed conclusion is recoverable protocol evidence. The durable
+    // stall lease bounds retries; an individual weak response is not terminal.
     if (input.deadlineMs !== undefined && input.now() - startedAt >= input.deadlineMs) {
       await controller.driveOnce({ resultKind: "error", resultReason: "调用方指定的运行时限已到，未生成可发布的回答。" });
       continue;

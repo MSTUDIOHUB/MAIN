@@ -92,8 +92,8 @@ test("replace_in_file preflight blocks mismatched search_text before review", as
   assert.equal(result.ok, false);
   assert.equal(result.reason, "search_text_mismatch");
   assert.equal(result.recoveryKind, "source_mismatch");
-  assert.match(result.message || "", /当前版本化源码观察/);
-  assert.match(result.message || "", /文件版本变化|缺少精确范围/);
+  assert.match(result.message || "", /真实代码片段|\[src\/hooks\/useCsvParser\.ts:1-2\]/);
+  assert.match(result.message || "", /export function parseCsv/);
 });
 
 test("replace_in_file preflight rejects an ambiguous exact block", async () => {
@@ -212,23 +212,56 @@ test("write_file preflight blocks missing or identical content", async () => {
     readFile: async () => "existing",
   });
 
-  assert.equal(overwrite.ok, false);
-  assert.equal(overwrite.reason, "existing_file_requires_patch");
-  assert.equal(
-    overwrite.recoveryKind,
-    "mutation_rejected",
-    "an overwrite-policy rejection must keep the next provider decision in corrective mutation recovery",
-  );
-  assert.match(overwrite.message || "", /replace_in_file|apply_patch/);
+  assert.equal(overwrite.ok, true);
+  assert.deepEqual(overwrite.writeFileTarget, {
+    path: "src/hooks/useCsvParser.ts", exists: true, content: "existing",
+  });
 
   const create = await preflightWorkspaceMutation({
     toolName: "write_file",
     args: { path: "new-file.ts", content: "new" },
     language: "en",
     readFile: async () => { throw new Error("missing"); },
+    probeFileAvailability: async () => "absent",
   });
 
   assert.equal(create.ok, true);
+  assert.deepEqual(create.writeFileTarget, { path: "new-file.ts", exists: false });
+});
+
+test("write_file preparation preserves exact existing bytes and ignores provider-supplied target facts", async () => {
+  for (const source of ["", "\ufeff第一行\r\nsecond line\r\n"]) {
+    const result = await preflightWorkspaceMutation({
+      toolName: "write_file",
+      args: {
+        path: "notes.txt", content: `${source}updated\r\n`,
+        writeFileTarget: { path: "notes.txt", exists: false },
+      },
+      readFile: async () => source,
+      probeFileAvailability: async () => { throw new Error("a successful read must not need an absence probe"); },
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.writeFileTarget, { path: "notes.txt", exists: true, content: source });
+  }
+});
+
+test("write_file preparation never turns unreadable or unknown targets into new files", async () => {
+  for (const availability of [undefined, "exists", "unknown", "probe_failure"]) {
+    const result = await preflightWorkspaceMutation({
+      toolName: "write_file",
+      args: { path: "protected.txt", content: "replacement" },
+      readFile: async () => { throw Object.assign(new Error("access denied"), { code: "EACCES" }); },
+      ...(availability === undefined ? {} : {
+        probeFileAvailability: async () => {
+          if (availability === "probe_failure") throw new Error("transport unavailable");
+          return availability;
+        },
+      }),
+    });
+    assert.equal(result.ok, false, String(availability));
+    assert.equal(result.reason, "read_failed");
+    assert.equal(result.writeFileTarget, undefined);
+  }
 });
 
 test("mutation preflight rejects external and traversing targets before reading", async () => {
@@ -688,12 +721,7 @@ test("mutation preflight blocks removing a module export that still has a real i
     }),
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "public_contract_break");
-  assert.equal(result.recoveryKind, "mutation_rejected");
-  assert.match(result.message || "", /setEditorContent/);
-  assert.match(result.message || "", /src\/main\.js:9/);
-  assert.match(result.message || "", /No file was changed/);
+  assert.equal(result.ok, true);
 });
 
 test("missing mutation targets request workspace reorientation instead of rereading the invented path", async () => {

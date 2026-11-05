@@ -32,11 +32,13 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "git_diff",
   "run_command",
   "browser_evaluate",
+  "computer_use",
   "get_project_skeleton",
   "spawn_subagent",
   "wait_subagents",
   "record_execution_contract",
   "load_skill",
+  "tool_search",
 ]);
 
 export function runtimeV2ToolDefinitions(
@@ -131,7 +133,7 @@ export function runtimeV2ToolDefinitions(
       function: {
         ...definition.function,
         description:
-          "Create a new file with complete content. Runtime v2 rejects overwriting an existing file; use replace_in_file or apply_patch for bounded edits to existing source.",
+          "创建新文件或写入完整文件内容（写入前会自动记录 Checkpoint 快照；局部小改动也可使用 replace_in_file）。",
       },
     };
   });
@@ -149,18 +151,48 @@ export function logRuntimeV2SkillLoad(input: {
 }): void {
   if (input.toolName !== LOAD_SKILL_TOOL_NAME || !input.succeeded) return;
   let revision: string | null = null;
+  let skillId = input.skillId;
+  let complete = true;
+  let disclosure: string | null = null;
+  let returnedRange: unknown = null;
   try {
-    revision = String(
-      JSON.parse(String(input.rawOutput || "")).version || "",
-    ) || null;
+    const result = JSON.parse(String(input.rawOutput || ""));
+    if (result.type === "skill.catalog") {
+      input.logStoreEvent("runtime_v2_skill_catalog_listed", {
+        turnId: input.turnId,
+        runId: input.runId,
+        total: result.total,
+        returned: Array.isArray(result.entries) ? result.entries.length : 0,
+        hasNextPage: !!result.nextCursor,
+        effect: "metadata_only",
+      });
+      return;
+    }
+    if (result.type === "skill.resource") {
+      input.logStoreEvent("runtime_v2_skill_resource_read", {
+        turnId: input.turnId, runId: input.runId, skillId: String(result.id || input.skillId),
+        resource: result.resource, revision: result.version, complete: result.complete !== false,
+        disclosure: result.disclosure, returnedRange: result.returnedRange,
+        effect: "resource_guidance_only",
+      });
+      return;
+    }
+    revision = String(result.version || "") || null;
+    skillId = String(result.id || skillId);
+    complete = result.complete !== false;
+    disclosure = typeof result.disclosure === "string" ? result.disclosure : null;
+    returnedRange = result.returnedRange || null;
   } catch {
     revision = null;
   }
-  input.logStoreEvent("runtime_v2_skill_loaded", {
+  input.logStoreEvent(complete ? "runtime_v2_skill_loaded" : "runtime_v2_skill_disclosed", {
     turnId: input.turnId,
     runId: input.runId,
-    skillId: input.skillId,
+    skillId,
     revision,
-    effect: "instructions_only",
+    complete,
+    disclosure,
+    returnedRange,
+    effect: complete ? "instructions_only" : "partial_instructions_only",
   });
 }

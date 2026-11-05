@@ -81,6 +81,11 @@ export default function MainOnboardingPanel({
             description: "Type @ or use the @ button to add exact workspace files. Use + to attach files that are outside the current workspace.",
           },
           {
+            label: "Skills",
+            title: "$ Skill shortcuts",
+            description: "Type $ to search Skills currently added and enabled in MAIN. Use ↑↓ to choose, Enter / Tab to insert, and Esc to close. Skills from disabled sources are excluded.",
+          },
+          {
             label: "Workflow",
             title: "Shift + Tab",
             description: "Toggle Plan for a reviewable proposal before implementation. Press it again to return to automatic intent routing.",
@@ -108,6 +113,11 @@ export default function MainOnboardingPanel({
             label: "上下文",
             title: "@ 引用文件",
             description: "输入 @ 或点击 @ 按钮可精确引用工作区文件；使用 + 可以附加当前工作区之外的文件。",
+          },
+          {
+            label: "技能",
+            title: "$ 技能快捷菜单",
+            description: "输入 $ 搜索当前已添加且启用的技能；↑↓ 选择，Enter / Tab 插入，Esc 关闭。已关闭来源的技能不会出现在菜单中。",
           },
           {
             label: "工作流",
@@ -176,7 +186,7 @@ export default function MainOnboardingPanel({
           <div
             key={card.title}
             data-guide-card
-            className="rounded-2xl border px-4 py-3"
+            className="rounded-2xl border px-4 py-3 md:last:col-span-2"
             style={cardStyle}
           >
             <div className="text-[11px] font-semibold uppercase tracking-[0.18em]" style={stepLabelStyle}>

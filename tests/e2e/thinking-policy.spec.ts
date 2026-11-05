@@ -29,9 +29,15 @@ test("process display ignores legacy hidden policy and keeps process text hierar
   await expect(page.getByTestId("turn-activity-notice")).toBeVisible();
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-thought-summary")).toContainText("流式结束后继续保留");
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  const archiveToggle = page.getByTestId("turn-process-archive-toggle");
+  await expect(archiveToggle).toHaveAttribute("aria-expanded", "false");
+  await archiveToggle.click();
+  await expect(archiveToggle).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByText("过程显示测试回复。")).toBeVisible();
-  const processTimeline = page.getByTestId("live-turn-process-timeline");
+  // A concluded workspace Turn keeps its process records in the expandable
+  // archive; the live timeline belongs to a running/continuous Turn.
+  await expect(page.getByTestId("live-turn-process-timeline")).toHaveCount(0);
+  const processTimeline = page.getByTestId("turn-process-archive-details");
   await expect(processTimeline).toBeVisible();
   await expect(processTimeline).toContainText("ChatArea.tsx");
 
@@ -82,8 +88,9 @@ test("process display ignores legacy hidden policy and keeps process text hierar
   expect(processFontSize).toBeLessThan(composerFontSize);
 
   await page.reload();
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
-  await expect(page.getByTestId("live-turn-process-timeline")).toContainText("ChatArea.tsx");
+  await expect(archiveToggle).toHaveAttribute("aria-expanded", "false");
+  await archiveToggle.click();
+  await expect(page.getByTestId("turn-process-archive-details")).toContainText("ChatArea.tsx");
   await expect(page.getByText("过程显示测试回复。")).toBeVisible();
   await expect(page.getByTestId("thinking-policy-action_only")).toHaveCount(0);
 });

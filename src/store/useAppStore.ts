@@ -1,4 +1,9 @@
 import { captureNetworkRead } from "../lib/networkRead";
+import { createRuntimeV2ExecutionBlockerView, resolveRuntimeV2ExecutionBlocker } from "./runtimeV2/executionBlocker";
+import { installRuntimeV2ExecutionDecisionReplay } from "./runtimeV2/executionDecisionReplay";
+import { reconcileRuntimeV2TimelineBlocks } from "./runtimeV2/projectionTimeline";
+import { deriveStreamSettings } from "../lib/providerLaneSettings";
+import { buildOpenAiCompatibleReasoningRequestExtras } from "../lib/streaming";
 // store/useAppStore.ts
 // Zustand global state for Local Agent IDE
 // All state that was previously scattered as useState in the monolith lives here.
@@ -52,6 +57,11 @@ import {
 } from "../lib/harnessCrashTelemetry";
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
 import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
+import { inspectGlobalSkillPackage, promoteLegacySkillPackage } from "../lib/ipc";
+import { globalSkillPackageId, migrateLegacySkillRegistrations, upsertGlobalSkillRegistration } from "../lib/globalSkillPackages";
+import { applyGithubSkillPackageCandidate, type GithubSkillUpdateCandidate, type GithubSkillUpdateResult } from "../lib/githubSkillUpdates";
+import { normalizeGithubSkillSource } from "../lib/githubSkillSource";
+import { resolveWorkspaceMcpView } from "../lib/workspaceMcp";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
@@ -116,6 +126,7 @@ import {
   type TurnRuntimeCheckpointMap,
 } from "../lib/turnRuntimeCheckpoint";
 import {
+  commitRuntimeV2EmergencyTerminalEnvelope,
   normalizeRuntimeV2Checkpoint,
   normalizeRuntimeV2CheckpointMap,
   serializeRuntimeV2CheckpointMap,
@@ -123,7 +134,6 @@ import {
 } from "../lib/runtime-v2/checkpoint";
 import {
   normalizeRuntimeV2EmergencyTerminalEnvelopeMap,
-  sameRuntimeV2EmergencyTerminalRun,
   type RuntimeV2EmergencyTerminalEnvelopeMap,
 } from "../lib/runtime-v2/emergencyTerminal";
 import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
@@ -270,6 +280,8 @@ import {
   stripRestoredUserChoiceControlText,
 } from "../lib/actionRequestRestore";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
+import { normalizeExternalSkillSelections, type ExternalSkillSelection } from "../lib/externalSkillSelections";
+import { normalizeExternalSkillSources, type ExternalSkillSource, type ExternalSkillSources } from "../lib/externalSkillSources";
 import {
   sanitizeUserContextItemsForPersist,
 } from "../lib/userContextItems";
@@ -277,6 +289,7 @@ import { resolveSessionTranscriptPageMetadata } from "../lib/sessionTranscriptPa
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
+  normalizePersistedSkills,
   sanitizeHydratedLockedComposerIntent,
   stripLegacyConfigFields,
   stripLegacyRuntimeFieldsFromPersistedState,
@@ -288,6 +301,7 @@ import {
   resolveWorkspaceAwareWorkflowMode,
   type ExecutionConsentPolicy,
   type CommandDirective,
+  type SemanticTaskIntent,
   type MainIntentShortcut,
   type PendingRunDecision,
   type PendingRunDecisionChoice,
@@ -376,6 +390,7 @@ import {
 } from "./submitRuntimeFacade";
 import { createSubmitSessionRuntimeController } from "./submitSessionRuntimeController";
 import { startSubmitBlockingPreflightEffect } from "./submitPreflightExecutor";
+import { isSubmitWorkspacePreflightLive } from "./submitWorkspacePreflight";
 import {
   applySubmitSeedSessionTitle,
   startSubmitSemanticMetadataEffect,
@@ -501,6 +516,7 @@ import type {
 import {
   WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
   type WorkspaceInstruction,
+  type WorkspaceInstructionDispatchClaim,
   type WorkspaceInstructionLedgerEntry,
   type WorkspaceInstructionReceipt,
   type WorkspaceInstructionSource,
@@ -528,6 +544,7 @@ import { compactThoughtContent } from "../lib/thoughtCompaction";
 import {
   buildWorkspaceTurnQueueEntryIdentity,
   createWorkspaceTurnQueueState,
+  isWorkspaceInstructionDispatchClaimCurrent,
   normalizeWorkspaceInstructionLedger,
   reconcileWorkspaceTurnQueueOnRestore,
   reduceWorkspaceTurnQueue,
@@ -1242,17 +1259,7 @@ export type WorkspaceInstructionAcceptance =
       retryable: boolean;
     };
 
-export interface WorkspaceInstructionDispatchClaim {
-  claimId: string;
-  receiptId: string;
-  clientSubmissionId: string;
-  sessionKey: string;
-  sessionEpoch: string;
-  turnId: string;
-  admittedUserBlockId: number;
-  /** Canonical immutable instruction+receipt envelope captured at claim time. */
-  instructionEnvelopeIdentity: string;
-}
+export type { WorkspaceInstructionDispatchClaim } from "../lib/workspaceInstruction";
 
 type CapsuleExplanationSource = "model" | "runtime";
 type CapsuleExplanationState = {
@@ -1392,6 +1399,7 @@ export interface AppState {
   removeMcpServer: (name: string) => void;
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
 
+
   // IM Adapters
   feishuAdapterStatus: FeishuAdapterRuntimeStatus;
   feishuPairingRequests: FeishuPendingPairing[];
@@ -1420,11 +1428,17 @@ export interface AppState {
 
   // Skills CRUD
   skills: Skill[];
+  externalSkillSelections: ExternalSkillSelection[];
+  externalSkillSources: ExternalSkillSources;
+  setExternalSkillSource: (source: ExternalSkillSource, enabled: boolean) => void;
+  setExternalSkillSelection: (selection: ExternalSkillSelection) => void;
   setSkills: (v: Skill[]) => void;
   toggleSkill: (id: string) => void;
   deleteSkill: (id: string) => void;
   addSkill: (skill: Omit<Skill, "id" | "active" | "isBuiltIn">) => void;
   updateSkill: (id: string, patch: Partial<Omit<Skill, "id" | "isBuiltIn">>) => void;
+  applyGithubSkillUpdate: (candidate: GithubSkillUpdateCandidate) => GithubSkillUpdateResult;
+  migrateLegacySkillPackages: () => Promise<void>;
 
   // Knowledge bases
   knowledgeBases: KnowledgeBase[];
@@ -1663,6 +1677,8 @@ export interface AppState {
       reuseCurrentTurn?: boolean;
       preservePlanState?: boolean;
       resolvedIntent?: ResolvedUserIntent;
+      explicitIntent?: ResolvedUserIntent;
+      semanticIntent?: SemanticTaskIntent;
       runtimeIntentOverride?: ResolvedUserIntent;
       forceExecuteRecoveryMode?: ExecuteRecoveryMode;
       forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -1691,6 +1707,7 @@ export interface AppState {
       goalContinuationGuidance?: string;
       /** Reserved child run identity for an approved Plan handoff. */
       runIdOverride?: string;
+      executionResumeRequestId?: string;
       /** Exact one-shot Plan execution attempt consumed only after Run admission. */
       planExecutionLeaseId?: string;
       planExecutionInstructionHash?: string;
@@ -1879,6 +1896,7 @@ export function normalizeProviderCompatibilityByRuntimeKey(
 
 const defaultSkills: Skill[] = [];
 const defaultKnowledgeBases: KnowledgeBase[] = [];
+let legacySkillPackageMigration: Promise<void> | null = null;
 
 const DEFAULT_MCP_SERVERS: MCPServer[] = [
   { name: "unityMCP", type: "http", url: "http://localhost:8080/mcp", enabled: true },
@@ -2226,6 +2244,40 @@ function workspaceInstructionEnvelopeIdentity(
   entry: WorkspaceTurnQueueEntry,
 ): string {
   return buildWorkspaceTurnQueueEntryIdentity(entry);
+}
+
+/** Synchronous submit acceptance transfers the exact FIFO claim to its Turn. */
+function acknowledgeWorkspaceInstructionClaim(
+  state: AppState,
+  claim: WorkspaceInstructionDispatchClaim,
+): WorkspaceTurnQueueState | null {
+  const queue = state.workspaceTurnQueue;
+  const entry = queue?.entries[0];
+  if (!queue || !entry || !isSessionRuntimeActive(state, claim.sessionKey) ||
+    !isWorkspaceInstructionDispatchClaimCurrent(queue, {
+      adoptExistingTurn: true, workspaceInstructionClaim: claim,
+      turnIdOverride: claim.turnId, admittedUserBlockId: claim.admittedUserBlockId,
+    }) || getPendingSessionCancellation(claim.sessionKey)) return null;
+  const inspection = inspectWorkspaceInstructionTerminalProjection({
+    entry, sessionKey: claim.sessionKey, taskFlow: state.taskFlow,
+    conversationTurns: state.conversationTurns, runtimeEvents: state.runtimeEvents,
+  });
+  if (!inspection.owner || inspection.terminals.length > 0 ||
+    isConversationTurnRuntimeClosed(inspection.owner.turn.runtimeOutcome) ||
+    !(state.currentTurnId === claim.turnId ||
+      (state.harnessRunMarker?.sessionKey === claim.sessionKey &&
+        state.harnessRunMarker.turnId === claim.turnId))) return null;
+  const transition = reduceWorkspaceTurnQueue(queue, {
+    type: "ack", expectedVersion: queue.version, at: Date.now(),
+    claimId: claim.claimId, sessionKey: queue.sessionKey, sessionEpoch: queue.sessionEpoch,
+    turnOwner: {
+      sessionKey: queue.sessionKey, sessionEpoch: queue.sessionEpoch,
+      turnId: entry.receipt.turnId, receiptId: entry.receipt.receiptId,
+      clientSubmissionId: entry.instruction.clientSubmissionId,
+      instructionEnvelopeIdentity: workspaceInstructionEnvelopeIdentity(entry),
+    },
+  });
+  return transition.disposition === "applied" ? transition.state : null;
 }
 
 function sameStringSequence(
@@ -3679,7 +3731,7 @@ export function normalizeSessionRuntimeSnapshot(
     snapshot.autoApproveTools === true,
     snapshot.autoApproveToolScopes,
   );
-  const rawTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
+  let rawTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   const persistedWorkspaceQueueEntries = Array.isArray(
     snapshot.workspaceTurnQueue?.entries,
   )
@@ -3806,7 +3858,7 @@ export function normalizeSessionRuntimeSnapshot(
     restoredPlanArtifacts.artifacts,
   );
   const actionRequestCandidate = normalizeActionRequest(snapshot.activeActionRequest);
-  const originalActionRequest = actionRequestCandidate && (
+  let originalActionRequest = actionRequestCandidate && (
     !expectedContainerSessionKey ||
     actionRequestCandidate.sessionKey === expectedContainerSessionKey
   )
@@ -4004,6 +4056,22 @@ export function normalizeSessionRuntimeSnapshot(
         isPlanApproved: restoredIsPlanApproved,
       }
     : null;
+  const executionCheckpoint = restoredHarnessRunMarker?.turnId
+    ? restoredRuntimeV2Checkpoints[restoredHarnessRunMarker.turnId] : null;
+  const executionChoice = executionCheckpoint && suppliedLifecycleSessionEpoch &&
+      executionCheckpoint.owner.sessionEpoch === suppliedLifecycleSessionEpoch &&
+      executionCheckpoint.owner.sessionKey === restoredLifecycleSessionKey &&
+      executionCheckpoint.aggregate.run?.identity.runId === restoredHarnessRunMarker?.runId
+    ? createRuntimeV2ExecutionBlockerView(executionCheckpoint.aggregate, "zh", Math.max(0, ...rawTaskFlow.map(block => block.id)) + 1)
+    : null;
+  if (executionChoice) {
+    originalActionRequest = executionChoice.request;
+    if (!rawTaskFlow.some(block => block.type === "agent" && block.choiceRequest?.requestId === executionChoice.request.requestId)) {
+      rawTaskFlow = [...rawTaskFlow, executionChoice.block];
+    }
+  } else if (originalActionRequest?.kind === "user_choice" && originalActionRequest.executionBlocker) {
+    originalActionRequest = null;
+  }
   const deletionOwnedActionRequest = goalDeletionFenced &&
     isActionRequestOwnedByGoalForDeletion({
       request: originalActionRequest,
@@ -4187,13 +4255,11 @@ export function normalizeSessionRuntimeSnapshot(
     if (
       checkpoint &&
       (
-        checkpoint.revision !== envelope.lastRevision ||
         !!checkpoint.aggregate.terminalOutcome ||
-        !checkpoint.aggregate.run ||
-        !sameRuntimeV2EmergencyTerminalRun(
-          checkpoint.aggregate.run.identity,
-          envelope.run,
-        )
+        commitRuntimeV2EmergencyTerminalEnvelope({
+          checkpoint, currentEnvelope: null, owner: envelope.owner,
+          run: envelope.run, expectedRevision: envelope.lastRevision, envelope,
+        }).disposition === "conflict"
       )
     ) {
       continue;
@@ -6482,7 +6548,16 @@ export function buildRestoredSessionRuntimePatch(input: {
     expectedSessionEpoch: input.expectedSessionEpoch,
   });
   if (!normalized) return {};
-  const taskFlow = normalized.taskFlow || [];
+  let taskFlow = normalized.taskFlow || [];
+  // Re-derive display outcomes from the owner-fenced canonical ledger,
+  // including rows persisted by older versions as attempted failures.
+  for (const persisted of Object.values(normalized.runtimeV2Checkpoints || {})) {
+    const checkpoint = normalizeRuntimeV2Checkpoint(persisted);
+    if (checkpoint) taskFlow = reconcileRuntimeV2TimelineBlocks(
+      taskFlow, checkpoint.aggregate, checkpoint.updatedAt,
+      input.fallbackState.config?.language === "en" ? "en" : "zh",
+    );
+  }
   const conversationTurns = normalized.conversationTurns || [];
   const restoredReviewTurnId = normalized.activeActionRequest?.kind === "plan_review"
     ? normalized.activeActionRequest.turnId
@@ -8428,6 +8503,7 @@ export const useAppStore = create<AppState>()(
       sessionGet,
       sessionSet,
       getSessionRevisionToken,
+      hasSessionRuntimeOwnership,
       publishOwnerScopedRuntimeProjection,
     } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
       get,
@@ -8456,19 +8532,21 @@ export const useAppStore = create<AppState>()(
         nextTaskId: () => get()._nextTaskId(),
         sessionGet,
         getSessionRevisionToken,
-        persistProjection: (projectedState) => persistSubmitRuntimeProjection({
+        isCurrent: hasSessionRuntimeOwnership,
+        persistProjection: (projectedState, options) => persistSubmitRuntimeProjection({
           state: projectedState,
           scopeKey,
           sessionId: current.currentSessionId,
           sanitizeTaskBlocksForPersist,
           buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
           persistSessionRecord: saveProjectSession,
-          nowMs,
+          isCurrent: options?.isCurrent,
+          nowMs: Date.now,
         }),
         publishProjection: publishOwnerScopedRuntimeProjection,
         persistHarnessMarker: settleCanceledTurnHarnessProjection,
         log: logStoreEvent,
-        nowMs,
+        nowMs: Date.now,
       });
       const settledState = sessionGet();
       const hasExistingTerminal = settledState.runtimeEvents.some((event) =>
@@ -9152,18 +9230,14 @@ export const useAppStore = create<AppState>()(
       systemLanguage: state.config.language === "en" ? "en" : "zh",
       fallbackLanguage: state.config.language === "en" ? "en" : "zh",
     });
-    const approvedExecutionIntent = intentChoice === "execute" ? intentChoice : null;
     set({ pendingRunDecision: null });
     scheduleRuntimeTask(() => {
       get().sendMessage(pending.originalInput, originalImages, {
-        resolvedIntent: intentChoice,
-        ...(approvedExecutionIntent
-          ? {
-              runtimeIntentOverride: approvedExecutionIntent,
-              executionConsentGranted: true,
-            }
-          : {}),
-        skipIntentResolution: true,
+        // A mode choice constrains task interpretation. It is not approval of
+        // a concrete tool, and must not erase restrictions in the original body.
+        ...(intentChoice === "image_studio"
+          ? { resolvedIntent: intentChoice, skipIntentResolution: true }
+          : { explicitIntent: intentChoice }),
         intentSummary: buildRunIntentSummary({
           input: pending.originalInput,
           intent: intentChoice,
@@ -10142,7 +10216,6 @@ export const useAppStore = create<AppState>()(
     setMcpToolServerMap(filtered.toolServerMap);
     set({ mcpDiscoveredTools: filtered.tools, mcpToolServerMap: filtered.toolServerMap });
   },
-
   // IM adapters
   feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
   feishuPairingRequests: [],
@@ -10235,6 +10308,14 @@ export const useAppStore = create<AppState>()(
   setFeishuLinkedSession: (sessionId, context) => set({ feishuLinkedSessionId: sessionId, feishuLinkedContext: context }),
 
   skills: defaultSkills,
+  externalSkillSelections: [],
+  externalSkillSources: normalizeExternalSkillSources(undefined),
+  setExternalSkillSource: (source, enabled) => set((state) => ({
+    externalSkillSources: normalizeExternalSkillSources({ ...state.externalSkillSources, [source]: enabled }),
+  })),
+  setExternalSkillSelection: (selection) => set((state) => ({
+    externalSkillSelections: normalizeExternalSkillSelections([...state.externalSkillSelections, selection]),
+  })),
   setSkills: (v) => set({ skills: v }),
   toggleSkill: (id) =>
     set((s) => ({ skills: s.skills.map((sk) => (sk.id === id ? { ...sk, active: !sk.active } : sk)) })),
@@ -10244,7 +10325,12 @@ export const useAppStore = create<AppState>()(
     const removeRecord = () => set((state) => ({
       skills: state.skills.filter((candidate) => candidate.id !== id),
     }));
-    if (skill.type === "package" && skill.packagePath) {
+    if (skill.type === "package" && !skill.packageStorage && skill.packagePath) {
+      if (get().skills.some((other) => other.id !== id && other.type === "package" &&
+        !other.packageStorage && other.packagePath === skill.packagePath && other.workspaceScope === skill.workspaceScope)) {
+        removeRecord();
+        return;
+      }
       void invoke("delete_protocol_package", {
         localPath: skill.packagePath,
         workspace: skill.workspaceScope || null,
@@ -10255,20 +10341,76 @@ export const useAppStore = create<AppState>()(
     }
     removeRecord();
   },
-  addSkill: ({ name, desc, content, type, toolParameters, packagePath, entryPoint, workspaceScope, allowImplicitInvocation }) =>
+  addSkill: ({ name, desc, content, type, toolParameters, packagePath, packageStorage, githubSource, entryPoint, entryPoints, workspaceScope, allowImplicitInvocation }) =>
     set((s) => ({
-      skills: [...s.skills, { id: Date.now().toString(), name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false, type: type || "instruction", toolParameters, packagePath, entryPoint, workspaceScope, allowImplicitInvocation }],
+      skills: upsertGlobalSkillRegistration(s.skills, {
+        id: packageStorage?.kind === "global" ? `global-skill:${packageStorage.packageId}` : Date.now().toString(),
+        name, desc, content: normalizeSkillContent(content), active: true, isBuiltIn: false,
+        type: type || "instruction", toolParameters, entryPoint, entryPoints, allowImplicitInvocation,
+        ...(type === "package" && packageStorage ? { githubSource: normalizeGithubSkillSource(githubSource) } : {}),
+        ...(packageStorage ? { packageStorage } : { packagePath, workspaceScope }),
+      }),
     })),
   updateSkill: (id, patch) =>
-    set((s) => ({
-      skills: s.skills.map((sk) => (sk.id === id ? {
+    set((s) => {
+      const packageId = globalSkillPackageId(patch);
+      if (packageId && s.skills.some((skill) => skill.id !== id && globalSkillPackageId(skill) === packageId)) {
+        return { skills: s.skills.filter((skill) => skill.id !== id) };
+      }
+      return { skills: s.skills.map((sk) => {
+        if (sk.id !== id) return sk;
+        const updated = {
         ...sk,
         ...patch,
         content: Object.prototype.hasOwnProperty.call(patch, "content")
           ? normalizeSkillContent(patch.content || "")
           : sk.content,
-      } : sk)),
-    })),
+        };
+        if (globalSkillPackageId(updated)) {
+          delete updated.packagePath;
+          delete updated.workspaceScope;
+        }
+        if (updated.type === "package" && globalSkillPackageId(updated)) {
+          updated.githubSource = normalizeGithubSkillSource(updated.githubSource);
+        } else {
+          delete updated.githubSource;
+        }
+        return updated;
+      }) };
+    }),
+  applyGithubSkillUpdate: (candidate) => {
+    const before = get().skills;
+    const result = applyGithubSkillPackageCandidate(before, candidate);
+    if (result.status === "updated") {
+      try {
+        set({ skills: result.skills });
+      } catch (error) {
+        // Synchronous persistence follows the memory commit. Restore only this
+        // exact update, preserving any later user action from storage callbacks.
+        if (get().skills === result.skills) {
+          try { set({ skills: before }); } catch { /* Memory is already restored. */ }
+        }
+        throw error;
+      }
+    }
+    return { status: result.status, ...(result.conflictId ? { conflictId: result.conflictId } : {}) };
+  },
+  migrateLegacySkillPackages: () => {
+    if (legacySkillPackageMigration) return legacySkillPackageMigration;
+    legacySkillPackageMigration = migrateLegacySkillRegistrations({
+      getSkills: () => get().skills,
+      updateSkills: (apply) => set((state) => ({ skills: apply(state.skills) })),
+      promote: promoteLegacySkillPackage,
+      inspect: inspectGlobalSkillPackage,
+    }).then((result) => {
+      logStoreEvent("skill_package_migration_completed", result);
+    }).catch((error) => {
+      logStoreEvent("skill_package_migration_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }).finally(() => { legacySkillPackageMigration = null; });
+    return legacySkillPackageMigration;
+  },
 
   knowledgeBases: defaultKnowledgeBases,
   setKnowledgeBases: (v) => set({ knowledgeBases: Array.isArray(v) ? v : [] }),
@@ -10314,6 +10456,9 @@ export const useAppStore = create<AppState>()(
         state.skills,
         associatedPaths,
         options.userPrompt || "",
+        undefined,
+        state.externalSkillSelections,
+        state.externalSkillSources,
       );
       if (
         workspaceInstructionProjectionOwner.canCommit(
@@ -10339,6 +10484,8 @@ export const useAppStore = create<AppState>()(
         associatedPaths,
         options.userPrompt || "",
         options.instructionIo,
+        state.externalSkillSelections,
+        state.externalSkillSources,
       ),
       loadHooksConfig(requestedWorkspace),
     ]);
@@ -11888,6 +12035,8 @@ export const useAppStore = create<AppState>()(
     set({
       config: defaultConfig,
       skills: defaultSkills,
+      externalSkillSelections: [],
+      externalSkillSources: normalizeExternalSkillSources(undefined),
       knowledgeBases: defaultKnowledgeBases,
       mcpServers: DEFAULT_MCP_SERVERS,
       mcpDiscoveredTools: [],
@@ -15816,6 +15965,14 @@ export const useAppStore = create<AppState>()(
         );
         const sourceHasTerminalBoundary = inspection.terminals.length > 0 ||
           isConversationTurnRuntimeClosed(inspection.owner?.turn.runtimeOutcome);
+        // Cancellation owns the terminal transaction through intake and its
+        // resumed dispatch. No re-entrant drain may classify the still-open
+        // claim as stale before that transaction settles.
+        if (!sourceHasTerminalBoundary &&
+          deferDispatchUntilCancellationSettles("before_claim")) return false;
+        if (!sourceHasTerminalBoundary && isSubmitWorkspacePreflightLive(state)) {
+          return false;
+        }
         const liveMarkerRunId = getHarnessActionRunId(state.harnessRunMarker);
         const liveMarkerParentRunId = state.harnessRunMarker?.activeParentRunId ||
           state.harnessRunMarker?.parentRunId ||
@@ -16296,6 +16453,9 @@ export const useAppStore = create<AppState>()(
         workspaceInstructionClaim: exactClaim,
         skipAutoPlanHydration: true,
         ...(hintedIntent ? { resolvedIntent: hintedIntent } : {}),
+        ...(normalizeWorkspaceInstructionIntentHint(hints.explicitIntent)
+          ? { explicitIntent: normalizeWorkspaceInstructionIntentHint(hints.explicitIntent)! }
+          : {}),
         ...(hintedRuntimeIntent ? { runtimeIntentOverride: hintedRuntimeIntent } : {}),
         ...(hintedSubagentPreference !== undefined
           ? { subagentPreferenceOverride: hintedSubagentPreference }
@@ -16416,35 +16576,10 @@ export const useAppStore = create<AppState>()(
     const acknowledgeAdmittedTurn = () => {
       let acknowledged = false;
       set((current) => {
-        const activeQueue = current.workspaceTurnQueue;
-        const activeHead = activeQueue?.entries[0];
-        if (
-          !activeQueue ||
-          activeHead?.status !== "dispatching" ||
-          activeHead.claim?.claimId !== claimId ||
-          activeHead.receipt.receiptId !== head.receipt.receiptId ||
-          workspaceInstructionEnvelopeIdentity(activeHead) !==
-            exactClaim.instructionEnvelopeIdentity
-        ) return {};
-        const transition = reduceWorkspaceTurnQueue(activeQueue, {
-          type: "ack",
-          expectedVersion: activeQueue.version,
-          at: Date.now(),
-          claimId,
-          sessionKey: activeQueue.sessionKey,
-          sessionEpoch: activeQueue.sessionEpoch,
-          turnOwner: {
-            sessionKey: activeQueue.sessionKey,
-            sessionEpoch: activeQueue.sessionEpoch,
-            turnId: head.receipt.turnId,
-            receiptId: head.receipt.receiptId,
-            clientSubmissionId: head.instruction.clientSubmissionId,
-            instructionEnvelopeIdentity: exactClaim.instructionEnvelopeIdentity,
-          },
-        });
-        if (transition.disposition !== "applied") return {};
+        const acknowledgedQueue = acknowledgeWorkspaceInstructionClaim(current, exactClaim);
+        if (!acknowledgedQueue) return {};
         acknowledged = true;
-        return { workspaceTurnQueue: transition.state };
+        return { workspaceTurnQueue: acknowledgedQueue };
       });
       if (acknowledged) {
         get().saveCurrentRuntimeToSession();
@@ -16565,6 +16700,14 @@ export const useAppStore = create<AppState>()(
       completeAdmittedTurn(durableResultKind, terminalSummary);
       return true;
     }
+    if (isWorkspaceInstructionDispatchClaimCurrent(postDispatch.workspaceTurnQueue, {
+      adoptExistingTurn: true,
+      workspaceInstructionClaim: exactClaim,
+      turnIdOverride: head.receipt.turnId,
+      admittedUserBlockId: head.receipt.userBlockId,
+    }) && isSubmitWorkspacePreflightLive(postDispatch)) {
+      return true;
+    }
     if (adoptedTurnOwnsRuntime) {
       acknowledgeAdmittedTurn();
       return true;
@@ -16603,7 +16746,7 @@ export const useAppStore = create<AppState>()(
     if (taskId == null) return;
     if (
       isToolPermissionActionRequest(state.activeActionRequest) &&
-      requiresPerCallToolPermissionApproval(state.activeActionRequest.risk)
+      requiresPerCallToolPermissionApproval(state.activeActionRequest.risk, state.activeActionRequest.approvalRequiredCapability)
     ) {
       logStoreEvent("tool_permission_session_approval_blocked", {
         taskId,
@@ -16886,6 +17029,8 @@ export const useAppStore = create<AppState>()(
     reuseCurrentTurn?: boolean;
     preservePlanState?: boolean;
     resolvedIntent?: ResolvedRunIntent;
+    explicitIntent?: ResolvedUserIntent;
+    semanticIntent?: SemanticTaskIntent;
     runtimeIntentOverride?: ResolvedRunIntent;
     forceExecuteRecoveryMode?: ExecuteRecoveryMode;
     forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -16909,6 +17054,7 @@ export const useAppStore = create<AppState>()(
     replyOptionIsCustom?: boolean;
     parentRunIdOverride?: string;
     runIdOverride?: string;
+    executionResumeRequestId?: string;
     planExecutionLeaseId?: string;
     planExecutionInstructionHash?: string;
     continueExistingGoal?: boolean;
@@ -16923,20 +17069,41 @@ export const useAppStore = create<AppState>()(
     subagentPreferenceOverride?: SubagentDelegationPreference;
   }) => {
     let state = get();
+    const executionChoice = options?.replyOptionRequestIdentity;
+    if (executionChoice && state.activeActionRequest?.kind === "user_choice" && state.activeActionRequest.executionBlocker) {
+      const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+      const sessionKey = resolveSessionRuntimeKey(scopeKey, state.currentSessionId);
+      if (sessionKey !== executionChoice.sessionKey) return false;
+      void resolveRuntimeV2ExecutionBlocker({ get, set, identity: executionChoice,
+        choice: options?.selectedReplyOptionText || text,
+        sessionEpoch: resolveActiveSessionPlanLifecycleEpoch(state, sessionKey) || "",
+        persist: (projected, isCurrent) => persistSubmitRuntimeProjection({ state: projected, scopeKey, sessionId: state.currentSessionId,
+          sanitizeTaskBlocksForPersist, buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState, persistSessionRecord: saveProjectSession, isCurrent }),
+        dispatch: (turn, requestId) => {
+          const resumedIntent = normalizeRuntimeV2Checkpoint(get().runtimeV2Checkpoints?.[turn.id])?.aggregate.strategy;
+          const intent = resumedIntent === "chat" ? "respond" : resumedIntent === "analyze" ? "analyze" : resumedIntent === "plan" ? "plan" : "execute";
+          get().sendMessage(turn.userPrompt, undefined, { hidden: true, reuseCurrentTurn: true, turnIdOverride: turn.id,
+            runIdOverride: executionChoice.runId, executionResumeRequestId: requestId, resolvedIntent: intent, runtimeIntentOverride: intent,
+            skipIntentResolution: true, submissionOriginSessionKey: executionChoice.sessionKey });
+        },
+        stop: turnId => { get().closeTurnAsCanceled(turnId, { reason: "user_cancelled", message: "用户停止了暂停的任务。" }); },
+      }).catch(error => logStoreEvent("runtime_v2_blocker_resolution_failed", { requestId: executionChoice.requestId, error: String(error) }));
+      return true;
+    }
+    if (options?.executionResumeRequestId) {
+      const checkpoint = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints?.[String(options.turnIdOverride)]);
+      if (!checkpoint || checkpoint.aggregate.run?.blocker?.requestId !== options.executionResumeRequestId ||
+        checkpoint.aggregate.run.status !== "paused" || state.harnessRunMarker?.status !== "paused" ||
+        !checkpoint.aggregate.run.blocker.decision || checkpoint.aggregate.run.identity.runId !== options.runIdOverride ||
+        checkpoint.owner.sessionKey !== resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId) ||
+        checkpoint.owner.sessionEpoch !== resolveActiveSessionPlanLifecycleEpoch(state, checkpoint.owner.sessionKey)) return false;
+      set({ activeActionRequest: null, agentStatus: "idle", isGenerating: false });
+      state = get();
+    }
     if (options?.adoptExistingTurn) {
       const claim = options.workspaceInstructionClaim;
       const head = state.workspaceTurnQueue?.entries[0];
-      const exactClaimMatches = !!claim &&
-        state.workspaceTurnQueue?.sessionKey === claim.sessionKey &&
-        state.workspaceTurnQueue?.sessionEpoch === claim.sessionEpoch &&
-        head?.status === "dispatching" &&
-        head.claim?.claimId === claim.claimId &&
-        head.receipt.receiptId === claim.receiptId &&
-        head.receipt.turnId === claim.turnId &&
-        head.receipt.userBlockId === claim.admittedUserBlockId &&
-        head.instruction.clientSubmissionId === claim.clientSubmissionId &&
-        options.turnIdOverride === claim.turnId &&
-        options.admittedUserBlockId === claim.admittedUserBlockId;
+      const exactClaimMatches = isWorkspaceInstructionDispatchClaimCurrent(state.workspaceTurnQueue, options);
       if (!exactClaimMatches) {
         logStoreEvent("workspace_turn_dispatch_claim_rejected", {
           expectedSessionKey: claim?.sessionKey || null,
@@ -17785,6 +17952,7 @@ export const useAppStore = create<AppState>()(
     });
     const intentRouting = resolveAndApplySubmitIntentRouting({
       text,
+      submittedText: submitPipelineDecision.originalText,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       images,
       options,
@@ -17900,12 +18068,133 @@ export const useAppStore = create<AppState>()(
       startBlockingPreflight: (blockingPreflightEffect) => {
         void startSubmitBlockingPreflightEffect({
           effect: blockingPreflightEffect,
-          runIntentPreflight,
+          runIntentPreflight: (request) => runIntentPreflight({
+            ...request,
+            onDiagnostic: (diagnostic) => logStoreEvent("intent_preflight_rejected", {
+              sessionKey: blockingPreflightEffect.sendOriginSessionKey,
+              turnId: blockingPreflightEffect.originalOptions?.workspaceInstructionClaim?.turnId ?? null,
+              ...diagnostic,
+            }),
+          }),
           getState: get,
+          setState: set,
           isSessionRuntimeActive,
           applyPreRunSessionPatch,
+          concludeWithoutExecution: (action) => {
+            const originalOptions = blockingPreflightEffect.originalOptions;
+            const claim = originalOptions?.workspaceInstructionClaim;
+            if (!claim) return;
+            let concluded = false;
+            set((current) => {
+              if (!isSessionRuntimeActive(current, claim.sessionKey) ||
+                !isWorkspaceInstructionDispatchClaimCurrent(current.workspaceTurnQueue, originalOptions) ||
+                getPendingSessionCancellation(claim.sessionKey)) return {};
+              const queue = current.workspaceTurnQueue!;
+              const head = queue.entries[0];
+              const timestampMs = Date.now();
+              const removed = reduceWorkspaceTurnQueue(queue, {
+                type: "remove", expectedVersion: queue.version, at: timestampMs,
+                claimId: claim.claimId, sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
+                terminalOwner: {
+                  sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
+                  turnId: claim.turnId, receiptId: claim.receiptId,
+                  clientSubmissionId: claim.clientSubmissionId,
+                  instructionEnvelopeIdentity: claim.instructionEnvelopeIdentity,
+                },
+              });
+              if (removed.disposition !== "applied") return {};
+              const conclusion = concludeWorkspaceInstructionEntry({
+                entry: head, sessionKey: claim.sessionKey,
+                taskFlow: current.taskFlow, conversationTurns: current.conversationTurns,
+                runtimeEvents: current.runtimeEvents,
+                resultKind: action.resultKind, summary: action.summary, timestampMs,
+                language: current.config.language === "en" ? "en" : "zh",
+                reservedTaskBlockIds: queue.entries.map((entry) => entry.receipt.userBlockId),
+              });
+              concluded = true;
+              return {
+                workspaceTurnQueue: removed.state,
+                taskFlow: conclusion.taskFlow, conversationTurns: conclusion.conversationTurns,
+                runtimeEvents: conclusion.runtimeEvents,
+                transcriptLoadedTurns: Math.max(current.transcriptLoadedTurns, conclusion.conversationTurns.length),
+                transcriptTotalTurns: Math.max(current.transcriptTotalTurns, conclusion.conversationTurns.length),
+              };
+            });
+            if (concluded) {
+              get().saveCurrentRuntimeToSession();
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(claim.sessionKey));
+            }
+          },
+          closeTurnAsCanceled: (turnId) => {
+            get().closeTurnAsCanceled(turnId, { reason: "intent_preflight_superseded" });
+          },
+          redispatchWorkspaceInstruction: (sessionKey) => {
+            get().dispatchNextWorkspaceInstruction(sessionKey);
+          },
           resumeSubmission: (nextText, nextImages, nextOptions) => {
-            get().sendMessage(nextText, nextImages, nextOptions);
+            return get().sendMessage(nextText, nextImages, nextOptions);
+          },
+          onWorkspaceResumeAccepted: (nextOptions) => {
+            const claim = nextOptions.workspaceInstructionClaim;
+            if (!claim) return false;
+            let acknowledged = false;
+            set((current) => {
+              const queue = acknowledgeWorkspaceInstructionClaim(current, claim);
+              if (!queue) return {};
+              acknowledged = true;
+              return { workspaceTurnQueue: queue };
+            });
+            if (acknowledged) {
+              get().saveCurrentRuntimeToSession();
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(claim.sessionKey));
+            }
+            return acknowledged;
+          },
+          onWorkspaceResumeRejected: (nextOptions) => {
+            const claim = nextOptions.workspaceInstructionClaim;
+            if (!claim) return;
+            let released = false;
+            let reconcileRejectedClaim = false;
+            set((current) => {
+              const queue = current.workspaceTurnQueue;
+              if (!queue || !isSessionRuntimeActive(current, claim.sessionKey) ||
+                !isWorkspaceInstructionDispatchClaimCurrent(queue, nextOptions)) return {};
+              if (getPendingSessionCancellation(claim.sessionKey) ||
+                hasCanceledTurnTerminalProjection({
+                  sessionKey: claim.sessionKey, turnId: claim.turnId,
+                  taskFlow: current.taskFlow, runtimeEvents: current.runtimeEvents,
+                })) {
+                // Keep cancellation's canonical transaction ahead of removal.
+                reconcileRejectedClaim = true;
+                return {};
+              }
+              if (!current.isGenerating && current.agentStatus !== "running" &&
+                current.agentStatus !== "pending_review") {
+                // A rejected idle submit cannot be retried as another intake.
+                // Let the ordinary dispatcher conclude this exact lost claim.
+                reconcileRejectedClaim = true;
+                return {};
+              }
+              const transition = reduceWorkspaceTurnQueue(queue, {
+                type: "release", expectedVersion: queue.version, at: Date.now(),
+                claimId: claim.claimId, sessionKey: claim.sessionKey, sessionEpoch: claim.sessionEpoch,
+              });
+              if (transition.disposition !== "applied") return {};
+              released = true;
+              return { workspaceTurnQueue: transition.state };
+            });
+            if (released) {
+              get().saveCurrentRuntimeToSession();
+              scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(claim.sessionKey));
+            } else if (reconcileRejectedClaim) {
+              scheduleRuntimeTask(() => {
+                const current = get();
+                if (isSessionRuntimeActive(current, claim.sessionKey) &&
+                  isWorkspaceInstructionDispatchClaimCurrent(current.workspaceTurnQueue, nextOptions)) {
+                  current.dispatchNextWorkspaceInstruction(claim.sessionKey);
+                }
+              });
+            }
           },
           logStoreEvent,
         });
@@ -18254,6 +18543,7 @@ export const useAppStore = create<AppState>()(
       currentMainModeKey,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       effectiveRunIntent,
+      semanticIntent: options?.semanticIntent,
       runtimeRunIntent,
       goalCreationAuthorization,
       goalContinuationAuthorization,
@@ -18352,6 +18642,13 @@ export const useAppStore = create<AppState>()(
       persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
       refreshWorkspaceAdmission: async (workspace, userPrompt) => {
+        const admissionState = get();
+        const mcpSnapshot = resolveWorkspaceMcpView({
+          workspace,
+          manualServers: admissionState.mcpServers,
+          manualTools: admissionState.mcpDiscoveredTools,
+          manualToolServerMap: admissionState.mcpToolServerMap,
+        });
         const associatedPaths = [
           ...turnInputContextSignals.mentionedFilePaths,
           ...turnInputContextSignals.attachedFilePaths,
@@ -18363,12 +18660,15 @@ export const useAppStore = create<AppState>()(
               { workspace, projectToUi: false, userPrompt },
             ),
             baseline: null,
+            mcpSnapshot,
             warnings: [],
           };
         }
         const snapshot = await resolveWorkspaceAdmissionSnapshot({
           workspace,
-          skills: get().skills,
+          skills: admissionState.skills,
+          externalSkillSelections: admissionState.externalSkillSelections,
+          externalSkillSources: admissionState.externalSkillSources,
           associatedPaths,
           userPrompt,
           io: workspaceAdmissionIpcIo,
@@ -18376,6 +18676,7 @@ export const useAppStore = create<AppState>()(
         return {
           instructions: snapshot.instructions,
           baseline: snapshot.baseline,
+          mcpSnapshot,
           warnings: snapshot.warnings.map((warning) =>
             `${warning.code}: ${warning.message}`
           ),
@@ -18392,7 +18693,8 @@ export const useAppStore = create<AppState>()(
         sanitizeTaskBlocksForPersist,
         buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
         persistSessionRecord: saveProjectSession,
-        nowMs,
+        isCurrent: hasSessionRuntimeOwnership,
+        nowMs: Date.now,
       }),
       PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
       PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
@@ -18556,6 +18858,8 @@ export const useAppStore = create<AppState>()(
         showTaskCenterPanel?: unknown;
         taskCenter?: unknown;
         taskCenterActiveTaskId?: unknown;
+        geminiExtensions?: unknown;
+        extensionMcpDiscovery?: unknown;
       }) || {};
       const {
         showTaskCenterPanel: _legacyShowTaskCenterPanel,
@@ -18566,6 +18870,8 @@ export const useAppStore = create<AppState>()(
         activeStudioAgentKey: _legacyActiveStudioAgentKey,
         gameStudioInitialized: _legacyGameStudioInitialized,
         pendingSlashCommand: _legacyPendingSlashCommand,
+        geminiExtensions: _retiredGeminiExtensions,
+        extensionMcpDiscovery: _retiredExtensionMcpDiscovery,
         ...persistedStateWithoutTaskCenter
       } = persistedState;
       const persistedConfig = stripLegacyConfigFields(persistedState.config) ?? {};
@@ -18631,6 +18937,9 @@ export const useAppStore = create<AppState>()(
       return {
         ...current,
         ...persistedStateWithoutTaskCenter,
+        skills: normalizePersistedSkills(persistedState.skills ?? current.skills),
+        externalSkillSelections: normalizeExternalSkillSelections(persistedState.externalSkillSelections),
+        externalSkillSources: normalizeExternalSkillSources(persistedState.externalSkillSources),
         config: {
           ...current.config,
           ...(persistedConfig as any),
@@ -18750,6 +19059,8 @@ export const useAppStore = create<AppState>()(
   )
 );
 
+installRuntimeV2ExecutionDecisionReplay(useAppStore);
+
 async function requestSemanticTurnMetadata(params: {
   input: string;
   intent: ResolvedRunIntent;
@@ -18867,7 +19178,13 @@ async function requestSemanticTurnMetadata(params: {
             }),
             ...(cloudAuthMode === "openai_chatgpt_oauth" ? { user_prompt_id: "main-turn-metadata" } : {}),
           }
-        : { model, messages: msgs, stream: false, max_tokens: 120 };
+        : {
+            model, messages: msgs, stream: false, max_tokens: 120,
+            ...buildOpenAiCompatibleReasoningRequestExtras({
+              ...deriveStreamSettings(params.config),
+              reasoningRequest: "off",
+            }, 120),
+          };
       headers = buildCloudHeaders("openai", ac.apiKey, true, params.config.cloud.customHeaders, cloudAuthMode);
     }
 
@@ -18932,12 +19249,7 @@ async function requestSemanticTurnMetadata(params: {
           reasoningChars: rawReasoningText.length,
         });
       }
-      return normalizeSemanticTurnMetadata({}, {
-        input: params.input,
-        intent: params.intent,
-        language: params.language,
-        contextSignals: params.contextSignals,
-      });
+      return null;
     }
     return normalizeSemanticTurnMetadata(parsedMetadata, {
       input: params.input,

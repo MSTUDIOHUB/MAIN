@@ -671,9 +671,15 @@ test("composite workspace admission freezes one baseline and skips the legacy tr
   });
   let captured = null;
   const harness = createHarness({
+    state: {
+      sessionsByWorkspace: { "/tmp/workspace": [{ id: 7, planLifecycleEpoch: "metadata-session-epoch" }] },
+      planLifecycle: { sessionKey: "unbound", sessionEpoch: "unbound-epoch" },
+    },
     input: {
+      runSessionKey: "/tmp/workspace:7",
       refreshWorkspaceAdmission: async (workspace) => {
         assert.equal(workspace, "/tmp/workspace");
+        harness.state.planLifecycle = { sessionKey: "another-session", sessionEpoch: "another-epoch" };
         return { instructions: null, baseline, warnings: [] };
       },
       phaseRunners: {
@@ -693,6 +699,8 @@ test("composite workspace admission freezes one baseline and skips the legacy tr
 
   await runSubmitAsyncWorkflowRun(harness.input);
 
+  assert.equal(captured.runSessionEpoch, "metadata-session-epoch");
+
   assert.equal(captured.projectBaselineContext, baseline);
   assert.equal(captured.workspaceTree, null);
   assert.equal(
@@ -700,6 +708,130 @@ test("composite workspace admission freezes one baseline and skips the legacy tr
     false,
   );
 });
+
+for (const constraint of ["approvalRequiredCapabilities", "forbiddenCapabilities"]) {
+  for (const admission of ["composite", "instructions"]) {
+    test(`${constraint} workspace_read defers pre-run file reads through ${admission} admission`, async () => {
+      const reads = [];
+      let attachmentBuilds = 0;
+      let captured;
+      let prompt;
+      const skillCatalog = { entries: [{ id: "package:global", name: "global-guide" }], explicitSkillIds: [], warnings: [], loadedAt: 1 };
+      const globalInstructions = { layers: [], templates: [], sources: [], matchedRules: [], associatedPaths: [], loadedAt: 1, debugSummary: "", skillCatalog };
+      const refresh = async (workspace) => {
+        reads.push(workspace);
+        return admission === "composite" ? { instructions: globalInstructions, baseline: null, warnings: [] } : globalInstructions;
+      };
+      const harness = createHarness({ input: {
+        text: "Review the selected files under the current constraints.",
+        semanticIntent: { objective: "Review files", workType: "investigate", answerFormat: "report", requiredCapabilities: ["workspace_read"], forbiddenCapabilities: [], approvalRequiredCapabilities: [], [constraint]: ["workspace_read"] },
+        ...(admission === "composite" ? { refreshWorkspaceAdmission: refresh } : { refreshWorkspaceContext: refresh }),
+        refreshProjectBaseline: async () => { reads.push("baseline"); return null; },
+        phaseRunners: {
+          buildAttachmentContext: async () => { attachmentBuilds++; return { userContent: "PRIVATE_UNREVIEWED_FILE_CONTENT", attachmentRefs: [], failedAttachmentCount: 0 }; },
+          buildPromptContext: (input) => { prompt = input.userContent; return { userContent: input.userContent }; },
+          createRuntimeContext: (input) => { captured = input; return { ...input, streamBuffer: null, thinkingInterceptor: null, agentBlockIdsCreatedThisRun: new Set() }; },
+          runRuntime: () => Promise.resolve(true),
+        },
+      } });
+      await runSubmitAsyncWorkflowRun(harness.input);
+      assert.equal(attachmentBuilds, 0, "attachment ingestion and source reads require the same review as later tools");
+      assert.deepEqual(reads, [""], "only global instructions and Skills can be admitted automatically");
+      assert.equal(harness.calls.some(([name]) => name === "workspace_tree"), false);
+      assert.equal(captured.projectBaselineContext, null);
+      assert.equal(captured.workspaceTree, null);
+      assert.equal(captured.skillCatalog, skillCatalog);
+      assert.equal(captured.attachedFilesSnapshot, harness.input.attachedFilesSnapshot);
+      assert.match(prompt, /src\/App\.tsx/);
+      assert.match(prompt, /\/tmp\/a\.txt/);
+      assert.doesNotMatch(prompt, /PRIVATE_UNREVIEWED_FILE_CONTENT/);
+    });
+  }
+}
+
+test("manual command review does not suppress unrelated workspace admission", async () => {
+  let attachmentBuilds = 0;
+  let captured;
+  const baseline = { kind: "project_baseline_context", fingerprints: { overall: "baseline" } };
+  const harness = createHarness({ input: {
+    semanticIntent: { objective: "Run an approved command", workType: "operate", answerFormat: "answer", requiredCapabilities: ["command"], forbiddenCapabilities: [], approvalRequiredCapabilities: ["command"] },
+    refreshWorkspaceAdmission: async (workspace) => {
+      assert.equal(workspace, "/tmp/workspace");
+      return { instructions: null, baseline, warnings: [] };
+    },
+    phaseRunners: {
+      buildAttachmentContext: async () => { attachmentBuilds++; return { userContent: "selected context", attachmentRefs: [], failedAttachmentCount: 0 }; },
+      createRuntimeContext: (input) => { captured = input; return { ...input, streamBuffer: null, thinkingInterceptor: null, agentBlockIdsCreatedThisRun: new Set() }; },
+      runRuntime: () => Promise.resolve(true),
+    },
+  } });
+  await runSubmitAsyncWorkflowRun(harness.input);
+  assert.equal(attachmentBuilds, 1);
+  assert.equal(captured.projectBaselineContext, baseline);
+  assert.equal(harness.calls.some(([name, event]) => name === "log" && event === "workspace_read_bootstrap_deferred"), false);
+});
+
+for (const constraint of ["approvalRequiredCapabilities", "capabilityRestrictions"]) {
+  test(`restored ${constraint} controls bootstrap before empty semantic context`, async () => {
+    const runtime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
+    const turn = { workspaceKey: "/tmp/workspace", sessionKey: "workspace::7", sessionEpoch: "runtime-v2:turn-1", clientSubmissionId: "submission-1", turnId: "turn-1" };
+    const aggregate = runtime.transition(null, { schemaVersion: "runtime-v2-event.v1", type: "turn.admitted", sequence: 0, eventId: "admission", at: 1, turn, strategy: "execute", objective: "Existing request", constraints: [], acceptanceCriteria: [], [constraint]: ["workspace_read"] });
+    const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate, revision: 1, updatedAt: 1 });
+    let attachmentBuilds = 0;
+    const refreshWorkspaces = [];
+    let captured;
+    const harness = createHarness({ state: { runtimeV2Checkpoints: { "turn-1": JSON.parse(JSON.stringify(checkpoint)) } }, input: {
+      semanticIntent: { objective: "Current context", workType: "investigate", answerFormat: "report", requiredCapabilities: [], forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
+      refreshWorkspaceAdmission: async (workspace) => { refreshWorkspaces.push(workspace); return { instructions: null, baseline: null, warnings: [] }; },
+      phaseRunners: {
+        buildAttachmentContext: async () => { attachmentBuilds++; return { userContent: "UNREVIEWED", attachmentRefs: [], failedAttachmentCount: 0 }; },
+        createRuntimeContext: (input) => { captured = input; return { ...input, streamBuffer: null, thinkingInterceptor: null, agentBlockIdsCreatedThisRun: new Set() }; },
+        runRuntime: () => Promise.resolve(true),
+      },
+    } });
+    await runSubmitAsyncWorkflowRun(harness.input);
+    assert.equal(attachmentBuilds, 0);
+    assert.deepEqual(refreshWorkspaces, [""]);
+    assert.equal(captured.workspaceTree, null);
+    assert.equal(captured.projectBaselineContext, null);
+  });
+}
+
+for (const corrupted of [false, true]) {
+  test(`${corrupted ? "invalid" : "legacy"} restored bootstrap cannot borrow replacement authority`, async () => {
+    const runtime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
+    const turn = { workspaceKey: "/tmp/workspace", sessionKey: "workspace::7", sessionEpoch: "runtime-v2:turn-1", clientSubmissionId: "submission-1", turnId: "turn-1" };
+    const aggregate = runtime.transition(null, { schemaVersion: "runtime-v2-event.v1", type: "turn.admitted", sequence: 0, eventId: "admission", at: 1, turn, strategy: "execute", objective: "Existing request", constraints: [], acceptanceCriteria: [] });
+    const checkpoint = JSON.parse(JSON.stringify(runtime.createRuntimeV2Checkpoint({ aggregate, revision: 1, updatedAt: 1 })));
+    if (corrupted) checkpoint.aggregateDigest = "tampered";
+    let attachmentBuilds = 0;
+    let admissions = 0;
+    let captured;
+    const harness = createHarness({ state: { runtimeV2Checkpoints: { "turn-1": checkpoint } }, input: {
+      semanticIntent: { objective: "Replacement", workType: "investigate", answerFormat: "report", requiredCapabilities: [], forbiddenCapabilities: [], approvalRequiredCapabilities: ["workspace_read"] },
+      refreshWorkspaceAdmission: async (workspace) => { admissions++; assert.equal(workspace, "/tmp/workspace"); return { instructions: null, baseline: null, warnings: [] }; },
+      phaseRunners: {
+        buildAttachmentContext: async () => { attachmentBuilds++; return { userContent: "context", attachmentRefs: [], failedAttachmentCount: 0 }; },
+        createRuntimeContext: (input) => { captured = input; return { ...input, streamBuffer: null, thinkingInterceptor: null, agentBlockIdsCreatedThisRun: new Set() }; },
+        runRuntime: () => Promise.resolve(true),
+      },
+    } });
+    await runSubmitAsyncWorkflowRun(harness.input);
+    if (corrupted) {
+      assert.equal(attachmentBuilds, 0);
+      assert.equal(admissions, 0);
+      assert.equal(captured, undefined);
+      const conclusions = harness.state.runtimeEvents.filter((event) => event.type === "turn.completed");
+      assert.equal(conclusions.length, 1);
+      assert.equal(conclusions[0].resultKind, "error");
+      assert.match(harness.state.conversationTurns[0].summary, /SUBMIT_BOOTSTRAP_CHECKPOINT_INVALID/);
+    } else {
+      assert.equal(attachmentBuilds, 1);
+      assert.equal(admissions, 1);
+      assert.equal(captured.approvalRequiredCapabilities, undefined, "legacy canonical absence cannot inherit a different submission's semantics");
+    }
+  });
+}
 
 test("an admitted A Run keeps its A instruction snapshot when the UI switches to B", async () => {
   const instructionSet = (workspace, content) => ({

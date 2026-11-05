@@ -10,6 +10,7 @@ import {
   IconZap,
 } from "./Icons";
 import { useAppStore } from "../store/useAppStore";
+import ToggleSwitch from "./ToggleSwitch";
 import {
   IMAGE_STUDIO_LOCAL_DEFAULT_ENDPOINT,
   IMAGE_STUDIO_WEB_FALLBACK_ENDPOINT,
@@ -459,26 +460,12 @@ export default function ImageStudioSetupModal() {
                     <span className={`min-w-0 text-[12px] font-bold ${draftWebPromptRefine ? "theme-text" : "text-[#a1a1aa]"}`}>
                       {draftWebPromptRefine ? copy.enabled : copy.disabled}
                     </span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={draftWebPromptRefine}
+                    <ToggleSwitch
+                      checked={draftWebPromptRefine}
                       data-testid="image-studio-web-refine-switch"
                       aria-label={copy.promptRefine}
-                      onClick={() => setDraftWebPromptRefine((value) => !value)}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
-                        draftWebPromptRefine
-                          ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
-                          : "border-[#3f3f46] bg-[#18181b]"
-                      }`}
-                      style={draftWebPromptRefine ? { backgroundColor: "var(--accent)" } : undefined}
-                    >
-                      <span
-                        className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                          draftWebPromptRefine ? "translate-x-5" : "translate-x-0"
-                        }`}
-                      />
-                    </button>
+                      onCheckedChange={setDraftWebPromptRefine}
+                    />
                   </div>
                 </div>
 
@@ -490,26 +477,12 @@ export default function ImageStudioSetupModal() {
                     <span className={`min-w-0 text-[12px] font-bold ${draftWebEnabled ? "theme-text" : "text-[#a1a1aa]"}`}>
                       {draftWebEnabled ? copy.enabled : copy.disabled}
                     </span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={draftWebEnabled}
+                    <ToggleSwitch
+                      checked={draftWebEnabled}
                       data-testid="image-studio-web-enabled-switch"
                       aria-label={copy.webEnabled}
-                      onClick={() => setDraftWebEnabled((value) => !value)}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
-                        draftWebEnabled
-                          ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
-                          : "border-[#3f3f46] bg-[#18181b]"
-                      }`}
-                      style={draftWebEnabled ? { backgroundColor: "var(--accent)" } : undefined}
-                    >
-                      <span
-                        className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                          draftWebEnabled ? "translate-x-5" : "translate-x-0"
-                        }`}
-                      />
-                    </button>
+                      onCheckedChange={setDraftWebEnabled}
+                    />
                   </div>
                 </div>
               </div>

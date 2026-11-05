@@ -1,4 +1,5 @@
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
 import {
   providerActionEpochExhausted,
@@ -14,7 +15,7 @@ import {
   type RuntimeV2TransportVariant,
 } from "../../lib/runtime-v2";
 import {
-  appendRuntimeV2RejectedToolCallHistory,
+  appendRuntimeV2RejectedToolCallBatchHistory,
   appendRuntimeV2ProviderFeedbackHistory,
   aggregateForCurrentTurn,
   baseProviderProfile,
@@ -53,13 +54,14 @@ import {
   normalizeRuntimeV2ProviderToolCalls,
 } from "./executionProviderTools";
 import {
-  runtimeV2RepeatedActionFeedback,
+  buildRuntimeV2RepeatedActionReceipts,
+  runtimeV2DeferredToolReceipts,
 } from "./executionProviderFeedback";
 import {
   rejectRuntimeV2InvalidCorrectiveSourceRead,
   rejectRuntimeV2InvalidProviderToolArguments,
-  rejectRuntimeV2InvalidValidationCommand,
   rejectRuntimeV2UnexpectedProviderTool,
+  rejectRuntimeV2FailedShellPredecessor,
 } from "./executionProviderSurfaceRejection";
 
 export { runtimeV2RepeatedActionFeedback } from "./executionProviderFeedback";
@@ -219,16 +221,6 @@ export function createRuntimeV2ProviderPort(
             result,
           });
           if (surfaceRejection) return surfaceRejection;
-          const validationCommandRejection =
-            rejectRuntimeV2InvalidValidationCommand({
-              ports: input,
-              command,
-              tools,
-              result,
-            });
-          if (validationCommandRejection) {
-            return validationCommandRejection;
-          }
           const argumentRejection =
             rejectRuntimeV2InvalidProviderToolArguments({
               ports: input,
@@ -290,6 +282,7 @@ export function createRuntimeV2ProviderPort(
               providerEffectFacts,
             ),
           );
+          for (const rejected of providerEffectFacts.rejectedActionIdentities) completedIdentities.delete(rejected);
           for (const call of schedulingCalls) {
             if (
               !coveredReadReceipts.has(
@@ -302,6 +295,24 @@ export function createRuntimeV2ProviderPort(
             completedIdentities.delete(
               runtimeV2ProviderToolCallIdentity(call),
             );
+          }
+          const skillWindows = runtimeV2TranscriptSkillGuidanceWindows(input.live.messages);
+          for (const call of schedulingCalls.filter(call => call.name === "load_skill")) {
+            const identity = runtimeV2ProviderToolCallIdentity(call);
+            const prior = skillWindows.filter(window => runtimeV2ProviderToolCallIdentity({
+              name: window.call.function.name, arguments: JSON.parse(window.call.function.arguments),
+            }) === identity);
+            const latest = prior[prior.length - 1];
+            if (!latest) continue;
+            const missing = prior.filter(window => window.documentKey === latest.documentKey && window.version === latest.version).some(window => {
+              const coveredEnd = (input.live.latestProviderRequestSkillGuidanceWindows || [])
+                .filter(visible => visible.documentKey === window.documentKey && visible.version === window.version)
+                .sort((a, b) => a.returnedRange.startChar - b.returnedRange.startChar)
+                .reduce((end, visible) => visible.returnedRange.startChar <= end
+                  ? Math.max(end, visible.returnedRange.endChar) : end, window.returnedRange.startChar);
+              return coveredEnd < window.returnedRange.endChar;
+            });
+            if (missing) completedIdentities.delete(identity);
           }
           const rejectedIdentities = new Set(
             providerEffectFacts.rejectedActionIdentities,
@@ -326,11 +337,14 @@ export function createRuntimeV2ProviderPort(
               );
             }
           }
+          const failedPredecessor = rejectRuntimeV2FailedShellPredecessor({ ports: input, command, result, rejectedIdentities });
+          if (failedPredecessor) return failedPredecessor;
           const batch = boundRuntimeV2ProviderToolCalls(
             schedulingCalls,
             completedIdentities,
             rejectedIdentities,
             {
+              allowMixedObservationShellBatch: true,
               maxSpawnSubagents: Math.max(
                 0,
                 Math.floor(
@@ -349,25 +363,13 @@ export function createRuntimeV2ProviderPort(
             const rejectedCall = schedulingCalls[0]!;
             const actionIdentity =
               runtimeV2ProviderToolCallIdentity(rejectedCall);
-            const feedback = runtimeV2RepeatedActionFeedback({
-              call: rejectedCall,
-              reason: runtimeRejectedReason,
-              workspace: input.context.runWorkspace || "",
-              visibleSourceTargets:
-                input.live.latestProviderRequestSourceCoverage.map(
-                  (coverage) => coverage.target,
-                ),
+            const actionReceipts = buildRuntimeV2RepeatedActionReceipts({
+              calls: schedulingCalls, aggregate: aggregateForCurrentTurn(input), reason: runtimeRejectedReason,
+              workspace: input.context.runWorkspace || "", visibleSourceTargets: input.live.latestProviderRequestSourceCoverage.map(coverage => coverage.target),
+              observed: input.live.latestProviderRequestRejectedIdentities, nextId: () => input.nextId("provider-rejected-tool-call"),
             });
-            const [rejectedHistoryCall] =
-              scopeRuntimeV2ProviderToolCallIds(
-                [rejectedCall],
-                () => input.nextId("provider-rejected-tool-call"),
-              );
-            appendRuntimeV2RejectedToolCallHistory(input.live, {
-              call: rejectedHistoryCall!,
-              actionIdentity,
-              feedback,
-            });
+            const feedback = actionReceipts.map(receipt => receipt.feedback).join("\n");
+            appendRuntimeV2RejectedToolCallBatchHistory(input.live, actionReceipts);
             appendRuntimeV2ProviderFeedbackHistory(input.live, {
               code: "repeated_action_rejected",
               feedback,
@@ -377,6 +379,7 @@ export function createRuntimeV2ProviderPort(
               ...result,
               visibleText: "",
               toolCalls: [],
+              actionReceipts,
               diagnostics: [
                 ...result.diagnostics,
                 {
@@ -387,7 +390,7 @@ export function createRuntimeV2ProviderPort(
                 },
               ],
             };
-            rememberRuntimeV2ProviderResult(input, result);
+            rememberRuntimeV2ProviderResult(input, result, command, tools);
             input.logStoreEvent("runtime_v2_provider_action_rejected", {
               turnId: command.run.turnId,
               runId: command.run.runId,
@@ -419,8 +422,9 @@ export function createRuntimeV2ProviderPort(
               batchSelection: batch.selection,
             });
           }
+          const freshReadCalls = new Set(batch.freshReadCalls);
           const coveredReads = selectedCalls.map((call) => ({
-            receipt: coveredReadReceipts.get(
+            receipt: freshReadCalls.has(call) ? null : coveredReadReceipts.get(
               runtimeV2ProviderToolCallIdentity(call),
             ) || null,
           }));
@@ -431,23 +435,23 @@ export function createRuntimeV2ProviderPort(
           const parallelReadCount =
             runtimeV2ParallelReadCount(scopedCalls);
           scopedCalls.forEach((call) => {
-            if (call.name === "read_file") {
-              input.live.parallelReadCountByToolCallId.set(
-                call.id,
-                parallelReadCount,
-              );
-            }
+            input.live.parallelReadCountByToolCallId.set(
+              call.id,
+              parallelReadCount,
+            );
           });
           result = {
             ...result,
             toolCalls: scopedCalls,
+            ...(discardedCalls.length ? { actionReceipts: runtimeV2DeferredToolReceipts(discardedCalls, () => input.nextId("provider-deferred-tool-call")) } : {}),
           };
+          if (result.actionReceipts?.length) appendRuntimeV2RejectedToolCallBatchHistory(input.live, result.actionReceipts);
           scopedCalls.forEach((call, index) => {
             const covered = coveredReads[index];
             if (!covered?.receipt) return;
             input.live.coveredReadToolResults.set(call.id, covered.receipt);
           });
-          rememberRuntimeV2ProviderResult(input, result);
+          rememberRuntimeV2ProviderResult(input, result, command, tools);
           input.logStoreEvent("runtime_v2_provider_result", {
             turnId: command.run.turnId,
             runId: command.run.runId,

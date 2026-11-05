@@ -1,8 +1,9 @@
 import type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import type { TurnAggregateV1 } from "./aggregate";
-import { deriveReadOnlyRecoveryWindow, readOnlyConclusionRequired } from "./readOnlyProgress";
+import { deriveReadOnlyRecoveryWindow } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
+import { runtimeV2ProviderAnswerText } from "./providerAnswer";
 import type {
   RuntimeV2Command,
   RuntimeV2CommandKind,
@@ -11,6 +12,8 @@ import type {
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
+import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
+import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 import {
   resolveRuntimeV2SubagentReferences,
   runtimeV2SubagentModelHandle,
@@ -234,6 +237,10 @@ function executeReadyForConclusion(state: TurnAggregateV1): boolean {
     return planCoverage.allMutationTargetsCovered &&
       planCoverage.allRequiredValidationsPassed;
   }
+  // A passing intermediate check does not say that the provider has finished
+  // the complete objective. Ordinary Execute keeps its action surface until
+  // a natural final; explicit implementation contracts retain their boundary.
+  if (state.strategy === "execute" && !deriveRuntimeV2ExecutionContract(state)) return false;
   return runtimeV2DirectExecuteReadyForConclusion(state);
 }
 
@@ -264,6 +271,7 @@ function providerRequestModesByCommandKey(
 
 function providerToolCallProgress(
   events: readonly RuntimeV2Event[],
+  novelSequences: ReadonlySet<number>,
 ): {
   readonly progressed: ReadonlySet<string>;
   readonly settledWithoutProgress: ReadonlySet<string>;
@@ -282,7 +290,7 @@ function providerToolCallProgress(
     if (event.type === "tool.completed") {
       const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
       if (!toolCallId) continue;
-      if (event.status === "succeeded") progressed.add(toolCallId);
+      if (novelSequences.has(event.sequence)) progressed.add(toolCallId);
       else settledWithoutProgress.add(toolCallId);
       continue;
     }
@@ -290,10 +298,10 @@ function providerToolCallProgress(
     const toolCallId = toolCallIdByCommandKey.get(event.idempotencyKey);
     if (!toolCallId) continue;
     if (
-      event.passed ||
+      isRuntimeV2ValidationAttempt(event) && (event.passed ||
       event.failureKind === "assertion_failed" ||
       event.failureKind === "execution_failed" ||
-      !event.failureKind
+      !event.failureKind)
     ) {
       progressed.add(toolCallId);
     } else {
@@ -315,10 +323,21 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
   if (state.pendingToolCalls.length > 0) return null;
   const providerRequestKeys = providerRequestCommandKeys(state.events);
   const providerRequestModes = providerRequestModesByCommandKey(state.events);
-  const toolCallProgress = providerToolCallProgress(state.events);
   let occurrence = 0;
   let latestReason: RuntimeV2ProviderRecoveryPressure["reason"] | null = null;
   let startedAt = 0;
+  const novelSequences = new Set<number>();
+  const facts = new Set<string>();
+  for (const event of state.events) {
+    const evidence = event.type === "tool.completed" && event.status === "succeeded" && event.receiptOrigin !== "replayed" ? event.evidence
+      : event.type === "observation.recorded" ? [event.evidence]
+      : event.type === "subagent.completed" && event.status === "completed" ? event.evidence : [];
+    for (const item of evidence) {
+      const key = JSON.stringify([item.kind, item.target, item.version, event.type === "tool.completed" ? event.modelContent : undefined]);
+      if (!facts.has(key)) { facts.add(key); novelSequences.add(event.sequence); }
+    }
+  }
+  const toolCallProgress = providerToolCallProgress(state.events, novelSequences);
 
   for (let index = state.events.length - 1; index >= 0; index -= 1) {
     const event = state.events[index]!;
@@ -334,12 +353,12 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
           toolCallProgress.settledWithoutProgress.has(call.id) &&
           !toolCallProgress.progressed.has(call.id)
         );
+      const answerText = runtimeV2ProviderAnswerText(state, event);
       const nonActionable =
         (event.result.toolCalls.length === 0 || failedToolDecision) &&
         (
           executableProgressRequired ||
-          event.result.diagnostics.length > 0 ||
-          !String(event.result.visibleText || "").trim()
+          !answerText
         );
       if (!nonActionable) break;
       occurrence += 1;
@@ -347,7 +366,13 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
       if (!latestReason) {
         latestReason = repeated
           ? "repeated_action_rejected"
-          : "empty_response";
+          : failedToolDecision
+            ? "tool_execution_failed"
+            : event.result.diagnostics.length > 0
+              ? "provider_response_rejected"
+              : answerText
+                ? "non_actionable_response"
+                : "empty_response";
       }
       continue;
     }
@@ -362,36 +387,44 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
       continue;
     }
     if (event.type === "tool.completed") {
-      if (event.status === "succeeded") break;
+      if (novelSequences.has(event.sequence)) break;
       continue;
     }
     if (event.type === "validation.completed") {
       if (
-        event.passed ||
+        isRuntimeV2ValidationAttempt(event) && (event.passed ||
         event.failureKind === "assertion_failed" ||
         event.failureKind === "execution_failed" ||
-        !event.failureKind
+        !event.failureKind)
       ) {
         break;
       }
       continue;
     }
     if (
-      event.type === "observation.recorded" ||
+      (event.type === "observation.recorded" && novelSequences.has(event.sequence)) ||
       event.type === "work_plan.sealed" ||
       event.type === "work_plan.approved" ||
       event.type === "work_plan.invalidated" ||
-      event.type === "subagent.completed" ||
+      (event.type === "subagent.completed" && novelSequences.has(event.sequence)) ||
       event.type === "subagent.handoff_applied" ||
-      event.type === "run.started"
+      event.type === "run.started" || event.type === "run.resumed"
     ) {
       break;
     }
   }
 
   if (!latestReason || occurrence === 0) return null;
+  let waitStart: number | null = null;
+  let waited = 0;
+  for (const event of state.events) {
+    if (event.at < startedAt) continue;
+    if (event.type === "run.wait_started") waitStart ??= event.at;
+    if (event.type === "run.wait_ended" && waitStart !== null) { waited += event.at - waitStart; waitStart = null; }
+  }
+  if (waitStart !== null) waited += state.updatedAt - waitStart;
   return {
-    startedAt,
+    startedAt: startedAt + waited,
     pressure: {
       schemaVersion: "runtime-v2-provider-recovery.v1",
       reason: latestReason,
@@ -514,6 +547,7 @@ export function decideNextCommands(
   state: TurnAggregateV1,
   input: RuntimeV2DecisionInput = {},
 ): readonly RuntimeV2Command[] {
+  if (state.run?.status === "paused") return [];
   if (!state.run || state.run.status === "completed" || state.terminalOutcome) return [];
   if (state.scheduledCommands.length > 0) return [];
   if (input.resultKind && input.resultReason) {
@@ -661,17 +695,13 @@ export function decideNextCommands(
     case "observing": {
       if (state.strategy === "chat" || state.strategy === "analyze") {
         const recovery = deriveReadOnlyRecoveryWindow(state);
-        const conclude = readOnlyConclusionRequired(state);
-        const active = currentRunSubagents(state).filter((job) => job.status === "queued" || job.status === "running");
-        if (conclude && active.length) return [boundedCommand(state, "join_subagents", { mode: "read_only", jobIds: active.map((job) => job.id), finalJoin: true })];
         return [boundedCommand(state, "request_model", {
-          mode: conclude ? "conclude" : state.strategy,
-          ...(conclude ? { conclusionKind: "read_only" } : {}),
+          mode: state.strategy,
           toolExpectation: "optional",
           objective: state.objective.text,
           evidenceIds: state.evidence.map((item) => item.id),
           ...(recovery ? { recoveryPressure: recovery.pressure } : {}),
-          ...(state.strategy === "analyze" && !conclude ? runtimeV2CollaborationPayload(state, input) : {}),
+          ...(state.strategy === "analyze" ? runtimeV2CollaborationPayload(state, input) : {}),
         })];
       }
       return [executeModelRequest(state, input)];

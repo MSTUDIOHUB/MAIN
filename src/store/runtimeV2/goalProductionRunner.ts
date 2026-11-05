@@ -33,6 +33,7 @@ import {
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import type { RuntimeV2ExecuteRunnerInput } from "./executeRunner";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 
 export interface RuntimeV2GoalProductionRunnerInput
   extends Omit<RuntimeV2ExecuteRunnerInput, "context"> {
@@ -62,11 +63,7 @@ function identities(input: {
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
 } {
-  const lifecycle = input.state?.planLifecycle;
-  const sessionEpoch = lifecycle?.sessionKey === input.context.runSessionKey &&
-    String(lifecycle.sessionEpoch || "").trim()
-    ? String(lifecycle.sessionEpoch).trim()
-    : `runtime-v2:${String(input.turn.clientSubmissionId || input.turn.id).trim()}`;
+  const sessionEpoch = resolveRuntimeV2SessionEpoch(input.state, input.context, input.turn);
   return {
     turn: {
       workspaceKey: String(input.context.runWorkspace || "").trim(),
@@ -348,9 +345,12 @@ export async function runSubmitRuntimeV2Goal(
     language: input.context.phaseLanguage,
     turnInputContextSignals: input.context.turnInputContextSignals,
     runtimeContextBudget: input.context.runtimeContextBudget,
+    capabilityRestrictions: existing ? existing.aggregate.objective.capabilityRestrictions : input.context.capabilityRestrictions,
+    approvalRequiredCapabilities: existing ? existing.aggregate.objective.approvalRequiredCapabilities : input.context.approvalRequiredCapabilities,
     workspaceInstructionContext: input.context.workspaceInstructionContext,
     projectBaselineContext: input.context.projectBaselineContext,
     skillCatalog: input.context.skillCatalog,
+    workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
     getSessionRevisionToken: input.getSessionRevisionToken,
     sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
     buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
@@ -366,6 +366,8 @@ export async function runSubmitRuntimeV2Goal(
         run: identity.run,
         strategy: "goal",
         objective: initial.objective.text,
+        capabilityRestrictions: input.context.capabilityRestrictions,
+        approvalRequiredCapabilities: input.context.approvalRequiredCapabilities,
         constraints: initial.objective.constraints,
         acceptanceCriteria: initial.objective.acceptanceCriteria,
         initialPhase: "acting",

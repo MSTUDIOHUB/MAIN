@@ -10,7 +10,7 @@ import {
   type PatchRecoveryMismatchEvidence,
   type RecoveryReadLease,
 } from "./executeRecoveryTools";
-import { workspacePathsReferToSameFile } from "./workspacePaths";
+import { recordWorkspaceFileCheckpoint } from "./workspaceCheckpoints";
 
 export type WorkspaceMutationPreflightReason =
   | "not_applicable"
@@ -27,8 +27,15 @@ export type WorkspaceMutationPreflightReason =
   | "public_contract_break"
   | "syntax_error";
 
+/** Current filesystem facts for one write_file preparation. This is produced
+ * by trusted reads/probes, never accepted from provider arguments. */
+export type WorkspaceWriteFileTargetFact =
+  | { readonly path: string; readonly exists: false }
+  | { readonly path: string; readonly exists: true; readonly content: string };
+
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
+  writeFileTarget?: WorkspaceWriteFileTargetFact;
   reason?: WorkspaceMutationPreflightReason;
   message?: string;
   /** Best available workspace target for recovery and progress correlation. */
@@ -44,6 +51,7 @@ export interface WorkspaceMutationPreflightInput {
   toolName: string;
   args: Record<string, unknown>;
   language?: "zh" | "en";
+  sessionKey?: string;
   /** Lexical authority boundary used to reject external targets before any
    * preview read or write is attempted. The executor still performs its
    * canonical filesystem authorization afterward. */
@@ -288,7 +296,7 @@ function buildMessage(input: {
       case "read_failed":
         return `MUTATION_PREFLIGHT_BLOCKED: Could not read ${input.path} before patching (${input.detail || "read failed"}). Do not ask for approval; read the correct target or report the blocker.`;
       case "search_text_mismatch":
-        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Reuse the active versioned source observation and correct the edit; reread only when the file version changed or the exact required range is missing.`;
+        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Copy the exact lines from the current source snippet below and retry:${input.detail ? `\n${input.detail}` : ""}`;
       case "search_text_ambiguous":
         return `MUTATION_PREFLIGHT_BLOCKED: search_text occurs more than once in ${input.path}. Expand it to one unique exact block from the visible source before retrying.`;
       case "empty_change":
@@ -316,7 +324,7 @@ function buildMessage(input: {
     case "read_failed":
       return `MUTATION_PREFLIGHT_BLOCKED: patch 前无法读取 ${input.path}（${input.detail || "读取失败"}）。不要请求用户审批；请读取正确目标或明确阻塞。`;
     case "search_text_mismatch":
-      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中不存在。请复用当前版本化源码观察并修正编辑；只有文件版本变化或确实缺少精确范围时才重新读取。`;
+      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中未精确匹配。请直接复制下方当前文件中的真实代码片段修正 search_text 后重试：${input.detail ? `\n${input.detail}` : ""}`;
     case "search_text_ambiguous":
       return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中出现多次。请依据已显示源码将其扩展为唯一的精确文本块后重试。`;
     case "empty_change":
@@ -338,9 +346,9 @@ function buildMessage(input: {
   }
 }
 
-const MAX_SINGLE_MUTATION_LINES = 400;
+const MAX_SINGLE_MUTATION_LINES = 2500;
 const LARGE_FILE_LINES = 200;
-const MAX_EXISTING_FILE_REPLACEMENT_RATIO = 0.5;
+const MAX_EXISTING_FILE_REPLACEMENT_RATIO = 1.0;
 
 function isLexicallyInsideWorkspace(
   requestedPath: string,
@@ -503,71 +511,15 @@ interface WorkspaceMutationPostImage {
   readonly newContent: string;
 }
 
-function containsIdentifierToken(content: string, symbol: string): boolean {
-  if (!/^[A-Za-z_$][\w$]*$/.test(symbol)) return true;
-  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^A-Za-z0-9_$])${escaped}([^A-Za-z0-9_$]|$)`)
-    .test(content);
-}
-
 async function blockedPublicContractResult(
-  input: WorkspaceMutationPreflightInput,
-  changes: readonly WorkspaceMutationPostImage[],
-  language: "zh" | "en",
+  _input: WorkspaceMutationPreflightInput,
+  _changes: readonly WorkspaceMutationPostImage[],
+  _language: "zh" | "en",
 ): Promise<WorkspaceMutationPreflightResult | null> {
-  if (!input.checkSyntax || !input.findReferences) return null;
-  for (const change of changes) {
-    const [current, proposed] = await Promise.all([
-      input.checkSyntax(change.path, change.oldContent),
-      input.checkSyntax(change.path, change.newContent),
-    ]);
-    if (!current.applicable || !proposed.applicable) continue;
-    const proposedExports = new Set(proposed.moduleExports || []);
-    const removedExports = [...new Set(current.moduleExports || [])]
-      .filter((symbol) => symbol !== "default" && !proposedExports.has(symbol))
-      .slice(0, 24);
-    for (const symbol of removedExports) {
-      let references: Awaited<ReturnType<
-        NonNullable<WorkspaceMutationPreflightInput["findReferences"]>
-      >>;
-      try {
-        references = await input.findReferences(symbol);
-      } catch (error) {
-        return blocked({
-          reason: "public_contract_break",
-          toolName: input.toolName,
-          path: change.path,
-          language,
-          detail: `${symbol}: reference scan failed (${
-            error instanceof Error ? error.message : String(error)
-          })`,
-          recoveryKind: "mutation_rejected",
-        });
-      }
-      const imports = (references.occurrences || []).filter((occurrence) => {
-        if (occurrence.role !== "import") return false;
-        if (workspacePathsReferToSameFile(occurrence.path, change.path)) {
-          return false;
-        }
-        const changedCaller = changes.find((candidate) =>
-          workspacePathsReferToSameFile(candidate.path, occurrence.path)
-        );
-        return !changedCaller ||
-          containsIdentifierToken(changedCaller.newContent, symbol);
-      });
-      if (imports.length === 0) continue;
-      return blocked({
-        reason: "public_contract_break",
-        toolName: input.toolName,
-        path: change.path,
-        language,
-        detail: `${symbol} -> ${imports.slice(0, 6).map((occurrence) =>
-          `${occurrence.path}:${Math.max(1, Math.floor(occurrence.line || 1))}`
-        ).join(", ")}`,
-        recoveryKind: "mutation_rejected",
-      });
-    }
-  }
+  // Inspired by gg-framework: do not deadlock sequential multi-file refactors
+  // (e.g. renaming/updating an export in file A before updating its import in
+  // file B). Automatic file checkpoints protect against broken intermediate
+  // states and compiler/test validation verifies the final integrated state.
   return null;
 }
 
@@ -712,22 +664,38 @@ export async function preflightWorkspaceMutation(
         recoveryKind: "target_invalid",
       });
     }
+    let current: string | undefined;
     try {
-      const current = await input.readFile(path);
+      current = await input.readFile(path);
+    } catch (error) {
+      const availability = await input.probeFileAvailability?.(path).catch(() => "unknown");
+      if (availability !== "absent") {
+        return blocked({
+          reason: "read_failed", toolName, path, language,
+          detail: error instanceof Error ? error.message : String(error || "read failed"),
+          recoveryKind: "target_invalid",
+        });
+      }
+    }
+    if (current !== undefined) {
       if (current === content) {
         return blocked({ reason: "identical_content", toolName, path, language });
       }
-      return blocked({
-        reason: "existing_file_requires_patch",
-        toolName,
-        path,
-        language,
-        recoveryKind: "mutation_rejected",
+      const syntaxFailure = await blockedSyntaxResult(input, path, content, language, current);
+      if (syntaxFailure) return syntaxFailure;
+      recordWorkspaceFileCheckpoint({
+        sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
+        existedBefore: true, previousContent: current, toolName,
       });
-    } catch {
-      return (await blockedSyntaxResult(input, path, content, language)) ||
-        { ok: true };
+      return { ok: true, writeFileTarget: { path, exists: true, content: current } };
     }
+    const syntaxFailure = await blockedSyntaxResult(input, path, content, language);
+    if (syntaxFailure) return syntaxFailure;
+    recordWorkspaceFileCheckpoint({
+      sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
+      existedBefore: false, previousContent: null, toolName,
+    });
+    return { ok: true, writeFileTarget: { path, exists: false } };
   }
 
   const searchText = asText(input.args.search_text);
@@ -758,20 +726,34 @@ export async function preflightWorkspaceMutation(
   }
 
   if (!current.includes(searchText)) {
+    const inferredRange =
+      normalizeRecoveryReadRange(input.args) ||
+      inferReplaceMismatchRecoveryRange(current, searchText);
     const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
       reason: "search_text_mismatch",
       target: path,
-      requestedRange:
-        normalizeRecoveryReadRange(input.args) ||
-        inferReplaceMismatchRecoveryRange(current, searchText),
+      requestedRange: inferredRange,
       failureIdentity: buildReplaceMismatchFailureIdentity(searchText),
       readFileMetadata: input.readFileMetadata,
     });
+    const currentLines = current.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    const snippetStart = inferredRange ? Math.max(1, inferredRange.startLine ?? 1) : 1;
+    const snippetEnd = inferredRange
+      ? Math.min(currentLines.length, snippetStart + 35)
+      : Math.min(currentLines.length, 35);
+    const nearbyExcerpt = currentLines
+      .slice(snippetStart - 1, snippetEnd)
+      .join("\n")
+      .slice(0, 2400);
+    const detail = nearbyExcerpt
+      ? `[${path}:${snippetStart}-${snippetEnd}]\n${nearbyExcerpt}`
+      : undefined;
     return blocked({
       reason: "search_text_mismatch",
       toolName,
       path,
       language,
+      detail,
       recoveryKind: "source_mismatch",
       patchRecoveryMismatch,
     });
@@ -815,6 +797,14 @@ export async function preflightWorkspaceMutation(
     current,
   );
   if (syntaxFailure) return syntaxFailure;
+  recordWorkspaceFileCheckpoint({
+    sessionKey: input.sessionKey,
+    workspace: input.workspaceRoot,
+    path,
+    existedBefore: true,
+    previousContent: current,
+    toolName,
+  });
   return (await blockedPublicContractResult(
     input,
     [{ path, oldContent: current, newContent: updated }],

@@ -29,6 +29,7 @@ import {
 import type { RuntimeV2GoalSlicePort } from "./goalRunner";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
+import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 
 export interface RuntimeV2GoalHarnessMarkerLease {
   read(): HarnessRunMarker | null;
@@ -47,9 +48,12 @@ export interface RuntimeV2GoalProductionSlicePortInput
   readonly language: "zh" | "en";
   readonly turnInputContextSignals?: TurnInputContextSignals;
   readonly runtimeContextBudget?: RuntimeContextBudget | null;
+  readonly capabilityRestrictions?: readonly import("../../lib/turnCapabilities").TurnCapability[];
+  readonly approvalRequiredCapabilities?: readonly import("../../lib/turnCapabilities").TurnCapability[];
   readonly workspaceInstructionContext?: string;
   readonly projectBaselineContext?: ProjectBaselineContext | null;
   readonly skillCatalog?: SkillCatalogSnapshot | null;
+  readonly workspaceMcpSnapshot?: import("../../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
   readonly markerLease?: RuntimeV2GoalHarnessMarkerLease;
   readonly execute?: (
     input: RuntimeV2ExecuteRunnerInput,
@@ -436,10 +440,12 @@ export function createRuntimeV2GoalProductionSlicePort(
     ) {
       throw new Error("RUNTIME_V2_GOAL_SLICE_OUTER_OWNER_LOST");
     }
-    const lifecycleEpoch = state.planLifecycle?.sessionKey === request.turn.sessionKey
-      ? String(state.planLifecycle.sessionEpoch || "").trim()
-      : `runtime-v2:${request.turn.clientSubmissionId}`;
-    if (lifecycleEpoch !== request.turn.sessionEpoch) {
+    const sessionEpoch = resolveRuntimeV2SessionEpoch(state, {
+      runSessionKey: input.sessionKey,
+      runSessionId: input.sessionId,
+      runScopeKey: input.scopeKey,
+    }, { id: request.turn.turnId, clientSubmissionId: request.turn.clientSubmissionId });
+    if (sessionEpoch !== request.turn.sessionEpoch) {
       throw new Error("RUNTIME_V2_GOAL_SLICE_SESSION_EPOCH_MISMATCH");
     }
     const existingTurn = state.conversationTurns?.find(
@@ -541,11 +547,14 @@ export function createRuntimeV2GoalProductionSlicePort(
       uiDisplayTurnId: request.turn.turnId,
       runWorkspace: input.workspace,
       runSessionKey: input.sessionKey,
+      runSessionEpoch: request.turn.sessionEpoch,
       runSessionId: input.sessionId,
       runScopeKey: input.scopeKey,
       phaseLanguage: input.language,
       effectiveRunIntent: "execute",
       runtimeRunIntent: "execute",
+      capabilityRestrictions: input.capabilityRestrictions,
+      approvalRequiredCapabilities: input.approvalRequiredCapabilities,
       abortCtrl: abortController,
       timerInterval,
       harnessRunId: request.run.runId,
@@ -556,6 +565,7 @@ export function createRuntimeV2GoalProductionSlicePort(
       workspaceInstructionContext: input.workspaceInstructionContext,
       projectBaselineContext: input.projectBaselineContext,
       skillCatalog: input.skillCatalog,
+      workspaceMcpSnapshot: input.workspaceMcpSnapshot,
       executeAdmission: runtimeV2GoalSliceExecuteAdmission(request),
     };
     const execution = Promise.resolve()

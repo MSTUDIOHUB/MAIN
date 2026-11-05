@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { APP_NAME, parseAppVersion, syncReleaseVersions, writeUpdaterManifest, toWindowsWixVersion } from "./release_tools.mjs";
+import { APP_NAME, parseAppVersion, readArchivedReleaseNotes, syncReleaseVersions, writeUpdaterManifest, toWindowsWixVersion } from "./release_tools.mjs";
 
 const DEFAULT_RELEASE_REPO = "MSTUDIOHUB/MAIN-Releases";
 const DEFAULT_UPDATE_REPO = "MSTUDIOHUB/MAIN-UpdateFeed";
@@ -33,7 +33,7 @@ Options:
                               Read TAURI_SIGNING_PRIVATE_KEY_PASSWORD from a local file.
   --no-merge-existing-latest  Do not merge an existing updater latest.json before upload.
   --update-existing-notes     Update existing GitHub Release notes even for Windows uploads.
-  --keep-existing-notes       Keep existing GitHub Release notes and only upload assets.
+  --keep-existing-notes       Keep existing notes when this version has no authored archive.
   -h, --help                  Show this help message.
 
 Environment:
@@ -730,7 +730,13 @@ function gitText(rootDir, args) {
   return result.status === 0 ? result.stdout.trim() : "";
 }
 
-async function writeReleaseNotes({ rootDir, version, outputPath }) {
+export async function writeReleaseNotes({ rootDir, version, outputPath }) {
+  version = parseAppVersion(version).raw;
+  const archivedNotes = await readArchivedReleaseNotes({ rootDir, version });
+  if (archivedNotes !== null) {
+    await fs.writeFile(outputPath, archivedNotes, "utf8");
+    return { authored: true };
+  }
   const latestTag = gitText(rootDir, ["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"]);
   const logRange = latestTag ? `${latestTag}..HEAD` : "-8";
   const recentCommits = gitText(rootDir, ["log", "--pretty=format:%h %s", logRange]);
@@ -790,6 +796,7 @@ async function writeReleaseNotes({ rootDir, version, outputPath }) {
   );
 
   await fs.writeFile(outputPath, `${lines.join("\n")}\n`, "utf8");
+  return { authored: false };
 }
 
 function ensureGhReady() {
@@ -855,7 +862,8 @@ function createOrUpdateRelease({ tag, repo, title, notesPath, assetPaths, option
   ]);
 }
 
-function shouldUpdateExistingNotes(options) {
+function shouldUpdateExistingNotes(options, hasAuthoredNotes) {
+  if (hasAuthoredNotes) return true;
   if (options.releaseNotesMode === "update") {
     return true;
   }
@@ -883,15 +891,16 @@ async function downloadExistingLatestJson({ tag, updateRepo, stageDir }) {
   return result.status === 0 && (await pathExists(latestPath)) ? latestPath : "";
 }
 
-async function publishAssets({ tag, stageDir, assetsDir, notesPath, options }) {
+async function publishAssets({ rootDir, tag, stageDir, assetsDir, notesPath, options, hasAuthoredNotes }) {
   ensureGhReady();
 
-  const updateExistingNotes = shouldUpdateExistingNotes(options);
+  const updateExistingNotes = shouldUpdateExistingNotes(options, hasAuthoredNotes);
   const existingManifestPath = options.mergeExistingLatest
     ? await downloadExistingLatestJson({ tag, updateRepo: options.updateRepo, stageDir })
     : "";
 
   const manifestResult = await writeUpdaterManifest({
+    rootDir,
     assetsDir,
     version: options.version,
     updateRepo: options.updateRepo,
@@ -937,8 +946,9 @@ async function publishAssets({ tag, stageDir, assetsDir, notesPath, options }) {
   return manifestResult;
 }
 
-async function stageManifestOnly({ assetsDir, notesPath, options }) {
+async function stageManifestOnly({ rootDir, assetsDir, notesPath, options }) {
   return writeUpdaterManifest({
+    rootDir,
     assetsDir,
     version: options.version,
     updateRepo: options.updateRepo,
@@ -995,15 +1005,17 @@ async function main() {
     await buildWindowsAssets({ rootDir, version: options.version, assetsDir, skipBuild: options.skipBuild });
   }
 
-  await writeReleaseNotes({ rootDir, version: options.version, outputPath: notesPath });
+  const { authored } = await writeReleaseNotes({ rootDir, version: options.version, outputPath: notesPath });
 
   if (options.upload) {
-    await publishAssets({ tag, stageDir, assetsDir, notesPath, options });
+    await publishAssets({ rootDir, tag, stageDir, assetsDir, notesPath, options, hasAuthoredNotes: authored });
   } else {
-    await stageManifestOnly({ assetsDir, notesPath, options });
+    await stageManifestOnly({ rootDir, assetsDir, notesPath, options });
   }
 
   printLocalSummary({ stageDir, assetsDir, options, tag, uploaded: options.upload });
 }
 
-await main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}

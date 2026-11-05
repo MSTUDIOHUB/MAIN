@@ -27,8 +27,11 @@ MAIN 的公开版本说明保存在 `docs/releases/`，网站手册可以把这�
 
 ## 版本说明归档
 
-当前仓库已有这些公开版本说明：
+版本说明按新到旧排列。安装包是否已发布，以公开 Releases 页面为准：
 
+- [2.3.8](../releases/Release_Notes_2.3.8_ZH.md)
+- [2.3.7](../releases/Release_Notes_2.3.7_ZH.md)
+- [2.3.5](../releases/Release_Notes_2.3.5_ZH.md)
 - [2.3.2](../releases/Release_Notes_2.3.2_ZH.md)
 - [2.3.1](../releases/Release_Notes_2.3.1_ZH.md)
 - [2.3.0](../releases/Release_Notes_2.3.0_ZH.md)

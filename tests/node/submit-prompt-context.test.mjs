@@ -176,4 +176,5 @@ test("operation approval prompt falls back to assistant summary", () => {
 
   assert.match(prompt, /Use the smaller patch/);
   assert.match(prompt, /User approval message: yes/);
+  assert.match(prompt, /Task-level consent is not approval of a specific tool invocation/);
 });

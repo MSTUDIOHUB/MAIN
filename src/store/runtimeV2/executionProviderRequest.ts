@@ -1,4 +1,6 @@
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
+import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
   deriveBudgetedStreamSettings,
   deriveProviderAdapterCapabilities,
@@ -11,14 +13,15 @@ import {
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   normalizeProviderResponseV1,
+  runtimeV2DirectExecuteContractCoverage,
   type RuntimeV2Command,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2ProviderRecoveryPressure,
 } from "../../lib/runtime-v2";
 import {
+  appendRuntimeV2ProviderFeedbackHistory,
   aggregateForCurrentTurn,
   compactTextEnvelopeCatalog,
-  buildRuntimeV2DecisionView,
   boundRuntimeV2ProviderConversation,
   containsProviderTextEnvelopePrompt,
   deriveRuntimeV2ProviderEffectFacts,
@@ -26,6 +29,7 @@ import {
   preferredFiniteValidationCommand,
   providerHistory,
   recordApprovedPlanContext,
+  restoreRuntimeV2ProviderRecoveryHistory,
   type RuntimeV2ExecutionPortsInput,
   type RuntimeV2LiveExecutionState,
 } from "./executionContext";
@@ -36,9 +40,6 @@ import {
   deriveRuntimeV2ExecutionContract,
 } from "./executionContract";
 import { deriveRuntimeV2ExecutionContractAdvance } from "./executionContractAdvance";
-import {
-  runtimeV2EvidenceOnlyDecisionConversation,
-} from "./executionContractFormation";
 import {
   deriveRuntimeV2ValidationCorrectionWindow,
 } from "./executionValidationCorrection";
@@ -83,18 +84,16 @@ export async function requestRuntimeV2ProviderOnce(input: {
     settings,
   );
   input.live.latestProviderAssistantReasoning = null;
+  input.live.latestProviderRequestSkillGuidanceWindows = [];
   const requestMode = String(input.command.payload.mode || "").trim();
-  const reasoningOnlyCharLimit =
-    requestMode === "execute" || requestMode === "validate"
-      ? RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT
-      : undefined;
   let streamedText = "";
   recordApprovedPlanContext(input.ports);
+  const aggregate = aggregateForCurrentTurn(input.ports);
+  restoreRuntimeV2ProviderRecoveryHistory(input.ports, aggregate, input.command);
   const history = providerHistory(input.live, input.ports);
   const sealedPreferredValidation = String(input.command.payload.mode || "") === "validate"
     ? preferredFiniteValidationCommand(input.ports)
     : "";
-  const aggregate = aggregateForCurrentTurn(input.ports);
   const providerEffectFacts = deriveRuntimeV2ProviderEffectFacts(aggregate);
   const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
   const executionContractAdvance =
@@ -111,19 +110,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     input.live.latestProviderActionWindow,
   );
   const readOnly = requestMode === "chat" || requestMode === "analyze" || input.command.payload.conclusionKind === "read_only";
-  const canonicalDecisionConversation = readOnly ? history.messages : budget
-    ? boundRuntimeV2ProviderConversation(
-        history.messages,
-        {
-          contextLimit: budget.contextLimit,
-          reservedOutputTokens: maxOutputTokens,
-        },
-        providerEffectFacts,
-      )
-    : buildRuntimeV2DecisionView(
-        history.messages,
-        providerEffectFacts,
-      );
+  const canonicalDecisionConversation = history.messages;
   input.live.latestProviderRequestSourceCoverage =
     materializedRuntimeV2SourceCoverage(
       canonicalDecisionConversation,
@@ -145,7 +132,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
       !Array.isArray(input.command.payload.effectPressure)
       ? input.command.payload.effectPressure as Record<string, unknown>
       : null;
-  const sourceOnlyFrontier =
+  let sourceOnlyFrontier =
     effectPressure?.reason === "source_only_frontier" &&
     input.live.latestProviderRequestSourceCoverage.length > 0;
   const recoveryPressure =
@@ -166,17 +153,14 @@ export async function requestRuntimeV2ProviderOnce(input: {
     executionContractAdvance.required ||
     validationCorrection.active ||
     validationCorrection.validationCommandUnavailable ||
-    recoveringFromRejectedAction ||
     runtimeV2RecoveryRequiresStructuredAction(
       recoveryPressure as RuntimeV2ProviderRecoveryPressure | null,
     ));
   const recoveryStage = String(recoveryPressure?.stage || "").trim();
+  const reasoningOnlyCharLimit = structuredActionRequired
+    ? RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT
+    : null;
   const forceStructuredAction = structuredActionRequired;
-  const boundedConversation = structuredActionRequired
-    ? runtimeV2EvidenceOnlyDecisionConversation(
-        canonicalDecisionConversation,
-      )
-    : canonicalDecisionConversation;
   const effectiveToolChoice = runtimeV2ExecutionEffectiveToolChoice({
     requested: input.toolChoice,
     tools: providerTools,
@@ -191,8 +175,6 @@ export async function requestRuntimeV2ProviderOnce(input: {
       : undefined;
   const derivedReasoningRequest = runtimeV2ExecutionReasoningRequest({
     configured: settings.reasoningRequest,
-    sourceOnlyFrontier,
-    hasMutationTool,
     providerSupportsReasoningToggle:
       adapterCapabilities.reasoningToggle,
     structuredActionRequired,
@@ -208,22 +190,26 @@ export async function requestRuntimeV2ProviderOnce(input: {
         reasoningRequest,
         preserveAssistantReasoning: false,
       };
-  const decisionInstruction = {
+  const decisionInstructionFor = (coverage: typeof input.live.latestProviderRequestSourceCoverage) => ({
     role: "system" as const,
     content: [
+      aggregate?.strategy === "execute" && executionContract
+        ? `Execution contract coverage (current mutation boundary): ${JSON.stringify(runtimeV2DirectExecuteContractCoverage(aggregate))}. Complete the missing targets and declared checks before a success report.`
+        : "",
       providerModeInstruction(
         input.command,
         preferredValidation,
         {
           hasReadFile: toolNames.has("read_file"),
           hasMutation: hasMutationTool,
+          hasCreateFile: toolNames.has("write_file"),
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
           hasWaitSubagents: toolNames.has("wait_subagents"),
           hasMaterializedSourceEvidence:
-            input.live.latestProviderRequestSourceCoverage.length > 0,
-          sourceOnlyFrontier,
+            coverage.length > 0,
+          sourceOnlyFrontier: effectPressure?.reason === "source_only_frontier" && coverage.length > 0,
           materializedSourceCoverage:
-            input.live.latestProviderRequestSourceCoverage,
+            coverage,
           actionWindow,
           executionContract: validationCorrection.active
             ? null
@@ -253,7 +239,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         structuredActionRequired,
       ),
     ].join(" "),
-  };
+  });
   const textEnvelopeInstructions = input.textEnvelope
     ? [{
         role: "system" as const,
@@ -266,26 +252,77 @@ export async function requestRuntimeV2ProviderOnce(input: {
         content: compactTextEnvelopeCatalog(providerTools),
       }]
     : [];
-  const firstNonSystemIndex = boundedConversation.findIndex((message) =>
-    message.role !== "system"
-  );
-  const instructionIndex = firstNonSystemIndex < 0
-    ? boundedConversation.length
-    : firstNonSystemIndex;
+  const toolsClosed =
+    requestMode === "conclude" ||
+    input.command.payload.conclusionKind === "read_only" ||
+    providerTools.length === 0 ||
+    (Array.isArray(input.command.payload.allowedToolNames) && input.command.payload.allowedToolNames.length === 0);
+  const concludePrompt =
+    "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags.";
+  const concludeInstructions = toolsClosed ? [{ role: "user" as const, content: concludePrompt }] : [];
+  const initialCoverage = input.live.latestProviderRequestSourceCoverage;
+  const inputBudget = budget ? budget.inputBudget ?? computeContextBudgets(budget.contextLimit, maxOutputTokens).inputBudget : null;
+  const toolSchemaTokens = estimateTokens(JSON.stringify(input.textEnvelope ? [] : providerTools));
+  const assembleExecuteRequest = (conversation: typeof canonicalDecisionConversation) => {
+    const sourceCoverage = materializedRuntimeV2SourceCoverage(
+      conversation, input.ports.context.runWorkspace || "", providerEffectFacts,
+    );
+    // Reserve both guidance shapes before pressure eviction. The empty-source
+    // branch may be longer than a short source anchor.
+    const fixedTokens = Math.max(...[sourceCoverage, []].map((coverage) =>
+      estimateMessagesTokens([decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions] as TrimMessage[])
+    ));
+    const standard = budget && inputBudget !== null
+      ? boundRuntimeV2ProviderConversation(conversation, {
+          contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens,
+          inputBudget: inputBudget - toolSchemaTokens - fixedTokens,
+        }, providerEffectFacts)
+      : conversation;
+    const coverage = materializedRuntimeV2SourceCoverage(
+      standard, input.ports.context.runWorkspace || "", providerEffectFacts,
+    );
+    // Recovery changes the frontier guidance, never the roles or bytes of
+    // surviving canonical assistant/tool groups. Source authority derives
+    // only from those exact receipts in the request being sent.
+    const assembled = [...standard, decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions];
+    const tokens = estimateMessagesTokens(assembled as TrimMessage[]) + toolSchemaTokens;
+    if (inputBudget !== null && tokens > inputBudget) {
+      input.live.latestProviderRequestSourceCoverage = [];
+      throw new Error("RUNTIME_CONTEXT_BUDGET_EXCEEDED: complete provider request exceeds the Run input budget");
+    }
+    return { standard, messages: assembled, coverage, tokens };
+  };
+  const executeRequest = readOnly ? null : assembleExecuteRequest(canonicalDecisionConversation);
+  const standardConversation = executeRequest?.standard || canonicalDecisionConversation;
+  const boundedConversation = executeRequest?.standard || canonicalDecisionConversation;
+  const decisionInstruction = decisionInstructionFor(initialCoverage);
   const unboundedMessages = [
-    ...boundedConversation.slice(0, instructionIndex),
+    // Keep stable instructions, objectives and receipt pairs as the cacheable
+    // prefix. Per-decision authority and protocol guidance belong at the
+    // current frontier, after the evidence they govern.
+    ...boundedConversation,
     decisionInstruction,
     ...textEnvelopeInstructions,
-    ...boundedConversation.slice(instructionIndex),
   ];
-  const messages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
-    contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens, tools: providerTools,
+  const boundedMessages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
+    contextLimit: budget.contextLimit,
+    reservedOutputTokens: maxOutputTokens + (toolsClosed ? 40 : 0),
+    tools: providerTools,
   }) : unboundedMessages;
-  if (readOnly) {
-    input.live.latestProviderRequestSourceCoverage = materializedRuntimeV2SourceCoverage(
+  const messages = executeRequest?.messages || (
+    toolsClosed && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
+      ? [...boundedMessages, { role: "user" as const, content: concludePrompt }]
+      : boundedMessages);
+  input.live.latestProviderRequestSourceCoverage = executeRequest?.coverage || materializedRuntimeV2SourceCoverage(
       messages, input.ports.context.runWorkspace || "", providerEffectFacts,
     );
-  }
+  input.live.latestProviderRequestSkillGuidanceWindows = runtimeV2TranscriptSkillGuidanceWindows(messages)
+    .map(({ documentKey, version, returnedRange, readTarget }) => ({ documentKey, version, returnedRange, readTarget }));
+  sourceOnlyFrontier = effectPressure?.reason === "source_only_frontier" && input.live.latestProviderRequestSourceCoverage.length > 0;
+  const estimatedInputTokens = estimateMessagesTokens(messages as TrimMessage[]) + toolSchemaTokens;
+  input.live.latestProviderRequestRejectedIdentities = new Set(
+    [...providerEffectFacts.rejectedActionIdentities].filter(identity => JSON.stringify(messages).includes(identity)),
+  );
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
@@ -300,6 +337,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
       (total, message) => total + providerMessageChars(message),
       0,
     ),
+    approximateToolSchemaChars: JSON.stringify(providerTools).length,
     preferredValidationCommand: preferredValidation || null,
     allowedToolCount: providerTools.length,
     nativeToolCount: input.textEnvelope ? 0 : providerTools.length,
@@ -343,6 +381,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     forceStructuredAction,
     actionOnlyCharLimit: actionOnlyCharLimit || null,
     maxOutputTokens,
+    inputBudget,
+    estimatedInputTokens,
     reasoningRequest: requestSettings.reasoningRequest || null,
     effectPressureActionDecoding:
       reasoningRequest === "off" &&
@@ -352,9 +392,11 @@ export async function requestRuntimeV2ProviderOnce(input: {
     recoveryReasoningEscalated:
       reasoningRequest === "explicit" &&
       settings.reasoningRequest !== "explicit",
-    decisionViewApplied: !readOnly,
+    decisionViewApplied: !readOnly && (standardConversation.length !== canonicalDecisionConversation.length || standardConversation.some((message, index) => message !== canonicalDecisionConversation[index])),
     contextPolicy: readOnly ? "read_only_budget" : "execute_decision",
     canonicalConversationMessages: history.messages.length,
+    visibleSkillGuidanceWindows: input.live.latestProviderRequestSkillGuidanceWindows.length,
+    visibleSkillGuidanceDocuments: new Set(input.live.latestProviderRequestSkillGuidanceWindows.map(window => window.documentKey)).size,
     removedDecisionMessages: Math.max(
       0,
       readOnly ? unboundedMessages.length - messages.length : history.messages.length - boundedConversation.length,
@@ -413,6 +455,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     if (
       shouldRetryRuntimeV2WithoutReasoning({
         finishReason: result.finishReason,
+        clientStopReason: result.clientStopReason,
         reasoningChars: result.reasoningContent?.length || 0,
         actionChars:
           result.actionableContent?.length ||
@@ -435,6 +478,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
           phase: input.command.phase,
           mode: String(input.command.payload.mode || ""),
           finishReason: result.finishReason,
+          stopSource: result.clientStopReason ? "client_guard" : "provider",
+          clientStopReason: result.clientStopReason || null,
           reasoningChars: result.reasoningContent?.length || 0,
             actionChars:
               result.actionableContent?.length ||
@@ -443,27 +488,67 @@ export async function requestRuntimeV2ProviderOnce(input: {
             truncationKind: (result.reasoningContent?.length || 0) > 0
               ? "reasoning_without_action"
               : "visible_prose_without_action",
-            recovery: "provider_reasoning_toggle_off",
+            recovery: adapterCapabilities.reasoningToggle
+              ? "provider_reasoning_toggle_off"
+              : "bounded_structured_action_feedback",
         },
       );
+      const truncatedVisibleText = result.semanticContent || streamedText;
       streamedText = "";
-      const recoveryMessages = [
+      const recoveryRequiresAction = !toolsClosed &&
+        (structuredActionRequired || !readOnly);
+      const recoveryHistoryStart = input.live.messages.length;
+      appendRuntimeV2ProviderFeedbackHistory(input.live, {
+        visibleText: truncatedVisibleText,
+        code: "output_truncated",
+        feedback: recoveryRequiresAction
+          ? [
+              result.clientStopReason
+                ? `CLIENT_OUTPUT_GUARD_REACHED: the client's ${result.clientStopReason} guard ended the previous decision before a tool call.`
+                : "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
+              "Do not repeat or explain the analysis. Submit exactly one currently advertised structured tool action now.",
+            ].join(" ")
+          : [
+              result.clientStopReason
+                ? `CLIENT_OUTPUT_GUARD_REACHED: the client's ${result.clientStopReason} guard ended the previous incomplete answer.`
+                : "ANSWER_OUTPUT_BUDGET_EXHAUSTED: the previous attempt reached the output limit without a complete answer. Its draft is incomplete and is not an accepted conclusion.",
+              "Do not repeat the analysis or continue the unfinished draft. Return one complete concise answer from the available evidence, stating any uncertainty.",
+              toolsClosed
+                ? "No tools are available in this decision."
+                : "If a specific missing fact still requires verification, the currently advertised tools remain available.",
+            ].join(" "),
+      });
+      const unboundedRecoveryMessages = [
         ...messages,
-        {
-          role: "system" as const,
-          content: [
-            "ACTION_OUTPUT_BUDGET_EXHAUSTED: the previous attempt spent the bounded action output on reasoning or visible prose without producing a tool call.",
-            "Do not repeat or explain the analysis. Submit exactly one currently advertised structured tool action now.",
-          ].join(" "),
-        },
+        ...input.live.messages.slice(recoveryHistoryStart),
       ];
+      const recoveredExecuteRequest = readOnly ? null : assembleExecuteRequest([
+        ...canonicalDecisionConversation, ...input.live.messages.slice(recoveryHistoryStart),
+      ]);
+      const recoveryMessages = recoveredExecuteRequest?.messages || (budget
+          ? boundReadOnlyHistory(unboundedRecoveryMessages, {
+              contextLimit: budget.contextLimit,
+              reservedOutputTokens: maxOutputTokens,
+              tools: providerTools,
+            })
+        : unboundedRecoveryMessages);
+      input.live.latestProviderRequestSourceCoverage = recoveredExecuteRequest?.coverage ||
+        materializedRuntimeV2SourceCoverage(
+          recoveryMessages,
+          input.ports.context.runWorkspace || "",
+          providerEffectFacts,
+        );
+      input.live.latestProviderRequestSkillGuidanceWindows = runtimeV2TranscriptSkillGuidanceWindows(recoveryMessages)
+        .map(({ documentKey, version, returnedRange, readTarget }) => ({ documentKey, version, returnedRange, readTarget }));
       result = await streamChatCompletion(
         recoveryMessages,
-        {
-          ...requestSettings,
-          reasoningRequest: "off",
-          preserveAssistantReasoning: false,
-        },
+        adapterCapabilities.reasoningToggle
+          ? {
+              ...requestSettings,
+              reasoningRequest: "off",
+              preserveAssistantReasoning: false,
+            }
+          : requestSettings,
         {
           onToken: (token) => {
             lane.markFirstToken();
@@ -507,6 +592,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     mode: String(input.command.payload.mode || ""),
     textEnvelope: input.textEnvelope,
     finishReason: result.finishReason || null,
+    clientStopReason: result.clientStopReason || null,
     rawContentChars: result.content.length,
     actionableContentChars: result.actionableContent?.length || 0,
     semanticContentChars: result.semanticContent?.length || 0,
@@ -522,6 +608,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   });
   const providerReasoning = String(result.reasoningContent || "").trim();
   if (
+    !reasoningFallbackApplied &&
     requestSettings.preserveAssistantReasoning === true &&
     providerReasoning
   ) {
@@ -534,10 +621,11 @@ export async function requestRuntimeV2ProviderOnce(input: {
   }
   const outputTruncated = runtimeV2ProviderOutputWasTruncated({
     finishReason: result.finishReason,
+    clientStopReason: result.clientStopReason,
     toolCallCount: result.toolCalls.length,
     availableToolCount: providerTools.length,
   });
-  return normalizeProviderResponseV1({
+  const normalized = normalizeProviderResponseV1({
     visibleText,
     content: protocolContent,
     toolCalls: result.toolCalls,
@@ -554,10 +642,21 @@ export async function requestRuntimeV2ProviderOnce(input: {
         ? [{
           code: "output_truncated",
           message:
-            "Provider output reached its token limit before a structured action or complete conclusion.",
+            result.clientStopReason
+              ? `Client ${result.clientStopReason} guard ended output before a structured action or complete conclusion.`
+              : "Provider output reached its token limit before a structured action or complete conclusion.",
           retryable: true,
         }]
         : []),
     ],
   });
+  input.ports.logStoreEvent("runtime_v2_provider_normalized_shape", {
+    turnId: input.command.run.turnId, runId: input.command.run.runId,
+    mode: input.command.payload.mode,
+    toolNames: normalized.toolCalls.map((call) => call.name),
+    diagnosticCodes: normalized.diagnostics.map((item) => item.code),
+    explicitActionMarkers: [...new Set(protocolContent.match(/<\/?(?:runtime-v2-tools|tool_call|function_call|tool_use|tool_code)\b/gi) || [])],
+    visibleTextChars: normalized.visibleText?.length || 0,
+  });
+  return normalized;
 }

@@ -1,7 +1,7 @@
 import { sha256Hex } from "./sha256";
 
 export const PROJECT_BASELINE_SCHEMA_VERSION = 1;
-export const PROJECT_BASELINE_PARSER_VERSION = 1;
+export const PROJECT_BASELINE_PARSER_VERSION = 2;
 
 export interface ProjectBaselineLimits {
   readonly maxAnchorBytes: number;
@@ -164,6 +164,11 @@ const STATIC_ANCHORS: readonly AnchorCandidate[] = [
   ...[".gitignore", ".ignore", ".dockerignore", "tsconfig.json", "jsconfig.json", "vite.config.ts", "vite.config.js", "vite.config.mjs", "next.config.js", "next.config.mjs", "next.config.ts", "nuxt.config.ts", "svelte.config.js", "astro.config.mjs", "eslint.config.js", "eslint.config.mjs", "biome.json", "biome.jsonc", "deno.json", "deno.jsonc", "ruff.toml", "pytest.ini", "mypy.ini", "tox.ini", ".python-version", "rust-toolchain.toml", "rustfmt.toml", "go.work", "settings.gradle", "settings.gradle.kts", "Directory.Build.props", "Directory.Build.targets", "global.json", "CMakeLists.txt", "Makefile", "Dockerfile", ".tool-versions", ".nvmrc"].map(path => ({ path, kind: "config" as const })),
 ];
 
+const NESTED_METADATA_ANCHORS: readonly AnchorCandidate[] = [
+  { path: "Packages/manifest.json", kind: "manifest" },
+  { path: "ProjectSettings/ProjectVersion.txt", kind: "config" },
+];
+
 const DYNAMIC_RULE_DIRECTORIES = [".cursor/rules", ".MAIN/steering", ".MAIN/rules"] as const;
 const IGNORED_SEGMENTS = new Set([".git", ".main", "node_modules", "dist", "build", "out", "target", "coverage", ".next", ".nuxt", ".svelte-kit", ".cache", "vendor", "pods", "deriveddata", ".venv", "venv", "__pycache__"]);
 const SENSITIVE_DIRECTORIES = new Set([".ssh", ".gnupg", ".aws"]);
@@ -279,6 +284,14 @@ async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omis
     if (!path || entry.kind !== "file") continue;
     if (/\.(?:sln|csproj|fsproj|vbproj)$/.test(path.toLowerCase())) candidates.push({ path, kind: "manifest" });
   }
+  for (const candidate of NESTED_METADATA_ANCHORS) {
+    const [directory, fileName] = candidate.path.split("/");
+    // Nested metadata must be an authored workspace file, never a symlinked
+    // directory or file. Content loading still uses the common byte preflight.
+    if (!rootEntries.some(entry => entry.name === directory && entry.kind === "directory")) continue;
+    const entries = await safeList(io, workspace, directory!);
+    if (entries.some(entry => entry.name === fileName && entry.kind === "file")) candidates.push(candidate);
+  }
   for (const directory of DYNAMIC_RULE_DIRECTORIES) {
     for (const entry of await safeList(io, workspace, directory)) {
       const path = joinRelative(directory, String(entry?.name || ""));
@@ -357,6 +370,16 @@ function safeVersionConstraint(value: unknown): string | null {
   return compact && /\d/u.test(compact) && /^[0-9xX.*+<>=~^|,&!() /_-]+$/u.test(compact) ? compact : null;
 }
 
+function metadataVersion(content: string, field: string): string | null {
+  const values = content.replace(/^\uFEFF/, "").split(/\r?\n/u)
+    .map(line => line.match(/^\s*([A-Za-z_]+):\s*(.*?)\s*$/u))
+    .filter(match => match?.[1] === field)
+    .map(match => match![2]!);
+  if (values.length !== 1) return null;
+  const value = safeScalar(values[0], 80);
+  return value && /^\d+\.\d+\.\d+(?:[A-Za-z]+\d+)?$/u.test(value) ? value : null;
+}
+
 function dedupeFacts(facts: ProjectBaselineFact[]): ProjectBaselineFact[] {
   const sorted = facts.sort((a, b) => compareText(`${a.name}\0${a.version || ""}\0${a.constraint || ""}\0${a.provenance.path}`, `${b.name}\0${b.version || ""}\0${b.constraint || ""}\0${b.provenance.path}`));
   const unique = new Map<string, ProjectBaselineFact>();
@@ -393,6 +416,30 @@ function buildFacts(loaded: LoadedAnchor[], topology: readonly ProjectBaselineTo
   for (const anchor of loaded.filter(item => /\.(?:sln|csproj|fsproj|vbproj)$/i.test(item.path))) {
     add(languages, anchor.path.endsWith(".fsproj") ? "F#" : anchor.path.endsWith(".vbproj") ? "Visual Basic" : "C#", anchor, "manifest_extension");
     add(packageManagers, "dotnet", anchor, "manifest_extension");
+  }
+  const editorVersion = byPath.get("ProjectSettings/ProjectVersion.txt");
+  if (editorVersion) {
+    for (const [name, field] of [["unity", "m_EditorVersion"], ["tuanjie", "m_TuanjieEditorVersion"]]) {
+      const version = metadataVersion(editorVersion.content, field!);
+      if (version) add(runtimes, name!, editorVersion, field!, { version });
+    }
+  }
+  const upmManifest = byPath.get("Packages/manifest.json");
+  if (upmManifest) {
+    try {
+      const parsed: unknown = JSON.parse(upmManifest.content);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid project manifest");
+      const dependencies = (parsed as Record<string, unknown>).dependencies;
+      // UPM project-manifest properties are optional. When dependencies are
+      // present they map package names to version, Git, or local-path strings.
+      if (dependencies !== undefined && (!dependencies || typeof dependencies !== "object" || Array.isArray(dependencies)
+        || Object.entries(dependencies).some(([name, value]) => !name.trim() || typeof value !== "string" || !value.trim()))) {
+        throw new Error("Invalid project dependencies");
+      }
+      add(packageManagers, "upm", upmManifest, "project_manifest");
+    } catch {
+      diagnostics.push({ code: "manifest_parse_failed", path: upmManifest.path });
+    }
   }
   const packageAnchor = byPath.get("package.json");
   let scriptManager: string | null = null;

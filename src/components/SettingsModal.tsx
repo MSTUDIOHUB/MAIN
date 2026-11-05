@@ -67,6 +67,8 @@ import {
 } from "../lib/cloudServers";
 import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
 import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
+import ToggleSwitch from "./ToggleSwitch";
+import MarkdownRenderer from "./MarkdownRenderer";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
   if (!server) return "";
@@ -139,11 +141,11 @@ type SettingsUpdateStatus = "idle" | "checking" | "upToDate" | "available" | "do
 
 const MAIN_RELEASES_URL = "https://github.com/MSTUDIOHUB/MAIN-Releases/releases";
 
-function summarizeReleaseNotes(notes: string, maxLength = 520) {
-  const normalized = String(notes || "").replace(/\r/g, "").trim();
-  if (!normalized) return "";
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, maxLength).trimEnd()}…`;
+function releasePageUrl(version: string) {
+  const normalized = String(version || "").trim().replace(/^v/, "");
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(normalized)
+    ? `${MAIN_RELEASES_URL}/tag/v${encodeURIComponent(normalized)}`
+    : MAIN_RELEASES_URL;
 }
 
 const SETTINGS_COPY = {
@@ -230,6 +232,9 @@ const SETTINGS_COPY = {
     openGitHubReleases: "打开 GitHub Releases",
     openGitHubReleasesDesc: "在浏览器中查看公开下载页面。",
     openGitHubReleasesFailed: "无法打开 GitHub Releases 页面。",
+    releaseNotes: "更新说明",
+    viewReleaseNotes: "查看此版本发布说明",
+    releaseNotesUnavailable: "此版本暂未提供更新说明，可打开发布页面查看。",
 
     compressionLow: "省显存",
     compressionBalanced: "均衡",
@@ -447,6 +452,9 @@ const SETTINGS_COPY = {
     openGitHubReleases: "Open GitHub Releases",
     openGitHubReleasesDesc: "View the public download page in your browser.",
     openGitHubReleasesFailed: "Could not open the GitHub Releases page.",
+    releaseNotes: "Release notes",
+    viewReleaseNotes: "Open this version's release notes",
+    releaseNotesUnavailable: "Release notes are not available for this version. Open its release page for details.",
 
     compressionLow: "Memory Saver",
     compressionBalanced: "Balanced",
@@ -831,24 +839,12 @@ function McpServerPanel({
                 )}
               </div>
               <div className="ml-4 flex shrink-0 items-center gap-3">
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={enabled}
+                <ToggleSwitch
+                  checked={enabled}
                   aria-label={`${server.name} ${enabled ? copy.mcpEnabled : copy.mcpDisabled}`}
-                  onClick={() => handleToggleServer(server.name, !enabled)}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
-                    enabled ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]" : "border-[#3f3f46] bg-[#18181b]"
-                  }`}
-                  style={enabled ? { backgroundColor: "var(--accent)" } : undefined}
+                  onCheckedChange={(checked) => handleToggleServer(server.name, checked)}
                   title={enabled ? copy.mcpEnabled : copy.mcpDisabled}
-                >
-                  <span
-                    className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                      enabled ? "translate-x-5" : "translate-x-0"
-                    }`}
-                  />
-                </button>
+                />
                 <button
                   onClick={() => handleTestServer(server)}
                   disabled={isTestingServer}
@@ -1136,26 +1132,12 @@ function DebugLogPanel({
           <span className={`text-[12px] font-bold ${recordFullTurnProcess ? "theme-text" : "text-[#a1a1aa]"}`}>
             {recordFullTurnProcess ? copy.enabled : copy.disabled}
           </span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={recordFullTurnProcess}
+          <ToggleSwitch
+            checked={recordFullTurnProcess}
             data-testid="debug-full-turn-process-switch"
             aria-label={copy.debugRecordFullTurnProcess}
-            onClick={() => setConfig({ ...config, debugRecordFullTurnProcess: !recordFullTurnProcess })}
-            className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
-              recordFullTurnProcess
-                ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
-                : "border-[#3f3f46] bg-[#18181b]"
-            }`}
-            style={recordFullTurnProcess ? { backgroundColor: "var(--accent)" } : undefined}
-          >
-            <span
-              className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                recordFullTurnProcess ? "translate-x-5" : "translate-x-0"
-              }`}
-            />
-          </button>
+            onCheckedChange={(checked) => setConfig({ ...config, debugRecordFullTurnProcess: checked })}
+          />
         </div>
       </div>
 
@@ -1497,10 +1479,10 @@ function FeishuAdapterPanel({ config, setConfig, t }: { config: any; setConfig: 
       <div className="rounded-lg border border-[#27272a] bg-[#000000] p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <label className="flex items-center gap-3">
-            <input
-              type="checkbox"
+            <ToggleSwitch
               checked={feishu.enabled}
-              onChange={(e) => updateFeishu({ enabled: e.target.checked })}
+              aria-label={t.feishuEnable}
+              onCheckedChange={(checked) => updateFeishu({ enabled: checked })}
             />
             <span className="text-[13px] font-bold text-[#e4e4e7]">{t.feishuEnable}</span>
           </label>
@@ -1741,13 +1723,13 @@ export default function SettingsModal({
   const lastUpdateCheckedText = lastUpdateCheckedAt
     ? new Date(lastUpdateCheckedAt).toLocaleString()
     : copy.neverChecked;
-  const releaseNotesSummary = summarizeReleaseNotes(availableUpdateNotes);
+  const releaseNotes = String(availableUpdateNotes || "").trim();
   const handleOpenGitHubReleases = useCallback(() => {
-    void openUrl(MAIN_RELEASES_URL).catch((error) => {
+    void openUrl(releasePageUrl(availableUpdateVersion)).catch((error) => {
       console.warn("Failed to open GitHub Releases", error);
       window.alert(copy.openGitHubReleasesFailed);
     });
-  }, [copy.openGitHubReleasesFailed]);
+  }, [availableUpdateVersion, copy.openGitHubReleasesFailed]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -3253,26 +3235,12 @@ export default function SettingsModal({
                     <span className={`min-w-0 text-[12px] font-bold ${config.sessionRecordingEnabled !== false ? "theme-text" : "text-[#a1a1aa]"}`}>
                       {config.sessionRecordingEnabled !== false ? copy.enabled : copy.disabled}
                     </span>
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={config.sessionRecordingEnabled !== false}
+                    <ToggleSwitch
+                      checked={config.sessionRecordingEnabled !== false}
                       data-testid="session-recording-switch"
                       aria-label={t.sessionRecording}
-                      onClick={() => setConfig({ ...config, sessionRecordingEnabled: !(config.sessionRecordingEnabled !== false) })}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full border p-0.5 transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#000000] ${
-                        config.sessionRecordingEnabled !== false
-                          ? "border-transparent shadow-[0_0_12px_var(--accent-subtle)]"
-                          : "border-[#3f3f46] bg-[#18181b]"
-                      }`}
-                      style={config.sessionRecordingEnabled !== false ? { backgroundColor: "var(--accent)" } : undefined}
-                    >
-                      <span
-                        className={`block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200 ${
-                          config.sessionRecordingEnabled !== false ? "translate-x-5" : "translate-x-0"
-                        }`}
-                      />
-                    </button>
+                      onCheckedChange={(checked) => setConfig({ ...config, sessionRecordingEnabled: checked })}
+                    />
                   </div>
                 </div>
               </div>
@@ -3355,10 +3323,17 @@ export default function SettingsModal({
                     }`}>
                       {updateStatusText}
                     </div>
-                    {releaseNotesSummary && availableUpdateVersion && (updateStatus === "available" || updateStatus === "error") && (
-                      <pre className="max-h-44 overflow-auto whitespace-pre-wrap rounded-md border border-[#27272a] bg-[#000000] p-3 text-[11px] leading-relaxed text-[#a1a1aa]">
-                        {releaseNotesSummary}
-                      </pre>
+                    {availableUpdateVersion && (updateStatus === "available" || updateStatus === "error") && (
+                      <section aria-label={copy.releaseNotes} className="space-y-2" data-testid="settings-release-notes">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h4 className="text-[12px] font-semibold" style={{ color: "var(--surface-text)" }}>{copy.releaseNotes}</h4>
+                          <button type="button" data-testid="settings-release-notes-open" onClick={handleOpenGitHubReleases} className="rounded-md border px-2 py-1 text-[11px] theme-ring" style={{ borderColor: "var(--surface-border)", color: "var(--surface-text-muted)" }}>{copy.viewReleaseNotes}</button>
+                        </div>
+                        <div className="max-h-72 overflow-auto rounded-md border p-3" style={{ borderColor: "var(--surface-border)", background: "var(--surface-0)", color: "var(--surface-text)" }}>
+                          {releaseNotes ? <MarkdownRenderer content={releaseNotes} baseFontSize={12} sourceId={`main-release-${availableUpdateVersion}`} />
+                            : <p className="text-[12px] leading-relaxed">{copy.releaseNotesUnavailable}</p>}
+                        </div>
+                      </section>
                     )}
                     <div className="flex flex-wrap gap-2">
                       <button
@@ -4040,11 +4015,11 @@ export default function SettingsModal({
                                 </div>
 
                                 <label className="flex items-start gap-3 rounded-md border border-[#27272a] bg-[#000000] p-3">
-                                  <input
-                                    type="checkbox"
+                                  <ToggleSwitch
                                     checked={draftCloudConfig.disableResponseStorage !== false}
                                     disabled={!canEditCloudDraftServer}
-                                    onChange={(e) => updateCloudDraftServer({ disableResponseStorage: e.target.checked })}
+                                    aria-label={copy.disableResponseStorage}
+                                    onCheckedChange={(checked) => updateCloudDraftServer({ disableResponseStorage: checked })}
                                     className="mt-0.5"
                                   />
                                   <span className="min-w-0">

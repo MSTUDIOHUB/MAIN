@@ -13,6 +13,7 @@ import {
   RuntimeV2CheckpointWriteBoundaryError,
 } from "../../lib/runtime-v2";
 import { persistSubmitRuntimeProjection } from "../persistSubmitRuntimeProjection";
+import type { ProjectSessionSaveOptions } from "../../lib/projectSessionMutationCoordinator";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -25,7 +26,7 @@ export interface RuntimeV2CheckpointStoreAdapterInput {
   readonly getSessionRevisionToken: () => unknown;
   readonly sanitizeTaskBlocksForPersist: (blocks: any[]) => any[];
   readonly buildSessionRuntimeSnapshot: (state: Record<string, unknown>) => unknown;
-  readonly persistSessionRecord: (scopeKey: string, session: unknown) => Promise<unknown>;
+  readonly persistSessionRecord: (scopeKey: string, session: unknown, options?: ProjectSessionSaveOptions) => Promise<unknown>;
   readonly publishOwnerScopedRuntimeProjection: (input: {
     projectedState: any;
     durableState?: any;
@@ -132,8 +133,24 @@ export function createRuntimeV2CheckpointPort(
             sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
             buildRuntimeSnapshot: (candidate) => input.buildSessionRuntimeSnapshot(candidate),
             persistSessionRecord: input.persistSessionRecord,
+            // Snapshot construction happens before the Session writer queue.
+            // Recheck the ledger at queue head so a newer terminal transaction
+            // cannot be overwritten by this captured checkpoint. The injected
+            // production writer additionally checks the Session owner lease.
+            isCurrent: () => {
+              const latest = input.get();
+              return !emergencyEnvelopeForOwner(latest, owner) &&
+                (checkpointForOwner(latest, owner)?.revision ?? 0) === expectedRevision;
+            },
           });
         } catch (error) {
+          if ((error as { code?: unknown })?.code === "project_session_stale_write_fenced") {
+            input.logStoreEvent("runtime_v2_checkpoint_projection_conflict", {
+              turnId: owner.turnId, revision: appended.checkpoint.revision,
+              disposition: "queued_snapshot_superseded", attempt,
+            });
+            return { disposition: "conflict" as const, checkpoint: null };
+          }
           input.logStoreEvent("runtime_v2_checkpoint_persist_failed", {
             turnId: owner.turnId,
             revision: appended.checkpoint.revision,
@@ -310,8 +327,15 @@ export function createRuntimeV2CheckpointPort(
               runtimeSnapshot: {
                 runtimeV2EmergencyTerminalEnvelopes: nextEnvelopeMap,
               },
-            });
+            }, { isCurrent: () => {
+              const latest = input.get();
+              return !emergencyEnvelopeForOwner(latest, owner) &&
+                (checkpointForOwner(latest, owner)?.revision ?? 0) === expectedRevision;
+            } });
           } catch (error) {
+            if ((error as { code?: unknown })?.code === "project_session_stale_write_fenced") {
+              return { disposition: "conflict" as const, envelope: null };
+            }
             input.logStoreEvent(
               "runtime_v2_emergency_terminal_persist_failed",
               {

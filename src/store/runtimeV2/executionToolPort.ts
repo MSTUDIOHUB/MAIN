@@ -5,7 +5,7 @@ import {
   ensureVersionedReadFileResultForModel,
   extractReadFileWindowMetadata,
 } from "../../lib/readFileWindow";
-import { executeTool } from "../../lib/toolExecutor";
+import { executeTool, type ToolExecutionOptions } from "../../lib/toolExecutor";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
   isRuntimeV2LifecycleDeadlineError,
@@ -47,6 +47,8 @@ import {
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
 import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
+import { runtimeV2AutomaticObservationDeferredReceipt, runtimeV2ToolPreExecutionReceipt, runtimeV2ToolAuthorizationRejectionReceipt } from "./executionToolGateReceipt";
+import { runtimeV2StructuredToolOutcome } from "./executionToolOutcome";
 
 function logRuntimeV2ToolDeadline(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
@@ -78,6 +80,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
   return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
       if (command.kind === "collect_observation") {
+        const deferred = runtimeV2AutomaticObservationDeferredReceipt(input, command);
+        if (deferred) return deferred;
         input.logStoreEvent("runtime_v2_tool_execution_started", {
           turnId: command.run.turnId,
           runId: command.run.runId,
@@ -173,13 +177,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           toolName,
           requestedTarget: target,
         });
-      input.logStoreEvent("runtime_v2_tool_execution_started", {
-        turnId: command.run.turnId,
-        runId: command.run.runId,
-        commandKind: command.kind,
-        toolName,
-        target: target || null,
-      });
+      const blockedReceipt = runtimeV2ToolPreExecutionReceipt({ ports: input, command, toolName, args, target });
+      if (blockedReceipt) return blockedReceipt;
       const hasCoveredSourceReceipt =
         !!toolCallId &&
         input.live.coveredReadToolResults.has(toolCallId);
@@ -188,50 +187,6 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         : null;
       if (hasCoveredSourceReceipt) {
         input.live.coveredReadToolResults.delete(toolCallId);
-      }
-      if (cachedSourceReceipt) {
-        const replayedActionIdentity =
-          runtimeV2ProviderToolCallIdentity({
-            name: toolName,
-            arguments: args,
-          });
-        recordToolResultHistory({
-          ports: input,
-          command,
-          toolName,
-          target,
-          status: "succeeded",
-          content: cachedSourceReceipt,
-        });
-        input.logStoreEvent("runtime_v2_source_receipt_replayed", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          toolName,
-          target: target || null,
-          sourceVersion:
-            extractReadFileWindowMetadata(cachedSourceReceipt)
-              ?.contentVersion || null,
-          actionIdentity: replayedActionIdentity,
-        });
-        const replayCompletion = toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          target,
-          cachedSourceReceipt,
-          "succeeded",
-          undefined,
-          extractReadFileWindowMetadata(cachedSourceReceipt)
-            ?.contentVersion,
-        );
-        return replayCompletion.type === "tool.completed"
-          ? {
-              ...replayCompletion,
-              evidence: [],
-              receiptOrigin: "replayed",
-            }
-          : replayCompletion;
       }
       if (!toolDefinitionExists(input, toolName)) {
         recordToolResultHistory({
@@ -289,44 +244,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           "protocol_invalid",
         );
       }
-      const phaseAndPlan = validateToolAgainstPhaseAndPlan({
-        ports: input,
-        command,
-        toolName,
-        args,
-        target,
-      });
-      if (!phaseAndPlan.allowed) {
-        recordToolResultHistory({
-          ports: input,
-          command,
-          toolName,
-          target: failureContextTarget,
-          status: "blocked",
-          content: `TOOL_BLOCKED: ${phaseAndPlan.reason}`,
-        });
-        input.logStoreEvent("runtime_v2_tool_execution_blocked", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          target: target || null,
-          reason: phaseAndPlan.reasonCode,
-        });
-        return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          failureContextTarget,
-          `TOOL_BLOCKED: ${phaseAndPlan.reason}`,
-          "blocked",
-          phaseAndPlan.failureKind || "not_authorized",
-          undefined,
-          undefined,
-          phaseAndPlan.reasonCode || undefined,
-        );
-      }
+      const phaseAndPlanRejection = (rejection: ReturnType<typeof validateToolAgainstPhaseAndPlan>) =>
+        runtimeV2ToolAuthorizationRejectionReceipt({ ports: input, command, toolName, args, target, failureContextTarget, rejection });
+      const phaseAndPlan = validateToolAgainstPhaseAndPlan({ ports: input, command, toolName, args, target });
+      if (!phaseAndPlan.allowed) return phaseAndPlanRejection(phaseAndPlan);
       const authorizationResolution =
         await resolveRuntimeV2ToolAuthorization({
           ports: input,
@@ -341,9 +262,53 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         return authorizationResolution.completion;
       }
       const authorization = authorizationResolution.authorization;
+      if (cachedSourceReceipt) {
+        const replayedActionIdentity =
+          runtimeV2ProviderToolCallIdentity({
+            name: toolName,
+            arguments: args,
+          });
+        recordToolResultHistory({
+          ports: input,
+          command,
+          toolName,
+          target,
+          status: "succeeded",
+          content: cachedSourceReceipt,
+        });
+        input.logStoreEvent("runtime_v2_source_receipt_replayed", {
+          turnId: command.run.turnId,
+          runId: command.run.runId,
+          toolName,
+          target: target || null,
+          sourceVersion:
+            extractReadFileWindowMetadata(cachedSourceReceipt)
+              ?.contentVersion || null,
+          actionIdentity: replayedActionIdentity,
+        });
+        const replayCompletion = toolCompletionFor(
+          input,
+          command,
+          toolName,
+          args,
+          target,
+          cachedSourceReceipt,
+          "succeeded",
+          undefined,
+          extractReadFileWindowMetadata(cachedSourceReceipt)
+            ?.contentVersion,
+        );
+        return replayCompletion.type === "tool.completed"
+          ? {
+              ...replayCompletion,
+              evidence: [],
+              receiptOrigin: "replayed",
+            }
+          : replayCompletion;
+      }
       try {
         let diffPreview;
-        const toolExecutionOptions = {
+        const toolExecutionOptions: ToolExecutionOptions = {
           ...(isReadOnlyContext(input) ? { networkRead: readOnlyNetworkPolicy(input) } : {}),
           toolCatalog: authorizationFor(input).toolCatalog,
           skillCatalog: input.context.skillCatalog,
@@ -363,6 +328,14 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
             toolExecutionOptions,
           });
           if (!preparation.allowed) return preparation.completion;
+          if (preparation.writeFileTarget) {
+            const actualOperationAuthorization = validateToolAgainstPhaseAndPlan({
+              ports: input, command, toolName, args, target,
+              writeFileTarget: preparation.writeFileTarget,
+            });
+            if (!actualOperationAuthorization.allowed) return phaseAndPlanRejection(actualOperationAuthorization);
+            toolExecutionOptions.writeFileTarget = preparation.writeFileTarget;
+          }
           diffPreview = preparation.diffPreview;
         }
         const executionArgs = runtimeV2ContextBoundToolArguments(
@@ -443,19 +416,30 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               sourceVersion || "",
             )
           : rawOutput;
-        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput);
-        const completion = toolCompletionFor(
+        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput, { parallelReadCount });
+        const outcome = runtimeV2StructuredToolOutcome(toolName, rawOutput);
+        let completion = toolCompletionFor(
           input,
           command,
           toolName,
           args,
           target,
           receiptOutput,
-          "succeeded",
-          undefined,
+          outcome.status,
+          outcome.failureKind,
           sourceVersion,
           diffPreview,
+          outcome.failureReasonCode,
         );
+        if (completion.type === "tool.completed" && completion.status === "succeeded" && toolExecutionOptions.writeFileTarget) {
+          completion = {
+            ...completion,
+            mutationRequests: [{
+              target: toolExecutionOptions.writeFileTarget.path,
+              operation: toolExecutionOptions.writeFileTarget.exists ? "modify" : "create",
+            }],
+          };
+        }
         const semanticStatus = toolResultStatusForCompletion(completion);
         const effectCommitted = recordRuntimeV2CommittedToolEffect({
           ports: input,

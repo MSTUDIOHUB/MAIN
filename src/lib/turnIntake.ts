@@ -122,6 +122,7 @@ export function resolveEffectiveSubagentDelegationPreference(input: {
  */
 export function buildSubagentDelegationGuidance(input: {
   readonly preference: SubagentDelegationPreference;
+  readonly requirement?: SubagentRequirement;
   readonly language: "zh" | "en";
 }): string {
   if (input.preference === "forbidden") {
@@ -135,20 +136,24 @@ export function buildSubagentDelegationGuidance(input: {
   ) {
     return "";
   }
-  const availability = input.preference === "preferred"
+  const availability = input.requirement === "required"
+    ? input.language === "en"
+      ? "The user explicitly requires delegation for this turn."
+      : "用户已明确要求本轮委派工作。"
+    : input.preference === "preferred"
     ? input.language === "en"
       ? "The user explicitly prefers collaboration for this turn."
       : "用户已明确选择本轮优先使用协作。"
     : input.language === "en"
       ? "Collaboration is available for this turn."
       : "本轮允许按需协作。";
-  const preferenceMethod = input.preference === "preferred"
+  const preferenceMethod = input.requirement === "required"
     ? input.language === "en"
-      ? "During intent analysis, identify genuinely independent work, dependencies, and exact ownership. When spawn_subagent is exposed and at least two bounded work packages can overlap, prioritize starting as many useful children as the advertised capacity permits while the parent continues non-dependent work. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly."
-      : "分析用户意图时就识别真正独立的工作、依赖关系和精确责任范围。实际暴露 spawn_subagent 且至少两个边界明确的工作包可以重叠时，应优先在公布的容量内启动尽可能多的有用子智能体，同时父线程继续推进不依赖子结果的工作。该偏好可用于读取、修改或验证任一阶段，但不是强制生命周期阶段；简单或线性任务直接执行。"
+      ? "Delegate the requested bounded outcome within the user's requested deliverable and depth, dependencies, and exact ownership. Keep the child objective and success criteria within that scope; the parent owns integration and completion."
+      : "按用户要求的交付范围与深度、依赖关系和精确责任范围委派所需结果；子目标和成功标准必须保持在该范围内，父线程负责整合与完成。"
     : input.language === "en"
-      ? "During intent analysis, identify genuinely independent work, dependencies, and exact ownership; invoke spawn_subagent only when that tool is exposed and useful. Delegation remains optional at inspect, edit, or verify and is never a prerequisite for mutation or completion."
-      : "分析用户意图时识别真正独立的工作、依赖关系和精确责任范围；只有实际暴露 spawn_subagent 且确有收益时才调用。读取、修改或验证任一阶段均可按需协作，但协作不是写入或完成的前置条件。";
+      ? "Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when it benefits the requested outcome enough to justify coordination. The parent continues non-dependent work in parallel. Delegation remains optional at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly."
+      : "子目标和成功标准保持在用户要求的交付范围与深度内；仅在所需独立结果对交付的收益足以抵偿协作成本时委派。父线程继续推进不依赖子结果的工作。读取、修改或验证任一阶段均可按需协作，但不是强制生命周期阶段；简单或线性任务直接执行。";
   return input.language === "en"
     ? [
         availability,
@@ -246,6 +251,7 @@ export function buildTurnIntakeContextBlock(input: {
 
   const delegationGuidance = buildSubagentDelegationGuidance({
     preference: subagentPreference,
+    requirement: subagentRequirement,
     language: input.language,
   });
   if (delegationGuidance) {

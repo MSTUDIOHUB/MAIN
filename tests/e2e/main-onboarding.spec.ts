@@ -28,6 +28,10 @@ test("composer help opens the MAIN guide without submitting a turn", async ({ pa
   await expect(guide).toContainText("/init");
   await expect(guide).toContainText("/init --refresh");
   await expect(guide).toContainText("@ 引用文件");
+  await expect(guide).toContainText("$ 技能快捷菜单");
+  await expect(guide).toContainText("输入 $ 搜索当前已添加且启用的技能");
+  await expect(guide).toContainText("↑↓ 选择，Enter / Tab 插入，Esc 关闭");
+  await expect(guide).toContainText("已关闭来源的技能不会出现在菜单中");
   await expect(guide).toContainText("自动审查");
 
   await expect.poll(async () =>
@@ -51,6 +55,21 @@ test("composer help opens the MAIN guide without submitting a turn", async ({ pa
   await expect(page.getByTestId("main-shortcut-item-plan")).toHaveAttribute("role", "option");
 });
 
+test("composer help explains Skill search and selection keys in English", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+  await page.evaluate(async () => {
+    const { useAppStore } = await import("/src/store/useAppStore.ts");
+    useAppStore.getState().setConfig((config) => ({ ...config, language: "en" }));
+  });
+  await page.getByTestId("composer-help-button").click();
+  const guide = page.getByTestId("main-onboarding-panel");
+  await expect(guide).toContainText("$ Skill shortcuts");
+  await expect(guide).toContainText("Type $ to search Skills currently added and enabled in MAIN.");
+  await expect(guide).toContainText("↑↓ to choose, Enter / Tab to insert, and Esc to close.");
+  await expect(guide).toContainText("Skills from disabled sources are excluded.");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null)).toBe(null);
+});
+
 for (const theme of ["light", "dark", "black"] as const) {
   test(`MAIN guide remains readable in ${theme} theme`, async ({ page }, testInfo) => {
     await page.goto("/?e2eScenario=composer-main-shortcuts");
@@ -63,6 +82,7 @@ for (const theme of ["light", "dark", "black"] as const) {
     const guide = page.getByTestId("main-onboarding-panel");
     await expect(guide).toBeVisible();
     await expect(guide).toHaveAttribute("data-theme-mode", theme);
+    await expect(guide).toContainText("$ 技能快捷菜单");
 
     const contrast = await guide.evaluate((node) => {
       const card = node.querySelector("[data-guide-card]") as HTMLElement | null;
@@ -94,6 +114,6 @@ for (const theme of ["light", "dark", "black"] as const) {
     expect(contrast.cardBackground).not.toBe("");
     expect(contrast.cardTitleColor).not.toBe("");
     expect(contrast.contrastRatio).toBeGreaterThanOrEqual(7);
-    await guide.screenshot({ path: testInfo.outputPath(`main-guide-${theme}.png`) });
+    await guide.screenshot({ path: testInfo.outputPath(`main-guide-${theme}.png`), animations: "disabled" });
   });
 }

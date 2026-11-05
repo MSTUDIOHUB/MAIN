@@ -1,3 +1,4 @@
+use base64::Engine;
 use futures_util::StreamExt;
 use regex::Regex;
 use reqwest::Response;
@@ -12,7 +13,7 @@ const MAX_SEARCH_RESULTS: usize = 8;
 const DEFAULT_MAX_CHARS: usize = 12_000;
 const MAX_FETCH_CHARS: usize = 30_000;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const USER_AGENT: &str = "MAIN/2.2 web-search (+https://github.com/)";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,9 +49,22 @@ pub struct WebFetchResponse {
     pub char_count: usize,
     pub truncated: bool,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<WebFetchRetrieval>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebFetchRetrieval {
+    pub usable: bool,
+    pub direct_error: String,
+    pub reader_status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_status: Option<u16>,
 }
 
 struct FetchedBody {
+    status: u16,
     final_url: String,
     content_type: String,
     text: String,
@@ -114,14 +128,27 @@ pub async fn web_search(
         }
     }
 
-    if results.is_empty()
-        && is_search_challenge(&attempt.provider, &attempt.source_url, &attempt.html)
-    {
-        return Err(
-            fallback_reason.unwrap_or_else(|| build_search_fallback_reason(&attempt, &results))
-        );
-    }
-    if results.is_empty() && fallback_reason.is_some() {
+    finalize_search_response(
+        query,
+        provider,
+        max_results,
+        attempt,
+        results,
+        fallback_provider,
+        fallback_reason,
+    )
+}
+
+fn finalize_search_response(
+    query: String,
+    provider: String,
+    max_results: usize,
+    attempt: SearchAttempt,
+    mut results: Vec<WebSearchResultItem>,
+    fallback_provider: Option<String>,
+    fallback_reason: Option<String>,
+) -> Result<WebSearchResponse, String> {
+    if results.is_empty() {
         return Err(
             fallback_reason.unwrap_or_else(|| build_search_fallback_reason(&attempt, &results))
         );
@@ -149,15 +176,15 @@ pub async fn web_fetch(url: String, max_chars: Option<usize>) -> Result<WebFetch
         return Ok(response);
     }
 
-    let (fetched, source) = match fetch_text(&requested_url, MAX_RESPONSE_BYTES).await {
-        Ok(body) => (body, "web"),
-        Err(primary_error) if primary_error.contains("NETWORK_GUARD_DENIED") => {
-            return Err(primary_error);
-        }
+    let (fetched, source, retrieval) = match fetch_text(&requested_url, MAX_RESPONSE_BYTES).await {
+        Ok(body) => (body, "web", None),
         Err(primary_error) => {
             let reader_url = jina_reader_url(&requested_url);
             match fetch_text(&reader_url, MAX_RESPONSE_BYTES).await {
-                Ok(body) => (body, "jina_reader"),
+                Ok(body) => {
+                    let retrieval = reader_retrieval(&body.text, body.status, primary_error);
+                    (body, "jina_reader", Some(retrieval))
+                }
                 Err(reader_error) => {
                     return Err(format!(
                         "Direct fetch failed: {primary_error}; Jina Reader fallback failed: {reader_error}"
@@ -185,14 +212,19 @@ pub async fn web_fetch(url: String, max_chars: Option<usize>) -> Result<WebFetch
     let truncated = fetched.truncated || char_truncated;
 
     Ok(WebFetchResponse {
+        final_url: if source == "jina_reader" {
+            reader_source_url(&fetched.text).unwrap_or_else(|| requested_url.clone())
+        } else {
+            fetched.final_url
+        },
         url: requested_url,
-        final_url: fetched.final_url,
         title,
         content,
         content_type: fetched.content_type,
         char_count,
         truncated,
         source: source.to_string(),
+        retrieval,
     })
 }
 
@@ -359,6 +391,7 @@ async fn fetch_text(url: &str, max_bytes: usize) -> Result<FetchedBody, String> 
     let (bytes, truncated) = read_limited_response(response, max_bytes).await?;
     let text = String::from_utf8_lossy(&bytes).to_string();
     Ok(FetchedBody {
+        status: status.as_u16(),
         final_url,
         content_type,
         text,
@@ -457,6 +490,34 @@ fn extract_jina_title(value: &str) -> String {
         .to_string()
 }
 
+fn reader_source_url(body: &str) -> Option<String> {
+    body.split("Markdown Content:")
+        .next()?
+        .lines()
+        .find_map(|line| {
+            validate_http_url(line.trim().strip_prefix("URL Source:")?.trim())
+                .ok()
+                .map(|url| url.to_string())
+        })
+}
+
+fn reader_retrieval(body: &str, reader_status: u16, direct_error: String) -> WebFetchRetrieval {
+    let metadata = body.split("Markdown Content:").next().unwrap_or("");
+    let status = Regex::new(r"(?im)^Warning: Target URL returned error ([0-9]{3})\b").unwrap();
+    let origin_status = status
+        .captures(metadata)
+        .and_then(|caps| caps[1].parse::<u16>().ok());
+    let content = body.split("Markdown Content:").nth(1).unwrap_or("").trim();
+    let has_origin_error = origin_status.map_or(false, |code| code >= 400);
+    let usable = reader_status == 200 && !has_origin_error && content.len() >= 80;
+    WebFetchRetrieval {
+        usable,
+        direct_error,
+        reader_status,
+        origin_status,
+    }
+}
+
 fn decode_html_entities(value: &str) -> String {
     let numeric = Regex::new(r"&#(x?[0-9A-Fa-f]+);").unwrap();
     let decoded = numeric.replace_all(value, |caps: &regex::Captures| {
@@ -527,14 +588,16 @@ fn parse_duckduckgo_results(html: &str) -> Vec<WebSearchResultItem> {
 fn parse_bing_results(html: &str) -> Vec<WebSearchResultItem> {
     let block_re =
         Regex::new(r#"(?is)<li[^>]+class=["'][^"']*b_algo[^"']*["'][^>]*>(.*?)</li>"#).unwrap();
+    let heading_re = Regex::new(r"(?is)<h2\b[^>]*>(.*?)</h2>").unwrap();
     let link_re = Regex::new(r#"(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
     let snippet_re = Regex::new(r#"(?is)<p[^>]*>(.*?)</p>"#).unwrap();
     block_re
         .captures_iter(html)
         .filter_map(|caps| {
             let block = caps.get(1)?.as_str();
-            let link = link_re.captures(block)?;
-            let url = cleanup_url(link.get(1)?.as_str());
+            let heading = heading_re.captures(block)?;
+            let link = link_re.captures(heading.get(1)?.as_str())?;
+            let url = normalize_bing_url(link.get(1)?.as_str())?;
             let title = cleanup_html_fragment(link.get(2)?.as_str());
             if title.is_empty() || url.is_empty() {
                 return None;
@@ -551,6 +614,24 @@ fn parse_bing_results(html: &str) -> Vec<WebSearchResultItem> {
             })
         })
         .collect()
+}
+
+fn normalize_bing_url(raw: &str) -> Option<String> {
+    let mut url = validate_http_url(&cleanup_url(raw)).ok()?;
+    let host = url.host_str().unwrap_or("");
+    if (host == "bing.com" || host.ends_with(".bing.com")) && url.path() == "/ck/a" {
+        let encoded = url
+            .query_pairs()
+            .find(|(key, _)| key == "u")?
+            .1
+            .into_owned();
+        let target = encoded.strip_prefix("a1").unwrap_or(&encoded);
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(target.trim_end_matches('='))
+            .ok()?;
+        url = validate_http_url(&String::from_utf8(bytes).ok()?).ok()?;
+    }
+    Some(url.to_string())
 }
 
 fn parse_baidu_results(html: &str) -> Vec<WebSearchResultItem> {
@@ -631,6 +712,7 @@ async fn fetch_github_url(
             char_count,
             truncated: fetched.truncated || char_truncated,
             source: "github_raw".to_string(),
+            retrieval: None,
         }));
     }
     if host != "github.com" {
@@ -668,6 +750,7 @@ async fn fetch_github_url(
             char_count,
             truncated: fetched.truncated || char_truncated,
             source: "github_blob".to_string(),
+            retrieval: None,
         }));
     }
 
@@ -771,6 +854,7 @@ async fn fetch_github_tree(
         char_count,
         truncated: fetched.truncated || char_truncated || tree.len() > lines.len(),
         source: "github_tree".to_string(),
+        retrieval: None,
     })
 }
 
@@ -788,9 +872,6 @@ pub async fn fetch_page_raw(url: &str) -> Result<WebFetchResponse, String> {
 
     let (fetched, source) = match fetch_text(&requested_url, MAX_RESPONSE_BYTES).await {
         Ok(body) => (body, "web"),
-        Err(primary_error) if primary_error.contains("NETWORK_GUARD_DENIED") => {
-            return Err(primary_error);
-        }
         Err(primary_error) => {
             let reader_url = jina_reader_url(&requested_url);
             match fetch_text(&reader_url, MAX_RESPONSE_BYTES).await {
@@ -830,6 +911,7 @@ pub async fn fetch_page_raw(url: &str) -> Result<WebFetchResponse, String> {
         char_count,
         truncated: fetched.truncated,
         source: source.to_string(),
+        retrieval: None,
     })
 }
 
@@ -883,6 +965,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bing_uses_title_anchor_and_real_destination_not_tracking_breadcrumbs() {
+        let html = r#"<li class="b_algo"><a href="https://www.bing.com/ck/a?p=crumb">example.com breadcrumb</a><h2><a href="https://www.bing.com/ck/a?p=one&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9zb3VyY2U&amp;ntb=1">Actual title</a></h2><p>Actual source snippet</p></li>"#;
+        let results = parse_bing_results(html);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Actual title");
+        assert_eq!(results[0].url, "https://example.com/source");
+        assert_eq!(results[0].snippet, "Actual source snippet");
+        assert!(normalize_bing_url("javascript:alert(1)").is_none());
+        assert!(normalize_bing_url("https://www.bing.com/ck/a?p=unresolved").is_none());
+    }
+
+    #[test]
+    fn reader_http_success_does_not_promote_error_or_unknown_origin_pages() {
+        let hard_error = "Title: Example\nURL Source: https://example.com/missing\nWarning: Target URL returned error 404: Not Found\nMarkdown Content:\nerror body";
+        let result = reader_retrieval(hard_error, 200, "direct HTTP failure".into());
+        assert!(!result.usable);
+        assert_eq!(result.origin_status, Some(404));
+        assert_eq!(result.direct_error, "direct HTTP failure");
+        assert_eq!(
+            reader_source_url(hard_error).as_deref(),
+            Some("https://example.com/missing")
+        );
+        // Incident shape: no origin status in the reader envelope. No model,
+        // website or language keyword may turn this into verified evidence.
+        let soft_error = "Title: Some page\nURL Source: https://example.com/missing\nMarkdown Content:\nanything";
+        assert!(!reader_retrieval(soft_error, 200, "direct failed".into()).usable);
+        assert!(reader_retrieval(soft_error, 200, "direct failed".into())
+            .origin_status
+            .is_none());
+    }
+
+    #[test]
+    fn reader_retrieval_marks_usable_when_success_and_sufficient_content() {
+        let content = "This is a legitimate article body fetched via Jina Reader. It has sufficient length and complete information for the reader.";
+        let valid = format!("Title: Valid Page\nURL Source: https://example.com/ok\nMarkdown Content:\n{content}");
+        let result = reader_retrieval(&valid, 200, "direct failed".into());
+        assert!(result.usable);
+        assert_eq!(result.origin_status, None);
+        assert_eq!(result.reader_status, 200);
+
+        // Reader status not 200 is not usable
+        let failed_reader = reader_retrieval(&valid, 500, "direct failed".into());
+        assert!(!failed_reader.usable);
+
+        // Origin error 500 is not usable
+        let origin_error = format!("Title: Page\nURL Source: https://example.com/err\nWarning: Target URL returned error 500: Server Error\nMarkdown Content:\n{content}");
+        let result_500 = reader_retrieval(&origin_error, 200, "direct failed".into());
+        assert!(!result_500.usable);
+        assert_eq!(result_500.origin_status, Some(500));
+    }
+
+    #[test]
     fn validates_only_http_urls() {
         assert!(validate_http_url("https://example.com/path").is_ok());
         assert!(validate_http_url("http://example.com/path").is_ok());
@@ -914,6 +1048,125 @@ mod tests {
         assert_eq!(results[0].title, "Example & Result");
         assert_eq!(results[0].url, "https://example.com/a");
         assert_eq!(results[0].snippet, "Short summary");
+    }
+
+    #[test]
+    fn empty_selected_provider_pages_return_failure_without_fallback() {
+        let html = r#"<html><head><title>Search results</title></head><body><main><p>No matching documents.</p></main></body></html>"#;
+        for provider in ["bing", "duckduckgo", "baidu"] {
+            let attempt = SearchAttempt {
+                provider: provider.to_string(),
+                source_url: search_url(provider, "missing result"),
+                html: html.to_string(),
+                truncated: false,
+            };
+            let results = parse_search_results(provider, &attempt.html);
+            assert!(results.is_empty());
+            assert!(!is_search_challenge(
+                provider,
+                &attempt.source_url,
+                &attempt.html
+            ));
+            let source_url = attempt.source_url.clone();
+            let error = finalize_search_response(
+                "missing result".to_string(),
+                provider.to_string(),
+                5,
+                attempt,
+                results,
+                None,
+                None,
+            )
+            .expect_err("an empty selected-provider page is failed search evidence");
+            assert!(error.contains("no parseable results"));
+            assert!(error.contains(provider));
+            assert!(error.contains(&source_url));
+        }
+    }
+
+    #[test]
+    fn search_finalization_keeps_challenge_and_exhausted_fallback_reasons() {
+        let challenge = SearchAttempt {
+            provider: "duckduckgo".to_string(),
+            source_url: search_url("duckduckgo", "query"),
+            html: "<form class=\"challenge-form\">Verify you are human</form>".to_string(),
+            truncated: false,
+        };
+        let results = parse_search_results(&challenge.provider, &challenge.html);
+        let error = finalize_search_response(
+            "query".to_string(),
+            "duckduckgo".to_string(),
+            5,
+            challenge,
+            results,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("anti-bot verification"));
+
+        let empty = SearchAttempt {
+            provider: "bing".to_string(),
+            source_url: search_url("bing", "query"),
+            html: "<main><p>No results</p></main>".to_string(),
+            truncated: false,
+        };
+        let results = parse_search_results(&empty.provider, &empty.html);
+        let reason = "bing returned no parseable results; fallback provider duckduckgo failed";
+        let error = finalize_search_response(
+            "query".to_string(),
+            "bing".to_string(),
+            5,
+            empty,
+            results,
+            None,
+            Some(reason.to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(error, reason);
+    }
+
+    #[test]
+    fn search_finalization_keeps_selected_provider_and_explicit_fallback_metadata() {
+        let html = r#"
+          <a class="result__a" href="https://example.com/first">First result</a>
+          <a class="result__snippet">First snippet</a>
+          <a class="result__a" href="https://example.com/second">Second result</a>
+        "#;
+        for fallback_provider in [None, Some("duckduckgo".to_string())] {
+            let selected_provider = if fallback_provider.is_some() {
+                "bing"
+            } else {
+                "duckduckgo"
+            };
+            let fallback_reason = fallback_provider
+                .as_ref()
+                .map(|_| "bing returned no parseable results".to_string());
+            let attempt = SearchAttempt {
+                provider: "duckduckgo".to_string(),
+                source_url: search_url("duckduckgo", "query"),
+                html: html.to_string(),
+                truncated: false,
+            };
+            let results = parse_search_results(&attempt.provider, &attempt.html);
+            let response = finalize_search_response(
+                "query".to_string(),
+                selected_provider.to_string(),
+                1,
+                attempt,
+                results,
+                fallback_provider.clone(),
+                fallback_reason.clone(),
+            )
+            .unwrap();
+            assert_eq!(response.provider, selected_provider);
+            assert_eq!(response.fallback_provider, fallback_provider);
+            assert_eq!(response.fallback_reason, fallback_reason);
+            assert_eq!(response.source_url, search_url("duckduckgo", "query"));
+            assert_eq!(response.results.len(), 1);
+            assert_eq!(response.results[0].url, "https://example.com/first");
+            assert!(response.truncated);
+        }
     }
 
     #[test]

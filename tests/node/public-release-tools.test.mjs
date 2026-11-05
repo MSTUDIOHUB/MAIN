@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import YAML from "yaml";
 
 import {
   collectPublicReleaseArtifacts,
@@ -13,6 +15,7 @@ import {
   writeUpdaterManifest,
 } from "../../scripts/release_tools.mjs";
 import { resolveReleaseMacVersion } from "../../scripts/release-mac.mjs";
+import { writeReleaseNotes } from "../../scripts/release-local.mjs";
 
 const temporaryRoots = new Set();
 
@@ -205,6 +208,7 @@ test("writeUpdaterManifest writes local updater entries and preserves existing p
   );
 
   const result = await writeUpdaterManifest({
+    rootDir,
     assetsDir,
     version,
     updateRepo: "mstudiohub/MAIN-UpdateFeed",
@@ -259,6 +263,7 @@ test("writeUpdaterManifest can preserve existing notes for asset-only platform u
   );
 
   const result = await writeUpdaterManifest({
+    rootDir,
     assetsDir,
     version,
     updateRepo: "mstudiohub/MAIN-UpdateFeed",
@@ -273,4 +278,177 @@ test("writeUpdaterManifest can preserve existing notes for asset-only platform u
   assert.equal(manifest.platforms["darwin-aarch64"].signature, "mac-signature");
   assert.equal(manifest.platforms["windows-x86_64"].signature, "windows-signature");
   assert.equal(manifest.platforms["windows-x86_64-nsis"].signature, "windows-signature");
+});
+
+async function writeArchivedNotes(rootDir, version, text) {
+  const directory = path.join(rootDir, "docs", "releases");
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, `Release_Notes_${version}_ZH.md`), text, "utf8");
+}
+
+async function writePublicArtifact(rootDir, version) {
+  const directory = path.join(rootDir, "src-tauri", "target", "release", "portable");
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, `MAIN-${version}-windows-portable.exe`), "portable");
+}
+
+async function writeWindowsUpdater(assetsDir, version) {
+  await fs.mkdir(assetsDir, { recursive: true });
+  const updaterPath = path.join(assetsDir, `MAIN_${version}_updater_windows_x86_64.exe`);
+  await fs.writeFile(updaterPath, "windows updater bytes");
+  await fs.writeFile(`${updaterPath}.sig`, "new-windows-signature\n");
+}
+
+test("public staging and a merged updater publish the same exact authored notes", async () => {
+  const rootDir = await createTempWorkspace();
+  const version = "1.2.3";
+  const authored = "# MAIN 1.2.3\r\n\r\n修复与功能说明。  \r\n\r\n";
+  await writeArchivedNotes(rootDir, version, authored);
+  await writeArchivedNotes(rootDir, "1.2.2", "WRONG_VERSION_NOTES");
+  await writePublicArtifact(rootDir, version);
+  const staged = await preparePublicRelease({ rootDir, version, publicRepo: "owner/releases" });
+  assert.equal(await fs.readFile(staged.notesPath, "utf8"), authored);
+  await writeWindowsUpdater(staged.assetsDir, version);
+  const existingManifestPath = path.join(rootDir, "existing.json");
+  const preservedMac = { signature: "preserved-mac-signature", url: "https://example.invalid/mac.tar.gz" };
+  await fs.writeFile(existingManifestPath, JSON.stringify({ version, notes: "OLD_INCORRECT_NOTES", platforms: {
+    "darwin-aarch64": preservedMac, "darwin-aarch64-app": preservedMac,
+  } }));
+  await fs.writeFile(staged.notesPath, "STALE_STAGED_NOTES");
+  const result = await writeUpdaterManifest({ rootDir, assetsDir: staged.assetsDir, version,
+    updateRepo: "owner/updates", notesPath: staged.notesPath, existingManifestPath, preserveExistingNotes: true });
+  const manifest = JSON.parse(await fs.readFile(result.outputPath, "utf8"));
+  assert.equal(manifest.notes, authored, "an asset-only Windows merge cannot preserve incorrect notes over the archive");
+  assert.equal(await fs.readFile(staged.notesPath, "utf8"), authored);
+  assert.deepEqual(manifest.platforms["darwin-aarch64"], preservedMac);
+  assert.deepEqual(manifest.platforms["darwin-aarch64-app"], preservedMac);
+  assert.equal(manifest.platforms["windows-x86_64"].signature, "new-windows-signature");
+  assert.deepEqual(manifest.platforms["windows-x86_64-nsis"], manifest.platforms["windows-x86_64"]);
+  assert.doesNotMatch(JSON.stringify(manifest), /WRONG_VERSION_NOTES|OLD_INCORRECT_NOTES|STALE_STAGED_NOTES/);
+});
+
+test("an empty authored archive rejects staging and manifest generation without replacing prior outputs", async () => {
+  for (const authored of ["", " \r\n\t\n"]) {
+    const rootDir = await createTempWorkspace();
+    const version = "1.1.1";
+    await writeArchivedNotes(rootDir, version, authored);
+    await writePublicArtifact(rootDir, version);
+    const stageDir = path.join(rootDir, "release-output", "public", `v${version}`);
+    await fs.mkdir(stageDir, { recursive: true });
+    const sentinel = path.join(stageDir, "previous-output.txt");
+    await fs.writeFile(sentinel, "previous output");
+    await assert.rejects(preparePublicRelease({ rootDir, version, publicRepo: "owner/releases" }), /empty.*release notes|release notes.*empty/i);
+    assert.equal(await fs.readFile(sentinel, "utf8"), "previous output");
+    const assetsDir = path.join(rootDir, "release-assets");
+    await writeWindowsUpdater(assetsDir, version);
+    const notesPath = path.join(assetsDir, "release_notes.md");
+    await fs.writeFile(notesPath, "previous notes");
+    await assert.rejects(writeUpdaterManifest({ rootDir, assetsDir, version, updateRepo: "owner/updates", notesPath }), /empty.*release notes|release notes.*empty/i);
+    assert.equal(await fs.readFile(notesPath, "utf8"), "previous notes");
+    await assert.rejects(fs.access(path.join(assetsDir, "latest.json")), { code: "ENOENT" });
+  }
+});
+
+test("release notes cannot read a different version or accept path-shaped versions", async () => {
+  const rootDir = await createTempWorkspace();
+  await writeArchivedNotes(rootDir, "1.1.0", "WRONG_ARCHIVE");
+  await writePublicArtifact(rootDir, "1.1.1");
+  const staged = await preparePublicRelease({ rootDir, version: "1.1.1", publicRepo: "owner/releases" });
+  const notes = await fs.readFile(staged.notesPath, "utf8");
+  assert.match(notes, /MAIN 1\.1\.1/);
+  assert.match(notes, /TODO: summarize/);
+  assert.doesNotMatch(notes, /WRONG_ARCHIVE/);
+  await writeWindowsUpdater(staged.assetsDir, "1.1.1");
+  for (const version of ["../1.1.0", "1.1.1/../../outside", ""]) {
+    await assert.rejects(preparePublicRelease({ rootDir, version, publicRepo: "owner/releases" }), /Unsupported app version/);
+    await assert.rejects(writeUpdaterManifest({ rootDir, assetsDir: staged.assetsDir, version, updateRepo: "owner/updates", notesPath: staged.notesPath }), /Unsupported app version/);
+  }
+});
+
+test("an updater merge cannot import another version's notes or platform signatures", async () => {
+  const rootDir = await createTempWorkspace();
+  const version = "1.1.1";
+  const authored = "# MAIN 1.1.1\nExact current release notes.\n";
+  await writeArchivedNotes(rootDir, version, authored);
+  const assetsDir = path.join(rootDir, "release-assets");
+  await writeWindowsUpdater(assetsDir, version);
+  const notesPath = path.join(assetsDir, "release_notes.md");
+  await fs.writeFile(notesPath, "outdated generated notes");
+  const existingManifestPath = path.join(rootDir, "existing.json");
+  await fs.writeFile(existingManifestPath, JSON.stringify({ version: "1.1.0", notes: "WRONG_VERSION_NOTES",
+    platforms: { "darwin-aarch64": { signature: "WRONG_VERSION_SIGNATURE", url: "https://example.invalid/old" } } }));
+  const result = await writeUpdaterManifest({ rootDir, assetsDir, version, updateRepo: "owner/updates",
+    notesPath, existingManifestPath, preserveExistingNotes: true });
+  const manifest = JSON.parse(await fs.readFile(result.outputPath, "utf8"));
+  assert.equal(manifest.notes, authored);
+  assert.deepEqual(Object.keys(manifest.platforms).sort(), ["windows-x86_64", "windows-x86_64-nsis"]);
+  assert.doesNotMatch(JSON.stringify(manifest), /WRONG_VERSION/);
+});
+
+test("local release generation and its updater use exact authored notes without reading git history", async () => {
+  const rootDir = await createTempWorkspace();
+  const version = "1.1.1";
+  const authored = "# MAIN 1.1.1\r\n\r\n完整发布说明。  \r\n\r\n";
+  await writeArchivedNotes(rootDir, version, authored);
+  const assetsDir = path.join(rootDir, "release-assets");
+  await writeWindowsUpdater(assetsDir, version);
+  const notesPath = path.join(assetsDir, "release_notes.md");
+  assert.deepEqual(await writeReleaseNotes({ rootDir, version, outputPath: notesPath }), { authored: true });
+  assert.equal(await fs.readFile(notesPath, "utf8"), authored);
+  const result = await writeUpdaterManifest({ rootDir, assetsDir, version, updateRepo: "owner/updates", notesPath });
+  assert.equal(JSON.parse(await fs.readFile(result.outputPath, "utf8")).notes, authored);
+});
+
+test("local release fallback remains version-specific and a blank archive never falls back", async () => {
+  const rootDir = await createTempWorkspace();
+  const version = "1.1.1";
+  const notesPath = path.join(rootDir, "release_notes.md");
+  await writeArchivedNotes(rootDir, "1.1.0", "WRONG_VERSION_NOTES");
+  execFileSync("git", ["init", "-q"], { cwd: rootDir });
+  execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+    "commit", "--allow-empty", "-qm", "Fallback release fixture change"], { cwd: rootDir });
+  assert.deepEqual(await writeReleaseNotes({ rootDir, version, outputPath: notesPath }), { authored: false });
+  const fallback = await fs.readFile(notesPath, "utf8");
+  assert.match(fallback, /MAIN 1\.1\.1/);
+  assert.match(fallback, /Fallback release fixture change/);
+  assert.doesNotMatch(fallback, /WRONG_VERSION_NOTES/);
+  await writeArchivedNotes(rootDir, version, " \n\t");
+  await assert.rejects(writeReleaseNotes({ rootDir, version, outputPath: notesPath }), /Empty authored release notes/);
+  assert.equal(await fs.readFile(notesPath, "utf8"), fallback);
+  await assert.rejects(writeReleaseNotes({ rootDir, version: "../../outside", outputPath: notesPath }), /Unsupported app version/);
+});
+
+test("desktop Actions generation preserves the same canonical notes in its actual updater manifest", async () => {
+  const workflow = YAML.parse(await fs.readFile(new URL("../../.github/workflows/build-desktop.yml", import.meta.url), "utf8"));
+  const steps = Object.values(workflow.jobs).flatMap((job) => job.steps);
+  const notesStep = steps.find((step) => step.name === "Generate release notes");
+  const manifestStep = steps.find((step) => step.name === "Generate updater manifest");
+  const rootDir = await createTempWorkspace();
+  const version = "1.1.1";
+  const authored = "# MAIN 1.1.1\r\n\r\n完整 Actions 说明。  \r\n\r\n";
+  await writeArchivedNotes(rootDir, version, authored);
+  await writeArchivedNotes(rootDir, "1.1.0", "WRONG_VERSION_NOTES");
+  await fs.mkdir(path.join(rootDir, "scripts"), { recursive: true });
+  await fs.copyFile(new URL("../../scripts/release_tools.mjs", import.meta.url), path.join(rootDir, "scripts", "release_tools.mjs"));
+  const assetsDir = path.join(rootDir, "release-assets");
+  await writeWindowsUpdater(assetsDir, version);
+  for (const architecture of ["x86_64", "aarch64"]) {
+    const file = path.join(assetsDir, `MAIN_${version}_updater_darwin_${architecture}.app.tar.gz`);
+    await fs.writeFile(file, `${architecture} bytes`);
+    await fs.writeFile(`${file}.sig`, `${architecture}-signature\n`);
+  }
+  const options = { cwd: rootDir, env: { ...process.env, VERSION: version, APP_NAME: "MAIN", UPDATE_REPO: "owner/updates" }, stdio: "pipe" };
+  execFileSync("bash", ["-c", notesStep.run], options);
+  const notesPath = path.join(assetsDir, "release_notes.md");
+  assert.equal(await fs.readFile(notesPath, "utf8"), authored);
+  execFileSync("bash", ["-c", manifestStep.run], options);
+  const manifest = JSON.parse(await fs.readFile(path.join(assetsDir, "latest.json"), "utf8"));
+  assert.equal(manifest.notes, authored);
+  assert.equal(manifest.platforms["darwin-aarch64"].signature, "aarch64-signature");
+  assert.equal(manifest.platforms["darwin-x86_64"].signature, "x86_64-signature");
+  assert.equal(manifest.platforms["windows-x86_64"].signature, "new-windows-signature");
+  await writeArchivedNotes(rootDir, version, " \n\t");
+  assert.throws(() => execFileSync("bash", ["-c", notesStep.run], options));
+  assert.equal(await fs.readFile(notesPath, "utf8"), authored);
+  assert.throws(() => execFileSync("bash", ["-c", notesStep.run], { ...options, env: { ...options.env, VERSION: "../../outside" } }));
 });

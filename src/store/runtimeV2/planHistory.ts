@@ -1,4 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 import type { RuntimeV2RunIdentity, TurnAggregateV1, WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
 
 /** Rebuild the Plan transcript and its evidence index from the sole ledger.
@@ -16,6 +17,8 @@ export function restorePlanHistory(input: {
   const responses = events.filter((event) => event.type === "provider.responded");
   const nextResponseSequence = new Map(responses.map((event, index) => [event.sequence, responses[index + 1]?.sequence ?? Infinity]));
   for (const event of events) {
+    const reply = runtimeV2ClarificationMessage(event);
+    if (reply) input.messages.push(reply);
     if (event.type === "provider.responded") {
       const calls = event.result.toolCalls;
       input.messages.push({ role: "assistant", content: event.result.visibleText || "",

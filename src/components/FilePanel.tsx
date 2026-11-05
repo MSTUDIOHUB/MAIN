@@ -16,6 +16,7 @@ import {
 } from "./Icons";
 import MarkdownRenderer from "./MarkdownRenderer";
 import WorkspaceTreePanel from "./WorkspaceTreePanel";
+import ToggleSwitch from "./ToggleSwitch";
 import { useAppStore } from "../store/useAppStore";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import { getFileMetadata } from "../lib/ipc";
@@ -661,14 +662,10 @@ function FileViewerPanel({
             </button>
           </div>
         )}
-        <button
-          type="button"
-          onClick={() => setWrapLines((value) => !value)}
-          className="rounded-full border px-3 py-1 text-[10px] font-semibold transition-opacity hover:opacity-75"
-          style={wrapLines ? activeButtonStyle : buttonBaseStyle}
-        >
-          {uiLanguage === "zh" ? "自动换行" : "Wrap"}
-        </button>
+        <label className="flex items-center gap-2 text-[10px] font-semibold" style={{ color: palette.muted }}>
+          <span>{uiLanguage === "zh" ? "自动换行" : "Wrap"}</span>
+          <ToggleSwitch checked={wrapLines} onCheckedChange={setWrapLines} aria-label={uiLanguage === "zh" ? "自动换行" : "Wrap"} />
+        </label>
         <button
           type="button"
           onClick={handleCopy}

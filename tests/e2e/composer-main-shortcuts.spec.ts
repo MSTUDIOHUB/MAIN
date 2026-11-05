@@ -34,6 +34,20 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test("the Web Search panel uses a switch while its compact toolbar entrance remains a button", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+  const toolbar = page.getByTestId("composer-web-search-toggle");
+  if (await toolbar.getAttribute("aria-pressed") === "true") await toolbar.click();
+  await toolbar.click();
+  const enabled = page.getByRole("switch", { name: "网络搜索", exact: true });
+  await expect(enabled).toHaveAttribute("aria-checked", "true");
+  await enabled.press("Space");
+  await expect(enabled).toHaveCount(0);
+  await expect(toolbar).toHaveAttribute("aria-pressed", "false");
+  await toolbar.click();
+  await expect(page.getByRole("switch", { name: "网络搜索", exact: true })).toHaveAttribute("aria-checked", "true");
+});
+
 test("composer keeps a two-line minimum height and grows until it scrolls", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 

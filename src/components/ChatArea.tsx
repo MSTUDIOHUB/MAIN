@@ -103,6 +103,7 @@ import {
 } from "../lib/pendingToolReview";
 import {
   getToolPermissionResolutionIdentity,
+  isExactToolPermissionResolutionIdentity,
   shouldRenderPermissionCapsule,
 } from "../lib/actionRequest";
 import {
@@ -1796,14 +1797,16 @@ function liveTimelineContainsProcessText(model: ReturnType<typeof buildLiveTurnP
 }
 
 function getArchiveStepStatusLabel(step: TurnArchiveStep, language: "zh" | "en") {
+  if (step.status === "not_executed") return language === "zh" ? "未执行" : "Not executed";
+  if (step.status === "blocked") return language === "zh" ? "被阻止" : "Blocked";
   if (language === "en") {
     if (step.status === "running") return "Running";
-    if (step.status === "failed") return "Failed";
+    if (step.status === "failed") return "Execution failed";
     if (step.status === "rejected") return "Rejected";
     return "Done";
   }
   if (step.status === "running") return "进行中";
-  if (step.status === "failed") return "失败";
+  if (step.status === "failed") return "执行失败";
   if (step.status === "rejected") return "拒绝";
   return "完成";
 }
@@ -1930,7 +1933,7 @@ function TurnArchiveStepCard({
       : language === "zh" ? "查看证据" : "Show evidence";
   const targetText = step.targets.slice(0, 3).join(language === "zh" ? "、" : ", ");
   const hiddenTargetCount = Math.max(0, step.targets.length - 3);
-  const primaryText = (isLive && step.intent) ? step.intent : step.activity?.title || step.intent;
+  const primaryText = step.activity?.title || step.intent;
   const activitySummary = step.activity?.summary || "";
   const shouldShowTargetSummary = targetText && !primaryText.includes(targetText) && !activitySummary.includes(targetText);
   const summaryText = activitySummary || (step.summary
@@ -3247,6 +3250,25 @@ export default function ChatArea({
     requestId: permissionResolutionIdentity?.requestId,
     taskId: pendingReviewTaskId,
   });
+  const handleCancelPendingToolReview = useCallback(() => {
+    const current = useAppStore.getState();
+    const marker = current.harnessRunMarker;
+    if (
+      !permissionResolutionIdentity ||
+      !isExactToolPermissionResolutionIdentity(current.activeActionRequest, permissionResolutionIdentity) ||
+      current.currentTurnId !== permissionResolutionIdentity.turnId ||
+      marker?.sessionKey !== permissionResolutionIdentity.sessionKey ||
+      !shouldRenderPermissionCapsule({
+        request: current.activeActionRequest,
+        sessionKey: current.getCurrentSessionKey() || "",
+        turnId: marker?.status === "running" ? marker.turnId : null,
+        runId: marker?.status === "running" ? getHarnessActionRunId(marker) : null,
+        requestId: permissionResolutionIdentity.requestId,
+        taskId: current.pendingReviewTaskId,
+      })
+    ) return;
+    onStopGeneration();
+  }, [onStopGeneration, permissionResolutionIdentity]);
   const capsuleControlTurnStatusKey = capsuleControlTurnVisibleStatus || capsuleControlTurn?.status || null;
   const capsuleControlIsRunActive =
     agentStatus === "running" &&
@@ -3563,10 +3585,13 @@ export default function ChatArea({
             toolName={block.toolName}
             target={block.target}
             toolStatus={block.toolStatus}
+            toolOutcome={block.toolOutcome}
+            diagnosticDetails={block.diagnosticDetails}
             message={block.message}
             diff={block.diff}
             shellPermissionDecision={block.shellPermissionDecision}
             permissionRisk={blockPermissionIdentity ? permissionActionRequest?.risk : undefined}
+            permissionApprovalRequiredCapability={blockPermissionIdentity ? permissionActionRequest?.approvalRequiredCapability : undefined}
             intentSummary={block.intentSummary}
             why={block.why}
             evidence={block.evidence}
@@ -3575,6 +3600,7 @@ export default function ChatArea({
               ? () => allowToolAction?.(block.id, blockPermissionIdentity)
               : undefined}
             onAllowForSession={blockPermissionIdentity
+              && !permissionActionRequest?.approvalRequiredCapability
               ? () => approvePendingReviewForSession?.(blockPermissionIdentity)
               : undefined}
             onReject={blockPermissionIdentity
@@ -3781,7 +3807,7 @@ export default function ChatArea({
       }
       if (block.type === "tool") {
         const status = String(block.toolStatus || block.status || "").toLowerCase();
-        return status === "executed" || status === "running";
+        return ["executed", "running", "failed", "error", "rejected"].includes(status);
       }
       return false;
     });
@@ -4590,6 +4616,7 @@ export default function ChatArea({
       requestId={permissionActionRequest?.requestId || undefined}
       permissionIdentity={permissionResolutionIdentity || undefined}
       permissionRisk={permissionActionRequest?.risk}
+      permissionApprovalRequiredCapability={permissionActionRequest?.approvalRequiredCapability}
       permissionToolName={permissionActionRequest?.toolName}
       permissionTarget={permissionActionRequest?.target}
       permissionArgumentDisclosure={pendingToolArgumentDisclosure}
@@ -4610,7 +4637,7 @@ export default function ChatArea({
       pendingToolReview={pendingToolReviewForExecutionCapsule}
       canApprovePlan={false}
       autoApproveTools={autoApproveTools}
-      onCancelTurn={onStopGeneration}
+      onCancelTurn={pendingToolReviewForExecutionCapsule ? handleCancelPendingToolReview : onStopGeneration}
       onApprovePlan={approvePlan}
       onRejectPlan={rejectPlan}
       onRejectDiff={(identity) => rejectToolAction?.(identity.taskId, identity)}

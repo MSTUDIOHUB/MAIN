@@ -5,6 +5,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 
 import ts from "typescript";
+import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 
 const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
@@ -20,7 +21,8 @@ async function loadCommonJs(relativePath, dependencies = {}) {
     fileName: sourcePath,
   }).outputText;
   const module = { exports: {} };
-  const localRequire = (id) => Object.hasOwn(dependencies, id) ? dependencies[id] : require(id);
+  const localRequire = (id) => Object.hasOwn(dependencies, id) ? dependencies[id]
+    : id === "./runtime-v2/checkpoint" ? createTsModuleLoader()("src/lib/runtime-v2/checkpoint.ts") : require(id);
   const factory = new Function("exports", "module", "require", transpiled);
   factory(module.exports, module, localRequire);
   return module.exports;
@@ -51,6 +53,7 @@ async function loadIpcWithInvoke(invoke, coordinatorOptions = null) {
       }
     : projectSessionMutationCoordinator;
   return loadCommonJs("src/lib/ipc.ts", {
+    "./runtime-v2/checkpoint": createTsModuleLoader()("src/lib/runtime-v2/checkpoint.ts"),
     "@tauri-apps/api/core": { invoke },
     "@tauri-apps/api/event": {
       listen: async () => () => {},

@@ -239,7 +239,7 @@ function isRuntimeMetricEvent(event) {
     event.event.startsWith("store.runtime_v2_");
 }
 
-function recordToolName(run, name, iteration) {
+function recordToolName(run, name, iteration, commandKind = null) {
   if (!name) {
     run.unclassifiedToolCalls += 1;
     return;
@@ -252,9 +252,10 @@ function recordToolName(run, name, iteration) {
       run.firstMutationIteration = iteration;
     }
   }
-  if (VALIDATION_TOOL_NAMES.has(name)) run.validationToolCalls += 1;
+  if (commandKind ? commandKind === "execute_validation" : VALIDATION_TOOL_NAMES.has(name)) run.validationToolCalls += 1;
 }
 
+const publishedFinalProjectionIds = new WeakMap();
 function applyEventToRun(run, event) {
   const { payload } = event;
   run.endedAt = event.timestamp;
@@ -402,6 +403,7 @@ function applyEventToRun(run, event) {
       run,
       name,
       run.providerRequests || run.totalToolCalls,
+      asString(payload.commandKind) || "execute_tool",
     );
   }
   if (
@@ -538,6 +540,16 @@ function applyEventToRun(run, event) {
     );
   }
   if (event.event === "store.runtime_v2_projection_published") {
+    if (payload.audience === "final" && payload.finalProjectionId) {
+      const ids = publishedFinalProjectionIds.get(run) || new Set();
+      if (ids.has(payload.finalProjectionId)) return;
+      ids.add(payload.finalProjectionId);
+      publishedFinalProjectionIds.set(run, ids);
+    }
+    if (payload.audience === "final" && payload.resultKind) {
+      run.terminalResultKind = asString(payload.resultKind);
+      run.terminalReason = asString(payload.reason);
+    }
     incrementCounter(
       run.projections,
       `${asString(payload.audience) || "unknown"}:${asString(payload.storeDisposition) || "unknown"}`,

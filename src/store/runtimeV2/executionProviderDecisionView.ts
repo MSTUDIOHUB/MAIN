@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
+import { boundRuntimeMessageGroupsToInputBudget } from "../../lib/runtimeContextBudget";
+import { computeContextBudgets, estimateMessagesTokens, type TrimMessage } from "../../lib/contextTrim";
 import type { RuntimeV2ProviderEffectFacts } from "./executionProviderEffectFacts";
 import {
   RUNTIME_V2_CONTEXT_ANCHOR_PREFIX,
@@ -16,6 +17,10 @@ import {
   minimumSourceWindowCover,
   sourceWindowsExtendContinuousCoverage,
 } from "./executionProviderSourceCover";
+import {
+  activeRuntimeV2SkillGuidanceWindows,
+  runtimeV2EvictedSkillGuidanceNotice,
+} from "./executionProviderSkillTranscript";
 
 const RUNTIME_V2_PROVIDER_FEEDBACK_PREFIX =
   "[runtime-v2 provider feedback:";
@@ -455,6 +460,10 @@ function runtimeDecisionAnchorIndices(
       )
     ) {
       selected.add(index);
+      const draft = messages[index - 1];
+      if (draft?.role === "assistant" && !draft.tool_calls?.length) {
+        selected.add(index - 1);
+      }
       break;
     }
   }
@@ -589,6 +598,7 @@ export function buildRuntimeV2DecisionView(
   })();
   const selectedCallIds = new Set([
     ...activeSourceCallIds,
+    ...activeRuntimeV2SkillGuidanceWindows(messages).map((window) => window.callId),
     ...[...latestCommittedCallIdByTarget.values()]
       .map((entry) => entry.callId),
     ...(latestFailedValidation
@@ -649,20 +659,37 @@ export function buildRuntimeV2DecisionView(
 }
 
 /**
- * Build the semantic decision view first. The shared token budget is only a
- * final hard-cap guard for genuinely large current facts, never the target
- * size of the model's working set.
+ * Canonical history remains verbatim while it fits. Under real input pressure,
+ * select the semantic workset and evict complete groups without cropping bytes.
  */
 export function boundRuntimeV2ProviderConversation(
   messages: readonly AgentMessage[],
   options: {
     readonly contextLimit: number;
     readonly reservedOutputTokens: number;
+    readonly inputBudget?: number;
   },
   effects?: RuntimeV2ProviderEffectFacts,
 ): AgentMessage[] {
-  return boundRuntimeMessagesToContext(
-    buildRuntimeV2DecisionView(messages, effects),
-    options,
-  );
+  const inputBudget = options.inputBudget ?? computeContextBudgets(
+    options.contextLimit, options.reservedOutputTokens,
+  ).inputBudget;
+  if (estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
+  const decision = buildRuntimeV2DecisionView(messages, effects);
+  const guidance = activeRuntimeV2SkillGuidanceWindows(decision);
+  const priorityToolCallIds = new Set(guidance.map((window) => window.callId));
+  const evictedIds = new Set<string>();
+  // A notice consumes input tokens too. Recompute from the same canonical
+  // projection until every newly evicted window is represented. The set grows
+  // monotonically and contains only the finite actually-read guidance set.
+  while (true) {
+    const evicted = guidance.filter((window) => evictedIds.has(window.callId));
+    const candidates = evicted.length
+      ? [...decision, runtimeV2EvictedSkillGuidanceNotice(evicted)] : decision;
+    const bounded = boundRuntimeMessageGroupsToInputBudget(candidates, inputBudget, { priorityToolCallIds });
+    const visibleIds = new Set(bounded.flatMap((message) => message.tool_calls?.map((call) => call.id) || []));
+    const newlyEvicted = guidance.filter((window) => !visibleIds.has(window.callId) && !evictedIds.has(window.callId));
+    if (!newlyEvicted.length) return bounded;
+    for (const window of newlyEvicted) evictedIds.add(window.callId);
+  }
 }
