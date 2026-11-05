@@ -16,6 +16,8 @@ import { filterToCoreAndUnlockedTools } from "../../lib/toolSearch";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
+  deriveRuntimeV2ExecutionContract,
+  runtimeV2ExecutionContractMutationTargets,
 } from "./executionContract";
 import type {
   RuntimeV2ExecutionPortsInput,
@@ -142,7 +144,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const executeCandidates = input.available.filter((definition) => {
     const name = definition.function.name;
     if (name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) {
-      return false;
+      return true;
     }
     return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
       RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
@@ -154,24 +156,87 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       collaboration.has(name);
   });
 
-  return filterToCoreAndUnlockedTools(executeCandidates, {
+  const selected = filterToCoreAndUnlockedTools(executeCandidates, {
     sessionKey,
     prompt: objectiveText,
-    alwaysInclude: collaboration,
+    alwaysInclude: new Set([...collaboration, RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME]),
+  });
+  const contract = deriveRuntimeV2ExecutionContract(aggregate);
+  return selected.map((definition) => {
+    if (contract && isWorkspaceMutationToolName(definition.function.name) && definition.function.parameters.properties?.path) {
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          parameters: {
+            ...definition.function.parameters,
+            properties: {
+              ...definition.function.parameters.properties,
+              path: { ...definition.function.parameters.properties.path, enum: runtimeV2ExecutionContractMutationTargets(contract) },
+            },
+          },
+        },
+      };
+    }
+    if (definition.function.name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
+      aggregate?.objective.acceptanceEvidenceRequirements?.some(requirement =>
+        requirement === "behavioral" || requirement === "interaction"
+      )) {
+      return {
+        ...definition,
+        function: {
+          ...definition.function,
+          description: `${definition.function.description} The admitted objective requires behavioral acceptance: build, lint, and typecheck alone are invalid.`,
+          parameters: {
+            ...definition.function.parameters,
+            required: [...new Set([...(definition.function.parameters.required || []), "behavioral_validation"])],
+          },
+        },
+      };
+    }
+    if (mode !== "validate" || definition.function.name !== "run_command") return definition;
+    const sealedCommand = input.actionWindow === "validation_handoff"
+      ? String(input.correctiveValidationCommand || "").trim()
+      : "";
+    return {
+      ...definition,
+      function: {
+        ...definition.function,
+        description: `${definition.function.description} Still-needed authorized ordinary shell actions remain available; they do not discharge file validation debt.`,
+        ...(sealedCommand ? {
+          parameters: {
+            ...definition.function.parameters,
+            properties: {
+              ...definition.function.parameters.properties,
+              command: {
+                ...(definition.function.parameters.properties?.command || {}),
+                enum: [sealedCommand],
+              },
+            },
+          },
+        } : {}),
+      },
+    };
   });
 }
 
 /**
- * Preserve canonical tool order across every step of the turn so local LLM
- * engines (Ollama / llama.cpp / LM Studio) never invalidate their prefix KV
- * cache due to tool array reordering.
+ * Source-only pressure may prioritize an available mutation, but cannot revoke
+ * reads or turn the observed files into mandatory mutation targets.
  */
 export function prioritizeRuntimeV2ProviderToolDefinitions(input: {
   readonly command: RuntimeV2Command;
   readonly tools: readonly ToolDefinition[];
   readonly hasMaterializedSourceEvidence: boolean;
 }): ToolDefinition[] {
-  return [...input.tools];
+  const pressure = input.command.payload.effectPressure as { reason?: string } | undefined;
+  if (!input.hasMaterializedSourceEvidence || pressure?.reason !== "source_only_frontier") {
+    return [...input.tools];
+  }
+  return [
+    ...input.tools.filter((tool) => isWorkspaceMutationToolName(tool.function.name)),
+    ...input.tools.filter((tool) => !isWorkspaceMutationToolName(tool.function.name)),
+  ];
 }
 
 export {

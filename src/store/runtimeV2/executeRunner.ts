@@ -14,10 +14,8 @@ import {
   deriveRuntimeV2PlanSourceFreshness,
   hasCompletedRuntimeV2InitialObservation,
   isRuntimeV2TurnTerminallyClosed,
-  isRuntimeV2ValidationAttempt,
   runtimeV2DirectExecuteReadyForConclusion,
   runtimeV2ProviderRecoveryStallExpired,
-  RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT,
   runtimeV2CheckpointWriteFailureReason,
   summarizeRuntimeV2ExecuteEvidence,
   type RuntimeV2ProviderRecoveryStallLease,
@@ -40,14 +38,6 @@ import {
 import {
   runtimeV2ExecuteAcceptanceEvidenceRequirements,
 } from "./executionAcceptance";
-import {
-  deriveRuntimeV2ProviderEffectFacts,
-  latestRuntimeV2CorrectiveMutationFailure,
-} from "./executionProviderEffectFacts";
-import {
-  RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES,
-  runtimeV2CorrectiveMutationFailureLimitReached,
-} from "./executionProviderActionWindow";
 import {
   runtimeV2ExecuteTerminalDecision,
   runtimeV2PhaseTransitionMessage,
@@ -360,101 +350,6 @@ export async function runSubmitRuntimeV2Execute(
       });
       if (terminal) {
         await controller.driveOnce(terminal);
-        if (controller.snapshot().aggregate?.terminalOutcome) break;
-        continue;
-      }
-      const validationProgress = summarizeRuntimeV2ExecuteEvidence(before, {
-        isMutationToolName: isWorkspaceMutationToolName,
-      });
-      if (
-        validationProgress.stalledValidationCount >=
-          RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT
-      ) {
-        const latestFailure = [...before.events].reverse().find(
-          (event): event is Extract<
-            (typeof before.events)[number],
-            { type: "validation.completed" }
-          > => isRuntimeV2ValidationAttempt(event) && !event.passed,
-        );
-        const latestDetail = String(
-          latestFailure?.presentation?.message || "",
-        ).trim().slice(0, 1_000);
-        input.logStoreEvent(
-          "runtime_v2_stalled_validation_limit_reached",
-          {
-            turnId: identity.turn.turnId,
-            runId: identity.run.runId,
-            phase: before.phase,
-            consecutiveFailures:
-              validationProgress.stalledValidationCount,
-            limit: RUNTIME_V2_STALLED_VALIDATION_FAILURE_LIMIT,
-            validationTarget:
-              latestFailure?.presentation?.target || null,
-          },
-        );
-        await controller.driveOnce({
-          resultKind: before.evidence.some((evidence) =>
-              evidence.kind === "mutation"
-            )
-            ? "partial"
-            : "error",
-          resultReason: [
-            `连续 ${validationProgress.stalledValidationCount} 次修改后得到相同的验收失败，MAIN 已停止无效的“修改—重试”循环；这不是执行时长限制。`,
-            "已保留实际修改，但没有将尚未通过验收的结果表述为成功。",
-            latestDetail,
-          ].filter(Boolean).join(" "),
-        });
-        if (controller.snapshot().aggregate?.terminalOutcome) break;
-        continue;
-      }
-      const providerEffectFacts = deriveRuntimeV2ProviderEffectFacts(before);
-      if (
-        runtimeV2CorrectiveMutationFailureLimitReached(providerEffectFacts)
-      ) {
-        const correctiveFailureCount =
-          providerEffectFacts.correctiveMutationFailureToolCallIds?.size || 0;
-        const latestCorrectiveFailure =
-          latestRuntimeV2CorrectiveMutationFailure(providerEffectFacts);
-        const latestCorrectiveFailureSequence = Number(
-          latestCorrectiveFailure?.requirement?.sequence,
-        );
-        const latestFailure = [...before.events].reverse().find(
-          (event): event is Extract<
-            (typeof before.events)[number],
-            { type: "tool.completed" }
-          > =>
-            event.type === "tool.completed" &&
-            Number.isFinite(latestCorrectiveFailureSequence) &&
-            event.sequence === latestCorrectiveFailureSequence,
-        );
-        const latestDetail = String(
-          latestFailure?.presentation?.message || "",
-        ).trim().slice(0, 1_000);
-        input.logStoreEvent(
-          "runtime_v2_corrective_mutation_failure_limit_reached",
-          {
-            turnId: identity.turn.turnId,
-            runId: identity.run.runId,
-            phase: before.phase,
-            failures: correctiveFailureCount,
-            limit: RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES,
-            latestFailureReasonCode:
-              latestFailure?.failureReasonCode ||
-              latestCorrectiveFailure?.requirement?.reasonCode ||
-              null,
-          },
-        );
-        await controller.driveOnce({
-          resultKind: before.evidence.some((evidence) =>
-              evidence.kind === "mutation"
-            )
-            ? "partial"
-            : "error",
-          resultReason: [
-            `连续 ${correctiveFailureCount} 次源码纠错修改均未执行，MAIN 已停止“补读—重试”循环；正常长任务仍可在产生真实修改或验证进展时继续运行。`,
-            latestDetail,
-          ].filter(Boolean).join(" "),
-        });
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }

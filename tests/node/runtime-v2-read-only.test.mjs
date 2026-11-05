@@ -447,7 +447,7 @@ test("Chat tools use the snapshot, reject workspace tools, and conclude has an e
   const input = { get: () => state, context: { runtimeRunIntent: "respond", runWorkspace: "", networkRead: enabled, turnId: turn.turnId }, live: types.createRuntimeV2LiveExecutionState() };
   const names = auth.providerToolDefinitionsForCommand(input, { payload: { mode: "chat" } }).map((item) => item.function.name);
   assert.ok(names.includes("web_search") && names.includes("web_fetch"));
-  assert.ok(names.every((name) => ["load_skill", "web_search", "web_fetch"].includes(name)));
+  assert.ok(names.every((name) => ["load_skill", "tool_search", "web_search", "web_fetch"].includes(name)));
   assert.equal((await toolPolicy.authorizeToolForCurrentTurn(input, "web_search", { query: "one" })).allowed, true);
   assert.deepEqual(auth.providerToolDefinitionsForCommand(input, { payload: { mode: "conclude", conclusionKind: "read_only" } }), []);
   state.webSearchEnabled = true;

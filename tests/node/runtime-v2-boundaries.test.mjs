@@ -131,8 +131,8 @@ test("Runtime v2 execution adapter has no provider/model-name or prose-lifecycle
     /visibleText\.(?:includes|match|search|startsWith)|RegExp\([^)]*visibleText/,
     "provider prose must never select a lifecycle transition",
   );
-  assert.match(source, /resolveRuntimeV2PlanMutationScope/);
-  assert.match(source, /resolveRuntimeV2PlanValidationScope/);
+  assert.match(source, /validateToolAgainstApprovedPlan/);
+  assert.match(source, /validateRuntimeV2MutationLease/);
   assert.match(source, /providerToolDefinitionsForCommand/);
   assert.match(source, /compactTextEnvelopeCatalog/);
 });

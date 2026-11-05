@@ -143,7 +143,6 @@ function stringList(value: unknown): string[] {
 
 function normalizeDependsOnList(
   record: unknown,
-  stepIndex: number,
 ): number[] {
   if (
     !record ||
@@ -154,18 +153,14 @@ function normalizeDependsOnList(
     return [];
   }
   const raw = (record as Record<string, unknown>).dependsOn as unknown[];
-  return [
-    ...new Set(
-      raw
-        .map((item) => Number(item))
-        .filter((num) => Number.isInteger(num) && num >= 0 && num < stepIndex),
-    ),
-  ];
+  // Optional edges may be omitted, but authored edges are not suggestions.
+  // Keep invalid indexes visible to the typed WorkPlan validator instead of
+  // silently changing the model's dependency graph before user review.
+  return [...new Set(raw)] as number[];
 }
 
 function normalizeStepIndexesList(
   record: unknown,
-  totalSteps: number,
   defaultStepIndexes: readonly number[],
 ): number[] {
   if (
@@ -174,14 +169,7 @@ function normalizeStepIndexesList(
     !Array.isArray(record) &&
     Array.isArray((record as Record<string, unknown>).stepIndexes)
   ) {
-    const valid = [
-      ...new Set(
-        ((record as Record<string, unknown>).stepIndexes as unknown[])
-          .map((item) => Number(item))
-          .filter((num) => Number.isInteger(num) && num >= 0 && num < totalSteps),
-      ),
-    ];
-    if (valid.length > 0) return valid;
+    return [...new Set((record as Record<string, unknown>).stepIndexes as unknown[])] as number[];
   }
   return [...defaultStepIndexes];
 }
@@ -249,7 +237,7 @@ function compileSteps(input: {
       change ||
       `完成对 ${targets.join(", ") || "目标文件"} 的修改`,
     ).trim();
-    const dependsOn = normalizeDependsOnList(step, index);
+    const dependsOn = normalizeDependsOnList(step);
     return {
       title: String(step?.title || change || targets[0] || `Step ${index + 1}`),
       operation,
@@ -313,7 +301,6 @@ function compileValidations(input: {
     const command = kind === "finite_command" ? requestedCommand : "";
     const stepIndexes = normalizeStepIndexesList(
       validation,
-      input.steps.length,
       defaultStepIndexes,
     );
     return {

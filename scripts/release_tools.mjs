@@ -1,7 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const APP_NAME = "MAIN";
+const PROJECT_ROOT = fileURLToPath(new URL("../", import.meta.url));
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -26,6 +28,20 @@ export function parseAppVersion(version) {
     prerelease,
     prereleaseNumber: prereleaseNumberMatch ? Number(prereleaseNumberMatch[1]) : prerelease ? 1 : 0,
   };
+}
+
+export async function readArchivedReleaseNotes({ rootDir, version }) {
+  const validatedVersion = parseAppVersion(version).raw;
+  const notesPath = path.join(rootDir, "docs", "releases", `Release_Notes_${validatedVersion}_ZH.md`);
+  let notes;
+  try {
+    notes = await fs.readFile(notesPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!notes.trim()) throw new Error(`Empty authored release notes: ${notesPath}`);
+  return notes;
 }
 
 export function toMacBundleVersion(version) {
@@ -286,9 +302,12 @@ export async function preparePublicRelease({
   outputDir = path.join(rootDir, "release-output", "public"),
   channel = "beta",
 }) {
+  version = parseAppVersion(version).raw;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(publicRepo || "")) {
     throw new Error(`Invalid public repo: ${publicRepo}`);
   }
+
+  const archivedNotes = await readArchivedReleaseNotes({ rootDir, version });
 
   const artifacts = await collectPublicReleaseArtifacts({ rootDir, version });
   if (artifacts.length === 0) {
@@ -350,7 +369,7 @@ export async function preparePublicRelease({
   const notesPath = path.join(stageDir, "release-notes.md");
   await fs.writeFile(
     notesPath,
-    `${buildReleaseNotes({
+    archivedNotes ?? `${buildReleaseNotes({
       version,
       channel,
       publicRepo,
@@ -422,6 +441,7 @@ export async function buildUpdaterManifest({
   preserveExistingNotes = false,
   generatedAt = new Date(),
 }) {
+  version = parseAppVersion(version).raw;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(updateRepo || "")) {
     throw new Error(`Invalid updater repo: ${updateRepo}`);
   }
@@ -473,6 +493,7 @@ export async function buildUpdaterManifest({
 }
 
 export async function writeUpdaterManifest({
+  rootDir = PROJECT_ROOT,
   assetsDir,
   version,
   updateRepo,
@@ -483,7 +504,9 @@ export async function writeUpdaterManifest({
   preserveExistingNotes = false,
   generatedAt,
 }) {
-  const notes = await fs.readFile(notesPath, "utf8");
+  version = parseAppVersion(version).raw;
+  const archivedNotes = await readArchivedReleaseNotes({ rootDir, version });
+  const notes = archivedNotes ?? await fs.readFile(notesPath, "utf8");
   const result = await buildUpdaterManifest({
     assetsDir,
     version,
@@ -491,10 +514,11 @@ export async function writeUpdaterManifest({
     notes,
     appName,
     existingManifestPath,
-    preserveExistingNotes,
+    preserveExistingNotes: archivedNotes === null && preserveExistingNotes,
     generatedAt,
   });
 
+  if (archivedNotes !== null) await fs.writeFile(notesPath, notes, "utf8");
   await fs.writeFile(outputPath, `${JSON.stringify(result.manifest, null, 2)}\n`, "utf8");
 
   return {

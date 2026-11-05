@@ -9,8 +9,7 @@ import ts from "typescript";
 const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
 
-async function loadCloudProtocolModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/cloudProtocol.ts");
+async function loadCloudProtocolModule(sourcePath = path.join(workspaceRoot, "src/lib/cloudProtocol.ts")) {
   const source = await fs.readFile(sourcePath, "utf8");
   const localRequire = createRequire(sourcePath);
   const transpiled = ts.transpileModule(source, {
@@ -94,6 +93,7 @@ const {
   normalizeLocalToolProtocol,
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
+const { parseTextForTools } = await loadCloudProtocolModule(path.join(workspaceRoot, "src/lib/textToolParser.ts"));
 
 const compactReadTool = {
   type: "function",
@@ -858,7 +858,11 @@ test("cloud responses XML compaction advertises only the current schema surface"
   assert.equal((instructions.match(/^\[TOOLS\]$/gm) || []).length, 1);
   assert.match(instructions, /protocol=xml-text/);
   assert.match(instructions, /read_file\(path: string\)/);
-  assert.match(instructions, /<tool>read_file<\/tool>/);
+  const example = instructions.match(/^<tool_call>[\s\S]*?^<\/tool_call>/m)?.[0];
+  assert.ok(example, "compaction retains a complete executable example of the current text protocol");
+  assert.deepEqual(parseTextForTools(example).toolCalls.map(({ name, arguments: args }) => ({ name, arguments: args })), [{
+    name: "read_file", arguments: { path: "src/example.ts" },
+  }]);
   assert.doesNotMatch(instructions, /write_file|replace_in_file|run_command|protocol=native/);
 });
 
@@ -885,6 +889,11 @@ test("Responses XML compaction preserves the prompt's active catalog when native
   assert.match(instructions, /protocol=xml-text/);
   assert.match(instructions, /read_file\(path: string\)/);
   assert.match(instructions, /<tool>read_file<\/tool>/);
+  const example = instructions.match(/^<tool_use>[\s\S]*?^<\/tool_use>/m)?.[0];
+  assert.ok(example);
+  assert.deepEqual(parseTextForTools(example).toolCalls.map(({ name, arguments: args }) => ({ name, arguments: args })), [{
+    name: "read_file", arguments: { path: "src/example.ts" },
+  }]);
   assert.doesNotMatch(instructions, /available=none|protocol=none/);
 });
 

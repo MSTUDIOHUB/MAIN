@@ -13,7 +13,10 @@ import {
 import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
+  resolveWorkspaceMutationRequests,
 } from "../../lib/workspaceMutationTools";
+import { normalizeWorkspacePathIdentity } from "../../lib/workspacePaths";
+import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
 import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
   type RuntimeV2Command,
@@ -30,9 +33,12 @@ import {
 } from "./executionSubagentWriteScope";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import { finiteValidationCommandRejection } from "./executionValidationCommand";
+import { validateRuntimeV2MutationLease } from "./correctiveMutationPolicy";
+import { runtimeV2MutationLeaseRejectionReason } from "./executionMutationRejection";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
   validateRuntimeV2ExecutionContractSubmission,
+  deriveRuntimeV2ExecutionContract,
 } from "./executionContract";
 import {
   deriveRuntimeV2ValidationCorrectionWindow,
@@ -248,6 +254,45 @@ export function validateToolAgainstPhaseAndPlan(input: {
     }
   }
   if (aggregate?.strategy !== "plan") {
+    if (input.command.kind === "execute_tool" && isWorkspaceMutationToolName(input.toolName)) {
+      const contract = deriveRuntimeV2ExecutionContract(aggregate);
+      if (contract) {
+        const requests = resolveWorkspaceMutationRequests(input.toolName, input.args, input.target);
+        const outsideContract = requests.length === 0 || requests.some(request =>
+          !contract.changes.some(change =>
+            change.operation !== "preserve" && change.operation === request.operation &&
+            change.targets.some(target =>
+              normalizeWorkspacePathIdentity(normalizeRuntimeV2WorkspacePath(target, input.ports.context.runWorkspace || "")) ===
+              normalizeWorkspacePathIdentity(normalizeRuntimeV2WorkspacePath(request.target, input.ports.context.runWorkspace || ""))
+            )
+          )
+        );
+        if (outsideContract) return {
+          allowed: false,
+          reason: "The recorded execution contract does not authorize this exact file operation. Revise the contract from new evidence before broadening its scope.",
+          failureKind: "not_authorized",
+          reasonCode: "execution_contract_mutation_scope",
+        };
+      }
+      const lease = validateRuntimeV2MutationLease({
+        ports: input.ports,
+        toolCallId: String(input.command.payload.toolCallId || ""),
+        toolName: input.toolName,
+        args: input.args,
+        target: input.target,
+      });
+      if (lease && !lease.allowed) return {
+        allowed: false,
+        reason: runtimeV2MutationLeaseRejectionReason({
+          toolName: input.toolName,
+          unexpectedTargets: lease.unexpectedTargets,
+          leaseTargets: lease.leases.map((entry) => entry.target),
+          recoveryExcerpt: lease.recoveryExcerpt,
+        }),
+        failureKind: lease.reasonCode === "mutation_source_text_mismatch" ? "source_mismatch" : "protocol_invalid",
+        reasonCode: lease.reasonCode,
+      };
+    }
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };
   }
   return validateToolAgainstApprovedPlan({ ...input, aggregate });

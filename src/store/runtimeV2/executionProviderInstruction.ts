@@ -173,7 +173,7 @@ export function providerModeInstruction(
   const recoveringCompleteReply = recoveryPressure?.reason === "non_actionable_response";
   const recoveryGuidance = recoveryPressure
     ? recoveringCompleteReply
-      ? `Previous response had no tool call (${String(recoveryPressure.reason)}). Take the next tool action if work remains, or ask a focused question if user input is required.`
+      ? `Previous response had no tool call (${String(recoveryPressure.reason)}). Use the actual prior result: take the next authorized action if work remains, give a complete final report when successful receipts cover the full request, or ask a focused question if user input is required.`
       : `Previous action made no progress (${String(recoveryPressure.reason || "non_actionable_response")}, attempt ${recoveryOccurrence}, stage ${recoveryStage || "retry"}). Check the latest tool error or file snippet and try a different approach or smaller edit.`
     : "";
   if (mode === "chat" || mode === "analyze" || (mode === "conclude" && command.payload.conclusionKind === "read_only")) {
@@ -194,10 +194,47 @@ export function providerModeInstruction(
       collaborationGuidance,
     ].filter(Boolean).join(" ");
   }
+  const sourceGuidance = toolSurface.hasMutation
+    ? [
+        toolSurface.hasMaterializedSourceEvidence
+          ? "For modifications to an existing file, use only its exact current source visible in this decision request. Each existing target needs its own versioned source lease; observing one file does not authorize edits to another."
+          : command.payload.hasVersionedSourceEvidence === true
+            ? "Existing-file source is cached but is not visible in this decision request; this does not authorize edits to those files. Request the exact missing target window so Runtime can replay it without another disk read."
+            : "Read the exact current target before modifying an existing file.",
+        runtimeV2EditableSourceAnchor(toolSurface.materializedSourceCoverage || []),
+      ].filter(Boolean).join(" ")
+    : "";
+  const creationGuidance = toolSurface.hasCreateFile &&
+      !toolSurface.actionWindow && !toolSurface.validationCorrectionActive &&
+      !toolSurface.executionContractAdvanceRequired
+    ? "New files within the user's authorized objective do not require existing-file source; use write_file when creation is needed. The preflight still checks whether the target already exists."
+    : "";
+  const objectiveGuidance = [
+    "Choose the next authorized action to advance the user's complete objective. Make a workspace change only when the user's current request authorizes that effect.",
+    toolSurface.sourceOnlyFrontier
+      ? "There is no recorded file mutation. Source evidence alone does not make its files mandatory edit targets. Safe reads remain available for a specific missing fact that blocks the next authorized action."
+      : "",
+    "Commands and external operations use their own authorization and result evidence, without an unrelated file-source lease or write obligation. For a command or external-operation task, a complete final report is appropriate when actual successful receipts cover the user's full request. A successful intermediate action does not require you to stop; file mutations still require subsequent matching validation.",
+  ].filter(Boolean).join(" ");
+  const validationGuidance = [
+    toolSurface.validationCorrectionActive
+      ? "[VALIDATION_CORRECTION] Use the actual failed validation diagnostics to identify the missing fact or smallest correction; safe reads remain available. Re-verify after the correction."
+      : "",
+    toolSurface.validationCommandUnavailable
+      ? `The previous validation command is unavailable${toolSurface.failedValidationCommand ? `: ${JSON.stringify(toolSurface.failedValidationCommand)}` : ""}. Choose an available finite validator that tests the same required behavior; do not repeat the unavailable command.`
+      : "",
+  ].filter(Boolean).join(" ");
+  const contractGuidance = toolSurface.executionContract
+    ? `[execution_contract_v1] ${JSON.stringify(toolSurface.executionContract)} Follow the recorded exact operations and do not broaden into cleanup or redesign; revise it from new evidence when the solution changes. Safe reads and finite checks remain available; early checks cannot discharge pending contract targets or newer mutation debt.`
+    : "";
   if (mode === "validate") {
     return [
       recoveryGuidance,
-      "Verify the latest workspace changes by running a finite validation tool (such as run_command for build/test/lint/typecheck, or browser_evaluate/computer_use for UI verification) before returning your final summary; read_file or prose alone does not satisfy validation. If verification reveals an issue, fix the code and re-verify.",
+      "Verify the latest committed mutation by running a finite validation tool (such as run_command for build/test/lint/typecheck, or browser_evaluate/computer_use for UI verification) before returning your final summary; read_file or prose alone does not satisfy validation. Still-needed authorized external actions remain available. Ordinary shell actions produce tool results and do not discharge file validation debt attached to the newest committed mutation. If verification reveals an issue, fix the code and re-verify.",
+      sourceGuidance,
+      creationGuidance,
+      validationGuidance,
+      contractGuidance,
       preferredValidationCommand
         ? `Preferred validation command: ${JSON.stringify(preferredValidationCommand)}.`
         : "",
@@ -206,7 +243,11 @@ export function providerModeInstruction(
   }
   return [
     recoveryGuidance,
-    "Inspect relevant files, make targeted edits using replace_in_file or write_file, and verify your changes.",
+    objectiveGuidance,
+    sourceGuidance,
+    creationGuidance,
+    validationGuidance,
+    contractGuidance,
     preferredValidationCommand
       ? `Preferred validation command: ${JSON.stringify(preferredValidationCommand)}.`
       : "",

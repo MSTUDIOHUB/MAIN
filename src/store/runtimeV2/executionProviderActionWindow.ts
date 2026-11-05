@@ -7,21 +7,10 @@ import type {
   RuntimeV2ProviderActionWindow,
 } from "./executionTypes";
 
-export const RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES = 8;
-
-export function runtimeV2CorrectiveMutationFailureLimitReached(
-  effects: RuntimeV2ProviderEffectFacts,
-): boolean {
-  return (effects.correctiveMutationFailureToolCallIds?.size || 0) >=
-    RUNTIME_V2_CORRECTIVE_MUTATION_MAX_FAILURES;
-}
-
 /**
- * Inspired by gg-framework / gg-agent:
- * Never trap the model in closed recovery windows (`corrective_source`,
- * `corrective_mutation`, `closed_recovery`) that confiscate inspection/edit
- * tools and invalidate the KV cache prefix. Let natural tool error feedback
- * (with nearby source context) guide the model's next action.
+ * Recovery pressure guides the next decision without confiscating safe reads
+ * or imposing a target lock. Mutation leases and per-call authorization remain
+ * enforced independently at execution; repeated failures are soft signals.
  */
 export function runtimeV2ProviderActionWindowFor(_input: {
   readonly command: Pick<RuntimeV2Command, "payload">;

@@ -50,6 +50,8 @@ function loadTs(sourcePath) {
   return module.exports;
 }
 
+const toolDiscovery = loadTs(path.join(workspaceRoot, "src/lib/toolSearch.ts"));
+test.afterEach(() => toolDiscovery.clearUnlockedToolsForSession("session-mcp"));
 const authorization = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionAuthorization.ts",
@@ -195,6 +197,10 @@ test("Runtime v2 freezes discovered MCP tools, advertises a bounded surface, and
   assert.ok(mcpEntry, "the Turn catalog should contain the discovered MCP tool");
   assert.equal(frozen.capabilityRegistry.tools[mcpEntry.exposedName].risk, "external_read");
 
+  const coldSurface = authorizationContext.providerToolDefinitionsForCommand(ports, { kind: "request_model", payload: { mode: "analyze" } });
+  assert.ok(coldSurface.some(tool => tool.function.name === "tool_search"));
+  assert.ok(!coldSurface.some(tool => tool.function.name === mcpEntry.exposedName));
+  toolDiscovery.unlockToolsForSession("session-mcp", [mcpEntry.exposedName]);
   const surface = authorizationContext.providerToolDefinitionsForCommand(
     ports,
     { kind: "request_model", payload: { mode: "analyze" } },
@@ -258,6 +264,7 @@ test("Runtime v2 keeps MCP effects out of Analyze and requires existing effect a
   const destructiveEntry = entryFor("desktop_delete_project");
   assert.ok(readEntry && writeEntry && destructiveEntry);
 
+  toolDiscovery.unlockToolsForSession("session-mcp", [readEntry.exposedName, writeEntry.exposedName, destructiveEntry.exposedName]);
   const analyzeSurface = authorizationContext.providerToolDefinitionsForCommand(
     ports,
     { kind: "request_model", payload: { mode: "analyze" } },

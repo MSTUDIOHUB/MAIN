@@ -26,17 +26,17 @@ export function runtimeV2CurrentToolSurfaceInstruction(
 ): string {
   const names = tools.map((tool) => tool.function.name);
   if (names.length === 0) {
-    return "No tools are exposed for this step; return your response directly.";
+    return "CURRENT_TOOL_SURFACE: this decision exposes no tools. Return your response directly; do not emit a tool name.";
   }
   return [
-    `Available tools (${names.length}): ${names.join(", ")}.`,
+    `CURRENT_TOOL_SURFACE: this decision exposes exactly ${names.length} ${names.length === 1 ? "tool" : "tools"}: ${names.join(", ")}.`,
     names.includes("tool_search")
       ? "Call tool_search if you need specialized or MCP tools not listed above."
       : "",
     actionRequired
       ? names.length === 1
-        ? `Submit a structured call to ${names[0]}.`
-        : "Submit a structured tool call from the list above."
+        ? `This decision requires exactly one structured action, and it must be ${names[0]}.`
+        : "This decision requires exactly one structured action from the list above."
       : "",
   ].filter(Boolean).join(" ");
 }

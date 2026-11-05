@@ -263,7 +263,7 @@ test("typed required collaboration hard-admits spawn until the Plan requirement 
   );
 });
 
-test("Plan submission schema requires explicit dependency and validation coverage edges", () => {
+test("Plan submission schema offers optional typed dependency and validation coverage edges", () => {
   const properties = protocol.SUBMIT_WORK_PLAN_TOOL.function.parameters.properties;
   const change = properties.changes.items;
   const validation = properties.validations.items;
@@ -391,7 +391,7 @@ function graphSubmission(overrides = {}) {
   };
 }
 
-test("typed Plan ingress rejects missing or non-array graph edges", () => {
+test("typed Plan ingress defaults omitted dependency and validation coverage edges", () => {
   const missingDependency = graphSubmission();
   delete missingDependency.changes[1].dependsOn;
   const autoDependency = protocol.workPlanDraftFromSubmission(
@@ -421,8 +421,11 @@ test("typed Plan ingress preserves invalid zero-based indexes for the core valid
     "Create a tested Snake game.",
   );
 
-  assert.deepEqual(compiled.draft.steps[1].dependsOn, []);
-  assert.deepEqual(compiled.draft.validations[0].stepIndexes, [0]);
+  assert.deepEqual(compiled.draft.steps[1].dependsOn, [1]);
+  assert.deepEqual(compiled.draft.validations[0].stepIndexes, [0, 2]);
+  assert.throws(() => workPlan.sealWorkPlanV1({
+    draft: compiled.draft, evidence: [], createdAt: 1,
+  }), /Dependencies must refer to earlier steps|Validation references an unknown step/);
 });
 
 test("typed Plan ingress does not invent validation coverage", () => {
@@ -434,7 +437,7 @@ test("typed Plan ingress does not invent validation coverage", () => {
     "Create a tested Snake game.",
   );
 
-  assert.deepEqual(compiled.draft.validations[0].stepIndexes, [0, 1]);
+  assert.deepEqual(compiled.draft.validations[0].stepIndexes, []);
 });
 
 test("typed Plan ingress requires exact admitted criterion mappings", () => {

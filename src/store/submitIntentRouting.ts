@@ -8,6 +8,7 @@ import {
 } from "../lib/runIntent";
 import {
   buildRunIntentSummary,
+  buildSubmitBlockingPreflightEffect,
   resolveSubmitEffectiveIntentDecision,
   type SubmitBlockingPreflightEffect,
   type SubmitEffectiveIntentInput,
@@ -136,14 +137,13 @@ export function resolveAndApplySubmitIntentRouting<
     shouldReuseExistingTurnIntent: input.shouldReuseExistingTurnIntent,
     shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
   });
-  let effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
+  const effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
   let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
   let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
 
-  // Inspired by gg-framework: do not block user messages behind a separate LLM
-  // JSON intent preflight call (which doubles TTFT, flushes local KV cache, and
-  // locks out write tools on classification errors). Rely on explicit UI modes
-  // plus zero-latency local heuristics.
+  // Natural language is interpreted once before choosing a capability surface.
+  // Explicit modes remain ceilings; only typed controls and trusted resumptions
+  // bypass this handoff. Lexical resolution supplies context, never authority.
   const trustedSubmission = input.isHidden || !!input.mainDebugShortcut ||
     input.lockedComposerIntent === "image_studio" || input.mainIntentShortcut?.intent === "image_studio" ||
     input.options?.skipIntentResolution === true || !!input.options?.resolvedIntent ||
@@ -159,20 +159,35 @@ export function resolveAndApplySubmitIntentRouting<
       isPlanApproved: input.isPlanApproved,
       previousTurnIntent: input.currentTurnIntent,
     });
-    const explicitUserChoice =
-      input.options?.explicitIntent ||
-      input.lockedComposerIntent ||
-      input.mainIntentShortcut?.intent;
-    if (!explicitUserChoice) {
-      const resolvedWorkspaceIntent = resolveWorkspaceTurnRuntimeIntent({
-        hasWorkspace: input.hasWorkspace,
-        currentMainModeKey: input.currentMainModeKey,
-        shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
-        resolution,
+    const previousRequest = input.shouldContinuePreviousTurnIntent
+      ? input.previousTurnContinuationTarget?.userPrompt
+      : input.shouldContinuePlanIntent || input.shouldReuseExistingTurnIntent || input.shouldRouteContinuationToPlanResume
+      ? input.currentTurn?.userPrompt
+      : undefined;
+    const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
+      resolution,
+      currentMainModeKey: input.currentMainModeKey,
+      hasWorkspace: input.hasWorkspace,
+      explicitIntent: input.options?.explicitIntent || input.lockedComposerIntent || input.mainIntentShortcut?.intent || undefined,
+      previousRequest,
+      text: input.text,
+      originalComposerInput: input.submittedText,
+      images: input.images,
+      options: input.options,
+      preferredLanguage: input.preferredLanguage,
+      currentConfig: input.currentConfig,
+      sendOriginSessionKey: input.sendOriginSessionKey,
+    });
+    if (blockingPreflightEffect) {
+      input.logStoreEvent("turn_intent_semantic_requested", {
+        heuristicHint: resolution.intent,
+        heuristicConfidence: resolution.confidence,
+        explicitIntent: blockingPreflightEffect.request.explicitIntent ?? null,
+        hasPreviousRequest: !!previousRequest,
+        inputChars: input.text.length,
       });
-      if (!(input.shouldContinuePlanIntent && resolvedWorkspaceIntent === "respond")) {
-        effectiveRunIntent = resolvedWorkspaceIntent;
-      }
+      input.startBlockingPreflight(blockingPreflightEffect);
+      return { handled: true, returnValue: true };
     }
   }
 

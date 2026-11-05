@@ -128,22 +128,23 @@ test('ordinary command effects use their own approval and result evidence withou
   } finally { f.restore(); }
 });
 
-test('corrective target locks and validation authority remain more specific than ordinary creation guidance', () => {
+test('recovery hints retain exact existing-file leases and validation debt without inventing a path lock', () => {
   const command = { kind: 'request_model', phase: 'acting', payload: { mode: 'execute' } };
-  const surface = { hasReadFile: false, hasMutation: true, hasCreateFile: true, hasSpawnSubagent: false, hasWaitSubagents: false, hasMaterializedSourceEvidence: true, sourceOnlyFrontier: true, materializedSourceCoverage: [{ target: 'src/existing.ts', version: 'v1', complete: true, windows: [{ startLine: 1, endLine: 1 }] }], actionWindow: 'closed_recovery' };
+  const surface = { hasReadFile: true, hasMutation: true, hasCreateFile: true, hasSpawnSubagent: false, hasWaitSubagents: false, hasMaterializedSourceEvidence: true, sourceOnlyFrontier: true, materializedSourceCoverage: [{ target: 'src/existing.ts', version: 'v1', complete: true, windows: [{ startLine: 1, endLine: 1 }] }], actionWindow: 'closed_recovery' };
   const corrective = instruction.providerModeInstruction(command, '', surface);
-  assert.match(corrective, /creating an unrelated file cannot discharge this existing-source effect debt/);
-  assert.doesNotMatch(corrective, /New files.*do not require.*existing.*source/i);
+  assert.match(corrective, /Each existing target needs its own versioned source lease/);
+  assert.match(corrective, /Safe reads remain available/);
+  assert.doesNotMatch(corrective, /observation branch is closed|target.locked/i);
   const validation = instruction.providerModeInstruction({ ...command, phase: 'validating', payload: { mode: 'validate' } }, '', { ...surface, actionWindow: 'validation_handoff' });
   assert.match(validation, /Ordinary shell actions produce tool results and do not discharge.*validation debt/);
-  assert.doesNotMatch(validation, /New files.*do not require.*existing.*source/i);
+  assert.match(validation, /latest committed mutation/);
   for (const restricted of [
     { ...surface, actionWindow: null, validationCorrectionActive: true },
     { ...surface, actionWindow: null, executionContractAdvanceRequired: true, executionContractPendingTargets: ['src/existing.ts'] },
   ]) {
-    const locked = instruction.providerModeInstruction({ ...command, phase: 'validating', payload: { mode: 'validate' } }, '', restricted);
-    assert.doesNotMatch(locked, /New files.*do not require.*existing.*source/i);
-    assert.match(locked, /Validation remains (withheld|unavailable)/);
+    const prompt = instruction.providerModeInstruction({ ...command, phase: 'validating', payload: { mode: 'validate' } }, '', restricted);
+    assert.doesNotMatch(prompt, /New files.*do not require.*existing.*source/i);
+    assert.match(prompt, /validation debt/);
   }
 });
 

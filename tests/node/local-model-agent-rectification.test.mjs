@@ -124,6 +124,9 @@ const { parseToolUseBlock } = loadTranspiledModuleSync(
 const { resolveAndApplySubmitIntentRouting } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitIntentRouting.ts"),
 );
+const { resolveSubmitPreflightResultDecision, buildSubmitPreflightResumeOptions } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"),
+);
 const { resolveRuntimeV2VisibleRunnerKind } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"),
 );
@@ -159,19 +162,31 @@ test("Phase 1: filterToCoreAndUnlockedTools exposes only the core tools by defau
   clearUnlockedToolsForSession(sessionKey);
 });
 
-test("Phase 1: prioritizeRuntimeV2ProviderToolDefinitions preserves static tool ordering for local LLM KV-cache stability", () => {
-  const sampleTools = buildToolDefinitions([]).slice(0, 6);
-  const firstOrder = prioritizeRuntimeV2ProviderToolDefinitions({
-    command: {},
-    tools: sampleTools,
-    hasMaterializedSourceEvidence: false,
-  }).map((t) => t.function.name);
-  const secondOrder = prioritizeRuntimeV2ProviderToolDefinitions({
-    command: {},
-    tools: sampleTools,
-    hasMaterializedSourceEvidence: true,
-  }).map((t) => t.function.name);
-  assert.deepEqual(firstOrder, secondOrder);
+test("Phase 1: source-only pressure softly prioritizes mutation without revoking tools or changing ordinary ordering", () => {
+  const wanted = ["read_file", "grep_search", "write_file", "replace_in_file", "apply_patch", "run_command"];
+  const allTools = buildToolDefinitions([]);
+  const sampleTools = wanted.map(name => allTools.find(tool => tool.function.name === name));
+  assert.ok(sampleTools.every(Boolean), "the fixture uses real advertised tool definitions");
+  /** @type {import('../../src/lib/runtime-v2/contracts.ts').RuntimeV2Command} */
+  const command = {
+    kind: "request_model", idempotencyKey: "rectification-model", phase: "acting",
+    run: { sessionKey: "session", sessionEpoch: "epoch", turnId: "turn", runId: "run", parentRunId: null, attemptId: "attempt" },
+    payload: { mode: "execute" },
+  };
+  const names = (tools) => tools.map(tool => tool.function.name);
+  for (const hasMaterializedSourceEvidence of [false, true]) {
+    assert.deepEqual(names(prioritizeRuntimeV2ProviderToolDefinitions({ command, tools: sampleTools, hasMaterializedSourceEvidence })), wanted,
+      "source visibility alone must not reorder an ordinary request");
+  }
+  const pressured = { ...command, payload: { ...command.payload, effectPressure: {
+    schemaVersion: "runtime-v2-effect-pressure.v1", reason: "source_only_frontier", mutationBoundarySequence: 0, sourceBoundarySequence: 12,
+  } } };
+  assert.deepEqual(names(prioritizeRuntimeV2ProviderToolDefinitions({ command: pressured, tools: sampleTools, hasMaterializedSourceEvidence: false })), wanted,
+    "pressure without visible source must not favor an unleased mutation");
+  const ordered = names(prioritizeRuntimeV2ProviderToolDefinitions({ command: pressured, tools: sampleTools, hasMaterializedSourceEvidence: true }));
+  assert.deepEqual(new Set(ordered.slice(0, 3)), new Set(["write_file", "replace_in_file", "apply_patch"]));
+  assert.deepEqual(ordered.slice(3), ["read_file", "grep_search", "run_command"]);
+  assert.deepEqual(new Set(ordered), new Set(wanted), "soft ordering cannot withdraw safe reads, commands, or an alternative editor");
 });
 
 test("Phase 3: workspaceCheckpoints records pre-mutation snapshots and rewinds to initial baseline cleanly", async () => {
@@ -260,7 +275,12 @@ test("Phase 4: parseExplicitTextToolEnvelope parses both <tool_call> JSON and le
   assert.equal(xmlCalls[0].arguments.path, "src/main.ts");
 });
 
-test("Phase 2 regression (main-debug.log): workspace summary and Q&A with fallbackRunIntent='execute' route to workspace_read instead of execute recovery loop", () => {
+test("Phase 2 regression (main-debug.log): natural workspace requests use semantic preflight once and admitted read-only intents cannot inherit execute authority", () => {
+  const preflights = [];
+  const preRunPatches = [];
+  const logs = [];
+  let approvals = 0;
+  let planResumes = 0;
   const baseRoutingInput = {
     images: undefined,
     preferredLanguage: "zh",
@@ -293,57 +313,47 @@ test("Phase 2 regression (main-debug.log): workspace summary and Q&A with fallba
     currentConfig: { workflowMode: "edit" },
     sendOriginSessionKey: "/Users/michael/Documents/Unity/ProjectM::1",
     setState: () => {},
-    applyPreRunSessionPatch: () => {},
-    approvePlan: () => {},
-    startPlanExecutionResume: () => {},
-    startBlockingPreflight: () => {},
-    logStoreEvent: () => {},
+    applyPreRunSessionPatch: patch => preRunPatches.push(patch),
+    approvePlan: () => { approvals += 1; },
+    startPlanExecutionResume: () => { planResumes += 1; },
+    startBlockingPreflight: effect => preflights.push(effect),
+    logStoreEvent: (event, data) => logs.push({ event, data }),
   };
 
-  const summaryTurn = resolveAndApplySubmitIntentRouting({
-    ...baseRoutingInput,
-    text: "查看项目里的说明文档，用简短的一段话总结一下 Castle Triad 的核心玩法",
-  });
-  assert.equal(summaryTurn.handled, false);
-  assert.equal(summaryTurn.effectiveRunIntent, "summarize");
-  assert.equal(
-    resolveRuntimeV2VisibleRunnerKind({
-      effectiveIntent: summaryTurn.effectiveRunIntent,
-      runtimeIntent: summaryTurn.effectiveRunIntent,
-      runWorkspace: "/Users/michael/Documents/Unity/ProjectM",
-    }),
-    "workspace_read",
-  );
+  for (const [text, semanticIntent, runner] of [
+    ["查看项目里的说明文档，用简短的一段话总结一下 Castle Triad 的核心玩法", "summarize", "workspace_read"],
+    ["Castle Triad 的卡牌翻面规则是怎么样的？", "respond", "workspace_read"],
+    ["请修改 README.md，补充一段玩法说明并运行测试。", "execute", "execute"],
+  ]) {
+    const previousCount = preflights.length;
+    const pending = resolveAndApplySubmitIntentRouting({ ...baseRoutingInput, text });
+    assert.deepEqual(pending, { handled: true, returnValue: true }, "natural-language hints must not choose a capability surface before semantic admission");
+    assert.equal(preflights.length, previousCount + 1);
+    const effect = preflights.at(-1);
+    assert.equal(effect.request.input, text, "semantic admission receives the exact submitted text");
+    assert.equal(effect.originalText, text);
+    assert.equal(effect.request.hasWorkspace, true);
+    assert.equal(effect.request.explicitIntent, undefined, "a fallback execute intent is not user authorization");
+    assert.equal(logs.at(-1).event, "turn_intent_semantic_requested");
+    assert.equal(logs.at(-1).data.heuristicHint, effect.resolution.intent, "lexical resolution is diagnostic context only");
 
-  const qaTurn = resolveAndApplySubmitIntentRouting({
-    ...baseRoutingInput,
-    text: "Castle Triad 的卡牌翻面规则是怎么样的？",
-  });
-  assert.equal(qaTurn.handled, false);
-  assert.equal(qaTurn.effectiveRunIntent, "respond");
-  assert.equal(
-    resolveRuntimeV2VisibleRunnerKind({
-      effectiveIntent: qaTurn.effectiveRunIntent,
-      runtimeIntent: qaTurn.effectiveRunIntent,
-      runWorkspace: "/Users/michael/Documents/Unity/ProjectM",
-    }),
-    "workspace_read",
-  );
-
-  const editTurn = resolveAndApplySubmitIntentRouting({
-    ...baseRoutingInput,
-    text: "请修改 README.md，补充一段玩法说明并运行测试。",
-  });
-  assert.equal(editTurn.handled, false);
-  assert.equal(editTurn.effectiveRunIntent, "execute");
-  assert.equal(
-    resolveRuntimeV2VisibleRunnerKind({
-      effectiveIntent: editTurn.effectiveRunIntent,
-      runtimeIntent: editTurn.effectiveRunIntent,
-      runWorkspace: "/Users/michael/Documents/Unity/ProjectM",
-    }),
-    "execute",
-  );
+    const decision = resolveSubmitPreflightResultDecision({ text, preferredLanguage: "zh", resolution: effect.resolution,
+      preflight: { intent: semanticIntent, summary: "Fixture semantic result", commandDirective: { kind: "none", source: "preflight", requiresApproval: false } },
+    });
+    assert.equal(decision.kind, "resume_with_preflight");
+    const admitted = resolveAndApplySubmitIntentRouting({ ...baseRoutingInput, text,
+      options: buildSubmitPreflightResumeOptions({ options: effect.originalOptions, decision }),
+    });
+    assert.equal(admitted.handled, false);
+    assert.equal(admitted.effectiveRunIntent, semanticIntent);
+    assert.equal(preflights.length, previousCount + 1, "consuming one semantic result must not request a second preflight");
+    assert.equal(resolveRuntimeV2VisibleRunnerKind({ effectiveIntent: "execute", runtimeIntent: admitted.effectiveRunIntent, runWorkspace: "/Users/michael/Documents/Unity/ProjectM" }), runner,
+      "immutable admitted intent owns the runner even if a later projection says execute");
+    assert.equal(admitted.goalCreationAuthorization, null);
+  }
+  assert.deepEqual(preRunPatches, [], "heuristic hints and semantic classification cannot approve tools or plans");
+  assert.equal(approvals, 0);
+  assert.equal(planResumes, 0);
 });
 
 test("Phase 5: resolveSkillId resolves human-readable name/slug without hash and load_skill defaults to full-body budget", async () => {

@@ -144,11 +144,12 @@ for (const text of [
     const harness = createHarness({ text, hasWorkspace: true,
       hasPlanArtifacts: true, isPlanApproved: true, planStage: "executing",
       dismissedPendingDecisionInputKey: text });
-    const resolved = harness.resolve();
-    assert.equal(resolved.handled, false);
-    assert.equal(harness.calls.preflights.length, 0);
+    assert.deepEqual(harness.resolve(), { handled: true, returnValue: true });
+    assert.equal(harness.calls.preflights.length, 1);
+    assert.equal(harness.calls.preflights[0].request.input, text);
     assert.equal(harness.calls.approvedPlans, 0);
     assert.equal(harness.calls.planResumes.length, 0);
+    assert.deepEqual(harness.calls.preRunPatches, []);
   });
 }
 
@@ -157,19 +158,21 @@ test("a continuation supplies its exact prior objective as context without inher
   const harness = createHarness({ text: "现在修复并验证。", hasWorkspace: true,
     shouldContinuePreviousTurnIntent: true, previousTurnContinuationTarget: prior,
     previousTurnContinuationIntent: "analyze", currentTurnIntent: "analyze" });
-  const resolved = harness.resolve();
-  assert.equal(resolved.handled, false);
-  assert.equal(harness.calls.preflights.length, 0);
+  assert.equal(harness.resolve().handled, true);
+  assert.equal(harness.calls.preflights.length, 1);
+  const request = harness.calls.preflights[0].request;
+  assert.equal(request.input, "现在修复并验证。");
+  assert.equal(request.previousRequest, prior.userPrompt);
   assert.equal(harness.calls.planResumes.length, 0);
 });
 
 test("an explicit capsule is passed as a mode boundary while its natural restrictions are interpreted", () => {
   const harness = createHarness({ text: "Only inspect; do not write or run commands.", hasWorkspace: true,
     lockedComposerIntent: "execute" });
-  const resolved = harness.resolve();
-  assert.equal(resolved.handled, false);
-  assert.equal(resolved.effectiveRunIntent, "execute");
-  assert.equal(harness.calls.preflights.length, 0);
+  assert.equal(harness.resolve().handled, true);
+  assert.equal(harness.calls.preflights.length, 1);
+  assert.equal(harness.calls.preflights[0].request.input, harness.input.text);
+  assert.equal(harness.calls.preflights[0].request.explicitIntent, "execute");
 });
 
 test("operation metadata cannot override semantic intent without an explicit execution choice", () => {

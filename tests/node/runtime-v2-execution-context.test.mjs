@@ -46,6 +46,9 @@ function loadTs(sourcePath) {
   return module.exports;
 }
 
+const toolDiscovery = loadTs(path.join(workspaceRoot, "src/lib/toolSearch.ts"));
+const requestPolicy = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderRequestPolicy.ts"));
+test.afterEach(() => toolDiscovery.clearUnlockedToolsForSession());
 const providerTools = loadTs(path.join(
   workspaceRoot,
   "src/store/runtimeV2/executionProviderTools.ts",
@@ -1959,39 +1962,7 @@ test("a mutation preflight rejection keeps one truthful diagnostic across model 
 });
 
 test("Runtime v2 collaboration schema exposes read investigations and transactional implementation", () => {
-  const spawn = {
-    type: "function",
-    function: {
-      name: "spawn_subagent",
-      description: "legacy collaboration contract",
-      parameters: {
-        type: "object",
-        properties: {
-          task_key: { type: "string" },
-          task_kind: {
-            type: "string",
-            enum: ["explore", "review", "implement", "validate"],
-          },
-          objective: { type: "string" },
-          success_criteria: { type: "string" },
-          name: { type: "string" },
-          role: { type: "string" },
-          required_paths: { type: "string" },
-          allowed_paths: { type: "string" },
-          access_mode: {
-            type: "string",
-            enum: ["read", "write"],
-          },
-          implementation_operation: {
-            type: "string",
-            enum: ["create", "modify", "delete"],
-          },
-          implementation_plan: { type: "string" },
-        },
-        required: ["objective"],
-      },
-    },
-  };
+  const spawn = executionToolDefinitions.runtimeV2ToolDefinitions().find(tool => tool.function.name === "spawn_subagent");
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
       now: () => 1,
@@ -2010,19 +1981,19 @@ test("Runtime v2 collaboration schema exposes read investigations and transactio
 
   assert.deepEqual(
     selected.function.parameters.properties.task_kind.enum,
-    ["explore", "review", "validate"],
+    ["explore", "review", "validate", "implement"],
   );
   assert.deepEqual(
     selected.function.parameters.properties.access_mode.enum,
-    ["read"],
+    ["read", "write"],
   );
   assert.match(
     selected.function.description,
-    /exclusive narrow paths|stages and commits/i,
+    /exclusive narrow path scope|stage.*transaction/i,
   );
   assert.deepEqual(
     selected.function.parameters.required,
-    ["objective", "required_paths"],
+    ["task_key", "task_kind", "name", "role", "objective", "success_criteria", "required_paths"],
   );
 
   const minimal = subagentCandidate.runtimeV2ModelSelectedSubagentCandidate({
@@ -2230,6 +2201,7 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
       "run_command",
       "record_execution_contract",
     ].includes(tool.function.name));
+  toolDiscovery.unlockToolsForSession(undefined, ["apply_patch"]);
   const gated = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports,
     command: {
@@ -2551,6 +2523,26 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     scopeRejection.reasonCode,
     "execution_contract_mutation_scope",
   );
+  for (const [toolName, args] of [
+    ["write_file", { path: "src/main.js", content: "replace whole file" }],
+    ["replace_in_file", { path: "/another-project/src/main.js", search_text: "old", replace_text: "new" }],
+    ["apply_patch", { patch: "*** Begin Patch\n*** Update File: src/main.js\n*** Move to: src/renamed.js\n@@\n-old\n+new\n*** End Patch" }],
+  ]) {
+    const denied = authorization.validateToolAgainstPhaseAndPlan({
+      ports: { ...afterPorts, live: executionTypes.createRuntimeV2LiveExecutionState() },
+      command: { kind: "execute_tool", payload: { toolCallId: "contract-negative" } },
+      toolName, args, target: args.path || "",
+    });
+    assert.equal(denied.allowed, false);
+    assert.equal(denied.reasonCode, "execution_contract_mutation_scope", "a same-name file, wrong operation or unapproved rename cannot inherit recorded scope");
+  }
+  const leasedLive = executionTypes.createRuntimeV2LiveExecutionState();
+  leasedLive.mutationSourceCoverageByToolCallId.set("contract-positive", [{ target: "src/main.js", version: "main-v1", totalLines: 1, complete: true, windows: [{ startLine: 1, endLine: 1, content: "old" }] }]);
+  assert.equal(authorization.validateToolAgainstPhaseAndPlan({
+    ports: { ...afterPorts, live: leasedLive },
+    command: { kind: "execute_tool", payload: { toolCallId: "contract-positive" } },
+    toolName: "replace_in_file", args: { path: "src/main.js", search_text: "old", replace_text: "new" }, target: "src/main.js",
+  }).allowed, true, "the exact recorded operation with visible source remains executable");
   const prompt = providerRequest.providerModeInstruction({
     payload: { mode: "execute" },
   }, "", {
@@ -2641,7 +2633,7 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
   const reviewRead = advanceTools.find((tool) =>
     tool.function.name === "read_file"
   );
-  assert.equal(reviewRead, undefined);
+  assert.ok(reviewRead, "a pending contract cannot revoke safe reads");
   assert.equal(
     advanceTools.some((tool) =>
       ["replace_in_file", "apply_patch", "write_file"].includes(
@@ -2656,8 +2648,8 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
       tool.function.name === "run_command" ||
       tool.function.name === "browser_evaluate"
     ),
-    false,
-    "validation cannot skip a contract target that has not received its implementation mutation",
+    true,
+    "validation tools remain available; early evidence cannot close incomplete contract coverage",
   );
   const recoveryAdvanceTools =
     providerTools.selectRuntimeV2ProviderToolDefinitions({
@@ -2684,8 +2676,8 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
       tool.function.name === "run_command" ||
       tool.function.name === "browser_evaluate"
     ),
-    false,
-    "closed recovery cannot advertise validation while a contracted mutation is pending",
+    true,
+    "recovery keeps validators available without discharging pending targets",
   );
   assert.equal(
     recoveryAdvanceTools.some((tool) =>
@@ -2719,11 +2711,7 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     args: { command: "npm run build" },
     target: "npm run build",
   });
-  assert.equal(prematureValidation.allowed, false);
-  assert.equal(
-    prematureValidation.reasonCode,
-    "execution_contract_pending_mutations",
-  );
+  assert.equal(prematureValidation.allowed, true, "a finite check may run early; it cannot prove later mutations");
   const outOfReviewRead = authorization.validateToolAgainstPhaseAndPlan({
     ports: advancePorts,
     command: {
@@ -2741,11 +2729,7 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     args: { path: "src/main.js" },
     target: "src/main.js",
   });
-  assert.equal(outOfReviewRead.allowed, false);
-  assert.equal(
-    outOfReviewRead.reasonCode,
-    "execution_contract_source_review_scope",
-  );
+  assert.equal(outOfReviewRead.allowed, true, "ordinary read authority is independent of contract mutation scope");
 
   const reviewedAggregate = mutatedAggregate;
   const reviewedAdvance =
@@ -2779,8 +2763,8 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
   });
   assert.equal(
     reviewedTools.some((tool) => tool.function.name === "read_file"),
-    false,
-    "post-edit inspection remains closed until all contracted mutations commit",
+    true,
+    "safe post-edit inspection remains available while contract targets are pending",
   );
 
   const mainMutationCommand = {
@@ -2857,8 +2841,8 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     });
   assert.deepEqual(
     validationOnlyTools.map((tool) => tool.function.name),
-    ["run_command"],
-    "once every contract target and the one self-review batch are complete, only a finite validation may advance the boundary",
+    reopened.map(tool => tool.function.name),
+    "contract coverage does not revoke tools; successful matching validation still owns acceptance",
   );
 
   const failedAggregate = {
@@ -2910,8 +2894,10 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
       "read_file",
       "replace_in_file",
       "apply_patch",
+      "run_command",
+      "record_execution_contract",
     ],
-    "a failed acceptance receipt supersedes the pre-edit outline and returns to one ordinary inspect/edit surface",
+    "failed acceptance keeps inspection, correction, contract revision and finite checks available",
   );
   assert.equal(
     correctionReadTools.find((tool) => tool.function.name === "read_file")
@@ -2920,11 +2906,11 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     "diagnostic locations guide the model but do not become a project-specific path lock",
   );
   for (const toolName of ["replace_in_file", "apply_patch"]) {
-    assert.equal(
+    assert.deepEqual(
       correctionReadTools.find((tool) => tool.function.name === toolName)
         .function.parameters.properties.path?.enum,
-      undefined,
-      "new acceptance evidence must not retain the stale contract target enum",
+      toolName === "replace_in_file" ? ["src/main.js", "src/components/editor.js"] : undefined,
+      "a failed check cannot silently broaden the recorded operation scope; explicit revision stays available",
     );
   }
   const correctionClosedTools =
@@ -2950,14 +2936,14 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     });
   assert.deepEqual(
     correctionClosedTools.map((tool) => tool.function.name),
-    ["replace_in_file", "apply_patch"],
+    correctionReadTools.map(tool => tool.function.name),
   );
-  assert.equal(
+  assert.deepEqual(
     correctionClosedTools.find((tool) =>
       tool.function.name === "replace_in_file"
     ).function.parameters.properties.path.enum,
-    undefined,
-    "closed recovery must force an edit without forcing it back into the stale pre-validation scope",
+    ["src/main.js", "src/components/editor.js"],
+    "legacy recovery hints cannot discard the recorded exact scope",
   );
 
   const unavailableValidationCommand = {
@@ -3031,11 +3017,11 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     });
   assert.deepEqual(
     replacementTools.map((tool) => tool.function.name),
-    ["run_command"],
-    "an unavailable validator opens one alternate finite validation action, not a source or mutation loop",
+    reopened.map(tool => tool.function.name),
+    "an unavailable validator keeps alternative authorized actions available",
   );
   assert.equal(
-    replacementTools[0].function.parameters.properties.command?.enum,
+    replacementTools.find(tool => tool.function.name === "run_command").function.parameters.properties.command?.enum,
     undefined,
     "the failed sealed command must not remain the only executable enum",
   );
@@ -3122,9 +3108,9 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
         },
       },
       available,
-    }),
-    [],
-    "two source-less operational validator failures must hand off instead of cycling commands",
+    }).map(tool => tool.function.name),
+    reopened.map(tool => tool.function.name),
+    "two operational failures are soft recovery signals, with the shared stall lease still active",
   );
 
   const advancePrompt = providerRequest.providerModeInstruction({
@@ -3141,17 +3127,11 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     executionContractSourceReviewAvailable: false,
     executionContractSourceReviewTargets: advance.sourceReviewTargets,
   });
-  assert.match(advancePrompt, /open-ended investigation is closed/i);
+  assert.match(advancePrompt, /execution_contract_v1/);
   assert.match(advancePrompt, /src\/main\.js/);
-  assert.match(advancePrompt, /Submit one concrete mutation/i);
-  assert.match(
-    advancePrompt,
-    /Validation remains unavailable until every pending contract target/i,
-  );
-  assert.doesNotMatch(
-    advancePrompt,
-    /Validate the latest committed mutation now/i,
-  );
+  assert.match(advancePrompt, /Safe reads and finite checks remain available/);
+  assert.match(advancePrompt, /early checks cannot discharge pending contract targets or newer mutation debt/);
+  assert.doesNotMatch(advancePrompt, /investigation is closed|Submit one concrete mutation/);
 });
 
 test("an Execute contract rejects unread targets, silent revisions, and scope drift", () => {
@@ -3279,7 +3259,7 @@ test("source evidence never closes the ordinary inspect-edit surface by batch co
     sourceOnlyFrontier: true,
   });
   assert.match(prompt, /advance the user's complete objective/i);
-  assert.match(prompt, /do not select the implementation targets or require a repair to the files already read/i);
+  assert.match(prompt, /does not make its files mandatory edit targets/i);
   assert.doesNotMatch(prompt, /observation branch is closed/i);
   assert.doesNotMatch(prompt, /call record_execution_contract now/i);
 });
@@ -3667,8 +3647,8 @@ test("a failed validation preserves diagnostic guidance without creating a read 
     validationCorrectionActive: true,
   });
   assert.match(prompt, /VALIDATION_CORRECTION/);
-  assert.match(prompt, /ordinary focused source reads/i);
-  assert.match(prompt, /Validation remains withheld until a workspace mutation/i);
+  assert.match(prompt, /safe reads remain available/i);
+  assert.match(prompt, /Re-verify after the correction/i);
   assert.doesNotMatch(prompt, /Validate the latest committed mutation now/i);
 
   const closedTools = providerTools.selectRuntimeV2ProviderToolDefinitions({
@@ -3691,8 +3671,8 @@ test("a failed validation preserves diagnostic guidance without creating a read 
   }).map((tool) => tool.function.name);
   assert.deepEqual(
     closedTools,
-    ["replace_in_file", "apply_patch"],
-    "general no-effect recovery must close reads even while failed-validation guidance remains active",
+    ["read_file", "grep_search", "replace_in_file", "apply_patch", "write_file", "run_command"],
+    "diagnostic guidance must not close safe reads or withdraw authorized effects",
   );
 });
 
@@ -4193,7 +4173,8 @@ test("Observe, Act, and Validate share one safe inspect-edit-verify surface", ()
   ]);
 });
 
-test("recovery preserves the current executable surface until the bounded stop", () => {
+test("recovery preserves the current executable surface without a count-based stop", () => {
+  toolDiscovery.unlockToolsForSession(undefined, ["apply_patch", "delete_workspace_path", "browser_evaluate"]);
   const available = [
     "read_file",
     "grep_search",
@@ -4225,18 +4206,7 @@ test("recovery preserves the current executable surface until the bounded stop",
     command: validationCommand,
     available,
   }).map((tool) => tool.function.name);
-  assert.deepEqual(ordinary, [
-    "read_file",
-    "grep_search",
-    "replace_in_file",
-    "apply_patch",
-    "write_file",
-    "delete_workspace_path",
-    "run_command",
-    "browser_evaluate",
-    "spawn_subagent",
-    "wait_subagents",
-  ]);
+  assert.deepEqual(new Set(ordinary), new Set(available.map(tool => tool.function.name)));
 
   const closed = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports,
@@ -4244,11 +4214,7 @@ test("recovery preserves the current executable surface until the bounded stop",
     available,
     actionWindow: "closed_recovery",
   }).map((tool) => tool.function.name);
-  assert.deepEqual(closed, [
-    "replace_in_file",
-    "apply_patch",
-    "delete_workspace_path",
-  ]);
+  assert.deepEqual(closed, ordinary, "recovery must retain safe reads and authorized effects");
 
   const recovery = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports,
@@ -4290,12 +4256,13 @@ test("recovery preserves the current executable surface until the bounded stop",
   });
   assert.deepEqual(
     validationHandoff.map((tool) => tool.function.name),
-    ["run_command"],
-    "a failed provider choice must retain the one executable validation action",
+    ordinary,
+    "sealing a validator must not confiscate unrelated safe tools",
   );
+  assert.deepEqual(validationHandoff.find(tool => tool.function.name === "run_command").function.parameters.properties.command.enum, ["npm run build"]);
 });
 
-test("one non-actionable validation decision closes inspection", () => {
+test("one non-actionable validation decision preserves safe inspection", () => {
   const base = {
     command: {
       payload: {
@@ -4324,8 +4291,8 @@ test("one non-actionable validation decision closes inspection", () => {
         },
       },
     }),
-    "closed_recovery",
-    "a non-actionable decision must close inspection while retaining validation and source-backed implementation",
+    null,
+    "a non-actionable decision cannot revoke safe reads or authorize an unsafe mutation",
   );
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
@@ -4334,12 +4301,13 @@ test("one non-actionable validation decision closes inspection", () => {
         repeatedObservationToolNames: new Set(["grep_search"]),
       },
     }),
-    "closed_recovery",
-    "equivalent inspection results cannot postpone validation",
+    null,
+    "repetition pressure preserves tools; actual validation debt remains independently enforced",
   );
 });
 
-test("a closed provider decision cannot escape its bounded mutation through reads or collaboration", () => {
+test("recovery does not confiscate safe reads or admitted collaboration", () => {
+  toolDiscovery.unlockToolsForSession(undefined, ["apply_patch", "delete_workspace_path", "browser_evaluate"]);
   const available = [
     "read_file",
     "grep_search",
@@ -4372,16 +4340,13 @@ test("a closed provider decision cannot escape its bounded mutation through read
   });
 
   assert.deepEqual(
-    selected.map((tool) => tool.function.name),
-    [
-      "replace_in_file",
-      "apply_patch",
-      "delete_workspace_path",
-    ],
+    new Set(selected.map((tool) => tool.function.name)),
+    new Set(available.map(tool => tool.function.name)),
   );
 });
 
-test("a missing mutation source exposes only a target-locked read", () => {
+test("missing source guidance preserves ordinary reads without manufacturing path authority", () => {
+  toolDiscovery.unlockToolsForSession(undefined, ["apply_patch", "delete_workspace_path", "browser_evaluate"]);
   const available = [
     "read_file",
     "grep_search",
@@ -4401,18 +4366,9 @@ test("a missing mutation source exposes only a target-locked read", () => {
     correctiveSourceTargets: ["src-tauri/src/main.rs"],
   });
 
-  assert.deepEqual(
-    selected.map((tool) => tool.function.name),
-    ["read_file"],
-  );
-  assert.deepEqual(
-    selected[0].function.parameters.properties.path.enum,
-    ["src-tauri/src/main.rs"],
-  );
-  assert.match(
-    selected[0].function.description,
-    /single fresh source-recovery batch/i,
-  );
+  assert.ok(selected.some(tool => tool.function.name === "read_file"));
+  assert.ok(selected.some(tool => tool.function.name === "replace_in_file"));
+  assert.equal(selected[0].function.parameters.properties.path?.enum, undefined);
 
   const validating = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
@@ -4432,16 +4388,14 @@ test("a missing mutation source exposes only a target-locked read", () => {
   });
   assert.deepEqual(
     validating.map((tool) => tool.function.name),
-    ["read_file"],
-    "a corrective source lease outranks the validate-phase tool surface",
+    selected.map(tool => tool.function.name),
+    "validate keeps the same admitted tools; source leases still guard writes",
   );
-  assert.deepEqual(
-    validating[0].function.parameters.properties.path.enum,
-    ["src-tauri/src/main.rs"],
-  );
+  assert.equal(validating[0].function.parameters.properties.path?.enum, undefined);
 });
 
-test("a corrective mutation lease outranks validation tools", () => {
+test("corrective failure leaves source and validation tools available", () => {
+  toolDiscovery.unlockToolsForSession(undefined, ["apply_patch", "delete_workspace_path", "browser_evaluate"]);
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
       now: () => 1,
@@ -4467,7 +4421,7 @@ test("a corrective mutation lease outranks validation tools", () => {
   });
   assert.deepEqual(
     selected.map((tool) => tool.function.name),
-    ["replace_in_file", "apply_patch", "delete_workspace_path"],
+    ["read_file", "replace_in_file", "apply_patch", "write_file", "delete_workspace_path", "run_command", "browser_evaluate"],
   );
 });
 
@@ -4638,7 +4592,7 @@ test("corrective action pressure reuses materialized target source without a fre
       effects,
       sourceCoverage: [],
     }),
-    "corrective_source",
+    null,
     "a missing exact target opens only the target-locked source recovery window",
   );
   assert.equal(
@@ -4653,7 +4607,7 @@ test("corrective action pressure reuses materialized target source without a fre
         complete: true,
       }],
     }),
-    "corrective_mutation",
+    null,
     "a rejected mutation changed no files, so already-materialized current source remains valid authority",
   );
 });
@@ -4678,7 +4632,7 @@ test("a failed optional editor hands a completed contract to validation instead 
       sourceCoverage: [],
       completedContractAwaitingValidation: true,
     }),
-    "validation_handoff",
+    null,
   );
   assert.equal(
     authorization.runtimeV2ProviderActionWindowFor({
@@ -4687,7 +4641,7 @@ test("a failed optional editor hands a completed contract to validation instead 
       sourceCoverage: [],
       completedContractAwaitingValidation: false,
     }),
-    "corrective_source",
+    null,
     "a failed required edit or post-validation correction still gets exact source recovery",
   );
 
@@ -4710,10 +4664,10 @@ test("a failed optional editor hands a completed contract to validation instead 
   });
   assert.deepEqual(
     selected.map((tool) => tool.function.name),
-    ["run_command"],
+    ["read_file", "replace_in_file", "run_command", "browser_evaluate"],
   );
   assert.deepEqual(
-    selected[0].function.parameters.properties.command.enum,
+    selected.find(tool => tool.function.name === "run_command").function.parameters.properties.command.enum,
     ["npm run build"],
   );
 });
@@ -4754,8 +4708,8 @@ test("a newer failed validation supersedes only older rejected-editor recovery",
       ...base,
       newerValidationFailureSequence: 10,
     }),
-    "corrective_source",
-    "an editor rejected after the validation still owns target-locked recovery",
+    null,
+    "a rejected editor does not acquire a target lock",
   );
 });
 
@@ -4809,8 +4763,8 @@ test("corrective source recovery closes on fresh target source while the new edi
       sourceCoverage: prefixOnly,
       workspace: "/workspace",
     }),
-    "corrective_mutation",
-    "fresh target source closes recovery reading without reconstructing the rejected patch",
+    null,
+    "fresh source changes the lease, not the tool surface",
   );
   const coveredHunk = [{
     target: "src/main.js",
@@ -4834,8 +4788,8 @@ test("corrective source recovery closes on fresh target source while the new edi
       sourceCoverage: coveredHunk,
       workspace: "/workspace",
     }),
-    "corrective_mutation",
-    "a focused hunk also closes the target-level recovery window",
+    null,
+    "a focused hunk leaves safe diagnostic reads available",
   );
   assert.equal(
     correctiveMutationPolicy.runtimeV2MaterializedSourceCoversMutation({
@@ -4849,23 +4803,50 @@ test("corrective source recovery closes on fresh target source while the new edi
   );
 });
 
-test("three uncommitted corrective mutation failures close the recovery cycle", () => {
-  assert.equal(
-    providerActionWindow.runtimeV2CorrectiveMutationFailureLimitReached({
-      correctiveMutationFailureToolCallIds: new Set(["one", "two"]),
-    }),
-    false,
-  );
-  assert.equal(
-    providerActionWindow.runtimeV2CorrectiveMutationFailureLimitReached({
-      correctiveMutationFailureToolCallIds: new Set([
-        "one",
-        "two",
-        "three",
-      ]),
-    }),
-    true,
-  );
+test("repeated corrective failures remain soft while the real no-progress lease expires", () => {
+  const now = 10_000;
+  let lease = null;
+  for (let occurrence = 1; occurrence <= 20; occurrence++) {
+    lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({ current: lease, pressure: { reason: "tool_execution_failed", occurrence, stage: "reconsider" }, now: now + occurrence });
+    assert.equal(runtime.runtimeV2ProviderRecoveryStallExpired(lease, now + occurrence), false);
+    assert.equal(authorization.runtimeV2ProviderActionWindowFor({ command: { payload: { mode: "execute" } }, effects: { correctiveMutationFailureToolCallIds: new Set(Array.from({length: occurrence}, (_, index) => `failure-${index}`)) }, sourceCoverage: [] }), null);
+  }
+  assert.equal(runtime.runtimeV2ProviderRecoveryStallExpired(lease, lease.startedAt + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS - 1), false);
+  assert.equal(runtime.runtimeV2ProviderRecoveryStallExpired(lease, lease.startedAt + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS), true);
+  assert.equal(runtime.advanceRuntimeV2ProviderRecoveryStallLease({ current: lease, pressure: null, now: now + 100 }), null, "real actionable progress clears the recovery lease");
+  const runner = fs.readFileSync(path.join(workspaceRoot, "src/store/runtimeV2/executeRunner.ts"), "utf8");
+  assert.doesNotMatch(runner, /CorrectiveMutationFailureLimitReached|stalledValidationCount\s*>=/);
+  assert.match(runner, /runtimeV2ProviderRecoveryStallExpired/);
+});
+
+test("many rejected edits cannot manufacture success, and lease exhaustion reports actual effects truthfully", () => {
+  for (const committed of [false, true]) {
+    const turn = { workspaceKey: "/fixture", sessionKey: "recovery", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn-recovery" };
+    const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId, runId: "run-recovery", parentRunId: null, attemptId: "attempt" };
+    let sequence = 0;
+    let aggregate = null;
+    const append = (type, fields) => {
+      aggregate = runtime.transition(aggregate, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: sequence++, eventId: `recovery-${sequence}`, at: sequence, type, ...fields });
+    };
+    append("turn.admitted", { turn, strategy: "execute", objective: "Repair the actual target.", constraints: [], acceptanceCriteria: ["The repair works."], acceptanceCriterionIds: ["repair-works"], acceptanceEvidenceRequirements: [null] });
+    append("run.started", { run, phase: "acting" });
+    if (committed) {
+      const command = { kind: "execute_tool", idempotencyKey: "committed-edit", phase: "acting", run, payload: { toolCallId: "committed-edit", toolName: "write_file", arguments: { path: "src/target.ts", content: "changed" } } };
+      append("command.scheduled", { run, command });
+      append("tool.completed", { run, idempotencyKey: command.idempotencyKey, status: "succeeded", evidence: [{ id: "actual-mutation", kind: "mutation", target: "src/target.ts", version: "v1" }] });
+    }
+    for (let failure = 1; failure <= 20; failure++) {
+      const command = { kind: "execute_tool", idempotencyKey: `rejected-edit-${failure}`, phase: "acting", run, payload: { toolCallId: `rejected-edit-${failure}`, toolName: "replace_in_file", arguments: { path: "src/target.ts", search_text: "unseen", replace_text: "invented" } } };
+      append("command.scheduled", { run, command });
+      append("tool.completed", { run, idempotencyKey: command.idempotencyKey, status: "blocked", failureKind: "protocol_invalid", failureReasonCode: "mutation_source_lease_missing", evidence: [], presentation: { toolName: "replace_in_file", target: "src/target.ts", message: "Exact target source is not visible; read its versioned window." } });
+      assert.equal(executionOutcome.runtimeV2ExecuteTerminalDecision({ aggregate, signal: new AbortController().signal }), null, "rejected edits are neither progress nor a terminal success");
+    }
+    const exhausted = executionOutcome.truthfulRuntimeV2RecoveryStallDecision({ aggregate, recoveryOccurrence: 20 });
+    assert.equal(exhausted.resultKind, committed ? "partial" : "error");
+    assert.match(exhausted.resultReason, /20.*动作被拒绝或执行失败/);
+    if (committed) assert.match(exhausted.finalMarkdown, /未经自动验收|部分完成/);
+    else assert.equal(exhausted.finalMarkdown, undefined);
+  }
 });
 
 test("a rejected repeated action does not create an Execute file-mutation obligation", () => {
@@ -5086,15 +5067,8 @@ test("source-only pressure prioritizes mutation without revoking safe tools", ()
       tools: available,
       hasMaterializedSourceEvidence: true,
     }).map((tool) => tool.function.name);
-  assert.deepEqual(withVisibleSource, [
-    "replace_in_file",
-    "apply_patch",
-    "write_file",
-    "read_file",
-    "grep_search",
-    "run_command",
-    "browser_evaluate",
-  ]);
+  assert.deepEqual(new Set(withVisibleSource.slice(0, 3)), new Set(["replace_in_file", "apply_patch", "write_file"]));
+  assert.deepEqual(withVisibleSource.slice(3), ["read_file", "grep_search", "run_command", "browser_evaluate"]);
   assert.deepEqual(
     new Set(withVisibleSource),
     new Set(withoutVisibleSource),
@@ -6808,7 +6782,7 @@ test("a missing-source rejection reuses unchanged materialized target source for
       effects,
       sourceCoverage: coverage,
     }),
-    "corrective_mutation",
+    null,
     "because the rejected editor changed no files, a still-materialized exact source receipt remains current",
   );
 
@@ -6970,7 +6944,7 @@ test("ordinary reasoning preserves its configuration without a recovery boundary
   }), "auto", "an adapter without a toggle cannot override the configuration");
 });
 
-test("corrective action window closes observation but not the Run", () => {
+test("legacy corrective hints cannot close safe observations or replace source leases", () => {
   const prompt = providerRequest.providerModeInstruction({
     payload: {
       mode: "execute",
@@ -6997,11 +6971,10 @@ test("corrective action window closes observation but not the Run", () => {
     }],
   });
 
-  assert.match(prompt, /CORRECTIVE_ACTION_WINDOW/);
-  assert.match(prompt, /previous workspace mutation changed no files/i);
-  assert.match(prompt, /observation branch is closed/i);
-  assert.match(prompt, /Inspection and validation reopen/i);
-  assert.doesNotMatch(prompt, /Continue reading|Safe reads remain available/i);
+  assert.doesNotMatch(prompt, /observation branch is closed/i);
+  assert.match(prompt, /Safe reads remain available/i);
+  assert.match(prompt, /editable_source_v1/);
+  assert.match(prompt, /Each existing target needs its own versioned source lease/);
   assert.equal(
     providerRequest.runtimeV2ExecutionReasoningRequest({
       configured: "auto",
@@ -7182,7 +7155,7 @@ test("a truncated reasoning or visible action draft gets one bounded action-mode
   );
   assert.equal(
     providerRequest.RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
-    1_000,
+    requestPolicy.RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
     "a required structured action is redirected before a long visible essay can consume the turn",
   );
 });
@@ -10240,12 +10213,12 @@ test("browser validation requires passed assertions and no page errors", () => {
   );
 });
 
-test("one-Turn consent reaches browser execution without advertising unavailable desktop control", async () => {
+test("one-Turn consent reaches browser execution while desktop control still requires per-call approval", async () => {
   assert.equal(
     executionToolDefinitions.runtimeV2ToolDefinitions()
       .some((definition) => definition.function.name === "computer_use"),
-    false,
-    "a tool that cannot pass the current Runtime approval path must not be advertised",
+    true,
+    "desktop control is discoverable, with independent per-call approval",
   );
   const state = {
     config: {},
@@ -10282,7 +10255,8 @@ test("one-Turn consent reaches browser execution without advertising unavailable
     { app_name: "MAIN" },
   );
   assert.equal(desktop.allowed, false);
-  assert.match(desktop.reason || "", /未暴露|not exposed/i);
+  assert.equal(desktop.approvalRequired, true);
+  assert.match(desktop.reason || "", /审批|approval/i);
 });
 
 test("external local read approval preserves the execution boundary flag", async () => {
@@ -10829,7 +10803,7 @@ test("recovery requests preserve canonical command and source receipts before re
         assert.equal(roomy.coverage[0]?.windows[0]?.content, source);
         assert.equal(roomy.coverage[0]?.version, "source-v1");
         assert.equal(roomy.options.contextOwnership, "caller");
-        assert.equal(roomy.options.actionOnlyCharLimit, 3_000, "semantic recovery uses ordinary reply decoding");
+        assert.equal(roomy.options.actionOnlyCharLimit, requestPolicy.RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT, "semantic recovery uses ordinary reply decoding");
         assert.equal(roomy.options.toolChoice, undefined);
         assert.doesNotMatch(roomy.messages.map((message) => message.content).join("\n"), /committed_source_snapshot_v1|committed_observation_receipts_v1/);
       }

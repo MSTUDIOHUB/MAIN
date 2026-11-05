@@ -111,8 +111,16 @@ test("conclusion output respects the Run allocation instead of the action recove
   assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command(), false, { outputBudget: 1024 }), 1024);
   assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command(), false, { outputBudget: 32768 }), 8192);
   assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command("conclude", { recoveryPressure: { reason: "output_truncated" } }), false, { outputBudget: 8192 }), 8192);
-  assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command("execute"), false, { outputBudget: 8192 }), 4096);
-  assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command("execute", { recoveryPressure: { reason: "output_truncated" } }), false, { outputBudget: 8192 }), 2048);
+  assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command("execute"), false, { outputBudget: 8192 }), requestPolicy.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS);
+  assert.equal(request.runtimeV2ExecutionProviderOutputTokenLimit(command("execute", { recoveryPressure: { reason: "output_truncated" } }), false, { outputBudget: 8192 }), requestPolicy.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS);
+  for (const mode of ["execute", "validate", "conclude"]) {
+    for (const outputBudget of [1, 512, 32_768]) {
+      const limit = request.runtimeV2ExecutionProviderOutputTokenLimit(command(mode), false, { outputBudget });
+      assert.ok(limit > 0 && limit <= outputBudget && limit <= 8_192, `${mode} must honor both the Run budget and parent-request ceiling`);
+    }
+  }
+  assert.ok(requestPolicy.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS <= requestPolicy.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS);
+
 });
 
 test("Chat and analyze recovery retain their answer budget while keeping tools available", () => {
@@ -261,7 +269,7 @@ test("Execute action recovery still submits an advertised tool after a reasoning
     assert.match(feedback.content, /Submit exactly one.*structured tool action/);
     assert.equal(calls[1].messages.at(-1), authority, "the actual tool surface is the final phase instruction");
     assert.match(authority.content, /CURRENT_TOOL_SURFACE: this decision exposes exactly 1 tool: read_file/);
-    assert.equal(calls[1].maxOutputTokens, 4096);
+    assert.equal(calls[1].maxOutputTokens, requestPolicy.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS);
     assert.deepEqual(calls[1].tools, [tool]);
     assert.equal(result.toolCalls[0].name, "read_file");
   });
@@ -290,8 +298,8 @@ test("client action guards retain canonical recovery and accurately distinguish 
       const result = await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "empty_response" } }), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
       assert.equal(calls.length, 2);
       assert.equal(calls[1].settings.reasoningRequest, "off");
-      assert.equal(calls[0].options.reasoningOnlyCharLimit, 4_000);
-      assert.equal(calls[1].options.reasoningOnlyCharLimit, 4_000);
+      assert.equal(calls[0].options.reasoningOnlyCharLimit, requestPolicy.RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT);
+      assert.equal(calls[1].options.reasoningOnlyCharLimit, requestPolicy.RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT);
       assert.deepEqual(calls[1].messages.slice(0, canonical.length), canonical);
       const { feedback } = assertOutboundRecoveryPair(calls[1].messages, "");
       assert.match(feedback.content, /CLIENT_OUTPUT_GUARD_REACHED/);
@@ -355,7 +363,7 @@ test("visible required-action recovery preserves settings for an adapter without
     assert.match(feedback.content, /Submit exactly one/);
     assert.equal(calls[1].messages.at(-1), authority, "required-action authority follows the causal draft/feedback pair");
     assert.match(authority.content, /requires exactly one structured action, and it must be read_file/);
-    assert.equal(calls[1].maxOutputTokens, 2048);
+    assert.equal(calls[1].maxOutputTokens, requestPolicy.RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS);
     assert.equal(result.toolCalls[0].name, "read_file");
   });
 });
@@ -475,7 +483,7 @@ test(`complete ${mode} replies retain causal feedback on the actual wire without
     await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command(mode, { recoveryPressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason: "non_actionable_response", occurrence: 1, stage: "reconsider" }, effectPressure: { reason: "source_only_frontier" } }), tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.toolChoice, undefined, "a complete no-action reply is a soft strategy signal");
-    assert.equal(calls[0].maxOutputTokens, mode === "execute" ? 4096 : 2048);
+    assert.equal(calls[0].maxOutputTokens, mode === "execute" ? requestPolicy.RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS : requestPolicy.RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS);
     assert.deepEqual(new Set(calls[0].tools.map((tool) => tool.function.name)), new Set(["read_file", "apply_patch"]));
     const feedbackIndex = calls[0].messages.findIndex((message) => message.role === "system" && message.content.startsWith("[runtime-v2 provider feedback: non_actionable_response]"));
     assert.ok(feedbackIndex > 0);
@@ -496,8 +504,8 @@ test("empty or malformed action recovery keeps its explicit protocol feedback an
 test("a complete Validate reply cannot close inspection solely from recovery occurrence", () => {
   const input = { command: command("validate", { recoveryPressure: { reason: "non_actionable_response", occurrence: 3 } }), effects: {}, sourceCoverage: [] };
   assert.equal(actionWindows.runtimeV2ProviderActionWindowFor(input), null);
-  assert.equal(actionWindows.runtimeV2ProviderActionWindowFor({ ...input, command: command("validate", { recoveryPressure: { reason: "empty_response", occurrence: 1 } }) }), "closed_recovery");
-  assert.equal(actionWindows.runtimeV2ProviderActionWindowFor({ ...input, effects: { replayedSourceReceiptCountSinceMutation: 1 } }), "closed_recovery", "an actual replay remains structured recovery evidence");
+  assert.equal(actionWindows.runtimeV2ProviderActionWindowFor({ ...input, command: command("validate", { recoveryPressure: { reason: "empty_response", occurrence: 1 } }) }), null);
+  assert.equal(actionWindows.runtimeV2ProviderActionWindowFor({ ...input, effects: { replayedSourceReceiptCountSinceMutation: 1 } }), null, "replay evidence cannot independently revoke safe reads");
 });
 
 test("empty protocol feedback cannot bind an older unrelated assistant draft on the actual wire", async () => {

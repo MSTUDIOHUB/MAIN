@@ -69,6 +69,7 @@ const handoff = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planHandoff
 const engineSelection = loadTs(path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"));
 const runIntent = loadTs(path.join(workspaceRoot, "src/lib/runIntent.ts"));
 const planProtocol = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planModelProtocol.ts"));
+const planSubmissionPolicy = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planSubmissionPolicy.ts"));
 const EXPLICIT_PLAN_TEST_BUDGET_MS = 8 * 60_000;
 const PLAN_RECOVERY_STALL_MS = 10 * 60_000;
 
@@ -683,7 +684,7 @@ function planningCheckpointWithRepeatedSubmitOnlyArgumentViolations() {
         diagnostics: [{
           code: "tool_arguments_rejected",
           message:
-            "submit_runtime_v2_work_plan did not satisfy its exact advertised Plan schema: arguments.changes[0].dependsOn is required.",
+            "submit_runtime_v2_work_plan did not satisfy its exact advertised Plan schema: arguments.changes[0].change is required.",
           retryable: true,
         }],
       },
@@ -3056,7 +3057,7 @@ test("production Plan rejects an incomplete typed graph before sealing", async (
       round += 1;
       if (round === 1) {
         const invalidSubmission = structuredClone(validSubmission);
-        delete invalidSubmission.changes[1].dependsOn;
+        delete invalidSubmission.changes[1].change;
         return {
           content: "",
           toolCalls: [{
@@ -3093,7 +3094,7 @@ test("production Plan rejects an incomplete typed graph before sealing", async (
   assert.equal(result.settlement.outcome.status, "paused");
   assert.match(
     correctionTranscript,
-    /PLAN_TOOL_ARGUMENTS_REJECTED:.*arguments\.changes\[1\]\.dependsOn is required/,
+    /PLAN_TOOL_ARGUMENTS_REJECTED:.*arguments\.changes\[1\]\.change is required/,
   );
   const rejectedProviderResult = result.checkpoint.aggregate.events.find(
     (event) =>
@@ -3112,7 +3113,7 @@ test("production Plan rejects an incomplete typed graph before sealing", async (
   );
   assert.ok(result.logs.some((entry) =>
     entry.eventName === "runtime_v2_plan_submission_rejected" &&
-    /arguments\.changes\[1\]\.dependsOn is required/.test(
+    /arguments\.changes\[1\]\.change is required/.test(
       String(entry.data?.detail || ""),
     )
   ));
@@ -3877,7 +3878,7 @@ test("Plan discovery keeps read and submit tools available until the model submi
   assert.ok(submitTool);
   assert.deepEqual(
     submitTool.function.parameters.required,
-    ["planMarkdown", "changes", "validations"],
+    ["planMarkdown", "changes"],
   );
   assert.equal(
     submitTool.function.parameters.properties.findingsJson,
@@ -4134,8 +4135,9 @@ test("Plan uses the text envelope first when the adapter lacks native tool round
       criterionIds: ["criterion-user-objective"],
     }],
   };
-  const envelope = (toolCalls) =>
-    `<runtime-v2-tools>${JSON.stringify({ toolCalls })}</runtime-v2-tools>`;
+  const envelope = (toolCalls) => toolCalls
+    .map((call) => `<tool_call>${JSON.stringify(call)}</tool_call>`)
+    .join("\n");
   let round = 0;
   const result = await runProductionPlanScenario(
     async (messages, _settings, _callbacks, _signal, tools, _maxTokens, requestOptions) => {
@@ -4193,7 +4195,8 @@ test("Plan uses the text envelope first when the adapter lacks native tool round
     const prompt = request.messages
       .map((message) => String(message.content || ""))
       .join("\n");
-    assert.match(prompt, /<runtime-v2-tools>/);
+    assert.match(prompt, /<tool_call>/);
+    assert.match(prompt, /\[runtime-v2 allowed tool catalog\]/);
   }
   assert.match(
     requests[0].messages
@@ -4240,7 +4243,7 @@ test("schema-bound Plan response ingress never searches surrounding prose for JS
   );
 });
 
-test("WorkPlan compilation removes unsafe finite commands only when another executable validation remains", () => {
+test("WorkPlan compilation downgrades non-finite commands without granting executable validation coverage", () => {
   const evidence = [{
     id: "E1",
     target: "src/main.js",
@@ -4273,14 +4276,20 @@ test("WorkPlan compilation removes unsafe finite commands only when another exec
     candidate,
     evidence,
     "Repair the reviewed behavior.",
+    ["criterion-user-objective"],
   );
   assert.deepEqual(
     compiled.draft.validations.map((validation) => validation.kind),
-    ["browser"],
+    ["advisory", "browser"],
   );
+  assert.equal(compiled.draft.validations[0].required, false);
+  assert.equal(compiled.draft.validations[0].command, undefined);
   assert.ok(compiled.normalizationReasons.includes(
-    "validations[0]:unsafe_finite_command_removed",
+    "validations[0]:non_finite_command_downgraded_to_advisory",
   ));
+  assert.doesNotThrow(() => planSubmissionPolicy.assertAdmittedPlanCriteriaMapped({
+    draft: compiled.draft, criterionIds: ["criterion-user-objective"],
+  }));
   assert.doesNotThrow(() => runtime.sealWorkPlanV1({
     draft: compiled.draft,
     evidence,
@@ -4291,14 +4300,16 @@ test("WorkPlan compilation removes unsafe finite commands only when another exec
     { ...candidate, validations: candidate.validations.slice(0, 1) },
     evidence,
     "Repair the reviewed behavior.",
+    ["criterion-user-objective"],
   );
+  // Core WorkPlan drafts can contain advisory-only recommendations. Production
+  // admission separately requires executable validation for admitted criteria.
   assert.throws(
-    () => runtime.sealWorkPlanV1({
+    () => planSubmissionPolicy.assertAdmittedPlanCriteriaMapped({
       draft: withoutFallback.draft,
-      evidence,
-      createdAt: 1,
+      criterionIds: ["criterion-user-objective"],
     }),
-    /needs at least one required validation/,
+    /Admitted criteria missing from required validations/,
   );
 });
 
@@ -4582,7 +4593,7 @@ test("a repeated submit-only Plan argument violation pivots to one compact struc
   const typedRejectedSubmission = structuredClone(validSubmission);
   typedRejectedSubmission.validations[0].stepIndexes = [1];
   const argumentRejectedSubmission = structuredClone(validSubmission);
-  delete argumentRejectedSubmission.changes[0].dependsOn;
+  delete argumentRejectedSubmission.changes[0].change;
 
   const result = await runProductionPlanScenario(
     async (
