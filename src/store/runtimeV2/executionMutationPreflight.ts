@@ -1,6 +1,7 @@
 import {
   checkSourceSyntax,
   findSymbolReferences,
+  getFileMetadata,
 } from "../../lib/ipc";
 import {
   executeTool,
@@ -14,7 +15,7 @@ import type {
   RuntimeV2Command,
   RuntimeV2EventDraft,
 } from "../../lib/runtime-v2";
-import { preflightWorkspaceMutation } from "../../lib/workspaceMutationPreflight";
+import { preflightWorkspaceMutation, type WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
 import {
   executeRuntimeV2ToolWithDeadline,
   type RuntimeV2ToolDeadlineBoundary,
@@ -32,6 +33,7 @@ type RuntimeV2MutationPreparation =
   | {
       readonly allowed: true;
       readonly diffPreview?: ToolDiffPreview;
+      readonly writeFileTarget?: WorkspaceWriteFileTargetFact;
     }
   | {
       readonly allowed: false;
@@ -136,6 +138,15 @@ export async function prepareRuntimeV2Mutation(input: {
         ),
       }),
     ),
+    probeFileAvailability: async (path) => {
+      try {
+        await getFileMetadata(path, workspace);
+        return "exists";
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || "");
+        return message.startsWith("FILE_METADATA_NOT_FOUND:") ? "absent" : "unknown";
+      }
+    },
     checkSyntax: checkSourceSyntax,
     findReferences: (symbol) => findSymbolReferences({
       symbol,
@@ -218,6 +229,7 @@ export async function prepareRuntimeV2Mutation(input: {
   try {
     return {
       allowed: true,
+      writeFileTarget: preflight.writeFileTarget,
       diffPreview: await buildToolDiffPreview(
         input.toolName,
         input.args,
@@ -236,6 +248,6 @@ export async function prepareRuntimeV2Mutation(input: {
       target: input.target || null,
       error: error instanceof Error ? error.message : String(error),
     });
-    return { allowed: true };
+    return { allowed: true, writeFileTarget: preflight.writeFileTarget };
   }
 }

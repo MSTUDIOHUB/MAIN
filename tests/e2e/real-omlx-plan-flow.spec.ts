@@ -1423,16 +1423,25 @@ test.beforeEach(async ({ page }) => {
     }
     return result.content;
   });
-  await page.exposeFunction("__MAIN_E2E_DISK_WRITE", async (rawPath: string, content: string) => {
+  await page.exposeFunction("__MAIN_E2E_DISK_WRITE", async (rawPath: string, content: string, createNew = false) => {
     const absolute = resolveDiskPath(rawPath);
     await fs.mkdir(path.dirname(absolute), { recursive: true });
-    await fs.writeFile(absolute, content, "utf8");
+    await fs.writeFile(absolute, content, { encoding: "utf8", flag: createNew ? "wx" : "w" });
     invalidateWorkspaceInventory();
     return null;
   });
   await page.exposeFunction("__MAIN_E2E_DISK_METADATA", async (rawPath: string) => {
     const absolute = resolveDiskPath(rawPath);
-    const stat = await fs.stat(absolute);
+    let stat;
+    try {
+      stat = await fs.stat(absolute);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`FILE_METADATA_NOT_FOUND: ${rawPath}`);
+      }
+      throw error;
+    }
+    if (!stat.isFile()) throw new Error(`FILE_METADATA_UNAVAILABLE: ${rawPath} is not a file`);
     return { path: rawPath, sizeBytes: stat.size, modifiedMs: stat.mtimeMs };
   });
   await page.exposeFunction("__MAIN_E2E_CHECK_SOURCE_SYNTAX", (
@@ -2096,8 +2105,8 @@ test.beforeEach(async ({ page }) => {
       return !normalizedScope || normalizedScope === "." ||
         normalizedFile === normalizedScope || normalizedFile.startsWith(`${normalizedScope}/`);
     };
-    const writeText = async (path: string, content: string) => {
-      await (window as any).__MAIN_E2E_DISK_WRITE(path, content);
+    const writeText = async (path: string, content: string, createNew = false) => {
+      await (window as any).__MAIN_E2E_DISK_WRITE(path, content, createNew);
     };
     (window as any).__REAL_OMLX_WORKSPACE__ = workspace;
     (window as any).__REAL_OMLX_CONFIG__ = { endpoint, apiKey, productionTools, skills };
@@ -2640,8 +2649,8 @@ test.beforeEach(async ({ page }) => {
         const path = String(args?.path || "");
         return await (window as any).__MAIN_E2E_DISK_METADATA(path);
       }
-      if (cmd === "write_file" || cmd === "write_file_atomic") {
-        await writeText(String(args?.path || ""), String(args?.content || ""));
+      if (cmd === "write_file" || cmd === "write_file_atomic" || cmd === "write_file_create_new") {
+        await writeText(String(args?.path || ""), String(args?.content || ""), cmd === "write_file_create_new");
         return null;
       }
       if (cmd === "shell_permission_preflight") {
@@ -5173,7 +5182,11 @@ for (const model of models) {
     test.skip(!process.env.REAL_OMLX_WORKSPACE || realOmlxMutationFile !== "README.md");
     test.setTimeout(20 * 60_000);
     const workspace = (page as any).__realOmlxWorkspace as string;
-    const prompt = "请直接修改 README.md，在文件末尾另起一行添加 Design validation complete.，保留原有内容。然后运行 node -e \"const fs = require('node:fs'); const assert = require('node:assert/strict'); assert.ok(fs.readFileSync('README.md', 'utf8').includes('Design validation complete.'))\" 验证结果。不要生成计划。完成后说明修改与验证结果。";
+    const forceWriteFileReplacement = process.env.REAL_OMLX_WRITE_FILE_REPLACEMENT === "1";
+    const editRequest = forceWriteFileReplacement
+      ? "请先完整读取 README.md 的当前内容，然后使用 write_file 完整写回原有内容，并在文件末尾另起一行添加 Design validation complete.。必须保留原有内容，此次请使用 write_file，不使用 replace_in_file 或 apply_patch。"
+      : "请直接修改 README.md，在文件末尾另起一行添加 Design validation complete.，保留原有内容。";
+    const prompt = `${editRequest}然后运行 node -e \"const fs = require('node:fs'); const assert = require('node:assert/strict'); assert.ok(fs.readFileSync('README.md', 'utf8').includes('Design validation complete.'))\" 验证结果。不要生成计划。完成后说明修改与验证结果。`;
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
     await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
     const initial = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
@@ -5202,6 +5215,22 @@ for (const model of models) {
       expect(after.startsWith(before.trimEnd())).toBe(true);
       expect(after.slice(before.trimEnd().length).trim()).toBe("Design validation complete.");
       const events = snapshot.runtimeV2?.events || [];
+      if (forceWriteFileReplacement) {
+        const commands = new Map((snapshot.runtimeV2?.commands || [])
+          .map((command: any) => [command.idempotencyKey, command]));
+        const sourceReadIndex = events.findIndex((event: any) =>
+          event.type === "tool.completed" && event.status === "succeeded" &&
+          (commands.get(event.idempotencyKey) as any)?.toolName === "read_file" &&
+          (event.evidence || []).some((item: any) => item.kind === "source" && item.target === "README.md")
+        );
+        const writeFileIndex = events.findIndex((event: any) =>
+          event.type === "tool.completed" && event.status === "succeeded" &&
+          (commands.get(event.idempotencyKey) as any)?.toolName === "write_file" &&
+          (event.evidence || []).some((item: any) => item.kind === "mutation" && item.target === "README.md")
+        );
+        expect(sourceReadIndex).toBeGreaterThanOrEqual(0);
+        expect(writeFileIndex).toBeGreaterThan(sourceReadIndex);
+      }
       const mutationIndex = events.findLastIndex((event: any) =>
         event.type === "tool.completed" && event.status === "succeeded" &&
         (event.evidence || []).some((item: any) => item.kind === "mutation")

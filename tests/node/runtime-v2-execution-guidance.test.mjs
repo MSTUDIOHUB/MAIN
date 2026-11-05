@@ -24,7 +24,7 @@ const instruction = loadTs(path.join(root, 'src/store/runtimeV2/executionProvide
 const streaming = loadTs(path.join(root, 'src/lib/streaming.ts'));
 const ipc = loadTs(path.join(root, 'src/lib/ipc.ts'));
 
-function fixture({ strategy = 'execute', objective = 'Create src/new-controller.ts and verify the requested behavior.' } = {}) {
+function fixture({ strategy = 'execute', objective = 'Create src/new-controller.ts and verify the requested behavior.', unreadableTarget = null, unknownProbeTarget = null, raceOnCreate = false } = {}) {
   let ordinal = 0; let aggregate = null;
   const files = new Map([['config/version.txt', 'version: 1\n'], ['src/existing-controller.ts', 'export const value = 1;\n']]);
   const writes = []; const shellCalls = []; const wires = [];
@@ -39,16 +39,18 @@ function fixture({ strategy = 'execute', objective = 'Create src/new-controller.
     state.runtimeV2Checkpoints.turn = runtime.createRuntimeV2Checkpoint({ aggregate, revision: ordinal, updatedAt: aggregate.updatedAt });
   };
   append({ type: 'turn.admitted', turn: { workspaceKey: '/fixture', sessionKey: '/fixture:1', sessionEpoch: 'epoch', turnId: 'turn', clientSubmissionId: 'submission' }, strategy, objective, constraints: [], acceptanceCriteria: [] });
-  append({ type: 'run.started', run, phase: 'observing' });
+  append({ type: 'run.started', run, phase: strategy === 'plan' ? 'planning' : 'observing' });
   const ports = { get: () => state, set: patch => Object.assign(state, typeof patch === 'function' ? patch(state) : patch), live,
-    context: { turnId: 'turn', runWorkspace: '/fixture', runSessionKey: '/fixture:1', runtimeRunIntent: strategy === 'execute' ? 'execute' : 'analyze', phaseLanguage: 'en', runtimeContextBudget: { contextLimit: 64000, inputBudget: 48000, outputBudget: 4096, readWindowChars: 24000 } },
+    context: { turnId: 'turn', runWorkspace: '/fixture', runSessionKey: '/fixture:1', runtimeRunIntent: strategy === 'plan' ? 'plan' : strategy === 'execute' ? 'execute' : 'analyze', phaseLanguage: 'en', runtimeContextBudget: { contextLimit: 64000, inputBudget: 48000, outputBudget: 4096, readWindowChars: 24000 } },
     nextId: scope => `${scope}-${++ordinal}`, now: () => ++ordinal, logStoreEvent() {},
   };
   const originals = new Map();
   const stub = (object, name, value) => { originals.set(name, [object, object[name]]); object[name] = value; };
-  stub(ipc, 'readFile', async target => { if (!files.has(target)) throw new Error('ENOENT'); return files.get(target); });
+  stub(ipc, 'readFile', async target => { if (target === unreadableTarget) throw Object.assign(new Error('read denied'), { code: 'EACCES' }); if (!files.has(target)) throw Object.assign(new Error('not found'), { code: 'ENOENT' }); return files.get(target); });
+  stub(ipc, 'getFileMetadata', async target => { if (target === unknownProbeTarget) throw new Error('FILE_METADATA_UNAVAILABLE: probe failed'); if (!files.has(target)) throw new Error('FILE_METADATA_NOT_FOUND: absent'); return { path: `/fixture/${target}`, sizeBytes: files.get(target).length, modifiedMs: 1 }; });
   stub(ipc, 'readFileWindow', async target => { const content = await ipc.readFile(target); return { content, contentVersion: runtime.runtimeV2EvidenceVersion(content), startLine: 1, endLine: 1, totalLines: 1, totalChars: content.length, returnedChars: content.length, truncated: false }; });
   stub(ipc, 'writeFile', async (target, content) => { writes.push(target); files.set(target, content); });
+  stub(ipc, 'writeFileCreateNew', async (target, content) => { if (raceOnCreate) files.set(target, 'concurrent file'); if (files.has(target)) throw new Error('CREATE_NEW_TARGET_EXISTS'); writes.push(target); files.set(target, content); });
   stub(ipc, 'checkSourceSyntax', async target => ({ path: target, language: 'typescript', applicable: true, hasErrors: false, errorCount: 0 }));
   stub(ipc, 'shellPermissionPreflight', async command => ({ command, decision: 'allow', requiresApproval: false, segmentDecisions: [], suggestedRules: [], riskLevel: 'low' }));
   stub(ipc, 'runCommand', async command => { shellCalls.push(command); return { command, stdout: '/fixture\n', stderr: '', exitCode: 0, success: true, durationMs: 1, timedOut: false }; });
@@ -62,11 +64,26 @@ function fixture({ strategy = 'execute', objective = 'Create src/new-controller.
     const receipt = await tool.createRuntimeV2ToolPort(ports).execute({ command: cmd, signal }); append(receipt); return receipt;
   };
   const request = async () => {
-    const cmd = command('request_model', { mode: strategy === 'execute' ? aggregate.phase === 'validating' ? 'validate' : 'execute' : 'analyze', hasVersionedSourceEvidence: aggregate.evidence.some(e => e.kind === 'source'), ...(strategy === 'execute' ? { effectPressure: runtime.deriveRuntimeV2EffectPressure(aggregate) } : {}) });
+    const cmd = command('request_model', { mode: strategy === 'analyze' ? 'analyze' : aggregate.phase === 'validating' ? 'validate' : 'execute', hasVersionedSourceEvidence: aggregate.evidence.some(e => e.kind === 'source'), ...(strategy === 'execute' ? { effectPressure: runtime.deriveRuntimeV2EffectPressure(aggregate) } : {}) });
     append({ type: 'command.scheduled', run, command: cmd });
     const result = await provider.createRuntimeV2ProviderPort(ports).request({ command: cmd, signal }); append({ type: 'provider.responded', run, idempotencyKey: cmd.idempotencyKey, result }); return result;
   };
   return { state, ports, live, files, writes, shellCalls, wires, execute, request, append, run, command, aggregate: () => aggregate, action: action => { nextAction = action; },
+    approvePlan(operation, target) {
+      const adapter = loadTs(path.join(root, 'src/store/runtimeV2/workPlanAdapter.ts'));
+      const plan = runtime.sealWorkPlanV1({ id: 'write-file-plan', revision: 1, createdAt: 1,
+        draft: { schemaVersion: runtime.WORK_PLAN_V1_SCHEMA_VERSION, objective, summary: 'Implement one exact approved file operation.', findings: [],
+          steps: [{ title: 'Update target', operation, targets: [target], basis: ['source-plan'], change: 'Implement the requested target.', expectedOutcome: 'The target is correct.', dependsOn: [], criterionIds: ['criterion-user-objective'] }],
+          validations: [{ stepIndexes: [0], kind: 'finite_command', command: 'npm test', expectedOutcome: 'Tests pass.', required: true, criterionIds: ['criterion-user-objective'] }], risks: [], assumptions: [], blockingQuestions: [] },
+        evidence: [{ id: 'source-plan', target, version: runtime.runtimeV2EvidenceVersion(files.get(target) || ''), statement: 'The exact target was reviewed.' }],
+      });
+      const commit = adapter.createRuntimeV2PlanReviewCommit({ plan, turn: aggregate.turn, run, requestId: 'approved-write-review', createdAt: 2 });
+      append({ type: 'work_plan.sealed', run, workPlan: adapter.toRuntimeV2WorkPlanReference(plan), sealedPlan: plan, reviewCommit: commit });
+      append({ type: 'work_plan.approved', run, workPlan: adapter.toRuntimeV2WorkPlanReference(plan) });
+      append({ type: 'phase.changed', run, phase: 'observing', reason: 'approved Plan begins execution' });
+    },
+    async readTarget(target) { const call = { id: `read-${target}`, name: 'read_file', arguments: { path: target } }; live.messages.push({ role: 'assistant', content: '', tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] }); return execute(call); },
+    async recordContract(operation, target) { return execute({ id: 'contract-call', name: 'record_execution_contract', arguments: { summary: 'Implement the requested exact change.', root_causes: ['Fixture evidence identifies the target.'], changes: [{ operation, targets: [target], change: 'Apply this exact operation.', expected_outcome: 'The target has the requested result.' }], validations: [{ kind: 'finite_command', command: 'npm test', expected_outcome: 'Assertions pass.' }] } }); },
     async readMetadata() { const call = { id: 'metadata-read', name: 'read_file', arguments: { path: 'config/version.txt' } }; live.messages.push({ role: 'assistant', content: '', tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] }); return execute(call); },
     final(text) { const cmd = command('request_model', { mode: 'execute' }); append({ type: 'command.scheduled', run, command: cmd }); append({ type: 'provider.responded', run, idempotencyKey: cmd.idempotencyKey, result: { visibleText: text, toolCalls: [], diagnostics: [] } }); },
     restore() { for (const [name, [object, value]] of originals) object[name] = value; },
@@ -192,4 +209,109 @@ test('ordinary validation keeps authorized second-file creation available while 
     f.final('Both requested modules were created; verification is still pending.');
     assert.equal(outcome.runtimeV2ExecuteTerminalDecision({ aggregate: f.aggregate(), signal: new AbortController().signal }), null);
   } finally { f.restore(); }
+});
+
+
+test('write_file cannot overwrite an unread existing file through an unrelated source or a create contract', async () => {
+  const target = 'src/existing-controller.ts';
+  for (const withCreateContract of [false, true]) {
+    const f = fixture();
+    try {
+      await f.readMetadata();
+      if (withCreateContract) assert.equal((await f.recordContract('create', target)).status, 'succeeded');
+      f.action({ name: 'write_file', arguments: { path: target, content: 'export const replaced = true;\n' } });
+      const response = await f.request(); const receipt = await f.execute(response.toolCalls[0]);
+      assert.notEqual(receipt.status, 'succeeded');
+      assert.deepEqual(f.writes, []);
+      assert.equal(f.files.get(target), 'export const value = 1;\n');
+    } finally { f.restore(); }
+  }
+});
+
+test('write_file modification uses actual existence and a complete current provider source lease', async () => {
+  const target = 'src/existing-controller.ts';
+  for (const condition of ['current', 'partial', 'stale', 'create-contract']) {
+    const f = fixture();
+    try {
+      assert.equal((await f.readTarget(target)).status, 'succeeded');
+      assert.equal((await f.recordContract(condition === 'create-contract' ? 'create' : 'modify', target)).status, 'succeeded');
+      f.action({ name: 'write_file', arguments: { path: target, content: 'export const value = 2;\n' } });
+      const response = await f.request();
+      if (condition === 'partial') f.live.mutationSourceCoverageByToolCallId.set(response.toolCalls[0].id, f.live.mutationSourceCoverageByToolCallId.get(response.toolCalls[0].id).map(source => ({ ...source, complete: false })));
+      if (condition === 'stale') f.files.set(target, 'export const concurrentlyChanged = true;\n');
+      const receipt = await f.execute(response.toolCalls[0]);
+      if (condition === 'current') {
+        assert.equal(receipt.status, 'succeeded', receipt.presentation?.message);
+        assert.deepEqual(f.writes, [target]);
+        assert.equal(f.files.get(target), response.toolCalls[0].arguments.content, 'the write preserves the accepted provider arguments');
+      } else {
+        assert.notEqual(receipt.status, 'succeeded', condition);
+        assert.deepEqual(f.writes, [], condition);
+      }
+    } finally { f.restore(); }
+  }
+});
+
+test('write_file requires proved absence and create_new preserves a file appearing after preflight', async () => {
+  for (const options of [
+    { unreadableTarget: 'src/existing-controller.ts' },
+    { unknownProbeTarget: 'src/new-controller.ts' },
+    { raceOnCreate: true },
+  ]) {
+    const f = fixture(options);
+    const target = options.unreadableTarget || 'src/new-controller.ts';
+    try {
+      f.action({ name: 'write_file', arguments: { path: target, content: 'export const value = 2;\n' } });
+      const response = await f.request(); const receipt = await f.execute(response.toolCalls[0]);
+      assert.notEqual(receipt.status, 'succeeded', JSON.stringify(options));
+      assert.deepEqual(f.writes, []);
+      if (options.raceOnCreate) assert.equal(f.files.get(target), 'concurrent file');
+    } finally { f.restore(); }
+  }
+});
+
+test('a preserve-only contract advertises no mutation tools while retaining read, revision and validation capabilities', async () => {
+  const f = fixture();
+  try {
+    await f.readTarget('src/existing-controller.ts');
+    assert.equal((await f.recordContract('preserve', 'src/existing-controller.ts')).status, 'succeeded');
+    const tools = loadTs(path.join(root, 'src/store/runtimeV2/executionAuthorizationContext.ts')).providerToolDefinitionsForCommand(f.ports, f.command('request_model', { mode: 'execute' }));
+    const names = tools.map(item => item.function.name);
+    assert.ok(names.includes('read_file') && names.includes('run_command') && names.includes('record_execution_contract'));
+    assert.ok(!names.some(name => ['write_file', 'replace_in_file', 'apply_patch', 'delete_workspace_path'].includes(name)));
+    assert.ok(tools.every(item => !Object.values(item.function.parameters.properties || {}).some(property => Array.isArray(property.enum) && property.enum.length === 0)));
+    const forged = await f.execute({ id: 'forged-preserve-write', name: 'write_file', arguments: { path: 'src/existing-controller.ts', content: 'forged' } });
+    assert.notEqual(forged.status, 'succeeded'); assert.deepEqual(f.writes, []);
+  } finally { f.restore(); }
+});
+
+
+test('Plan write_file uses actual create/modify facts and preserves that operation through checkpoint restore', async () => {
+  const target = 'src/existing-controller.ts';
+  for (const operation of ['create', 'modify']) {
+    const f = fixture({ strategy: 'plan', objective: 'Update the reviewed target.' });
+    try {
+      f.approvePlan(operation, target);
+      assert.equal((await f.readTarget(target)).status, 'succeeded');
+      f.action({ name: 'write_file', arguments: { path: target, content: 'export const value = 2;' } });
+      const response = await f.request();
+      assert.equal(response.toolCalls[0]?.name, 'write_file', JSON.stringify(response.diagnostics));
+      const receipt = await f.execute(response.toolCalls[0]);
+      if (operation === 'create') {
+        assert.notEqual(receipt.status, 'succeeded');
+        assert.equal(receipt.failureReasonCode, 'approved_plan_write_file_operation_scope');
+        assert.deepEqual(f.writes, []);
+      } else {
+        assert.equal(receipt.status, 'succeeded', receipt.presentation?.message);
+        assert.deepEqual(receipt.mutationRequests, [{ target, operation: 'modify' }]);
+        const frontier = runtime.deriveRuntimeV2PlanExecutionFrontier(f.aggregate());
+        assert.equal(frontier.steps[0].status, 'completed');
+        const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: f.aggregate(), revision: 100, updatedAt: 100 });
+        const restored = runtime.normalizeRuntimeV2CheckpointMap({ turn: JSON.parse(JSON.stringify(checkpoint)) }).turn;
+        assert.ok(restored);
+        assert.equal(runtime.deriveRuntimeV2PlanExecutionFrontier(restored.aggregate).steps[0].status, 'completed');
+        assert.deepEqual(restored.aggregate.events.find(event => event.type === 'tool.completed' && event.mutationRequests)?.mutationRequests, [{ target, operation: 'modify' }]);
+      }
+    } finally { f.restore(); }
+  }
 });

@@ -1,3 +1,5 @@
+import { sha256Hex } from "../../lib/sha256";
+import type { WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
 import { parseApplyPatch } from "../../lib/applyPatchTool";
 import {
   isWorkspaceMutationToolName,
@@ -44,7 +46,6 @@ export function runtimeV2MutationLeases(
   input: RuntimeV2ExecutionPortsInput,
   toolCallId: string,
 ): RuntimeV2MutationLease[] {
-  if (aggregateForCurrentTurn(input)?.strategy === "plan") return [];
   const coverage =
     input.live.mutationSourceCoverageByToolCallId.get(toolCallId) || [];
   return coverage.map((source) => ({
@@ -386,6 +387,7 @@ export function validateRuntimeV2MutationLease(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly target: string;
+  readonly writeFileTarget?: WorkspaceWriteFileTargetFact;
 }): {
   readonly allowed: boolean;
   readonly lease: RuntimeV2MutationLease | null;
@@ -402,7 +404,7 @@ export function validateRuntimeV2MutationLease(input: {
     input.toolCallId,
   );
   const aggregate = aggregateForCurrentTurn(input.ports);
-  if (aggregate?.strategy === "plan") return null;
+  if (aggregate?.strategy === "plan" && !input.writeFileTarget) return null;
   const workspace = input.ports.context.runWorkspace || "";
   const requestedTargets = resolveWorkspaceMutationTargets(
     input.toolName,
@@ -415,15 +417,15 @@ export function validateRuntimeV2MutationLease(input: {
     )
   );
   const creationTargets = new Set(
-    resolveWorkspaceMutationCreationTargets(
+    (input.writeFileTarget?.exists ? [] : resolveWorkspaceMutationCreationTargets(
       input.toolName,
       input.args,
       input.target,
-    ).map((target) =>
+    )).map((target) =>
       normalizeRuntimeV2WorkspacePath(target, workspace)
     ),
   );
-  if (input.toolName === "write_file") {
+  if (input.toolName === "write_file" && !input.writeFileTarget?.exists) {
     requestedTargets.forEach((target) => creationTargets.add(target));
   }
   const leasesByTarget = new Map(
@@ -441,6 +443,7 @@ export function validateRuntimeV2MutationLease(input: {
         return false;
       }
       const lease = leasesByTarget.get(target);
+      if (input.writeFileTarget?.exists && lease?.version !== `sha256-${sha256Hex(input.writeFileTarget.content)}`) return true;
       return !lease || !leaseCoversMutation(
         input.toolName,
         input.args,
@@ -453,7 +456,7 @@ export function validateRuntimeV2MutationLease(input: {
   if (
     leases.length === 0 &&
     unexpectedTargets.length > 0 &&
-    !aggregate
+    !aggregate && !input.writeFileTarget
   ) {
     return null;
   }

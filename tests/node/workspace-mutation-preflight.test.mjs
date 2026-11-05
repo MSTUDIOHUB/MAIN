@@ -213,15 +213,55 @@ test("write_file preflight blocks missing or identical content", async () => {
   });
 
   assert.equal(overwrite.ok, true);
+  assert.deepEqual(overwrite.writeFileTarget, {
+    path: "src/hooks/useCsvParser.ts", exists: true, content: "existing",
+  });
 
   const create = await preflightWorkspaceMutation({
     toolName: "write_file",
     args: { path: "new-file.ts", content: "new" },
     language: "en",
     readFile: async () => { throw new Error("missing"); },
+    probeFileAvailability: async () => "absent",
   });
 
   assert.equal(create.ok, true);
+  assert.deepEqual(create.writeFileTarget, { path: "new-file.ts", exists: false });
+});
+
+test("write_file preparation preserves exact existing bytes and ignores provider-supplied target facts", async () => {
+  for (const source of ["", "\ufeff第一行\r\nsecond line\r\n"]) {
+    const result = await preflightWorkspaceMutation({
+      toolName: "write_file",
+      args: {
+        path: "notes.txt", content: `${source}updated\r\n`,
+        writeFileTarget: { path: "notes.txt", exists: false },
+      },
+      readFile: async () => source,
+      probeFileAvailability: async () => { throw new Error("a successful read must not need an absence probe"); },
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.writeFileTarget, { path: "notes.txt", exists: true, content: source });
+  }
+});
+
+test("write_file preparation never turns unreadable or unknown targets into new files", async () => {
+  for (const availability of [undefined, "exists", "unknown", "probe_failure"]) {
+    const result = await preflightWorkspaceMutation({
+      toolName: "write_file",
+      args: { path: "protected.txt", content: "replacement" },
+      readFile: async () => { throw Object.assign(new Error("access denied"), { code: "EACCES" }); },
+      ...(availability === undefined ? {} : {
+        probeFileAvailability: async () => {
+          if (availability === "probe_failure") throw new Error("transport unavailable");
+          return availability;
+        },
+      }),
+    });
+    assert.equal(result.ok, false, String(availability));
+    assert.equal(result.reason, "read_failed");
+    assert.equal(result.writeFileTarget, undefined);
+  }
 });
 
 test("mutation preflight rejects external and traversing targets before reading", async () => {

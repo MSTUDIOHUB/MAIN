@@ -2532,6 +2532,7 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
       ports: { ...afterPorts, live: executionTypes.createRuntimeV2LiveExecutionState() },
       command: { kind: "execute_tool", payload: { toolCallId: "contract-negative" } },
       toolName, args, target: args.path || "",
+      ...(toolName === "write_file" ? { writeFileTarget: { path: args.path, exists: false } } : {}),
     });
     assert.equal(denied.allowed, false);
     assert.equal(denied.reasonCode, "execution_contract_mutation_scope", "a same-name file, wrong operation or unapproved rename cannot inherit recorded scope");

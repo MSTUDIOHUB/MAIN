@@ -15,6 +15,7 @@ import {
   resolveWorkspaceMutationTargets,
   resolveWorkspaceMutationRequests,
 } from "../../lib/workspaceMutationTools";
+import type { WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
 import { normalizeWorkspacePathIdentity } from "../../lib/workspacePaths";
 import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
 import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
@@ -84,6 +85,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly target: string;
+  readonly writeFileTarget?: WorkspaceWriteFileTargetFact;
 }): RuntimeV2PlanToolAuthorizationResult {
   const aggregate = aggregateForCurrentTurn(input.ports);
   const durableChildWritePending = (aggregate?.subagents || []).some(
@@ -253,6 +255,32 @@ export function validateToolAgainstPhaseAndPlan(input: {
       };
     }
   }
+  const leaseRejection = () => {
+    // write_file is creation-capable, not create-only. Its operation and lease
+    // requirement cannot be decided until trusted preflight observes the target.
+    if (input.toolName === "write_file" && !input.writeFileTarget) return null;
+    const lease = validateRuntimeV2MutationLease({
+      ports: input.ports, toolCallId: String(input.command.payload.toolCallId || ""),
+      toolName: input.toolName, args: input.args, target: input.target,
+      writeFileTarget: input.writeFileTarget,
+    });
+    if (!lease || lease.allowed) return null;
+    return {
+      allowed: false as const,
+      reason: input.writeFileTarget?.exists
+        ? "WRITE_FILE_SOURCE_NOT_CURRENT: Overwriting requires the exact target's complete current-version source in this provider request; internal preflight reads do not grant that lease. Read or replay the complete target before retrying."
+        : runtimeV2MutationLeaseRejectionReason({
+            toolName: input.toolName, unexpectedTargets: lease.unexpectedTargets,
+            leaseTargets: lease.leases.map(entry => entry.target), recoveryExcerpt: lease.recoveryExcerpt,
+          }),
+      failureKind: lease.reasonCode === "mutation_source_text_mismatch" ? "source_mismatch" as const : "protocol_invalid" as const,
+      reasonCode: lease.reasonCode,
+    };
+  };
+  if (input.toolName === "write_file" && input.writeFileTarget) {
+    const rejected = leaseRejection();
+    if (rejected) return rejected;
+  }
   if (aggregate?.strategy !== "plan") {
     if (input.command.kind === "execute_tool" && isWorkspaceMutationToolName(input.toolName)) {
       const contract = deriveRuntimeV2ExecutionContract(aggregate);
@@ -260,7 +288,12 @@ export function validateToolAgainstPhaseAndPlan(input: {
         const requests = resolveWorkspaceMutationRequests(input.toolName, input.args, input.target);
         const outsideContract = requests.length === 0 || requests.some(request =>
           !contract.changes.some(change =>
-            change.operation !== "preserve" && change.operation === request.operation &&
+            change.operation !== "preserve" &&
+            (input.toolName === "write_file"
+              ? input.writeFileTarget
+                ? change.operation === (input.writeFileTarget.exists ? "modify" : "create")
+                : change.operation === "create" || change.operation === "modify"
+              : change.operation === request.operation) &&
             change.targets.some(target =>
               normalizeWorkspacePathIdentity(normalizeRuntimeV2WorkspacePath(target, input.ports.context.runWorkspace || "")) ===
               normalizeWorkspacePathIdentity(normalizeRuntimeV2WorkspacePath(request.target, input.ports.context.runWorkspace || ""))
@@ -274,24 +307,8 @@ export function validateToolAgainstPhaseAndPlan(input: {
           reasonCode: "execution_contract_mutation_scope",
         };
       }
-      const lease = validateRuntimeV2MutationLease({
-        ports: input.ports,
-        toolCallId: String(input.command.payload.toolCallId || ""),
-        toolName: input.toolName,
-        args: input.args,
-        target: input.target,
-      });
-      if (lease && !lease.allowed) return {
-        allowed: false,
-        reason: runtimeV2MutationLeaseRejectionReason({
-          toolName: input.toolName,
-          unexpectedTargets: lease.unexpectedTargets,
-          leaseTargets: lease.leases.map((entry) => entry.target),
-          recoveryExcerpt: lease.recoveryExcerpt,
-        }),
-        failureKind: lease.reasonCode === "mutation_source_text_mismatch" ? "source_mismatch" : "protocol_invalid",
-        reasonCode: lease.reasonCode,
-      };
+      const rejected = leaseRejection();
+      if (rejected) return rejected;
     }
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };
   }

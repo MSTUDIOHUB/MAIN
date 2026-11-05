@@ -27,8 +27,15 @@ export type WorkspaceMutationPreflightReason =
   | "public_contract_break"
   | "syntax_error";
 
+/** Current filesystem facts for one write_file preparation. This is produced
+ * by trusted reads/probes, never accepted from provider arguments. */
+export type WorkspaceWriteFileTargetFact =
+  | { readonly path: string; readonly exists: false }
+  | { readonly path: string; readonly exists: true; readonly content: string };
+
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
+  writeFileTarget?: WorkspaceWriteFileTargetFact;
   reason?: WorkspaceMutationPreflightReason;
   message?: string;
   /** Best available workspace target for recovery and progress correlation. */
@@ -657,41 +664,38 @@ export async function preflightWorkspaceMutation(
         recoveryKind: "target_invalid",
       });
     }
+    let current: string | undefined;
     try {
-      const current = await input.readFile(path);
+      current = await input.readFile(path);
+    } catch (error) {
+      const availability = await input.probeFileAvailability?.(path).catch(() => "unknown");
+      if (availability !== "absent") {
+        return blocked({
+          reason: "read_failed", toolName, path, language,
+          detail: error instanceof Error ? error.message : String(error || "read failed"),
+          recoveryKind: "target_invalid",
+        });
+      }
+    }
+    if (current !== undefined) {
       if (current === content) {
         return blocked({ reason: "identical_content", toolName, path, language });
       }
-      const syntaxFailure = await blockedSyntaxResult(
-        input,
-        path,
-        content,
-        language,
-        current,
-      );
+      const syntaxFailure = await blockedSyntaxResult(input, path, content, language, current);
       if (syntaxFailure) return syntaxFailure;
       recordWorkspaceFileCheckpoint({
-        sessionKey: input.sessionKey,
-        workspace: input.workspaceRoot,
-        path,
-        existedBefore: true,
-        previousContent: current,
-        toolName,
+        sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
+        existedBefore: true, previousContent: current, toolName,
       });
-      return { ok: true };
-    } catch {
-      const syntaxFailure = await blockedSyntaxResult(input, path, content, language);
-      if (syntaxFailure) return syntaxFailure;
-      recordWorkspaceFileCheckpoint({
-        sessionKey: input.sessionKey,
-        workspace: input.workspaceRoot,
-        path,
-        existedBefore: false,
-        previousContent: null,
-        toolName,
-      });
-      return { ok: true };
+      return { ok: true, writeFileTarget: { path, exists: true, content: current } };
     }
+    const syntaxFailure = await blockedSyntaxResult(input, path, content, language);
+    if (syntaxFailure) return syntaxFailure;
+    recordWorkspaceFileCheckpoint({
+      sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
+      existedBefore: false, previousContent: null, toolName,
+    });
+    return { ok: true, writeFileTarget: { path, exists: false } };
   }
 
   const searchText = asText(input.args.search_text);

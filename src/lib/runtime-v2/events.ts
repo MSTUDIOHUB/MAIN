@@ -123,6 +123,12 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      /** Actual successful mutation operations determined at the effect boundary.
+       * Historical events without this field retain their static-tool fallback. */
+      readonly mutationRequests?: readonly {
+        readonly target: string;
+        readonly operation: "create" | "modify" | "delete";
+      }[];
       /** A replay closes the provider tool pair with an already committed
        * same-version receipt. It is not a new observation or progress
        * boundary and therefore carries no new evidence. */

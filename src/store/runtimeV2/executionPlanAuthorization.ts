@@ -1,3 +1,5 @@
+import { resolveRuntimeV2PlanMutationScope } from "../../lib/runtime-v2";
+import type { WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
 import type {
   RuntimeV2Command,
   TurnAggregateV1,
@@ -28,6 +30,7 @@ export function validateToolAgainstApprovedPlan(input: {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly target: string;
+  readonly writeFileTarget?: WorkspaceWriteFileTargetFact;
 }): RuntimeV2PlanToolAuthorizationResult {
   const approved = approvedPlanForCurrentTurn(input.ports);
   if (!approved) {
@@ -36,6 +39,17 @@ export function validateToolAgainstApprovedPlan(input: {
       reason: "当前 Plan 的批准权威无效或已过期，运行时拒绝执行外部效果。",
       failureKind: "not_authorized",
       reasonCode: "approved_plan_authority_missing",
+    };
+  }
+  if (input.toolName === "write_file" && input.writeFileTarget) {
+    const scope = resolveRuntimeV2PlanMutationScope({
+      plan: approved.plan,
+      requestedTargets: [input.writeFileTarget.path],
+      requestedMutations: [{ target: input.writeFileTarget.path, operation: input.writeFileTarget.exists ? "modify" : "create" }],
+    });
+    if (!scope.allowed) return {
+      allowed: false, reason: "The actual write_file operation does not match the approved Plan's exact target and create/modify scope.",
+      failureKind: "not_authorized", reasonCode: "approved_plan_write_file_operation_scope",
     };
   }
   return { allowed: true, reason: null, failureKind: null, reasonCode: null };

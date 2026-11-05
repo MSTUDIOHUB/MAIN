@@ -162,7 +162,10 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     alwaysInclude: new Set([...collaboration, RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME]),
   });
   const contract = deriveRuntimeV2ExecutionContract(aggregate);
-  return selected.map((definition) => {
+  const contractMutationTargets = runtimeV2ExecutionContractMutationTargets(contract);
+  return selected.filter(definition =>
+    !contract || contractMutationTargets.length > 0 || !isWorkspaceMutationToolName(definition.function.name)
+  ).map((definition) => {
     if (contract && isWorkspaceMutationToolName(definition.function.name) && definition.function.parameters.properties?.path) {
       return {
         ...definition,
@@ -172,7 +175,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
             ...definition.function.parameters,
             properties: {
               ...definition.function.parameters.properties,
-              path: { ...definition.function.parameters.properties.path, enum: runtimeV2ExecutionContractMutationTargets(contract) },
+              path: { ...definition.function.parameters.properties.path, enum: contractMutationTargets },
             },
           },
         },

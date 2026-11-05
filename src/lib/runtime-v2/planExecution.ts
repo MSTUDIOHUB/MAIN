@@ -186,11 +186,11 @@ function successfulPlanMutationReceipts(
         ? command.payload.arguments as Record<string, unknown>
         : {};
       const presentationTarget = event.presentation?.target || "";
-      const mutations = resolveWorkspaceMutationRequests(
+      const mutations = (event.mutationRequests ?? resolveWorkspaceMutationRequests(
         toolName,
         args,
         presentationTarget,
-      ).flatMap((request) => {
+      )).flatMap((request) => {
         if (!request.operation) return [];
         const proved = event.evidence.some((evidence) =>
           evidence.kind === "mutation" &&
