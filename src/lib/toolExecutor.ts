@@ -73,6 +73,11 @@ import {
   type SkillCatalogSnapshot,
 } from "./agentSkills";
 import { executeAgentSkillTool } from "./agentSkillExecutor";
+import {
+  TOOL_SEARCH_TOOL_NAME,
+  executeToolSearch,
+  unlockToolsForSession,
+} from "./toolSearch";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -377,6 +382,13 @@ export async function executeTool(
   if (executionName === LOAD_SKILL_TOOL_NAME) {
     return executeAgentSkillTool(options.skillCatalog, args);
   }
+  if (executionName === TOOL_SEARCH_TOOL_NAME) {
+    return executeToolSearch(args, {
+      sessionKey,
+      toolCatalog: options.toolCatalog,
+    });
+  }
+  unlockToolsForSession(sessionKey, [executionName]);
 
   // ── MCP tool routing ────────────────────────────────────────
   // If the tool was discovered from an MCP server, forward the call

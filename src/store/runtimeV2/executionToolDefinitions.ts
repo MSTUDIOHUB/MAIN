@@ -32,11 +32,13 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "git_diff",
   "run_command",
   "browser_evaluate",
+  "computer_use",
   "get_project_skeleton",
   "spawn_subagent",
   "wait_subagents",
   "record_execution_contract",
   "load_skill",
+  "tool_search",
 ]);
 
 export function runtimeV2ToolDefinitions(
@@ -131,7 +133,7 @@ export function runtimeV2ToolDefinitions(
       function: {
         ...definition.function,
         description:
-          "Create a new file with complete content. Runtime v2 rejects overwriting an existing file; use replace_in_file or apply_patch for bounded edits to existing source.",
+          "创建新文件或写入完整文件内容（写入前会自动记录 Checkpoint 快照；局部小改动也可使用 replace_in_file）。",
       },
     };
   });

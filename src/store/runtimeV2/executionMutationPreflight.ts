@@ -99,6 +99,7 @@ export async function prepareRuntimeV2Mutation(input: {
     toolName: input.toolName,
     args: input.args,
     language: input.ports.context.phaseLanguage,
+    sessionKey: input.ports.context.runSessionKey,
     workspaceRoot: workspace,
     readFile: async (path) => String(
       await executeRuntimeV2ToolWithDeadline({

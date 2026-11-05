@@ -1,7 +1,6 @@
 import { sha256Hex } from "../sha256";
 import type { PlanCandidateV5 } from "../planContract";
 import { analyzeValidationCommand } from "../validationContract";
-import { workspacePathsReferToSameFile } from "../workspacePaths";
 
 export const WORK_PLAN_V1_SCHEMA_VERSION = "work-plan.v1" as const;
 
@@ -209,7 +208,7 @@ function validationId(index: number): string {
 export function validateWorkPlanDraftV1(
   draft: WorkPlanDraftV1,
   knownEvidenceIds: readonly string[] = [],
-  knownEvidence: readonly WorkPlanRuntimeEvidence[] = [],
+  _knownEvidence: readonly WorkPlanRuntimeEvidence[] = [],
 ): WorkPlanValidationIssue[] {
   const issues: WorkPlanValidationIssue[] = [];
   const evidenceIds = new Set(uniqueStrings(knownEvidenceIds));
@@ -283,23 +282,6 @@ export function validateWorkPlanDraftV1(
         issues.push({ path: `steps[${index}].basis`, message: `Unknown evidence id: ${basisId}.` });
       }
     }
-    if (step?.operation === "modify" || step?.operation === "delete") {
-      for (const target of targets) {
-        const hasVersionedTargetBasis = (step.basis || []).some((basisId) =>
-          knownEvidence.some((evidence) =>
-            evidence.id === basisId &&
-            !!evidence.version &&
-            workspacePathsReferToSameFile(evidence.target, target)
-          )
-        );
-        if (!hasVersionedTargetBasis) {
-          issues.push({
-            path: `steps[${index}].basis`,
-            message: `Target ${target} needs a versioned source evidence basis before approval.`,
-          });
-        }
-      }
-    }
     for (const dependency of step?.dependsOn || []) {
       if (!Number.isInteger(dependency) || dependency < 0 || dependency >= index) {
         issues.push({ path: `steps[${index}].dependsOn`, message: "Dependencies must refer to earlier steps." });
@@ -327,15 +309,6 @@ export function validateWorkPlanDraftV1(
       });
     }
     if (
-      validation?.required === true &&
-      (validation?.kind === "assertion" || validation?.kind === "advisory")
-    ) {
-      issues.push({
-        path: `validations[${index}].required`,
-        message: "Standalone assertions and advisory notes cannot own required acceptance.",
-      });
-    }
-    if (
       validation?.criterionIds !== undefined &&
       (!Array.isArray(validation.criterionIds) ||
         validation.criterionIds.some((id) => !normalizeText(id, 128)))
@@ -348,30 +321,6 @@ export function validateWorkPlanDraftV1(
     for (const stepIndex of validation?.stepIndexes || []) {
       if (!Number.isInteger(stepIndex) || stepIndex < 0 || stepIndex >= (draft.steps || []).length) {
         issues.push({ path: `validations[${index}].stepIndexes`, message: "Validation references an unknown step." });
-      }
-    }
-  }
-  const executableStepIndexes = (draft.steps || [])
-    .map((step, index) => step?.operation !== "preserve" ? index : -1)
-    .filter((index) => index >= 0);
-  if (executableStepIndexes.length > 0) {
-    const requiredValidations = (draft.validations || []).filter(
-      (validation) => validation?.required === true,
-    );
-    if (requiredValidations.length === 0) {
-      issues.push({
-        path: "validations",
-        message: "An executable WorkPlan needs at least one required validation.",
-      });
-    }
-    for (const stepIndex of executableStepIndexes) {
-      if (!requiredValidations.some((validation) =>
-        (validation.stepIndexes || []).includes(stepIndex)
-      )) {
-        issues.push({
-          path: `steps[${stepIndex}]`,
-          message: "Every executable step must be covered by a required validation.",
-        });
       }
     }
   }

@@ -84,7 +84,7 @@ function extractMatches(text: string, regex: RegExp): string[] {
   return results;
 }
 
-function parseToolUseBlock(inner: string): ParsedToolCall[] {
+export function parseToolUseBlock(inner: string): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   const paramRe = /<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi;
   const parseArgs = (part: string): Record<string, unknown> => {

@@ -1752,19 +1752,19 @@ export function resolveTurnRunIntent(
   const complexImplementationMatches = countPatternMatches(normalizedInput, COMPLEX_IMPLEMENTATION_PATTERNS);
   if (complexImplementationMatches >= 2) {
     return finalize({
-      intent: isWorkspaceTurn ? "plan" : "respond",
+      intent: isWorkspaceTurn ? "execute" : "respond",
       reason: localizeReason(
         language,
         isWorkspaceTurn
-          ? "检测到多文件/架构级工作区任务；本轮先进入正式计划流程，源码写入仍需计划批准。"
+          ? "检测到多文件工作区实现任务；本轮直接进入执行流程。"
           : "检测到多文件/架构级实现请求；真实操作或正式计划都需要用户选择后继续。",
         isWorkspaceTurn
-          ? "Detected a multi-file or architecture-level workspace task. This turn enters formal planning first, and source writes still require plan approval."
+          ? "Detected a multi-file workspace implementation task; entering execute workflow directly."
           : "Detected a multi-file or architecture-level implementation request; real operations or formal planning require the user to choose first.",
       ),
       confidence: 0.93,
       bypassMainRouter: false,
-      riskLevel: "high",
+      riskLevel: "medium",
       ...(isWorkspaceTurn
         ? {}
         : {
@@ -1811,19 +1811,19 @@ export function resolveTurnRunIntent(
   }
   if (riskMatches >= 2) {
     return finalize({
-      intent: isWorkspaceTurn ? "plan" : "respond",
+      intent: isWorkspaceTurn ? "execute" : "respond",
       reason: localizeReason(
         language,
         isWorkspaceTurn
-          ? "这条工作区请求涉及多个阶段或系统；本轮先进入正式计划流程。"
+          ? "这条工作区请求涉及多个模块；本轮直接进入执行流程。"
           : "这条请求涉及较多阶段或系统，MAIN 建议先确认是否进入计划阶段，再决定是否直接实施。",
         isWorkspaceTurn
-          ? "This workspace request spans multiple phases or systems, so the turn enters formal planning first."
+          ? "This workspace request spans multiple modules; entering execute workflow directly."
           : "This request spans multiple phases or systems. MAIN should confirm whether to plan first before implementing.",
       ),
       confidence: 0.82,
       bypassMainRouter: false,
-      riskLevel: "high",
+      riskLevel: "medium",
       ...(isWorkspaceTurn
         ? {}
         : {

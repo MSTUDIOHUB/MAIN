@@ -1024,6 +1024,7 @@ export interface GlobalSkillPackageMeta {
   entryPoints: string[];
   files: string[];
   reused: boolean;
+  payloadDir?: string;
 }
 
 export function extractGlobalSkillPackage(zipPath: string): Promise<GlobalSkillPackageMeta> {

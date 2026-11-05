@@ -83,9 +83,9 @@ export function runtimeV2ContextBoundToolArguments(
 ): Record<string, unknown> {
   if (toolName === "load_skill" && args.operation !== "list") {
     const parallelReadCount = Math.max(1, Math.floor(Number(options.parallelReadCount) || 1));
-    const defaultWindow = skillCatalogContextCharBudget(budget?.contextLimit);
+    const defaultWindow = Math.max(32_000, skillCatalogContextCharBudget(budget?.contextLimit));
     const sharedWindow = budget
-      ? Math.max(1, Math.floor(budget.readWindowChars / parallelReadCount))
+      ? Math.max(32_000, Math.floor((Number(budget.readWindowChars) || 32_000) / parallelReadCount))
       : defaultWindow;
     const requested = Number(args.max_chars);
     return {

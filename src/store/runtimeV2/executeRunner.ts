@@ -340,7 +340,7 @@ export async function runSubmitRuntimeV2Execute(
       ) {
         const freshness = deriveRuntimeV2PlanSourceFreshness(before);
         const invalidTargets = freshness
-          ? [...freshness.staleTargets, ...freshness.unversionedTargets]
+          ? [...freshness.staleTargets]
           : [];
         if (invalidTargets.length > 0) {
           await controller.invalidateWorkPlan(

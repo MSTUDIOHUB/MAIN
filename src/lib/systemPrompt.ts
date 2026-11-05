@@ -96,15 +96,6 @@ export function buildLanguageContract(input: {
   ].join("\n");
 }
 
-function xmlEscape(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
 function schemaTypeName(schema: { type?: string; enum?: string[] } | undefined): string {
   if (!schema) return "value";
   if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum.join("|");
@@ -147,20 +138,24 @@ function selectExampleDefinition(definitions: ToolDefinition[]): ToolDefinition 
 function buildXmlExample(tool: ToolDefinition | null, fallbackName: string): string[] {
   if (!tool) {
     return fallbackName
-      ? ["<tool_use>", `<tool>${xmlEscape(fallbackName)}</tool>`, "</tool_use>"]
+      ? ["<tool_call>", JSON.stringify({ name: fallbackName, arguments: {} }), "</tool_call>"]
       : [];
   }
   const required = new Set(tool.function.parameters?.required || []);
   const entries = Object.entries(tool.function.parameters?.properties || {})
     .filter(([name]) => required.has(name))
     .slice(0, 4);
+  const exampleArgs: Record<string, unknown> = {};
+  for (const [name, schema] of entries) {
+    const raw = schemaExampleValue(name, schema);
+    if (schema.type === "boolean") exampleArgs[name] = raw === "true";
+    else if (schema.type === "number" || schema.type === "integer") exampleArgs[name] = Number(raw);
+    else exampleArgs[name] = raw;
+  }
   return [
-    "<tool_use>",
-    `<tool>${xmlEscape(tool.function.name)}</tool>`,
-    ...entries.map(([name, schema]) => (
-      `<parameter name=\"${xmlEscape(name)}\">${xmlEscape(schemaExampleValue(name, schema))}</parameter>`
-    )),
-    "</tool_use>",
+    "<tool_call>",
+    JSON.stringify({ name: tool.function.name, arguments: exampleArgs }),
+    "</tool_call>",
   ];
 }
 
@@ -183,10 +178,15 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     return [
       "[TOOLS]",
       `protocol=native; available=${availableNames.join(", ") || "none"}.`,
+      availableSet.has("tool_search")
+        ? (language === "zh"
+            ? "默认仅暴露高频核心工具；若需要更多专业工具（如 git、浏览器、表格、子代理、MCP 工具），请先调用 tool_search 解锁。"
+            : "Only core tools are exposed by default; call tool_search to discover and unlock specialized or MCP tools on demand.")
+        : "",
       language === "zh"
-        ? "工具 schema 是名称、参数和描述的唯一事实来源。需要工具时直接发起 native tool call；不要在正文复制工具目录、伪造 JSON/XML 或输出 `[Tool call: ...]`。"
-        : "The native schemas are the sole source of truth for tool names, arguments, and descriptions. Call tools directly; do not copy a tool catalog into prose or emit pseudo JSON/XML or `[Tool call: ...]`.",
-    ].join("\n");
+        ? "工具 schema 是名称、参数和描述的唯一事实来源。需要工具时直接发起 native tool call；不要在正文伪造 JSON/XML 或输出 `[Tool call: ...]`。"
+        : "The native schemas are the sole source of truth for tool names, arguments, and descriptions. Call tools directly via native tool calls; do not emit pseudo JSON/XML or `[Tool call: ...]` in prose.",
+    ].filter(Boolean).join("\n");
   }
 
   if (availableNames.length === 0) {
@@ -213,14 +213,14 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     "[TOOLS]",
     "protocol=xml-text.",
     language === "zh"
-      ? "以下目录由本轮真实 schema 动态生成。需要工具时只输出一个完整 XML 工具块，不要混排正文；参数名必须与目录完全一致。"
-      : "This catalog is generated from the active schemas. When a tool is needed, output exactly one complete XML block with no surrounding prose; argument names must match the catalog exactly.",
+      ? "需要工具时输出一个完整的 `<tool_call>{\"name\": \"...\", \"arguments\": {...}}</tool_call>` 块，参数名必须与下列目录一致："
+      : "When a tool is needed, output a complete `<tool_call>{\"name\": \"...\", \"arguments\": {...}}</tool_call>` block matching the catalog below:",
     ...catalog,
     "Example:",
     ...example,
     language === "zh"
-      ? "禁止输出 `[Tool call: ...]`、`<tool_code>` 或自然语言工具占位符。"
-      : "Never emit `[Tool call: ...]`, `<tool_code>`, or a prose placeholder for a tool call.",
+      ? "禁止输出 `[Tool call: ...]` 或自然语言工具占位符。"
+      : "Never emit `[Tool call: ...]` or a prose placeholder for a tool call.",
   ].join("\n");
 }
 
@@ -321,11 +321,9 @@ function buildIntentModule(input: {
 
   if (intent === "execute") {
     return makeSection("EXECUTE", [
-      "Treat the active tool schemas above as the sole capability surface; built-in, MCP, engine, and browser tools may all provide valid task-specific actions.",
-      "Act on the user request with the smallest relevant context reads and targeted edits. Do not stop after narrating intended steps when an exposed tool can perform the next safe action.",
-      "Prefer a delta edit over rewriting a large existing file. After editing, inspect the actual diff when available and run the most relevant exposed validation.",
-      "A successful write proves only that exact mutation. It does not prove that the user's other requested outcomes are complete.",
-      "For a multi-step turn, optionally give a brief user-facing update when a material finding changes the approach, implementation begins, validation begins, or a real blocker appears. Do not narrate file reads, searches, commands, or tool names; missing commentary never blocks execution.",
+      "Use the exposed tools to read relevant files, make targeted edits, and run verification checks.",
+      "Prefer replace_in_file for focused edits and write_file for new files or full rewrites. A successful write proves only that exact mutation.",
+      "Do not stop after describing intended steps when a tool can perform the next action directly.",
     ]);
   }
 
@@ -464,9 +462,7 @@ export function buildSystemPrompt(
   ]));
 
   sections.push(makeSection("TURN CONTRACT", [
-    `conversationIntent=${contract.conversationIntent}; runtimeIntent=${contract.runtimeIntent}.`,
-    `planReviewState=${contract.planReviewState}; operationApprovalState=${contract.operationApprovalState}; allowedToolRisks=${contract.allowedToolRisks}.`,
-    `mutationExpected=${contract.mutationExpected}; validationExpected=${contract.validationExpected}; completionEvidence=${contract.completionEvidenceRequired}.`,
+    `intent=${contract.runtimeIntent}.`,
     commandDirective && commandDirective.kind !== "none"
       ? `commandDirective=${commandDirective.kind}${commandDirective.action ? `/${commandDirective.action}` : ""}${commandDirective.target ? `; target=${commandDirective.target}` : ""}.`
       : null,

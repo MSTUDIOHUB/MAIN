@@ -6,6 +6,7 @@ import type {
 } from "./contracts";
 import {
   parseExplicitCompatibilityTokenToolCalls,
+  parseToolUseBlock,
 } from "../textToolParser";
 import type {
   ToolDefinition,
@@ -486,7 +487,22 @@ function inspectExplicitTextToolEnvelope(
         blockContent = codeFence[1].trim();
       }
       const parsed = inspectExplicitTextToolEnvelope(`<runtime-v2-tools>${blockContent}</runtime-v2-tools>`);
-      if (!parsed.calls.length || parsed.diagnostic?.retryable) return parsed;
+      if (!parsed.calls.length || parsed.diagnostic?.retryable) {
+        if (/<parameter\s+name=/i.test(blockContent)) {
+          const xmlParamCalls = parseToolUseBlock(blockContent);
+          if (xmlParamCalls.length > 0) {
+            calls.push(
+              ...xmlParamCalls.map((call, idx) => ({
+                id: `xml-tool-${calls.length + idx + 1}-${call.id}`,
+                name: call.name,
+                arguments: call.arguments,
+              })),
+            );
+            continue;
+          }
+        }
+        return parsed;
+      }
       calls.push(...parsed.calls.map((call) => ({ ...call, id: `xml-tool-${calls.length + 1}-${call.id}` })));
     }
     return { calls };

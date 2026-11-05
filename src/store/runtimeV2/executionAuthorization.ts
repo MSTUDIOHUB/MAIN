@@ -14,7 +14,6 @@ import {
   isWorkspaceMutationToolName,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
-import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
   type RuntimeV2Command,
@@ -26,28 +25,15 @@ import {
   aggregateForCurrentTurn,
 } from "./executionAggregate";
 import {
-  validateRuntimeV2MutationLease,
-} from "./correctiveMutationPolicy";
-import {
-  runtimeV2MutationLeaseRejectionReason,
-} from "./executionMutationRejection";
-import {
   activeRuntimeV2ChildWriteConflict,
   activeRuntimeV2SubagentJobWriteConflict,
 } from "./executionSubagentWriteScope";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import { finiteValidationCommandRejection } from "./executionValidationCommand";
-import { preferredFiniteValidationCommand } from "./executionProviderContext";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
-  deriveRuntimeV2ExecutionContract,
-  runtimeV2ExecutionContractAllowsTargets,
-  runtimeV2ExecutionContractMutationTargets,
   validateRuntimeV2ExecutionContractSubmission,
 } from "./executionContract";
-import {
-  deriveRuntimeV2ExecutionContractAdvance,
-} from "./executionContractAdvance";
 import {
   deriveRuntimeV2ValidationCorrectionWindow,
 } from "./executionValidationCorrection";
@@ -100,9 +86,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
       job.taskKind === "implement" &&
       job.accessMode === "write",
   );
-  const directExecutionContractAdvance = aggregate?.strategy === "execute"
-    ? deriveRuntimeV2ExecutionContractAdvance(aggregate)
-    : null;
   const validationCorrection = aggregate?.strategy === "execute"
     ? deriveRuntimeV2ValidationCorrectionWindow(aggregate)
     : null;
@@ -123,7 +106,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
   );
   if (
     (aggregate?.strategy === "chat" || isChatContext(input.ports)) &&
-    (catalogSource !== "built_in" || !["load_skill", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
+    (catalogSource !== "built_in" || !["load_skill", "tool_search", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
   ) {
     return { allowed: false, reason: "Chat 仅允许已接纳的 Skill 与网络读取。", failureKind: "not_authorized", reasonCode: "chat_read_only_authority" };
   }
@@ -172,22 +155,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
   }
   if (
     input.command.kind === "execute_validation" &&
-    directExecutionContractAdvance?.required &&
-    directExecutionContractAdvance.pendingTargets.length > 0
-  ) {
-    return {
-      allowed: false,
-      reason: [
-        "当前 Execute 实施契约仍有尚未提交修改的目标，不能用提前验证跳过实施步骤。",
-        `待实施目标：${directExecutionContractAdvance.pendingTargets.join(", ")}。`,
-        "请先完成这些目标，或依据新证据显式修订执行契约。",
-      ].join(" "),
-      failureKind: "not_authorized",
-      reasonCode: "execution_contract_pending_mutations",
-    };
-  }
-  if (
-    input.command.kind === "execute_validation" &&
     input.toolName === "run_command"
   ) {
     const command = String(
@@ -203,7 +170,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
       };
     }
     if (aggregate?.strategy === "execute") {
-      const preferred = preferredFiniteValidationCommand(input.ports);
       if (
         validationCorrection?.validationCommandUnavailable &&
         command === validationCorrection.failedValidationCommand
@@ -214,19 +180,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
             `有限验证命令 ${JSON.stringify(command)} 已在当前工作区证明无法执行；请选择另一个有限 build、test、lint、typecheck、check 或行为断言。`,
           failureKind: "not_authorized",
           reasonCode: "failed_validation_command_repeated",
-        };
-      }
-      if (
-        !validationCorrection?.validationCommandUnavailable &&
-        preferred &&
-        command !== preferred
-      ) {
-        return {
-          allowed: false,
-          reason:
-            `当前 Execute 验证权威只允许精确命令 ${JSON.stringify(preferred)}；不得改用另一个有限命令。`,
-          failureKind: "not_authorized",
-          reasonCode: "execution_contract_validation_scope",
         };
       }
     }
@@ -265,29 +218,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
     };
   }
   if (
-    aggregate?.strategy === "execute" &&
-    input.command.kind === "execute_tool" &&
-    input.toolName === "read_file" &&
-    directExecutionContractAdvance?.required
-  ) {
-    const target = String(input.args.path || input.target || "").trim();
-    if (
-      !directExecutionContractAdvance.sourceReviewAvailable ||
-      !directExecutionContractAdvance.sourceReviewTargets.some((candidate) =>
-        workspacePathsReferToSameFile(candidate, target)
-      )
-    ) {
-      return {
-        allowed: false,
-        reason: directExecutionContractAdvance.sourceReviewAvailable
-          ? `本轮只允许复查刚修改的目标：${directExecutionContractAdvance.sourceReviewTargets.join(", ")}。`
-          : "本次修改后的单批源码复查已经结束；请继续契约修改或进入验收。",
-        failureKind: "not_authorized",
-        reasonCode: "execution_contract_source_review_scope",
-      };
-    }
-  }
-  if (
     input.command.kind === "execute_tool" &&
     isWorkspaceMutationToolName(input.toolName)
   ) {
@@ -296,28 +226,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
       input.args,
       input.target,
     );
-    if (aggregate?.strategy === "execute") {
-      const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
-      if (
-        executionContract &&
-        !validationCorrection?.active &&
-        !runtimeV2ExecutionContractAllowsTargets({
-          contract: executionContract,
-          targets: requestedTargets,
-        })
-      ) {
-        return {
-          allowed: false,
-          reason: [
-            "修改目标超出当前 Execute 实施契约。",
-            `允许目标：${runtimeV2ExecutionContractMutationTargets(executionContract).join(", ") || "无"}。`,
-            "如新证据确实改变方案，请先读取精确目标并用 record_execution_contract + revision_reason 显式修订；不得在修改动作中临时扩张范围。",
-          ].join(" "),
-          failureKind: "not_authorized",
-          reasonCode: "execution_contract_mutation_scope",
-        };
-      }
-    }
     const childConflict = activeRuntimeV2ChildWriteConflict({
       live: input.ports.live,
       targets: requestedTargets,
@@ -336,29 +244,6 @@ export function validateToolAgainstPhaseAndPlan(input: {
         ].join(" "),
         failureKind: "not_authorized",
         reasonCode: "active_child_write_scope_conflict",
-      };
-    }
-    const mutationLease = validateRuntimeV2MutationLease({
-      ports: input.ports,
-      toolCallId: String(input.command.payload.toolCallId || ""),
-      toolName: input.toolName,
-      args: input.args,
-      target: input.target,
-    });
-    if (mutationLease && !mutationLease.allowed) {
-      return {
-        allowed: false,
-        reason: runtimeV2MutationLeaseRejectionReason({
-          toolName: input.toolName,
-          unexpectedTargets: mutationLease.unexpectedTargets,
-          leaseTargets: mutationLease.leases.map((lease) => lease.target),
-          recoveryExcerpt: mutationLease.recoveryExcerpt,
-        }),
-        failureKind:
-          mutationLease.reasonCode === "mutation_source_text_mismatch"
-            ? "source_mismatch"
-            : "protocol_invalid",
-        reasonCode: mutationLease.reasonCode,
       };
     }
   }

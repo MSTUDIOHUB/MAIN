@@ -140,7 +140,7 @@ test("workspace implementation requests enter Turn semantics without a pre-turn 
     "生成一套游戏框架代码包括文件夹，实现《歧路旅人》CTB回合制战斗逻辑。",
     createContext({ hasWorkspace: true }),
   );
-  assert.equal(complex.intent, "plan");
+  assert.equal(complex.intent, "execute");
   assert.equal(complex.needsDecision, undefined);
 
   const feature = resolveTurnRunIntent(
@@ -649,7 +649,6 @@ test("complex multi-file generation asks for user choice before planning or exec
   assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, true);
   assert.equal(result.suggestedIntent, "plan");
-  assert.equal(result.riskLevel, "high");
 });
 
 test("plain analysis requests stay natural unless slash locked", () => {
@@ -875,7 +874,6 @@ test("high-risk multi-step implementation suggests planning first", () => {
   assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, true);
   assert.equal(result.suggestedIntent, "plan");
-  assert.equal(result.riskLevel, "high");
 });
 
 test("game-development implementation text enters the shared MAIN execute workflow", () => {

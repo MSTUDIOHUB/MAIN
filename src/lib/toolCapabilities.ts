@@ -147,6 +147,7 @@ const READ_ONLY_BUILT_INS = new Set([
   "submit_plan_candidate",
   "record_execution_contract",
   "load_skill",
+  "tool_search",
   "spawn_subagent",
   "wait_subagents",
   "cancel_subagent",

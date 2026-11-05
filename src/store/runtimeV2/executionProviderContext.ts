@@ -26,12 +26,12 @@ export function containsProviderTextEnvelopePrompt(
 ): string {
   if (language === "en") {
     return toolRequired
-      ? "Native tools are unavailable for this request. A structured tool call is required now. Output exactly `<runtime-v2-tools>{\"toolCalls\":[{\"id\":\"id\",\"name\":\"tool_name\",\"arguments\":{}}]}</runtime-v2-tools>` with valid JSON and no prose."
-      : "Native tools are unavailable for this request. If a tool is needed, output exactly `<runtime-v2-tools>{\"toolCalls\":[{\"id\":\"id\",\"name\":\"tool_name\",\"arguments\":{}}]}</runtime-v2-tools>` with valid JSON and no prose.";
+      ? "Native tools are unavailable for this request. A structured tool call is required now. Output `<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>` with valid JSON and no prose."
+      : "Native tools are unavailable for this request. If a tool is needed, output `<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>` with valid JSON and no prose.";
   }
   return toolRequired
-    ? "本次请求不使用原生工具，但当前阶段必须提交一个结构化工具调用。只输出完整的 `<runtime-v2-tools>{\"toolCalls\":[{\"id\":\"id\",\"name\":\"tool_name\",\"arguments\":{}}]}</runtime-v2-tools>` JSON 信封，不要混入说明文字。"
-    : "本次请求不使用原生工具。若需要工具，只输出一个完整的 `<runtime-v2-tools>{\"toolCalls\":[{\"id\":\"id\",\"name\":\"tool_name\",\"arguments\":{}}]}</runtime-v2-tools>` JSON 信封，不要混入说明文字。";
+    ? "本次请求不使用原生工具，当前阶段必须提交一个结构化工具调用。只输出完整的 `<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>` JSON 调用块，不要混入说明文字。"
+    : "本次请求不使用原生工具。若需要工具，只输出一个完整的 `<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>` JSON 调用块，不要混入说明文字。";
 }
 
 export function baseProviderProfile(state: any): ProviderLaneProfileV1 {
@@ -85,16 +85,10 @@ export function recordApprovedPlanContext(
           }
         : null,
     }, null, 2),
-    freshness && !freshness.allFresh
-      ? `Before the first mutation, call read_file for every missing exact target: ${freshness.missingTargets.join(", ") || "none"}. A stale target invalidates this approval.`
-      : "",
     frontier && !frontier.validationReady
-      ? [
-          "Execute only the currently ready WorkPlan steps and exact targets shown in executionFrontier.",
-          "Do not request a blocked step or any validation until Runtime advances the frontier from committed mutation receipts.",
-        ].join(" ")
+      ? "Follow the approved WorkPlan steps and verify once changes are complete."
       : frontier?.validationReady
-        ? "All mutation stages are complete. Run the sealed required validations exactly as declared."
+        ? "All mutation stages are complete. Run the planned validations."
         : "",
   ].join("\n\n");
   upsertRuntimeV2ContextAnchor(input.live, {

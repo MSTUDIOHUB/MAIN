@@ -19,6 +19,7 @@ import {
   renderSkillCatalogContext,
   skillCatalogContextCharBudget,
 } from "../../lib/agentSkills";
+import { filterToCoreAndUnlockedTools } from "../../lib/toolSearch";
 import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 
 export const SUBMIT_WORK_PLAN_TOOL_NAME = "submit_runtime_v2_work_plan";
@@ -42,19 +43,22 @@ export const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "git_diff",
   "get_project_skeleton",
   "load_skill",
+  "tool_search",
 ]);
 
 export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
   type: "function",
   function: {
     name: SUBMIT_WORK_PLAN_TOOL_NAME,
-    description: "Submit an evidence-grounded plan for review. The narrative is open Markdown; only concrete changes and validations are structurally required. This does not modify project files.",
+    description:
+      "提交可审阅的实现计划（不会直接修改项目文件）。只需提供 Markdown 方案说明（planMarkdown）、文件变更步骤（changes）及可选的验证方式（validations），依赖关系与准则映射由运行时自动推断。",
     parameters: {
       type: "object",
       properties: {
         planMarkdown: {
           type: "string",
-          description: "Free task-specific Markdown for the diagnosis, approach, decisions, or caveats that add value. State proved causes rather than guesses. Do not repeat the changes or validation lists; the runtime renders those.",
+          description:
+            "清晰的 Markdown 计划正文（包含问题诊断、设计思路与关键注意事项）。",
         },
         changes: {
           type: "array",
@@ -62,44 +66,44 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
           items: {
             type: "object",
             properties: {
-              title: { type: "string" },
+              title: { type: "string", description: "步骤简短标题" },
               operation: {
                 type: "string",
                 enum: ["modify", "create", "delete", "preserve"],
+                description: "操作类型，默认为 modify",
               },
               targets: {
                 type: "array",
                 minItems: 1,
                 items: { type: "string" },
+                description: "涉及的工作区相对文件路径列表",
               },
               change: {
                 type: "string",
-                description: "The exact code, contract, or behavior change. Include relevant symbols and preserved boundaries.",
+                description: "具体的代码或行为改动说明",
               },
-              expectedOutcome: { type: "string" },
+              expectedOutcome: { type: "string", description: "可选，预期结果" },
               basis: {
                 type: "array",
                 items: { type: "string" },
-                description: "Exact retained evidence IDs supporting this change. Cite child evidence IDs here when adopting a joined subagent finding.",
+                description: "可选，支撑该步骤的证据 ID（如 E1、E2）",
               },
               dependsOn: {
                 type: "array",
                 items: { type: "integer" },
-                description: "Zero-based indexes of earlier changes that must complete before this change. Use [] when independent.",
+                description: "可选，前置步骤的 0-based 索引列表，默认自动推断",
               },
               criterionIds: {
                 type: "array",
-                minItems: 1,
                 items: { type: "string" },
-                description: "Exact admitted criterion IDs this change serves. Do not invent or omit IDs.",
+                description: "可选，对应的验收准则 ID，默认自动映射",
               },
             },
-            required: ["operation", "targets", "change", "dependsOn", "criterionIds"],
+            required: ["targets", "change"],
           },
         },
         validations: {
           type: "array",
-          minItems: 1,
           items: {
             type: "object",
             properties: {
@@ -109,36 +113,33 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
               },
               command: {
                 type: "string",
-                description: "Only for finite_command. Use a bounded build, test, check, or lint command; never a dev server, watcher, or manual instruction.",
+                description: "可选，用于验证的构建/测试/检查命令（如 npm run build）",
               },
               cwd: { type: "string" },
               expectedOutcome: {
                 type: "string",
-                description: "The observable pass condition. Put browser or desktop interaction details here.",
+                description: "预期的验证通过结果说明",
               },
               required: { type: "boolean" },
               stepIndexes: {
                 type: "array",
                 items: { type: "integer" },
-                description: "Zero-based change indexes whose outcome this validation proves.",
               },
               criterionIds: {
                 type: "array",
-                minItems: 1,
                 items: { type: "string" },
-                description: "Exact admitted criterion IDs this required validation proves.",
               },
             },
-            required: ["kind", "expectedOutcome", "stepIndexes", "criterionIds"],
+            required: ["expectedOutcome"],
           },
         },
         questions: {
           type: "array",
           items: { type: "string" },
-          description: "Optional decisions that genuinely require the user. Omit when evidence resolves the task.",
+          description: "可选，确需用户决策的问题；无阻塞问题时省略。",
         },
       },
-      required: ["planMarkdown", "changes", "validations"],
+      required: ["planMarkdown", "changes"],
     },
   },
 };
@@ -161,11 +162,15 @@ export function planModelTools(
     return PLAN_READ_ONLY_TOOL_NAMES.has(name) ||
       (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
   });
-  return [
+  const allCandidates = [
     ...baseTools,
     ...(loadSkill ? [loadSkill] : []),
     SUBMIT_WORK_PLAN_TOOL,
   ];
+  return filterToCoreAndUnlockedTools(allCandidates, {
+    sessionKey: context.runSessionKey,
+    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME],
+  });
 }
 
 function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
@@ -321,14 +326,9 @@ export function providerPlanMessages(input: {
         "[MAIN RUNTIME V2 PLAN]",
         `Workspace: ${input.context.runWorkspace || "global"}`,
         `Respond in: ${language}`,
-        "You are preparing a reviewable plan, not implementing it. Only the supplied read-only tools and submit_runtime_v2_work_plan are available.",
-        "Base the plan on tool evidence. Do not invent source facts, edit project files, or write plan.md.",
-        "Read every exact modify/delete target before submitting; the runtime binds its versioned evidence automatically.",
-        "Trace the complete cause across owners before submitting. If an investigated owner must remain unchanged, say so in the narrative or add a preserve change instead of proposing an unnecessary edit.",
-        "When evidence is sufficient, call submit_runtime_v2_work_plan exactly once. Write task-specific Markdown rather than filling a fixed report template.",
-        "The submission needs a concrete change list, explicit dependency edges, and a complete validation list. Use zero-based earlier change indexes in changes[].dependsOn; use [] only when a change is genuinely independent. The runtime validates and normalizes these edges but does not infer them from prose or filenames.",
-        "Use finite_command for each bounded build/test/check command explicitly required by the user or promised in your plan. Put every command in a separate validations[] entry and name the zero-based changes it proves in stepIndexes. Use browser only for web DOM behavior and desktop for native GUI behavior; put interaction details in expectedOutcome, not command.",
-        "Every change and every required validation must include criterionIds copied exactly from the admitted criteria below. Each admitted criterion must appear in at least one change and one required validation; mapping an ID is a reviewable claim, not permission to weaken its text.",
+        "You are in Plan Mode: inspect relevant files with read-only tools and then submit a clear plan via submit_runtime_v2_work_plan.",
+        "Do not invent file paths or modify project files during planning.",
+        "When you have enough context, call submit_runtime_v2_work_plan once with planMarkdown (narrative diagnosis & design), changes (each with targets and change description), and validations (bounded build/test commands or expected outcomes).",
         `[ADMITTED CRITERIA]\n${admission.acceptanceCriteria.map((criterion) => `${criterion.id}: ${criterion.text}`).join("\n")}`,
         collaborationRequired
           ? "[REQUIRED COLLABORATION]\nThe user explicitly requires a planning child. Before submitting, admit at least one bounded read-only child through spawn_subagent, later join it, assess its result, and cite any adopted exact evidence ID. This is a hard admission condition, not a collaboration preference."

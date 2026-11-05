@@ -46,7 +46,7 @@ export function runtimeV2TranscriptSkillDocumentReads(
       const range = record(body.returnedRange);
       if (!target || !range || !safeString(body.id) || !safeString(body.ref) ||
         !safeString(body.version) || target.skill_id !== body.ref || target.expected_version !== body.version ||
-        ![body.id, body.ref].includes(String(args.skill_id || "").trim()) ||
+        !safeString(String(args.skill_id || "").trim()) ||
         (args.expected_version !== undefined && args.expected_version !== body.version) ||
         typeof body.content !== "string" ||
         !["full", "overview", "window"].includes(body.disclosure as string)) return [];

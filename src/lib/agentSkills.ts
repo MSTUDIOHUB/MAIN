@@ -1,5 +1,5 @@
 import type { Skill } from "./appTypes";
-import { isMap, parseDocument } from "yaml";
+import { isMap, isSeq, parseDocument } from "yaml";
 import {
   discoverPersonalAgentSkills,
   globSearch,
@@ -26,6 +26,8 @@ export interface SkillCatalogEntry {
   readonly content: string;
   readonly entryPath: string | null;
   readonly basePath: string | null;
+  readonly realBasePath?: string | null;
+  readonly triggers?: readonly string[];
   readonly version: string;
   readonly allowImplicitInvocation: boolean;
   readonly supportingFiles: readonly string[];
@@ -51,6 +53,7 @@ export interface LoadedSkillContent {
   readonly source: SkillCatalogSource;
   readonly entryPath: string | null;
   readonly basePath: string | null;
+  readonly realBasePath?: string | null;
   readonly version: string;
   readonly supportingFiles: readonly string[];
   readonly hostGuidance: string;
@@ -137,6 +140,7 @@ export interface SkillCatalogPage {
 interface ParsedSkillDocument {
   readonly name: string;
   readonly description: string;
+  readonly triggers: readonly string[];
   readonly body: string;
   readonly warnings: readonly string[];
 }
@@ -168,6 +172,7 @@ export function parseSkillDocument(raw: string, fallbackName: string, fallbackDe
   const fallback = {
     name: fallbackName.trim(),
     description: fallbackDescription.trim(),
+    triggers: [] as string[],
     body: value,
     warnings: [] as string[],
   };
@@ -183,6 +188,7 @@ export function parseSkillDocument(raw: string, fallbackName: string, fallbackDe
   }
   let name = "";
   let description = "";
+  const triggers: string[] = [];
   const warnings: string[] = [];
   // Read scalar nodes only: no conversion of the document or alias expansion.
   // YAML owns folding, escaping, comments, indentation and CRLF handling.
@@ -195,9 +201,24 @@ export function parseSkillDocument(raw: string, fallbackName: string, fallbackDe
       warnings.push(`YAML ${key} must be a string scalar; fallback metadata was used.`);
     }
   }
+  const triggersNode = document.get("triggers", true);
+  if (isSeq(triggersNode)) {
+    for (const item of triggersNode.items) {
+      const val = (item as { value?: unknown })?.value;
+      if (typeof val === "string" && val.trim()) {
+        triggers.push(val.trim());
+      }
+    }
+  } else {
+    const triggerScalar = document.get("triggers");
+    if (typeof triggerScalar === "string" && triggerScalar.trim()) {
+      triggers.push(...triggerScalar.split(",").map((s) => s.trim()).filter(Boolean));
+    }
+  }
   return {
     name: name || fallbackName.trim(),
     description: description || fallbackDescription.trim(),
+    triggers,
     // Keep the complete SKILL.md. Frontmatter is useful provenance and is how
     // Codex/OpenCode Skill authors expect the loaded resource to look.
     body: value,
@@ -230,9 +251,29 @@ export function resolveSkillId(
 ): string | null {
   if (!snapshot) return null;
   const value = String(reference || "").trim();
+  if (!value) return null;
   const exact = snapshot.entries.find((entry) => entry.id === value);
   if (exact) return exact.id;
-  return snapshot.entries.find((entry) => skillReference(snapshot, entry.id) === value)?.id || null;
+  const byRef = snapshot.entries.find((entry) => skillReference(snapshot, entry.id) === value);
+  if (byRef) return byRef.id;
+  const lower = value.toLocaleLowerCase();
+  const byNameMatches = snapshot.entries.filter(
+    (entry) => entry.name.toLocaleLowerCase() === lower,
+  );
+  if (byNameMatches.length === 1) return byNameMatches[0]!.id;
+  const slugMatches = snapshot.entries.filter((entry) => {
+    const slug = entry.name
+      .toLocaleLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    const baseSlug = normalizeSlashPath(entry.basePath || "")
+      .split("/")
+      .pop()
+      ?.toLocaleLowerCase();
+    return (slug && slug === lower) || (baseSlug && baseSlug === lower);
+  });
+  if (slugMatches.length === 1) return slugMatches[0]!.id;
+  return null;
 }
 
 interface SkillSourceLine { readonly start: number; readonly end: number }
@@ -344,6 +385,7 @@ function freezeEntry(entry: SkillCatalogEntry): SkillCatalogEntry {
   return Object.freeze({
     ...entry,
     supportingFiles: Object.freeze([...entry.supportingFiles]),
+    ...(entry.triggers ? { triggers: Object.freeze([...entry.triggers]) } : {}),
     ...(entry.globalResourcePaths ? { globalResourcePaths: Object.freeze([...entry.globalResourcePaths]) } : {}),
   });
 }
@@ -453,11 +495,19 @@ export async function loadSkillCatalog(input: {
         const prefix = base ? `${base}/` : "";
         const configPath = `${prefix}agents/openai.yaml`;
         const config = files.includes(configPath) ? await readGlobalSkillPackageFile(packageId, configPath) : null;
+        const realPayloadDir = typeof meta.payloadDir === "string" && meta.payloadDir.trim()
+          ? normalizeSlashPath(meta.payloadDir)
+          : "";
+        const realBasePath = realPayloadDir
+          ? (base ? `${realPayloadDir}/${base}` : realPayloadDir)
+          : null;
         entries.push(freezeEntry({
           id: `global:${packageId}:${entryPoint}`, name,
           description: validEntryDescription(parsed.description, name), source: "package",
           content: admittedBody, entryPath: `main-skill://${packageId}/${entryPoint}`,
           basePath: `main-skill://${packageId}${base ? `/${base}` : ""}`,
+          ...(realBasePath ? { realBasePath } : {}),
+          ...(parsed.triggers.length > 0 ? { triggers: parsed.triggers } : {}),
           version: stableContentVersion(admittedBody),
           allowImplicitInvocation: skill.allowImplicitInvocation !== false && allowImplicitFromConfig(config),
           supportingFiles: files.filter((file) => file.startsWith(prefix) && file !== entryPoint && file !== configPath)
@@ -511,6 +561,7 @@ export async function loadSkillCatalog(input: {
       content: admittedBody,
       entryPath,
       basePath,
+      ...(parsed.triggers.length > 0 ? { triggers: parsed.triggers } : {}),
       version: stableContentVersion(admittedBody),
       allowImplicitInvocation: allowImplicitFromConfig(document.openaiYaml),
       supportingFiles: [...new Set(
@@ -553,6 +604,7 @@ export async function loadSkillCatalog(input: {
             content: admittedBody,
             entryPath,
             basePath,
+            ...(parsed.triggers.length > 0 ? { triggers: parsed.triggers } : {}),
             version: stableContentVersion(admittedBody),
             allowImplicitInvocation: skill.allowImplicitInvocation !== false && await allowImplicitFor(basePath, workspace),
             supportingFiles: await supportingFilesFor(basePath, entryPath, workspace),
@@ -594,6 +646,7 @@ export async function loadSkillCatalog(input: {
           content: admittedBody,
           entryPath,
           basePath,
+          ...(parsed.triggers.length > 0 ? { triggers: parsed.triggers } : {}),
           version: stableContentVersion(admittedBody),
           allowImplicitInvocation: await allowImplicitFor(basePath, workspace),
           supportingFiles: await supportingFilesFor(basePath, entryPath, workspace),
@@ -670,6 +723,7 @@ export function listSkillCatalog(
     source: entry.source,
     entryPath: entry.entryPath,
     basePath: entry.basePath,
+    ...(entry.realBasePath ? { realBasePath: entry.realBasePath } : {}),
     version: entry.version,
     explicitlyRequested: explicit.has(entry.id),
   }));
@@ -803,6 +857,7 @@ function discloseSkillDocument(
     source: entry.source,
     entryPath: entry.entryPath,
     basePath: entry.basePath,
+    ...(entry.realBasePath ? { realBasePath: entry.realBasePath } : {}),
     version: entry.version,
     supportingFiles: Object.freeze(relativeSupportingPaths(entry)),
     hostGuidance: entry.globalPackageId ? `${SKILL_HOST_GUIDANCE} ${GLOBAL_SKILL_RESOURCE_GUIDANCE}` : SKILL_HOST_GUIDANCE,
@@ -863,7 +918,7 @@ export function buildLoadSkillToolDefinition(
     function: {
       name: LOAD_SKILL_TOOL_NAME,
       description:
-        "Read an admitted Skill (default operation=load). Small bodies are complete; long bodies first return an exact preface and section index, explicitly partial. Read relevant sections or line windows before following their instructions. Reuse returned readTarget with chosen section, line or index coordinates; nextStartLine/nextStartChar continue source windows. For global package references, set resource relative to the selected Skill base. operation=list discovers metadata only, with nextCursor pagination. No additional permissions; never executes Skill content.",
+        "Load an admitted Skill's instructions (default operation=load). Pass skill_id as the skill name, slug, short ref (s:...), or canonical id. Most Skills return their complete SKILL.md in a single call; for partial continuations or resources, reuse readTarget. For global package references, set resource relative to the selected Skill base. operation=list discovers metadata only.",
       parameters: {
         type: "object",
         properties: {
@@ -874,7 +929,7 @@ export function buildLoadSkillToolDefinition(
           },
           skill_id: {
             type: "string",
-            description: "Required for load: short ref from the catalog, or an exact canonical id from a list result. Unknown or hidden entries are rejected.",
+            description: "Required for load: skill name, slug, short ref (s:...) from the catalog, or canonical id.",
           },
           resource: { type: "string", description: "Optional global package reference path relative to this Skill base, e.g. references/setup.md. Repeat on every continuation by reusing that resource's readTarget; omit for SKILL.md. Rejects absolute paths, traversal and unknown resources. Guidance only; never executes scripts or grants project/source/write permissions." },
           section: { type: "string", description: "Optional exact section id from the Skill index, such as L15. Returns original source, never a generated summary." },

@@ -41,6 +41,7 @@ pub struct GlobalSkillPackageMeta {
     pub entry_points: Vec<String>,
     pub files: Vec<String>,
     pub reused: bool,
+    pub payload_dir: String,
 }
 
 fn is_package_id(value: &str) -> bool {
@@ -234,7 +235,7 @@ fn build_manifest(payload: &Path, name: String) -> Result<PackageManifest, Strin
     })
 }
 
-fn metadata(manifest: &PackageManifest, reused: bool) -> GlobalSkillPackageMeta {
+fn metadata(manifest: &PackageManifest, payload: &Path, reused: bool) -> GlobalSkillPackageMeta {
     GlobalSkillPackageMeta {
         package_id: manifest.package_id.clone(),
         name: manifest.name.clone(),
@@ -246,6 +247,7 @@ fn metadata(manifest: &PackageManifest, reused: bool) -> GlobalSkillPackageMeta 
             .map(|file| file.path.clone())
             .collect(),
         reused,
+        payload_dir: payload.to_string_lossy().into_owned(),
     }
 }
 
@@ -308,15 +310,18 @@ fn publish(
     let destination = store.join(&manifest.package_id);
     if fs::symlink_metadata(&destination).is_ok() {
         return inspect_at_store(store, &manifest.package_id)
-            .map(|(existing, _)| metadata(&existing, true));
+            .map(|(existing, payload)| metadata(&existing, &payload, true));
     }
     match fs::rename(staging.path(), &destination) {
-        Ok(()) => Ok(metadata(&manifest, false)),
+        Ok(()) => {
+            let payload = regular_directory(&destination.join("payload"))?;
+            Ok(metadata(&manifest, &payload, false))
+        }
         Err(error) => {
             // Another importer may have published the same immutable tree first.
             if fs::symlink_metadata(&destination).is_ok() {
                 inspect_at_store(store, &manifest.package_id)
-                    .map(|(existing, _)| metadata(&existing, true))
+                    .map(|(existing, payload)| metadata(&existing, &payload, true))
             } else {
                 Err(format!("Cannot publish Skill package: {error}"))
             }
@@ -401,7 +406,7 @@ pub fn inspect_global_skill_package_at(
     package_id: &str,
 ) -> Result<GlobalSkillPackageMeta, String> {
     let store = store_root(app_data, false)?;
-    inspect_at_store(&store, package_id).map(|(manifest, _)| metadata(&manifest, true))
+    inspect_at_store(&store, package_id).map(|(manifest, payload)| metadata(&manifest, &payload, true))
 }
 
 pub fn read_global_skill_package_file_at(

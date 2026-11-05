@@ -5,6 +5,7 @@
 
 import type { Skill } from "./appTypes";
 import type { MCPTool } from "./mcpClient";
+import { TOOL_SEARCH_DEFINITION } from "./toolSearch";
 import {
   SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS,
   SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS,
@@ -1177,6 +1178,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
     },
   },
+  TOOL_SEARCH_DEFINITION,
 ];
 
 // ── Skill → Tool Schema conversion ──────────────────────────────────

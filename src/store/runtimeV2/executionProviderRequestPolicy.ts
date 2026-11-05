@@ -12,13 +12,13 @@ import type {
 } from "./executionTypes";
 
 export const RUNTIME_V2_EXECUTION_PROVIDER_MAX_OUTPUT_TOKENS = 8_192;
-export const RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS = 4_096;
-export const RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS = 2_048;
-export const RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS = 2_048;
-export const RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS = 2_048;
-export const RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT = 4_000;
-export const RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT = 3_000;
-export const RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT = 1_000;
+export const RUNTIME_V2_EXECUTION_ACTION_MAX_OUTPUT_TOKENS = 8_192;
+export const RUNTIME_V2_EXECUTION_RECOVERY_MAX_OUTPUT_TOKENS = 4_096;
+export const RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS = 4_096;
+export const RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS = 4_096;
+export const RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT = 32_000;
+export const RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT = 16_000;
+export const RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT = 12_000;
 
 export function runtimeV2CurrentToolSurfaceInstruction(
   tools: readonly ToolDefinition[],
@@ -26,22 +26,19 @@ export function runtimeV2CurrentToolSurfaceInstruction(
 ): string {
   const names = tools.map((tool) => tool.function.name);
   if (names.length === 0) {
-    return [
-      "CURRENT_TOOL_SURFACE: this decision exposes no tools.",
-      "Do not emit a tool name, tool-call wrapper, or pseudo command; return only the concise evidence report requested above.",
-    ].join(" ");
+    return "No tools are exposed for this step; return your response directly.";
   }
   return [
-    `CURRENT_TOOL_SURFACE: this decision exposes exactly ${names.length} tool${names.length === 1 ? "" : "s"}: ${names.join(", ")}.`,
-    "A tool mentioned in earlier conversation but absent from this exact list is unavailable now.",
+    `Available tools (${names.length}): ${names.join(", ")}.`,
+    names.includes("tool_search")
+      ? "Call tool_search if you need specialized or MCP tools not listed above."
+      : "",
     actionRequired
       ? names.length === 1
-        ? `This decision requires exactly one structured action, and it must be ${names[0]}.`
-        : "This decision requires exactly one structured action chosen from this exact list."
-      : names.length === 1
-        ? `If you take an action, it must be ${names[0]}.`
-        : "If you take an action, choose only from this exact list.",
-  ].join(" ");
+        ? `Submit a structured call to ${names[0]}.`
+        : "Submit a structured tool call from the list above."
+      : "",
+  ].filter(Boolean).join(" ");
 }
 
 export function runtimeV2ExecutionEffectiveToolChoice(input: {
