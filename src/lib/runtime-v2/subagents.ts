@@ -174,8 +174,9 @@ export function areRuntimeV2SubagentWriteScopesDisjoint(
 }
 
 /**
- * Materialize frozen jobs from provider-authored spawn_subagent calls within
- * the capacity admitted by the provider lane. Read-only jobs may overlap.
+ * Materialize frozen jobs from provider-authored spawn_subagent calls when
+ * the provider lane admits children. Jobs wait in the existing model-lane
+ * dispatcher; its active-request capacity is not a total task quota.
  * Write jobs require an explicit implementation contract and exclusive path
  * ownership against every active or newly admitted write job.
  */
@@ -235,10 +236,7 @@ export function scheduleRuntimeV2Subagents(input: {
     }
     seenScopeKeys.add(scopeKey);
     seenSemanticIdentities.add(semanticIdentity);
-    if (
-      activeExistingJobs.length + jobs.length >=
-        maxActiveJobs
-    ) {
+    if (maxActiveJobs <= 0) {
       rejectedScopeKeys.push(scopeKey);
       continue;
     }

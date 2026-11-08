@@ -1,8 +1,9 @@
+import { retireRemovedFeatures } from "./retiredFeatureMigration";
 import { normalizeExternalSkillSelections } from "./externalSkillSelections";
 import { normalizeExternalSkillSources } from "./externalSkillSources";
 import { normalizeGithubSkillSource } from "./githubSkillSource";
 
-export const LOCAL_PERSIST_SCHEMA_VERSION = 2;
+export const LOCAL_PERSIST_SCHEMA_VERSION = 3;
 
 export const LEGACY_RUNTIME_PERSIST_KEYS = [
   "taskFlow",
@@ -56,7 +57,7 @@ export function normalizePersistedSkills<T>(skills: T): T {
  * persistence behavior.
  */
 export function sanitizeHydratedLockedComposerIntent(value: unknown): unknown {
-  return value === "goal" ? null : value;
+  return value === "goal" || value === "image_studio" ? null : value;
 }
 
 export function stripLegacyConfigFields(config: unknown): Record<string, unknown> | undefined {
@@ -70,6 +71,7 @@ export function stripLegacyConfigFields(config: unknown): Record<string, unknown
 
 function stripSessionDetailsForLocalPersist(session: any): any | null {
   if (session?.recordingDisabled && session?.storageStatus !== "temporary") return null;
+  if (session?._retirementMigrationPending === true) return retireRemovedFeatures(session);
   const { messages: _messages, runtimeSnapshot: _runtimeSnapshot, ...meta } = session || {};
   return {
     ...meta,
@@ -97,7 +99,7 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
   persistedState: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
   if (!persistedState || typeof persistedState !== "object") return {};
-  const nextState = { ...persistedState } as Record<string, unknown>;
+  const nextState = retireRemovedFeatures({ ...persistedState }) as Record<string, unknown>;
   // Retired Gemini ZIP installation metadata must not rehydrate hidden Skills
   // or MCP capabilities. Existing package files are left untouched on disk.
   delete nextState.geminiExtensions;
@@ -113,9 +115,11 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
     );
   }
   if (nextState.sessionsByWorkspace) {
-    nextState.sessionsByWorkspace = stripSessionsByWorkspaceForLocalPersist(
-      nextState.sessionsByWorkspace as Record<string, any[]>,
-    );
+    // Keep legacy full snapshots in memory until the startup migration has
+    // committed them to native storage. Only the persistence writer slims them.
+    nextState.sessionsByWorkspace = Object.fromEntries(Object.entries(retireRemovedFeatures(nextState.sessionsByWorkspace) as Record<string, any[]>).map(([workspace, sessions]) => [workspace, (sessions || []).filter(session => !session.recordingDisabled || session.storageStatus === "temporary").map(session => ({ ...session,
+      ...((session.messages?.length || session.runtimeSnapshot) && !session.recordingDisabled && session.storageStatus !== "temporary" ? { _retirementMigrationPending: true } : {}),
+    }))]));
   }
   if (nextState.config) {
     nextState.config = stripLegacyConfigFields(nextState.config);
@@ -139,8 +143,6 @@ export function buildPersistedAppState(state: Record<string, any>): Record<strin
     currentWorkspace: state.currentWorkspace,
     selectedWorkspace: state.selectedWorkspace,
     currentSessionId: state.currentSessionId,
-    selectedMainModeKey: state.selectedMainModeKey,
-    imageStudio: state.imageStudio,
     preferredResponseLanguage: state.preferredResponseLanguage,
     mcpServers: state.mcpServers,
     sidebarWidth: state.sidebarWidth,

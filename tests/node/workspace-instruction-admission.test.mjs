@@ -87,6 +87,12 @@ test("same submission id cannot silently change intent or remote ownership paylo
   );
 });
 
+test("message knowledge scope and source revision participate in admission identity", () => {
+  const selected = { kind: "source", kbId: "kb-1", sourceId: "source-1", sourceRevision: "rev-1" };
+  assert.notEqual(identity(), identity({ knowledgeReferences: [selected] }));
+  assert.notEqual(identity({ knowledgeReferences: [selected] }), identity({ knowledgeReferences: [{ ...selected, sourceRevision: "rev-2" }] }));
+});
+
 test("the durable receipt ledger survives paging but rejects foreign owners and duplicate ids", () => {
   const receipt = {
     schemaVersion: 1,

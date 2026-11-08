@@ -189,7 +189,6 @@ export interface SpawnSubagentRequest {
   accessMode?: CollaborationAccessMode;
   dependsOn?: string;
   independentReviewOf?: string;
-  goalSliceId?: string;
 }
 
 export type DelegationRuntimePhase =

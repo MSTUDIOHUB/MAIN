@@ -1,4 +1,5 @@
 import { isChatContext } from "./readOnlyPolicy";
+import { RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { type ToolDefinition } from "../../lib/toolSchemas";
 import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
@@ -97,6 +98,13 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     : null;
   const sessionKey = input.ports.context?.runSessionKey;
   const objectiveText = aggregate?.objective?.text || "";
+  const hasWorkspace = !!String(input.ports.context.runWorkspace || "").trim();
+  const globalNetworkTools = hasWorkspace ? [] :
+    [...RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES].filter(name =>
+      input.capabilityRegistry?.tools[name]?.enabled === true);
+  const knowledgeTool = (name: string) => !!input.ports.context?.knowledgeContext?.references.length &&
+    input.ports.context.knowledgeContext.state !== "stale" && input.ports.context.knowledgeContext.state !== "error" &&
+    RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES.has(name);
 
   if (mode === "conclude") {
     if (input.command.payload.conclusionKind === "read_only") return [];
@@ -109,7 +117,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     return input.available.filter((definition) =>
       ["load_skill", "tool_search", "web_search", "web_fetch"].includes(
         definition.function.name,
-      )
+      ) || knowledgeTool(definition.function.name)
     );
   }
   if (mode === "analyze") {
@@ -117,6 +125,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       ? input.available.filter((definition) => {
           const name = definition.function.name;
           return RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(name) ||
+            knowledgeTool(name) ||
             RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
             RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
             isMcpObservation(name);
@@ -124,6 +133,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       : input.available.filter((definition) => {
           const name = definition.function.name;
           return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
+            knowledgeTool(name) ||
             RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
             RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
             isMcpObservation(name) ||
@@ -134,7 +144,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       prompt: objectiveText,
       // Runtime admission already checked collaboration, capacity and runway.
       // Tool discovery must not hide that admitted capability from this request.
-      alwaysInclude: collaboration,
+      alwaysInclude: new Set([...collaboration, ...globalNetworkTools]),
     });
   }
 
@@ -147,6 +157,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       return true;
     }
     return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
+      (!hasWorkspace && RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(name)) ||
+      knowledgeTool(name) ||
       RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(name) ||
       RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) ||
       isWorkspaceMutationToolName(name) ||
@@ -159,7 +171,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const selected = filterToCoreAndUnlockedTools(executeCandidates, {
     sessionKey,
     prompt: objectiveText,
-    alwaysInclude: new Set([...collaboration, RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME]),
+    alwaysInclude: new Set([...collaboration, RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME, ...globalNetworkTools]),
   });
   const contract = deriveRuntimeV2ExecutionContract(aggregate);
   const contractMutationTargets = runtimeV2ExecutionContractMutationTargets(contract);

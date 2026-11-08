@@ -4,7 +4,7 @@ export const RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION = "turn-runtime-checkpoint.v5"
 
 export type RuntimeEngineVersion = "legacy" | typeof RUNTIME_V2_ENGINE_VERSION;
 
-export type RuntimeV2Strategy = "chat" | "analyze" | "plan" | "execute" | "goal";
+export type RuntimeV2Strategy = "chat" | "analyze" | "plan" | "execute";
 
 export type RuntimeV2Phase =
   | "preparing"
@@ -108,7 +108,7 @@ export interface RuntimeV2Objective {
   readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly constraints: readonly string[];
   readonly acceptanceCriteria: readonly string[];
-  /** Stable runtime-owned identities. Goal slices preserve their original
+  /** Stable runtime-owned identities. Continuations preserve their original
    * criterion ids; direct Execute uses one id for the complete user request. */
   readonly acceptanceCriterionIds?: readonly string[];
   /** Runtime-owned lower bound. A provider may request stronger evidence in
@@ -204,7 +204,7 @@ export interface RuntimeV2NormalizedToolCall {
 
 export interface RuntimeV2ExecutionBlocker {
   readonly requestId: string;
-  readonly reasonCode: "rejected_action_cycle" | "recovery_stalled" | "external_state_required" | "intent_clarification";
+  readonly reasonCode: "rejected_action_cycle" | "recovery_stalled" | "external_state_required" | "intent_clarification" | "user_questionnaire" | "document_save_failed";
   readonly evidenceSequence: number;
   readonly message: string;
   readonly actionIdentity?: string;
@@ -213,6 +213,8 @@ export interface RuntimeV2ExecutionBlocker {
   readonly decision?: "recheck" | "continue" | "stop";
   readonly clarification?: import("../turnClarification").TurnClarification;
   readonly decisionReply?: string;
+  readonly questionnaire?: import("../userQuestions").UserQuestionnaire;
+  readonly decisionAnswer?: import("../userQuestions").UserChoiceAnswer;
 }
 
 export interface RuntimeV2ProviderDiagnostic {

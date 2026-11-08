@@ -7,6 +7,7 @@ interface PlanReviewCapsuleProps {
   themeMode: "light" | "dark" | "black";
   onOpenPlan: () => void;
   onApprove: () => void;
+  opensApprovalDialog?: boolean;
 }
 
 /**
@@ -20,6 +21,7 @@ export default function PlanReviewCapsule({
   themeMode,
   onOpenPlan,
   onApprove,
+  opensApprovalDialog = false,
 }: PlanReviewCapsuleProps) {
   const isLight = themeMode === "light";
   const isBlack = themeMode === "black";
@@ -80,7 +82,9 @@ export default function PlanReviewCapsule({
             }`}
           >
             <IconCheck className="h-4 w-4" />
-            {language === "zh" ? "批准执行" : "Approve & Execute"}
+            {opensApprovalDialog
+              ? (language === "zh" ? "审阅并批准" : "Review & approve")
+              : (language === "zh" ? "批准执行" : "Approve & Execute")}
           </button>
         </div>
       </div>

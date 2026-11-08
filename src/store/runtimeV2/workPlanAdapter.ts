@@ -8,6 +8,7 @@ import {
   RUNTIME_V2_PLAN_ARTIFACT_PATH,
   RUNTIME_V2_PLAN_REVIEW_COMMIT_SCHEMA_VERSION,
   sealWorkPlanV1,
+  isWorkPlanArtifactProjectionBound,
   type RuntimeV2PlanArtifactProjection,
   type RuntimeV2PlanAuthority,
   type RuntimeV2PlanChatProjection,
@@ -16,6 +17,7 @@ import {
   type RuntimeV2PlanReviewCommit,
   type SealedWorkPlanV1,
 } from "../../lib/runtime-v2/workPlan";
+import type { PlanDocumentRef } from "../../lib/planDocuments";
 
 export {
   RUNTIME_V2_PLAN_ARTIFACT_PATH,
@@ -136,6 +138,7 @@ export function validateSealedWorkPlanV1Integrity(
       id: plan.id,
       createdAt: plan.createdAt,
       ...(plan.legacy ? { legacy: plan.legacy } : {}),
+      ...(plan.decisionJournal !== undefined ? { decisionJournal: plan.decisionJournal } : {}),
     });
   } catch {
     return { ok: false, reason: "work_plan_invalid" };
@@ -218,6 +221,7 @@ function buildPlanChatProjection(
 }
 
 function buildReviewCommitUnchecked(input: {
+  readonly documentRef?: PlanDocumentRef;
   readonly plan: SealedWorkPlanV1;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -229,7 +233,8 @@ function buildReviewCommitUnchecked(input: {
     schemaVersion: RUNTIME_V2_PLAN_REVIEW_COMMIT_SCHEMA_VERSION,
     authority,
     artifact: {
-      path: RUNTIME_V2_PLAN_ARTIFACT_PATH,
+      path: input.documentRef?.path || RUNTIME_V2_PLAN_ARTIFACT_PATH,
+      ...(input.documentRef ? { documentRef: input.documentRef } : {}),
       content: input.plan.markdown,
       projectionHash: authority.projectionHash,
     },
@@ -249,6 +254,7 @@ function buildReviewCommitUnchecked(input: {
 }
 
 export function createRuntimeV2PlanReviewCommit(input: {
+  readonly documentRef?: PlanDocumentRef;
   readonly plan: SealedWorkPlanV1;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -260,6 +266,7 @@ export function createRuntimeV2PlanReviewCommit(input: {
   if (input.plan.status !== "pending_review") {
     throw new Error("plan_not_pending_review");
   }
+  if (input.documentRef && !isWorkPlanArtifactProjectionBound({ path: input.documentRef.path, documentRef: input.documentRef, content: input.plan.markdown, projectionHash: input.plan.projectionHash }, input.plan, input.turn)) throw new Error("plan_artifact_projection_mismatch");
   requiredIdentity(input.turn.sessionKey, "turn.sessionKey");
   requiredIdentity(input.turn.sessionEpoch, "turn.sessionEpoch");
   requiredIdentity(input.turn.turnId, "turn.turnId");
@@ -302,13 +309,14 @@ function validateRuntimeV2PlanReviewCommitIntegrity(input: {
   }
 
   const expected = buildReviewCommitUnchecked({
+    ...(input.commit.artifact.documentRef ? { documentRef: input.commit.artifact.documentRef } : {}),
     plan: input.currentPlan,
     turn: input.turn,
     run: input.run,
     requestId: input.commit.review.requestId,
     createdAt: input.commit.review.createdAt,
   });
-  if (!sameJson(input.commit.artifact, expected.artifact)) {
+  if (!isWorkPlanArtifactProjectionBound(input.commit.artifact, input.currentPlan, input.turn) || !sameJson(input.commit.artifact, expected.artifact)) {
     return { ok: false, reason: "plan_artifact_projection_mismatch" };
   }
   if (!sameJson(input.commit.panel, expected.panel)) {

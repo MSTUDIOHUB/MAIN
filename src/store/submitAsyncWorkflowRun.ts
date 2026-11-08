@@ -27,17 +27,12 @@ import type {
   PlanArtifact,
   PlanStage,
 } from "../lib/workflowModels";
-import type { SubagentDelegationPreference, TurnInputContextSignals } from "../lib/turnIntake";
-import type {
-  GoalContinuationAuthorization,
-  GoalCreationAuthorization,
-} from "../lib/submit/turnSubmission";
+import type { TurnInputContextSignals } from "../lib/turnIntake";
 import {
   renderResolvedInstructionContext,
   type ResolvedInstructionSet,
 } from "../lib/instructions";
 import type { ProjectBaselineContext } from "../lib/projectBaseline";
-import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import {
   buildSubmitAttachmentContext,
   type SubmitAttachmentContextInput,
@@ -45,6 +40,8 @@ import {
 import { buildSubmitPromptContext } from "./submitPromptContext";
 import { resolveRuntimeV2SessionEpoch } from "./runtimeV2/sessionIdentity";
 import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2/checkpoint";
+import { resolveBoundPlanDraftCheckpoint } from "./runtimeV2/planDraftSource";
+import { hasExecutablePlanChoice } from "./runtimeV2/planQuestionTool";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
 import {
   createSubmitHarnessRunId,
@@ -123,7 +120,7 @@ export interface SubmitAsyncWorkflowRunState {
   };
   resolvedInstructionSet?: ResolvedInstructionSet | null;
   runtimeV2Checkpoints?: unknown;
-  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
+
 }
 
 export interface SubmitAsyncWorkflowElapsedTimer {
@@ -162,14 +159,8 @@ export interface StartSubmitAsyncWorkflowRunInput<
   effectiveRunIntent: ResolvedRunIntent;
   semanticIntent?: import("../lib/runIntent").SemanticTaskIntent;
   runtimeRunIntent: ResolvedRunIntent;
-  goalCreationAuthorization: GoalCreationAuthorization | null;
-  goalContinuationAuthorization: GoalContinuationAuthorization | null;
-  /** Commits the Goal's active state only after this continuation owns a Run. */
-  activateGoalContinuation: (input: {
-    authorization: GoalContinuationAuthorization;
-    ownerTurnId: string;
-    timestampMs: number;
-  }) => boolean;
+
+
   effectiveWorkflowMode: LegacyWorkflowMode;
   effectiveCommandDirective: CommandDirective | null;
   effectiveIntentSummary: string;
@@ -181,7 +172,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   previousTurnContinuationTarget: ConversationTurn | null;
   existingTurn: ConversationTurn | null;
   selectedChoiceText: string;
-  goalSourceContextSnapshot?: string;
+
   parentRunIdOverride?: string;
   runIdOverride?: string;
   planExecutionLeaseId?: string;
@@ -230,6 +221,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   refreshWorkspaceAdmission?: (
     workspace: string,
     userPrompt?: string,
+    options?: { readonly includeProjectBaseline: boolean },
   ) => Promise<{
     instructions: ResolvedInstructionSet | null;
     baseline: ProjectBaselineContext | null;
@@ -1726,6 +1718,19 @@ export async function runSubmitAsyncWorkflowRun<
     sessionKey: input.runSessionKey, sessionEpoch: runSessionEpoch, turnId: input.turnId,
   });
   if (checkpointCandidate !== undefined && !checkpoint) throw new Error("SUBMIT_BOOTSTRAP_CHECKPOINT_INVALID");
+  const planOptions = input.options as { planPurpose?: unknown; sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord } | undefined;
+  const sourceDraft = admissionTurn?.sourcePlanDraft || planOptions?.sourcePlanDraft;
+  const reusePlanContext = input.runtimeRunIntent === "plan" && planOptions?.planPurpose !== "rules" && (
+    checkpoint
+      ? checkpoint.aggregate.strategy === "plan" && checkpoint.aggregate.phase === "planning" &&
+        checkpoint.aggregate.run?.identity.runId === submissionRunId && hasExecutablePlanChoice(checkpoint.aggregate)
+      : !!sourceDraft && !!resolveBoundPlanDraftCheckpoint(
+        { runtimeV2Checkpoints: checkpointMap as Record<string, unknown> | undefined },
+        sourceDraft,
+        { workspaceKey: input.runScopeKey, sessionKey: input.runSessionKey, sessionEpoch: runSessionEpoch,
+          clientSubmissionId: admissionTurn?.clientSubmissionId || input.turnId, turnId: input.turnId },
+      )
+  );
   // A restored Turn's immutable objective wins over a missing or looser
   // resubmission context. Legacy objective fields stay absent, never borrowed.
   const capabilityRestrictions = checkpoint ? checkpoint.aggregate.objective.capabilityRestrictions : input.semanticIntent?.forbiddenCapabilities;
@@ -1801,14 +1806,6 @@ export async function runSubmitAsyncWorkflowRun<
 
   input.sessionSet({ contextMentions: [], attachedFiles: [] });
 
-  const goalSourceContext = input.effectiveRunIntent === "goal"
-    ? input.goalSourceContextSnapshot || buildGoalSourceContextSnapshot({
-        objective: input.text,
-        agentMessages: input.sessionGet().agentMessages,
-        conversationTurns: input.sessionGet().conversationTurns,
-        planArtifacts: input.sessionGet().planArtifacts,
-      })
-    : undefined;
 
   // Workspace discovery is fallible and does not require an execution lease.
   // Resolve it before marking the harness/run as active so a read failure can
@@ -1817,6 +1814,11 @@ export async function runSubmitAsyncWorkflowRun<
   let projectBaselineSnapshot: ProjectBaselineContext | null = null;
   let workspaceMcpSnapshot: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null = null;
   const bootstrapWorkspace = deferWorkspaceReads ? "" : input.runWorkspace;
+  const originalPlanPrompt = input.runtimeRunIntent === "plan" && checkpoint?.aggregate.strategy === "plan" &&
+    checkpoint.aggregate.run?.identity.runId === submissionRunId
+    ? admissionTurn?.userPrompt : undefined;
+  const instructionPrompt = originalPlanPrompt && originalPlanPrompt !== input.text
+    ? [originalPlanPrompt, input.text].filter(Boolean).join("\n") : input.text;
   if (deferWorkspaceReads) input.logStoreEvent("workspace_read_bootstrap_deferred", {
     turnId: input.turnId,
     referenceCount: deferredReferences.length,
@@ -1826,7 +1828,8 @@ export async function runSubmitAsyncWorkflowRun<
     try {
       const admission = await input.refreshWorkspaceAdmission(
         bootstrapWorkspace,
-        input.text,
+        instructionPrompt,
+        reusePlanContext ? { includeProjectBaseline: false } : undefined,
       );
       resolvedInstructionSnapshot = admission.instructions;
       projectBaselineSnapshot = deferWorkspaceReads ? null : admission.baseline;
@@ -1840,6 +1843,7 @@ export async function runSubmitAsyncWorkflowRun<
           projectBaselineSnapshot?.fingerprints.overall || null,
         warnings: [...(admission.warnings || [])],
         elapsedMs: Math.round(input.nowMs() - admissionRefreshStartedAt),
+        reusedPlanContext: reusePlanContext,
       });
     } catch (error) {
       input.logStoreEvent("workspace_admission_refresh_failed", {
@@ -1853,7 +1857,7 @@ export async function runSubmitAsyncWorkflowRun<
     try {
       resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
         bootstrapWorkspace,
-        input.text,
+        instructionPrompt,
       );
       input.logStoreEvent("workspace_instructions_refreshed", {
         turnId: input.turnId,
@@ -1879,7 +1883,7 @@ export async function runSubmitAsyncWorkflowRun<
     }
   }
 
-  if (!deferWorkspaceReads && !input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
+  if (!deferWorkspaceReads && !reusePlanContext && !input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
     const baselineRefreshStartedAt = input.nowMs();
     try {
       projectBaselineSnapshot = await input.refreshProjectBaseline(
@@ -1903,7 +1907,7 @@ export async function runSubmitAsyncWorkflowRun<
   // Runtime v2 consumes the typed baseline. Keep the legacy tree only as a
   // compatibility fallback when baseline construction was unavailable.
   let workspaceTree: string | null = null;
-  if (!deferWorkspaceReads && !projectBaselineSnapshot) {
+  if (!deferWorkspaceReads && !reusePlanContext && !projectBaselineSnapshot) {
     const workspaceTreeStartedAt = input.nowMs();
     workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
     input.logStoreEvent("workspace_tree_ready", {
@@ -1982,7 +1986,7 @@ export async function runSubmitAsyncWorkflowRun<
   const runLease = (phaseRunners.startRunLease || startSubmitRunLease)({
     userContent,
     canonicalUserText: input.text,
-    goalSourceContext,
+
     currentImages: input.currentImages,
     runSessionKey: input.runSessionKey,
     runWorkspace: input.runWorkspace,
@@ -1990,8 +1994,8 @@ export async function runSubmitAsyncWorkflowRun<
     turnId: input.turnId,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
-    goalCreationAuthorization: input.goalCreationAuthorization,
-    continueExistingGoal: !!input.goalContinuationAuthorization,
+
+
     subagentPreference: input.turnInputContextSignals.subagentPreference,
     parentRunIdOverride: input.parentRunIdOverride,
     runIdOverride: submissionRunId,
@@ -2008,9 +2012,7 @@ export async function runSubmitAsyncWorkflowRun<
     setAbortController: (abortController: TAbortController) => {
       input.sessionSet({ abortController });
     },
-    startGoal: (objective: string, goalOptions: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => {
-      input.sessionGet().startGoal(objective, goalOptions);
-    },
+
     getCurrentHarnessInstanceId: input.getCurrentHarnessInstanceId,
     expectedHarnessRunMarker,
     acquireHarnessRunMarker: input.acquireHarnessRunMarker,
@@ -2077,18 +2079,7 @@ export async function runSubmitAsyncWorkflowRun<
   if (!planExecutionAdmission.ok) {
     throw new Error(`PLAN_EXECUTION_ADMISSION_REJECTED: ${planExecutionAdmission.reason}`);
   }
-  if (input.goalContinuationAuthorization) {
-    const activated = input.activateGoalContinuation({
-      authorization: input.goalContinuationAuthorization,
-      ownerTurnId: input.turnId,
-      timestampMs: input.nowMs(),
-    });
-    if (!activated) {
-      throw new Error(
-        "GOAL_CONTINUATION_OWNER_LOST: the Goal changed before the resume Run lease was accepted",
-      );
-    }
-  }
+
 
   const context = (phaseRunners.createRuntimeContext || createSubmitRuntimeContext)({
     turnId: input.turnId,
@@ -2105,8 +2096,8 @@ export async function runSubmitAsyncWorkflowRun<
     approvalRequiredCapabilities,
     requiredCapabilities: input.semanticIntent?.requiredCapabilities,
     intentClarification: input.semanticIntent?.clarification,
-    goalCreationAuthorization: input.goalCreationAuthorization,
-    goalContinuationAuthorization: input.goalContinuationAuthorization,
+
+
     effectiveCommandDirective: input.effectiveCommandDirective,
     options: input.options,
     attachedFilesSnapshot: input.attachedFilesSnapshot,
@@ -2116,6 +2107,9 @@ export async function runSubmitAsyncWorkflowRun<
     workspaceInstructionContext: renderResolvedInstructionContext(
       resolvedInstructionSnapshot,
     ),
+    planPurpose: (input.options as { planPurpose?: unknown } | undefined)?.planPurpose === "rules" ? "rules" : undefined,
+    sourcePlanDraft: input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.sourcePlanDraft ||
+      (input.options as { sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord } | undefined)?.sourcePlanDraft,
     projectBaselineContext: projectBaselineSnapshot,
     skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
     workspaceMcpSnapshot,

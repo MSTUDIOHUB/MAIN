@@ -90,9 +90,6 @@ const { beginSessionCancellation, getPendingSessionCancellation } = loadTranspil
 const actionRequests = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/actionRequest.ts"));
 const pendingToolReview = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/pendingToolReview.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
-const goalState = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalState.ts"));
-const goalRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalRuntime.ts"));
-const goalPersistence = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalPersistence.ts"));
 const {
   extractPlanTasks,
   validatePlanArtifactContent,
@@ -114,6 +111,40 @@ const runtimeV2 = loadTranspiledModuleSync(
 
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
+
+test("global Execute preserves its admitted checkpoint through Session normalization before starting the Run", () => {
+  const { createRuntimeV2RunnerIdentity } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionRunnerIdentity.ts"));
+  const sessionId = 1788619431453;
+  const sessionKey = `${GLOBAL_CHAT_KEY}:${sessionId}`;
+  const sessionEpoch = "global-execute-session-epoch";
+  const turn = { id: "turn-global-execute", clientSubmissionId: "submission-global-execute" };
+  const context = { turnId: turn.id, runSessionKey: sessionKey, runSessionId: sessionId,
+    runScopeKey: GLOBAL_CHAT_KEY, runWorkspace: "", harnessRunId: "run-global-execute" };
+  const identity = createRuntimeV2RunnerIdentity({
+    sessionsByWorkspace: { [GLOBAL_CHAT_KEY]: [{ id: sessionId, planLifecycleEpoch: sessionEpoch }] },
+  }, context, turn);
+  const admitted = runtimeV2.appendRuntimeV2Checkpoint({ checkpoint: null, owner: identity.turn, expectedRevision: 0,
+    event: { schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "global-execute-admitted", at: 1,
+      type: "turn.admitted", turn: identity.turn, strategy: "execute", objective: "Use the enabled network capability", constraints: [], acceptanceCriteria: [] },
+  });
+  assert.equal(admitted.disposition, "committed");
+  const serialized = JSON.parse(JSON.stringify(runtimeV2.serializeRuntimeV2CheckpointMap({ [turn.id]: admitted.checkpoint })));
+  const restored = normalizeSessionRuntimeSnapshot({ runtimeV2Checkpoints: serialized }, {
+    workspacePath: GLOBAL_CHAT_KEY, expectedSessionKey: sessionKey, expectedSessionEpoch: sessionEpoch,
+  });
+  const started = runtimeV2.appendRuntimeV2Checkpoint({
+    checkpoint: restored.runtimeV2Checkpoints[turn.id] || null, owner: identity.turn, expectedRevision: admitted.checkpoint.revision,
+    event: { schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 1, eventId: "global-execute-started", at: 2,
+      type: "run.started", run: identity.run, phase: "preparing" },
+  });
+  assert.equal(started.disposition, "committed", "Session normalization must retain the first admitted Execute event");
+  assert.equal(started.checkpoint.owner.workspaceKey, GLOBAL_CHAT_KEY);
+  assert.equal(started.checkpoint.aggregate.run.identity.runId, context.harnessRunId);
+  const stale = normalizeSessionRuntimeSnapshot({ runtimeV2Checkpoints: serialized }, {
+    workspacePath: GLOBAL_CHAT_KEY, expectedSessionKey: sessionKey, expectedSessionEpoch: "replacement-epoch",
+  });
+  assert.equal(stale.runtimeV2Checkpoints[turn.id], undefined);
+});
 
 test("the first Run after restoring a metadata-only Session keeps its canonical epoch across persistence", () => {
   const { buildPersistedAppState } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/persistState.ts"));
@@ -696,126 +727,11 @@ test("legacy Game Studio Session mode keys hydrate into MAIN without reviving re
   }
 });
 
-test("a fresh Session snapshot cannot inherit runtime identity, memory, Goal, or queue time from its predecessor", () => {
-  const createdAt = 2_000;
-  const sessionKey = "/tmp/fresh-session:2000";
-  const sessionEpoch = "fresh-session-epoch";
-  const foreignSessionKey = "/tmp/fresh-session:1000";
-  const snapshot = buildEmptySessionRuntimeSnapshot({
-    currentSessionId: 1_000,
-    currentWorkspace: "/tmp/fresh-session",
-    selectedMainModeKey: "main_mode",
-    runtimeEvents: [{
-      schemaVersion: 2,
-      type: "run.started",
-      threadId: foreignSessionKey,
-      turnId: "turn-foreign",
-      timestampMs: 1,
-      runId: "run-foreign",
-      parentRunId: null,
-    }],
-    harnessRunMarker: {
-      schemaVersion: 1,
-      instanceId: "instance-foreign",
-      runId: "run-foreign",
-      sessionKey: foreignSessionKey,
-      turnId: "turn-foreign",
-      status: "paused",
-      startedAt: 1,
-      updatedAt: 1,
-      closedAt: 1,
-      closeReason: "waiting",
-    },
-    activeActionRequest: {
-      schemaVersion: 1,
-      requestId: "request-foreign",
-      kind: "user_choice",
-      sessionKey: foreignSessionKey,
-      turnId: "turn-foreign",
-      runId: "run-foreign",
-      parentRunId: null,
-      title: "Foreign choice",
-      status: "pending",
-      createdAt: 1,
-      optionValues: ["continue"],
-    },
-    turnRuntimeCheckpoints: {
-      "turn-foreign": {
-        schemaVersion: 1,
-        turnId: "turn-foreign",
-        sessionKey: foreignSessionKey,
-        sessionEpoch: "foreign-session-epoch",
-      },
-    },
-    subagentClosureReceiptLedger: {
-      schemaVersion: 1,
-      owner: {
-        workspaceKey: "/tmp/fresh-session",
-        sessionKey: foreignSessionKey,
-        sessionEpoch: "foreign-session-epoch",
-      },
-      receipts: {},
-      updatedAt: 1,
-    },
-    contextMemoryState: { summary: "foreign memory" },
-    contextMemoryStateByRuntimeKey: { foreign: { summary: "foreign lane memory" } },
-    providerCompatibilityByRuntimeKey: { foreign: { forceXml: true } },
-    planAutoResumeCount: 8,
-    planExecutionProgressSnapshot: { turnId: "turn-foreign", runId: "run-foreign" },
-    activeGoal: {
-      id: "goal-foreign",
-      objective: "Foreign goal",
-      definitionOfDone: [],
-      createdAt: 1,
-      status: "active",
-      iterationBudget: 10,
-      sessionKey: foreignSessionKey,
-    },
-    goalProgress: { goalId: "goal-foreign" },
-    goalStatus: "active",
-    goalRuntime: { schemaVersion: 3 },
-  }, "main_mode", {
-    sessionKey,
-    sessionEpoch,
-    createdAt,
-  });
 
-  assert.deepEqual(snapshot.runtimeEvents, []);
-  assert.equal(snapshot.harnessRunMarker, null);
-  assert.equal(snapshot.activeActionRequest, null);
-  assert.deepEqual(snapshot.turnRuntimeCheckpoints, {});
-  assert.equal(snapshot.subagentClosureReceiptLedger, null);
-  assert.equal(snapshot.contextMemoryState, null);
-  assert.deepEqual(snapshot.contextMemoryStateByRuntimeKey, {});
-  assert.deepEqual(snapshot.providerCompatibilityByRuntimeKey, {});
-  assert.equal(snapshot.planAutoResumeCount, 0);
-  assert.equal(snapshot.planExecutionProgressSnapshot, null);
-  assert.equal(snapshot.activeGoal, null);
-  assert.equal(snapshot.goalProgress, null);
-  assert.equal(snapshot.goalStatus, "paused");
-  assert.equal(snapshot.goalRuntime, null);
-  assert.equal(snapshot.planLifecycle.sessionKey, sessionKey);
-  assert.equal(snapshot.planLifecycle.sessionEpoch, sessionEpoch);
-  assert.equal(snapshot.planLifecycle.updatedAt, createdAt);
-  assert.equal(snapshot.workspaceTurnQueue.sessionKey, sessionKey);
-  assert.equal(snapshot.workspaceTurnQueue.sessionEpoch, sessionEpoch);
-  assert.equal(snapshot.workspaceTurnQueue.updatedAt, createdAt);
-});
 
-test("cold restore rejects cross-Session controls, events, queued work, and Goal runtime at the container boundary", () => {
+test("cold restore rejects cross-Session controls, events and queued work at the container boundary", () => {
   const sessionKey = "/tmp/restore-container:2";
   const foreignSessionKey = "/tmp/restore-container:1";
-  const foreignGoal = goalState.createGoalDefinition({
-    objective: "Foreign persisted Goal",
-    sessionKey: foreignSessionKey,
-    ownerTurnId: "turn-foreign-goal",
-  });
-  const foreignGoalProgress = goalState.createGoalProgress(foreignGoal.id, "progress.md");
-  const foreignGoalRuntime = goalRuntime.buildGoalRuntimeSnapshot({
-    goal: foreignGoal,
-    progress: foreignGoalProgress,
-    phase: "execute",
-  });
   const restored = normalizeSessionRuntimeSnapshot({
     runtimeEvents: [
       {
@@ -868,21 +784,8 @@ test("cold restore rejects cross-Session controls, events, queued work, and Goal
       text: "Continue foreign Goal",
       status: "queued",
       createdAt: 1,
-      runtimeIntentOverride: "goal",
-      goalContinuationAuthorization: {
-        kind: "goal_continuation_authorization",
-        source: "goal_manual_resume",
-        workspaceKey: "/tmp/restore-container",
-        sessionKey: foreignSessionKey,
-        goalId: foreignGoal.id,
-        goalRevision: foreignGoal.revision || 1,
-        ownerTurnId: "turn-foreign-goal",
-      },
+      runtimeIntentOverride: "execute",
     },
-    activeGoal: foreignGoal,
-    goalProgress: foreignGoalProgress,
-    goalStatus: "active",
-    goalRuntime: foreignGoalRuntime,
     taskFlow: [],
     agentMessages: [],
     conversationTurns: [],
@@ -895,10 +798,10 @@ test("cold restore rejects cross-Session controls, events, queued work, and Goal
   assert.equal(restored.harnessRunMarker, null);
   assert.equal(restored.activeActionRequest, null);
   assert.equal(restored.queuedUserMessage, null);
-  assert.equal(restored.activeGoal, null);
-  assert.equal(restored.goalProgress, null);
-  assert.equal(restored.goalRuntime, null);
-  assert.equal(restored.goalStatus, "paused");
+  assert.equal(Object.hasOwn(restored, "activeGoal"), false);
+  assert.equal(Object.hasOwn(restored, "goalProgress"), false);
+  assert.equal(Object.hasOwn(restored, "goalRuntime"), false);
+  assert.equal(Object.hasOwn(restored, "goalStatus"), false);
   assert.deepEqual(
     restored.runtimeEvents.map((event) => event.threadId),
     [sessionKey],
@@ -921,118 +824,11 @@ test("cold restore quarantines a keyless queued message with no current Session 
   assert.equal(restored.queuedUserMessage, null);
 });
 
-test("cold restore preserves exact Goals and only evidence-owned workspace or keyless legacy Goals", () => {
-  const sessionKey = "/tmp/restore-goal-owner:2";
-  const workspace = "/tmp/restore-goal-owner";
-  for (const ownerSessionKey of [sessionKey, workspace, undefined]) {
-    const goal = goalState.createGoalDefinition({
-      objective: ownerSessionKey ? "Exact Goal" : "Legacy keyless Goal",
-      sessionKey: ownerSessionKey,
-      ownerTurnId: "turn-goal-owner",
-    });
-    const progress = goalState.createGoalProgress(goal.id, "progress.md");
-    const runtime = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
-    const restored = normalizeSessionRuntimeSnapshot({
-      activeGoal: goal,
-      goalProgress: progress,
-      goalStatus: "active",
-      goalRuntime: runtime,
-      taskFlow: [],
-      agentMessages: [],
-      conversationTurns: ownerSessionKey === sessionKey
-        ? []
-        : [{
-            id: goal.ownerTurnId,
-            userPrompt: "Continue the legacy Goal",
-            title: "Legacy Goal",
-            mode: "edit",
-            status: "paused",
-            summary: "Paused legacy Goal",
-            blockIds: [],
-            collapsed: false,
-            createdAt: 1,
-          }],
-      currentTurnId: null,
-    }, {
-      expectedSessionKey: sessionKey,
-      expectedSessionEpoch: "restore-goal-owner-epoch",
-      workspacePath: workspace,
-    });
 
-    assert.equal(restored.activeGoal?.id, goal.id);
-    assert.equal(restored.goalRuntime?.goal.id, goal.id);
-    assert.equal(restored.goalProgress?.goalId, goal.id);
-  }
-});
 
-test("cold restore quarantines workspace-scoped and keyless legacy Goals without local Turn ownership evidence", () => {
-  const sessionKey = "/tmp/restore-goal-quarantine:2";
-  const workspace = "/tmp/restore-goal-quarantine";
-  for (const ownerSessionKey of [workspace, undefined]) {
-    const goal = goalState.createGoalDefinition({
-      objective: "Ambiguous legacy Goal",
-      sessionKey: ownerSessionKey,
-      ownerTurnId: "turn-not-in-current-container",
-    });
-    const progress = goalState.createGoalProgress(goal.id, "progress.md");
-    const runtime = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
-    const restored = normalizeSessionRuntimeSnapshot({
-      activeGoal: goal,
-      goalProgress: progress,
-      goalStatus: "active",
-      goalRuntime: runtime,
-      taskFlow: [],
-      agentMessages: [],
-      conversationTurns: [],
-      currentTurnId: null,
-    }, {
-      expectedSessionKey: sessionKey,
-      expectedSessionEpoch: "restore-goal-quarantine-epoch",
-      workspacePath: workspace,
-    });
 
-    assert.equal(restored.activeGoal, null);
-    assert.equal(restored.goalRuntime, null);
-    assert.equal(restored.goalProgress, null);
-    assert.equal(restored.goalStatus, "paused");
-  }
-});
 
-test("cold restore never mixes accepted Goal identity with progress from another Goal", () => {
-  const sessionKey = "/tmp/restore-goal-progress:2";
-  const goal = goalState.createGoalDefinition({
-    objective: "Current Goal",
-    sessionKey,
-    ownerTurnId: "turn-current-goal",
-  });
-  const foreignProgress = {
-    ...goalState.createGoalProgress("goal-from-another-session", "foreign-progress.md"),
-    evidence: [{ id: "foreign-evidence" }],
-    milestones: [{ id: "foreign-milestone", text: "Foreign", status: "completed" }],
-  };
-  const runtime = goalRuntime.buildGoalRuntimeSnapshot({
-    goal,
-    progress: foreignProgress,
-    phase: "execute",
-  });
-  const restored = normalizeSessionRuntimeSnapshot({
-    activeGoal: goal,
-    goalProgress: foreignProgress,
-    goalStatus: "active",
-    goalRuntime: runtime,
-  }, {
-    expectedSessionKey: sessionKey,
-    expectedSessionEpoch: "restore-goal-progress-epoch",
-  });
 
-  assert.equal(restored.activeGoal?.id, goal.id);
-  assert.equal(restored.goalRuntime?.goal.id, goal.id);
-  assert.equal(restored.goalProgress?.goalId, goal.id);
-  assert.equal(restored.goalRuntime?.progress.goalId, goal.id);
-  assert.deepEqual(restored.goalProgress?.evidence, []);
-  assert.deepEqual(restored.goalProgress?.milestones, []);
-  assert.equal(restored.goalProgress?.progressFile, "");
-});
 
 test("FIFO acknowledgement saves the live Session without revoking its seeded submit owner", () => {
   const originalState = useAppStore.getState();
@@ -1802,44 +1598,7 @@ test("cold restore completes an exact run-only FIFO projection without rewriting
   assert.equal(finals[0].content, summary);
 });
 
-test("queued Goal continuation guidance survives session normalization only with authorization", () => {
-  const authorization = {
-    kind: "goal_continuation_authorization",
-    source: "goal_manual_resume",
-    workspaceKey: "/repo",
-    sessionKey: "/repo:7",
-    goalId: "goal-1",
-    goalRevision: 2,
-    ownerTurnId: "turn-goal",
-  };
-  const restored = normalizeSessionRuntimeSnapshot({
-    queuedUserMessage: {
-      id: "queued-goal-guidance",
-      sessionKey: "/repo:7",
-      text: "queue display text",
-      status: "queued",
-      createdAt: 100,
-      goalContinuationAuthorization: authorization,
-      goalContinuationGuidance: "exact continuation guidance",
-    },
-  });
-  assert.equal(
-    restored.queuedUserMessage.goalContinuationGuidance,
-    "exact continuation guidance",
-  );
 
-  const untrusted = normalizeSessionRuntimeSnapshot({
-    queuedUserMessage: {
-      id: "queued-untrusted-guidance",
-      sessionKey: "/repo:7",
-      text: "queue display text",
-      status: "queued",
-      createdAt: 100,
-      goalContinuationGuidance: "must not survive alone",
-    },
-  });
-  assert.equal(untrusted.queuedUserMessage.goalContinuationGuidance, undefined);
-});
 
 function planArtifact(content, overrides = {}) {
   return {
@@ -2459,6 +2218,65 @@ test("restore rewrites the exact owner pause boundary when an internal Plan choi
   const pause = ownedRunEvents.find((event) => event.type === "run.paused");
   assert.equal(pause.reason, "invalid_plan_user_choice_cleared");
   assert.match(pause.message, /Plan|计划/i);
+});
+
+test("cold restore rehydrates a sanitized Plan questionnaire block from its exact ledger owner", () => {
+  const workspaceKey = "/tmp/plan-questionnaire-restore";
+  const owner = { workspaceKey, sessionKey: `${workspaceKey}:42`, sessionEpoch: "question-epoch",
+    turnId: "question-turn", clientSubmissionId: "question-submission" };
+  const run = { ...owner, runId: "question-run", attemptId: "question-attempt", parentRunId: null };
+  const questionnaire = { revision: 1, purpose: "plan_confirmation", title: "Confirm a method", questions: [{
+    id: "method", prompt: "Which validation method?", selectionMode: "single", required: true, minSelections: 1,
+    maxSelections: 1, allowText: false, options: [{ id: "play", label: "Play Mode tests" }],
+  }] };
+  const events = [
+    { type: "turn.admitted", turn: owner, strategy: "plan", objective: "Plan a fixture", constraints: [], acceptanceCriteria: [] },
+    { type: "run.started", run, phase: "planning" },
+    { type: "run.paused", run, blocker: { reasonCode: "user_questionnaire", requestId: "question-request",
+      message: "Confirm a method", evidenceSequence: 1, options: ["recheck", "stop"], questionnaire } },
+  ];
+  let checkpoint = null;
+  for (const [sequence, data] of events.entries()) {
+    const committed = runtimeV2.appendRuntimeV2Checkpoint({ checkpoint, owner, expectedRevision: sequence,
+      event: { schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence, at: 100 + sequence,
+        eventId: `question-${sequence}`, ...data } });
+    assert.equal(committed.disposition, "committed");
+    checkpoint = committed.checkpoint;
+  }
+  const { createRuntimeV2ExecutionBlockerView } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionBlocker.ts"));
+  const view = createRuntimeV2ExecutionBlockerView(checkpoint.aggregate, "zh", 301);
+  const taskFlow = sanitizeTaskBlocksForPersist([view.block]);
+  assert.equal(taskFlow[0].choiceRequest.questionnaire, undefined);
+  const snapshot = {
+    taskFlow, activeActionRequest: view.request, currentTurnId: owner.turnId,
+    harnessRunMarker: { schemaVersion: 1, instanceId: "test-instance", sessionKey: owner.sessionKey,
+      turnId: owner.turnId, runId: run.runId, status: "paused", workflowMode: "plan", runtimeIntent: "plan",
+      planStage: "plan", isPlanApproved: false, startedAt: 100, updatedAt: 102, closeReason: "user_questionnaire" },
+    conversationTurns: [{ id: owner.turnId, clientSubmissionId: owner.clientSubmissionId, userPrompt: "Plan a fixture",
+      title: "Plan a fixture", mode: "plan", intent: "plan", status: "awaiting_input", blockIds: [301], createdAt: 100 }],
+    runtimeV2Checkpoints: runtimeV2.serializeRuntimeV2CheckpointMap({ [owner.turnId]: checkpoint }),
+  };
+  const restored = normalizeSessionRuntimeSnapshot(JSON.parse(JSON.stringify(snapshot)), {
+    coldRestore: true, workspacePath: workspaceKey, expectedSessionKey: owner.sessionKey, expectedSessionEpoch: owner.sessionEpoch,
+  });
+  assert.equal(restored.activeActionRequest?.requestId, view.request.requestId);
+  assert.equal(restored.activeActionRequest.questionnaire.questions[0].id, "method");
+  assert.equal(restored.taskFlow.filter(block => block.choiceRequest?.requestId === view.request.requestId).length, 1);
+  assert.equal(restored.taskFlow.find(block => block.choiceRequest?.requestId === view.request.requestId).id, 301);
+  const wrongEpoch = normalizeSessionRuntimeSnapshot(snapshot, {
+    coldRestore: true, workspacePath: workspaceKey, expectedSessionKey: owner.sessionKey, expectedSessionEpoch: "different-epoch",
+  });
+  assert.equal(wrongEpoch.activeActionRequest, null);
+  const decision = runtimeV2.appendRuntimeV2Checkpoint({ checkpoint, owner, expectedRevision: 3,
+    event: { schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 3, at: 103, eventId: "question-answered",
+      type: "run.decision_recorded", run, requestId: "question-request", choice: "recheck", reply: "Play Mode tests",
+      answer: { requestId: "question-request", revision: 1, answers: [{ questionId: "method", selectedValues: ["play"] }] } } });
+  assert.equal(decision.disposition, "committed");
+  const answered = normalizeSessionRuntimeSnapshot({ ...snapshot,
+    runtimeV2Checkpoints: runtimeV2.serializeRuntimeV2CheckpointMap({ [owner.turnId]: decision.checkpoint }) }, {
+    coldRestore: true, workspacePath: workspaceKey, expectedSessionKey: owner.sessionKey, expectedSessionEpoch: owner.sessionEpoch,
+  });
+  assert.equal(answered.activeActionRequest, null, "persisted answer must not revive the consumed questionnaire");
 });
 
 test("restore removes a genuine but stale choice whose run owner no longer matches", () => {
@@ -3551,228 +3369,9 @@ test("paused Harness restore adopts only one exact Run start and fail-closes cor
   }
 });
 
-test("a loaded durable Goal deletion fence prevents an old session snapshot from resurrecting", () => {
-  const workspace = "/tmp/deleted-goal-restore";
-  const sessionKey = `${workspace}:71`;
-  const turnId = "turn-deleted-goal";
-  const runId = "run-deleted-goal";
-  const goal = goalState.createGoalDefinition({
-    objective: "修复按钮并验证交互",
-    sessionKey,
-    ownerTurnId: turnId,
-  });
-  const progress = goalState.createGoalProgress(goal.id, "progress.md");
-  const runtime = goalRuntime.buildGoalRuntimeSnapshot({
-    goal,
-    progress,
-    phase: "execute",
-  });
-  const request = actionRequests.buildUserChoiceActionRequest({
-    sessionKey,
-    turnId,
-    runId,
-    title: "Goal choice",
-    optionValues: ["继续"],
-    allowCustomReply: true,
-    now: 200,
-  });
 
-  goalPersistence.markGoalRuntimeDeleted(workspace, goal.id);
-  try {
-    const restored = normalizeSessionRuntimeSnapshot({
-      activeGoal: goal,
-      goalProgress: progress,
-      goalStatus: "awaiting_input",
-      goalRuntime: { ...runtime, status: "awaiting_input" },
-      queuedUserMessage: {
-        id: "queued-deleted-goal",
-        sessionKey,
-        text: "继续",
-        status: "queued",
-        createdAt: 210,
-        runtimeIntentOverride: "goal",
-        goalContinuationAuthorization: {
-          kind: "goal_continuation_authorization",
-          source: "goal_user_choice",
-          workspaceKey: workspace,
-          sessionKey,
-          goalId: goal.id,
-          goalRevision: goal.revision || 1,
-          ownerTurnId: turnId,
-          requestId: request.requestId,
-        },
-        goalContinuationGuidance: "继续",
-      },
-      activeActionRequest: request,
-      harnessRunMarker: {
-        schemaVersion: 1,
-        instanceId: "deleted-goal-instance",
-        sessionKey,
-        workspace,
-        sessionId: 71,
-        turnId,
-        runId,
-        status: "paused",
-        workflowMode: "edit",
-        runtimeIntent: "goal",
-        planStage: "idle",
-        isPlanApproved: false,
-        iteration: 1,
-        maxIterations: 6,
-        messagesLen: 2,
-        toolCount: 0,
-        latestTool: null,
-        latestToolTarget: null,
-        activeStreamId: null,
-        streamStatus: "closed",
-        streamChunkCount: 0,
-        streamByteCount: 0,
-        streamElapsedMs: 0,
-        streamLifecycleStatus: "completed",
-        lastStreamError: null,
-        startedAt: 100,
-        updatedAt: 200,
-        closedAt: 200,
-        closeReason: "awaiting_user_choice",
-      },
-      taskFlow: [{
-        id: 501,
-        type: "agent",
-        turnId,
-        content: "请选择",
-        options: [{ label: "继续", value: "继续" }],
-        choiceRequest: request,
-      }],
-      conversationTurns: [{
-        id: turnId,
-        userPrompt: "修复按钮",
-        title: "Goal",
-        mode: "edit",
-        intent: "goal",
-        displayIntent: "goal",
-        status: "awaiting_input",
-        summary: "等待选择",
-        blockIds: [501],
-        collapsed: false,
-        createdAt: 100,
-      }],
-    }, {
-      restoreInterruptedGoal: true,
-      workspacePath: workspace,
-    });
 
-    assert.equal(restored.activeGoal, null);
-    assert.equal(restored.goalRuntime, null);
-    assert.equal(restored.goalProgress, null);
-    assert.equal(restored.goalStatus, "paused");
-    assert.equal(restored.queuedUserMessage, null);
-    assert.equal(restored.activeActionRequest, null);
-    assert.equal(restored.harnessRunMarker, null);
-    assert.deepEqual(restored.taskFlow[0].options, []);
-    assert.equal(restored.conversationTurns[0].status, "paused");
-  } finally {
-    goalPersistence.unmarkGoalRuntimeDeleted(workspace, goal.id);
-  }
-});
 
-test("a Goal deletion fence preserves an unrelated pending request in the same session", () => {
-  const workspace = "/tmp/deleted-goal-with-new-run";
-  const sessionKey = `${workspace}:72`;
-  const goalTurnId = "turn-old-goal";
-  const requestTurnId = "turn-current-run";
-  const requestRunId = "run-current-run";
-  const goal = goalState.createGoalDefinition({
-    objective: "旧 Goal",
-    sessionKey,
-    ownerTurnId: goalTurnId,
-  });
-  const progress = goalState.createGoalProgress(goal.id, "progress.md");
-  const runtime = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
-  const request = actionRequests.buildUserChoiceActionRequest({
-    sessionKey,
-    turnId: requestTurnId,
-    runId: requestRunId,
-    title: "Current non-Goal choice",
-    optionValues: ["保留这个选择"],
-    allowCustomReply: true,
-    now: 300,
-  });
-
-  goalPersistence.markGoalRuntimeDeleted(workspace, goal.id);
-  try {
-    const restored = normalizeSessionRuntimeSnapshot({
-      activeGoal: goal,
-      goalProgress: progress,
-      goalStatus: "active",
-      goalRuntime: runtime,
-      activeActionRequest: request,
-      harnessRunMarker: {
-        schemaVersion: 1,
-        instanceId: "current-run-instance",
-        sessionKey,
-        workspace,
-        sessionId: 72,
-        turnId: requestTurnId,
-        runId: requestRunId,
-        status: "paused",
-        workflowMode: "edit",
-        runtimeIntent: "execute",
-        planStage: "idle",
-        isPlanApproved: false,
-        iteration: 1,
-        maxIterations: 6,
-        messagesLen: 2,
-        toolCount: 0,
-        latestTool: null,
-        latestToolTarget: null,
-        activeStreamId: null,
-        streamStatus: "closed",
-        streamChunkCount: 0,
-        streamByteCount: 0,
-        streamElapsedMs: 0,
-        streamLifecycleStatus: "completed",
-        lastStreamError: null,
-        startedAt: 200,
-        updatedAt: 300,
-        closedAt: 300,
-        closeReason: "awaiting_user_choice",
-      },
-      taskFlow: [{
-        id: 601,
-        type: "agent",
-        turnId: requestTurnId,
-        content: "请选择当前请求",
-        options: [{ label: "保留这个选择", value: "保留这个选择" }],
-        choiceRequest: request,
-      }],
-      conversationTurns: [{
-        id: requestTurnId,
-        userPrompt: "当前非 Goal 请求",
-        title: "Current request",
-        mode: "edit",
-        intent: "execute",
-        displayIntent: "execute",
-        status: "awaiting_input",
-        summary: "等待选择",
-        blockIds: [601],
-        collapsed: false,
-        createdAt: 200,
-      }],
-    }, {
-      restoreInterruptedGoal: true,
-      workspacePath: workspace,
-    });
-
-    assert.equal(restored.activeGoal, null);
-    assert.equal(restored.goalRuntime, null);
-    assert.equal(restored.activeActionRequest?.requestId, request.requestId);
-    assert.equal(restored.harnessRunMarker?.runId, requestRunId);
-    assert.equal(restored.taskFlow[0].options.length, 1);
-    assert.equal(restored.conversationTurns[0].status, "awaiting_input");
-  } finally {
-    goalPersistence.unmarkGoalRuntimeDeleted(workspace, goal.id);
-  }
-});
 
 test("switching A to B preserves B background runtime and queued workspace Turns", () => {
   const originalState = useAppStore.getState();
@@ -6558,4 +6157,111 @@ test("restore rejects an emergency terminal envelope whose checkpoint revision d
     ),
     false,
   );
+});
+
+
+test("a fresh Session snapshot cannot inherit runtime identity, memory, Goal, or queue time from its predecessor", () => {
+  const createdAt = 2_000;
+  const sessionKey = "/tmp/fresh-session:2000";
+  const sessionEpoch = "fresh-session-epoch";
+  const foreignSessionKey = "/tmp/fresh-session:1000";
+  const snapshot = buildEmptySessionRuntimeSnapshot({
+    currentSessionId: 1_000,
+    currentWorkspace: "/tmp/fresh-session",
+    selectedMainModeKey: "main_mode",
+    runtimeEvents: [{
+      schemaVersion: 2,
+      type: "run.started",
+      threadId: foreignSessionKey,
+      turnId: "turn-foreign",
+      timestampMs: 1,
+      runId: "run-foreign",
+      parentRunId: null,
+    }],
+    harnessRunMarker: {
+      schemaVersion: 1,
+      instanceId: "instance-foreign",
+      runId: "run-foreign",
+      sessionKey: foreignSessionKey,
+      turnId: "turn-foreign",
+      status: "paused",
+      startedAt: 1,
+      updatedAt: 1,
+      closedAt: 1,
+      closeReason: "waiting",
+    },
+    activeActionRequest: {
+      schemaVersion: 1,
+      requestId: "request-foreign",
+      kind: "user_choice",
+      sessionKey: foreignSessionKey,
+      turnId: "turn-foreign",
+      runId: "run-foreign",
+      parentRunId: null,
+      title: "Foreign choice",
+      status: "pending",
+      createdAt: 1,
+      optionValues: ["continue"],
+    },
+    turnRuntimeCheckpoints: {
+      "turn-foreign": {
+        schemaVersion: 1,
+        turnId: "turn-foreign",
+        sessionKey: foreignSessionKey,
+        sessionEpoch: "foreign-session-epoch",
+      },
+    },
+    subagentClosureReceiptLedger: {
+      schemaVersion: 1,
+      owner: {
+        workspaceKey: "/tmp/fresh-session",
+        sessionKey: foreignSessionKey,
+        sessionEpoch: "foreign-session-epoch",
+      },
+      receipts: {},
+      updatedAt: 1,
+    },
+    contextMemoryState: { summary: "foreign memory" },
+    contextMemoryStateByRuntimeKey: { foreign: { summary: "foreign lane memory" } },
+    providerCompatibilityByRuntimeKey: { foreign: { forceXml: true } },
+    planAutoResumeCount: 8,
+    planExecutionProgressSnapshot: { turnId: "turn-foreign", runId: "run-foreign" },
+    activeGoal: {
+      id: "goal-foreign",
+      objective: "Foreign goal",
+      definitionOfDone: [],
+      createdAt: 1,
+      status: "active",
+      iterationBudget: 10,
+      sessionKey: foreignSessionKey,
+    },
+    goalProgress: { goalId: "goal-foreign" },
+    goalStatus: "active",
+    goalRuntime: { schemaVersion: 3 },
+  }, "main_mode", {
+    sessionKey,
+    sessionEpoch,
+    createdAt,
+  });
+
+  assert.deepEqual(snapshot.runtimeEvents, []);
+  assert.equal(snapshot.harnessRunMarker, null);
+  assert.equal(snapshot.activeActionRequest, null);
+  assert.deepEqual(snapshot.turnRuntimeCheckpoints, {});
+  assert.equal(snapshot.subagentClosureReceiptLedger, null);
+  assert.equal(snapshot.contextMemoryState, null);
+  assert.deepEqual(snapshot.contextMemoryStateByRuntimeKey, {});
+  assert.deepEqual(snapshot.providerCompatibilityByRuntimeKey, {});
+  assert.equal(snapshot.planAutoResumeCount, 0);
+  assert.equal(snapshot.planExecutionProgressSnapshot, null);
+  assert.equal(Object.hasOwn(snapshot, "activeGoal"), false);
+  assert.equal(Object.hasOwn(snapshot, "goalProgress"), false);
+  assert.equal(Object.hasOwn(snapshot, "goalStatus"), false);
+  assert.equal(Object.hasOwn(snapshot, "goalRuntime"), false);
+  assert.equal(snapshot.planLifecycle.sessionKey, sessionKey);
+  assert.equal(snapshot.planLifecycle.sessionEpoch, sessionEpoch);
+  assert.equal(snapshot.planLifecycle.updatedAt, createdAt);
+  assert.equal(snapshot.workspaceTurnQueue.sessionKey, sessionKey);
+  assert.equal(snapshot.workspaceTurnQueue.sessionEpoch, sessionEpoch);
+  assert.equal(snapshot.workspaceTurnQueue.updatedAt, createdAt);
 });

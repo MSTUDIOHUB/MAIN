@@ -13,7 +13,6 @@
   </p>
 </div>
 
-![MAIN 桌面工作台](docs/main-manual/assets/screenshots/main-workbench.png)
 
 > [!IMPORTANT]
 > MAIN 正在快速迭代，当前适合开发者试用和共同完善。涉及文件写入、Shell、网络或外部程序的操作仍需人工审查。MAIN 的受信任执行边界不是操作系统级沙箱。
@@ -26,7 +25,7 @@ MAIN 是一个基于 Tauri 2、React、TypeScript 与 Rust 构建的本地优先
 
 - 连接本地模型：LM Studio、Ollama、OMLX。
 - 连接云端模型：OpenAI Compatible、OpenAI Responses API、Anthropic、Gemini 等协议。
-- 在 Chat、Plan、Fast 三种工作方式之间选择分析、先审后做或快速执行。
+- 用自然语言提出任务；需要先确认方案时使用 `/计划`，维护项目约束时使用 `/规则`。
 - 使用文件、终端、PTY、浏览器验证、知识库和 MCP 工具完成任务。
 - 在写文件、执行命令和高风险操作前显示审批与 Diff。
 - 持久化 Workspace、Session、Turn 和 Run，支持暂停、恢复和结构化结论。
@@ -150,7 +149,7 @@ npm run build:windows
 
 - [快速开始](docs/main-manual/quickstart.md)
 - [本地模型](docs/main-manual/local-models.md) / [云端模型](docs/main-manual/cloud-models.md)
-- [Chat / Plan / Fast](docs/main-manual/run-modes.md)
+- [任务入口与计划](docs/main-manual/run-modes.md)
 - [权限与审批](docs/main-manual/permissions-and-approval.md)
 - [MCP 服务器](docs/main-manual/mcp.md)
 - [架构与唯一所有权](docs/ARCHITECTURE.md)

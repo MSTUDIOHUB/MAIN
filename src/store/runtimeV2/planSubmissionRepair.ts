@@ -1,4 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import type { PlanSubmissionDiagnostic } from "../../lib/planDrafts";
 import {
   WORK_PLAN_V1_SCHEMA_VERSION,
   type RuntimeV2Event,
@@ -8,12 +9,16 @@ import {
 } from "../../lib/runtime-v2";
 import { settlePlanTool } from "./planEvidencePort";
 import { PlanLedger } from "./planLedger";
+import { appendPlanToolResult } from "./planHistory";
 import {
   SUBMIT_WORK_PLAN_TOOL_NAME,
 } from "./planModelProtocol";
 
 export const PLAN_SUBMISSION_VALIDATION_REJECTION_CODE =
   "runtime_v2_plan_submission_validation_rejected";
+
+const PLAN_SUBMISSION_FEEDBACK_PREFIX = "WORK_PLAN_REJECTED: ";
+const PLAN_SUBMISSION_FEEDBACK_MAX_CHARS = 4_000;
 
 type PlanToolCall =
   RuntimeV2NormalizedProviderResult["toolCalls"][number];
@@ -46,22 +51,45 @@ function submissionCommand(
   );
 }
 
-function firstTypedSubmissionRejection(
+function latestTypedSubmissionRejection(
   aggregate: TurnAggregateV1,
   run: RuntimeV2RunIdentity,
 ): Extract<RuntimeV2Event, { type: "tool.completed" }> | undefined {
-  return aggregate.events.find((event): event is Extract<
-    RuntimeV2Event,
-    { type: "tool.completed" }
-  > =>
-    event.type === "tool.completed" &&
-    sameRun(event.run, run) &&
-    event.status === "failed" &&
-    event.failureKind === "protocol_invalid" &&
-    event.failureReasonCode ===
-      PLAN_SUBMISSION_VALIDATION_REJECTION_CODE &&
-    !!submissionCommand(aggregate, event.idempotencyKey)
-  );
+  for (let index = aggregate.events.length - 1; index >= 0; index--) {
+    const event = aggregate.events[index];
+    if (event?.type === "tool.completed" && sameRun(event.run, run) &&
+      event.status === "failed" && event.failureKind === "protocol_invalid" &&
+      event.failureReasonCode === PLAN_SUBMISSION_VALIDATION_REJECTION_CODE &&
+      submissionCommand(aggregate, event.idempotencyKey)) return event;
+  }
+  return undefined;
+}
+
+/** Reassess only the latest submitted candidate when its decision boundary
+ * and tool outcome still permit recovery. */
+export function recoverPlanSubmission(
+  aggregate: TurnAggregateV1,
+  run: RuntimeV2RunIdentity,
+  allowRejectedDraft = false,
+): { result: RuntimeV2NormalizedProviderResult; draftOnly: boolean } | null {
+  const events = aggregate.events.filter(event => "run" in event && sameRun(event.run, run));
+  const response = [...events].reverse().find(event => event.type === "provider.responded");
+  if (response?.type !== "provider.responded" || response.result.toolCalls.length !== 1) return null;
+  const [call] = response.result.toolCalls;
+  if (call?.name !== SUBMIT_WORK_PLAN_TOOL_NAME || typeof call.arguments.planMarkdown !== "string" || !call.arguments.planMarkdown.trim()) return null;
+
+  const later = events.filter(event => event.sequence > response.sequence);
+  if (later.some(event => event.type === "run.decision_recorded" && event.choice !== "stop" && (event.answer || event.reply))) return null;
+  const commands = new Set(later.flatMap(event => event.type === "command.scheduled" &&
+    event.command.kind === "execute_tool" && event.command.payload.toolName === call.name && event.command.payload.toolCallId === call.id
+    ? [event.command.idempotencyKey] : []));
+  const rejection = later.find(event => (event.type === "tool.completed" || event.type === "command.completed") &&
+    commands.has(event.idempotencyKey) && event.status !== "succeeded");
+  if (rejection && !(allowRejectedDraft && rejection.type === "tool.completed" &&
+    rejection.failureReasonCode === PLAN_SUBMISSION_VALIDATION_REJECTION_CODE)) return null;
+  // Older Plans may have crashed after rejecting a candidate but before saving
+  // its independent partial draft. The rejected call can only save that draft.
+  return { result: response.result, draftOnly: !!rejection };
 }
 
 export function createRuntimeV2PlanSubmissionLifecycle(input: {
@@ -105,7 +133,7 @@ export function resolveRuntimeV2PlanSubmissionLifecycle(input: {
     : Number.isFinite(input.lifecycleMs)
       ? (runStarted?.at ?? input.fallbackStartedAt) + input.lifecycleMs!
       : Number.POSITIVE_INFINITY;
-  const rejection = firstTypedSubmissionRejection(
+  const rejection = latestTypedSubmissionRejection(
     input.aggregate,
     input.run,
   );
@@ -120,6 +148,24 @@ export function resolveRuntimeV2PlanSubmissionLifecycle(input: {
   };
 }
 
+function formatPlanSubmissionRejection(diagnostics: readonly PlanSubmissionDiagnostic[]): string {
+  const selected: PlanSubmissionDiagnostic[] = [];
+  const format = () => {
+    const omittedDiagnosticCount = diagnostics.length - selected.length;
+    return PLAN_SUBMISSION_FEEDBACK_PREFIX + JSON.stringify({
+      code: "PLAN_EXECUTION_READINESS_INCOMPLETE",
+      diagnostics: selected,
+      ...(omittedDiagnosticCount > 0 ? { omittedDiagnosticCount } : {}),
+    });
+  };
+  for (const diagnostic of diagnostics) {
+    const message = diagnostic.message.length > 360 ? `${diagnostic.message.slice(0, 359)}…` : diagnostic.message;
+    selected.push({ ...diagnostic, message });
+    if (format().length > PLAN_SUBMISSION_FEEDBACK_MAX_CHARS) selected.pop();
+  }
+  return format();
+}
+
 /** Compiler/criteria/adoption feedback is durable recovery authority.
  * Malformed transport input never calls this. */
 export async function recordRuntimeV2PlanSubmissionRejection(input: {
@@ -127,9 +173,9 @@ export async function recordRuntimeV2PlanSubmissionRejection(input: {
   readonly run: RuntimeV2RunIdentity;
   readonly call: PlanToolCall;
   readonly messages: AgentMessage[];
-  readonly detail: string;
+  readonly diagnostics: readonly PlanSubmissionDiagnostic[];
 }): Promise<void> {
-  const feedback = `WORK_PLAN_REJECTED: ${input.detail}`.slice(0, 4_000);
+  const feedback = formatPlanSubmissionRejection(input.diagnostics);
   await settlePlanTool({
     ledger: input.ledger,
     run: input.run,
@@ -144,11 +190,7 @@ export async function recordRuntimeV2PlanSubmissionRejection(input: {
       message: feedback,
     },
   });
-  input.messages.push({
-    role: "tool",
-    tool_call_id: input.call.id,
-    content: feedback,
-  });
+  appendPlanToolResult(input.messages, input.call.id, feedback);
 }
 
 /** Rebuild only the causal rejected submission pair needed by a cold repair.
@@ -158,7 +200,7 @@ export function restoreRuntimeV2PlanSubmissionRepairHistory(input: {
   readonly run: RuntimeV2RunIdentity;
   readonly messages: AgentMessage[];
 }): void {
-  const rejection = firstTypedSubmissionRejection(input.aggregate, input.run);
+  const rejection = latestTypedSubmissionRejection(input.aggregate, input.run);
   if (!rejection) return;
   const scheduled = submissionCommand(
     input.aggregate,
@@ -167,7 +209,10 @@ export function restoreRuntimeV2PlanSubmissionRepairHistory(input: {
   if (scheduled?.type !== "command.scheduled") return;
   const toolCallId = String(scheduled.command.payload.toolCallId || "").trim();
   if (!toolCallId) return;
-  if (input.messages.some((message) => message.role === "tool" && message.tool_call_id === toolCallId)) return;
+  const feedback = rejection.modelContent || rejection.presentation?.message ||
+    "WORK_PLAN_REJECTED: correct the typed WorkPlan and submit it again.";
+  if (input.messages.some((message) => message.role === "tool" &&
+    message.tool_call_id === toolCallId && message.content === feedback)) return;
   input.messages.push({
     role: "assistant",
     content: "",
@@ -182,7 +227,6 @@ export function restoreRuntimeV2PlanSubmissionRepairHistory(input: {
   }, {
     role: "tool",
     tool_call_id: toolCallId,
-    content: rejection.presentation?.message ||
-      "WORK_PLAN_REJECTED: correct the typed WorkPlan and submit it again.",
+    content: feedback,
   });
 }

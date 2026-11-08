@@ -26,7 +26,6 @@ const {
   canOfferPlanContinuation,
   isPlanActionRequestPresentationEligible,
   isPlanReviewCapsulePresentationEligible,
-  resolveGoalPresentationBehavior,
   resolvePlanPresentationBehavior,
   resolveTurnPresentationLifecycle,
   shouldRenderTurnBoundary,
@@ -76,14 +75,11 @@ test("Capsule status projection exposes only structured high-level lifecycle cop
     path.join(workspaceRoot, "src/components/ExecutionCapsule.tsx"),
     "utf8",
   );
-  assert.match(chatAreaSource, /data-testid="capsule-status-label"/);
-  assert.match(chatAreaSource, /data-testid="capsule-guidance-label"/);
-  assert.match(chatAreaSource, /selectCapsuleLiveGuidance/);
-  assert.match(chatAreaSource, /buildCapsuleGuidanceText/);
-  assert.match(chatAreaSource, /content=\{capsuleGuidanceText\}/);
+  assert.match(chatAreaSource, /<CapsuleActivityText line=\{capsuleActivityLine\} language=\{language\} announce \/>/);
+  assert.match(chatAreaSource, /current=\{capsuleActivityLine\}/);
+  assert.match(chatAreaSource, /buildCapsuleActivityHistory/);
   assert.doesNotMatch(chatAreaSource, /data-testid="capsule-activity-label"/);
   assert.doesNotMatch(chatAreaSource, /buildCapsuleActivityText\(capsuleRunStatus, language\)/);
-  assert.match(chatAreaSource, /aria-live="polite"/);
   assert.doesNotMatch(chatAreaSource, /currentTurnState\.capsuleExplanation/);
   assert.doesNotMatch(chatAreaSource, /deriveDynamicFirstPersonText/);
   assert.doesNotMatch(chatAreaSource, /planExecutionCapsuleProjection\?\.headline/);
@@ -137,22 +133,19 @@ test("workspace ordinary turns retain a visible Turn title and lifecycle anchor"
   assert.equal(model.title, "Inspect the editor launch flow");
 });
 
-test("Plan Goal and exceptional states retain a presentation anchor", () => {
+test("Plan and exceptional states retain a presentation anchor", () => {
   const plan = buildTurnPresentationModel({
     turn: turn({ intent: "plan", displayIntent: "execute", mode: "plan", status: "done", title: "Plan runtime changes" }),
-  });
-  const goal = buildTurnPresentationModel({
-    turn: turn({ intent: "goal", status: "executing", title: "Goal runtime changes" }),
   });
   const paused = buildTurnPresentationModel({ turn: turn({ status: "paused" }) });
   const blocked = buildTurnPresentationModel({ turn: turn({ status: "stopped_no_action" }) });
   const failed = buildTurnPresentationModel({ turn: turn({ status: "error" }) });
 
   assert.deepEqual(
-    [plan.kind, goal.kind, paused.kind, blocked.kind, failed.kind],
-    ["plan", "goal", "paused", "blocked", "failed"],
+    [plan.kind, paused.kind, blocked.kind, failed.kind],
+    ["plan", "paused", "blocked", "failed"],
   );
-  assert.ok([plan, goal, paused, blocked, failed].every((model) => model.showStateAnchor));
+  assert.ok([plan, paused, blocked, failed].every((model) => model.showStateAnchor));
 });
 
 test("canonical runtime outcomes own terminal presentation semantics", () => {
@@ -483,38 +476,7 @@ test("Plan execution Capsule headline follows runtime progress instead of the fi
   assert.deepEqual(failed.repeatedTargets, ["src/runtime.ts"]);
 });
 
-test("Goal behavior projects tone and primary controls from lifecycle", () => {
-  assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "active", status: "active" }),
-    { tone: "active", primaryAction: "pause", primaryActionPending: false, canEdit: true, canResume: false },
-  );
-  assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "resumable", status: "paused" }),
-    { tone: "paused", primaryAction: "resume", primaryActionPending: false, canEdit: true, canResume: true },
-  );
-  assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "resumable", status: "pausing" }),
-    { tone: "paused", primaryAction: "pause", primaryActionPending: true, canEdit: false, canResume: false },
-  );
-  assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "action_required", status: "awaiting_input", actionKind: "goal_confirmation" }),
-    { tone: "paused", primaryAction: "resume", primaryActionPending: false, canEdit: true, canResume: true },
-  );
-  for (const actionKind of ["tool_permission", "user_choice"]) {
-    assert.deepEqual(
-      resolveGoalPresentationBehavior({ lifecycle: "action_required", status: "awaiting_input", actionKind }),
-      { tone: "paused", primaryAction: "pause", primaryActionPending: false, canEdit: false, canResume: false },
-    );
-  }
-  assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "success", status: "completed" }),
-    { tone: "completed", primaryAction: null, primaryActionPending: false, canEdit: false, canResume: false },
-  );
-  assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "failed", status: "failed" }),
-    { tone: "failed", primaryAction: null, primaryActionPending: false, canEdit: false, canResume: false },
-  );
-});
+
 
 test("turn boundaries render only between adjacent visible turns", () => {
   assert.equal(shouldRenderTurnBoundary(0, 0), false);

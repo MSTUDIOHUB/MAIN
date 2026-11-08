@@ -12,8 +12,6 @@ import {
   resolveSubmitEffectiveIntentDecision,
   type SubmitBlockingPreflightEffect,
   type SubmitEffectiveIntentInput,
-  type GoalCreationAuthorization,
-  type GoalContinuationAuthorization,
   type SubmitPipelineOptions,
 } from "../lib/submit/turnSubmission";
 import type { PlanStage } from "../lib/workflowModels";
@@ -44,8 +42,8 @@ export interface SubmitIntentRoutingInput<
   mainDebugShortcut: SubmitEffectiveIntentInput["mainDebugShortcut"];
   mainIntentShortcut: SubmitEffectiveIntentInput["mainIntentShortcut"];
   lockedComposerIntent: SubmitEffectiveIntentInput["lockedComposerIntent"];
-  goalCreationAuthorization: GoalCreationAuthorization | null;
-  goalContinuationAuthorization: GoalContinuationAuthorization | null;
+
+
   currentTurn: SubmitEffectiveIntentInput["currentTurn"];
   currentTurnIntent: ResolvedRunIntent;
   hasPlanArtifacts: boolean;
@@ -83,7 +81,7 @@ export type SubmitIntentRoutingResult =
       effectiveRunIntent: ResolvedRunIntent;
       effectiveIntentSummary: string;
       effectiveCommandDirective: CommandDirective | null;
-      goalCreationAuthorization: GoalCreationAuthorization | null;
+
     };
 
 /**
@@ -126,8 +124,8 @@ export function resolveAndApplySubmitIntentRouting<
     mainDebugShortcut: input.mainDebugShortcut,
     mainIntentShortcut: input.mainIntentShortcut,
     lockedComposerIntent: input.lockedComposerIntent,
-    goalCreationAuthorization: input.goalCreationAuthorization,
-    goalContinuationAuthorization: input.goalContinuationAuthorization,
+
+
     currentTurn: input.currentTurn,
     currentTurnIntent: input.currentTurnIntent,
     shouldContinuePlanIntent: input.shouldContinuePlanIntent,
@@ -145,10 +143,8 @@ export function resolveAndApplySubmitIntentRouting<
   // Explicit modes remain ceilings; only typed controls and trusted resumptions
   // bypass this handoff. Lexical resolution supplies context, never authority.
   const trustedSubmission = input.isHidden || !!input.mainDebugShortcut ||
-    input.lockedComposerIntent === "image_studio" || input.mainIntentShortcut?.intent === "image_studio" ||
     input.options?.skipIntentResolution === true || !!input.options?.resolvedIntent ||
-    input.shouldExecuteOnceFromReplyOption || !!input.goalCreationAuthorization ||
-    !!input.goalContinuationAuthorization;
+    input.shouldExecuteOnceFromReplyOption;
   if (input.currentMainModeKey === "main_mode" && !trustedSubmission) {
     const resolution = resolveTurnRunIntent(input.text, {
       language: input.preferredLanguage,
@@ -160,10 +156,11 @@ export function resolveAndApplySubmitIntentRouting<
       previousTurnIntent: input.currentTurnIntent,
     });
     const previousRequest = input.shouldContinuePreviousTurnIntent
-      ? input.previousTurnContinuationTarget?.userPrompt
-      : input.shouldContinuePlanIntent || input.shouldReuseExistingTurnIntent || input.shouldRouteContinuationToPlanResume
-      ? input.currentTurn?.userPrompt
-      : undefined;
+      ? input.previousTurnContinuationTarget?.userPrompt ?? input.currentTurn?.userPrompt
+      : input.currentTurn?.userPrompt;
+    // The semantic classifier needs the preceding objective to decide whether
+    // this is a follow-up. A lexical continuation route cannot gate that
+    // context, and the prior route itself never becomes current authority.
     const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
       resolution,
       currentMainModeKey: input.currentMainModeKey,
@@ -214,8 +211,6 @@ export function resolveAndApplySubmitIntentRouting<
     effectiveRunIntent,
     effectiveIntentSummary,
     effectiveCommandDirective,
-    goalCreationAuthorization: effectiveRunIntent === "goal"
-      ? input.goalCreationAuthorization
-      : null,
+
   };
 }

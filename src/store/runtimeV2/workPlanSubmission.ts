@@ -1,10 +1,21 @@
-import { analyzeValidationCommand } from "../../lib/validationContract";
+import { analyzeValidationCommand, finiteValidationRepairHint, type ValidationCommandRejectionReason } from "../../lib/validationContract";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   WORK_PLAN_V1_SCHEMA_VERSION,
   type WorkPlanDraftV1,
   type WorkPlanRuntimeEvidence,
 } from "../../lib/runtime-v2";
+
+/** Compiler provenance, separate from the executable validation contract. */
+export interface WorkPlanValidationOrigin {
+  readonly fieldPath: string;
+  readonly rawKind?: string;
+  readonly compiledKind: WorkPlanDraftV1["validations"][number]["kind"];
+  readonly normalizationReason?: string;
+  readonly commandRejectionReason?: ValidationCommandRejectionReason | "service_observation";
+  readonly commandSegmentIndex?: number;
+  readonly commandRepairHint?: string;
+}
 
 /**
  * Parse only a complete JSON response (or one complete JSON fence). Unlike
@@ -259,7 +270,7 @@ function compileValidations(input: {
   readonly steps: WorkPlanDraftV1["steps"];
   readonly normalizationReasons: string[];
   readonly knownCriterionIds: ReadonlySet<string>;
-}): WorkPlanDraftV1["validations"] {
+}): { validations: WorkPlanDraftV1["validations"]; origins: readonly WorkPlanValidationOrigin[] } {
   const executableStepIndexes = input.steps
     .map((step, index) => (step.operation !== "preserve" ? index : -1))
     .filter((index) => index >= 0);
@@ -288,6 +299,7 @@ function compileValidations(input: {
     return (entry && typeof entry === "object" ? entry : {}) as Record<string, any>;
   });
 
+  const origins: WorkPlanValidationOrigin[] = [];
   const compiled = normalizedRaw.map((validation) => {
     const requestedCommand = typeof validation?.command === "string"
       ? validation.command.trim()
@@ -324,26 +336,41 @@ function compileValidations(input: {
       criterionIds: resolveCriterionIds(validation, input.knownCriterionIds),
     };
   }).flatMap((validation, index) => {
-    if (
-      validation.kind === "finite_command" &&
-      analyzeValidationCommand(validation.command || "", {
-        cwd: validation.cwd,
-      }).spec?.kind !== "finite_command"
-    ) {
+    const raw = input.rawValidations[index];
+    const rawKind = raw && typeof raw === "object" && "kind" in raw && typeof raw.kind === "string"
+      ? raw.kind : undefined;
+    const analysis = validation.kind === "finite_command"
+      ? analyzeValidationCommand(validation.command || "", { cwd: validation.cwd })
+      : undefined;
+    if (analysis && analysis.spec?.kind !== "finite_command") {
+      const commandRejectionReason = analysis.rejectionReason ??
+        (analysis.spec?.kind === "service_observation" ? "service_observation" : undefined);
+      const commandSegmentIndex = commandRejectionReason === "unbounded_command_segment"
+        ? analysis.segments.findIndex(segment => segment.role === "unknown")
+        : commandRejectionReason === "service_observation"
+          ? analysis.segments.findIndex(segment => segment.role === "service")
+          : -1;
+      const commandRepairHint = finiteValidationRepairHint(analysis);
       input.normalizationReasons.push(
         `validations[${index}]:non_finite_command_downgraded_to_advisory`,
       );
+      origins.push({ fieldPath: `validations[${index}]`, ...(rawKind !== undefined ? { rawKind } : {}),
+        compiledKind: "advisory", normalizationReason: "non_finite_command_downgraded_to_advisory",
+        ...(commandRejectionReason ? { commandRejectionReason } : {}),
+        ...(commandRepairHint ? { commandRepairHint } : {}),
+        ...(commandSegmentIndex >= 0 ? { commandSegmentIndex } : {}) });
+      const { command: _nonFiniteCommand, ...advisory } = validation;
       return [{
-        ...validation,
+        ...advisory,
         kind: "advisory" as const,
-        command: undefined,
         required: false,
       }];
     }
+    origins.push({ fieldPath: `validations[${index}]`, ...(rawKind !== undefined ? { rawKind } : {}), compiledKind: validation.kind });
     return [validation];
   });
 
-  return compiled as Array<WorkPlanDraftV1["validations"][number]>;
+  return { validations: compiled as Array<WorkPlanDraftV1["validations"][number]>, origins };
 }
 
 export function workPlanDraftFromSubmission(
@@ -355,6 +382,7 @@ export function workPlanDraftFromSubmission(
   readonly draft: WorkPlanDraftV1;
   readonly normalized: boolean;
   readonly normalizationReasons: readonly string[];
+  readonly validationOrigins: readonly WorkPlanValidationOrigin[];
 } {
   const normalizationReasons: string[] = [];
   const raw = {
@@ -425,7 +453,7 @@ export function workPlanDraftFromSubmission(
     autoBasisEvidenceIds,
     knownCriterionIds,
   });
-  const validations = compileValidations({
+  const { validations, origins: validationOrigins } = compileValidations({
     rawValidations: raw.validations,
     steps,
     normalizationReasons,
@@ -451,5 +479,6 @@ export function workPlanDraftFromSubmission(
       normalizationReasons.length > 0 ||
       JSON.stringify(draft) !== JSON.stringify(raw),
     normalizationReasons,
+    validationOrigins,
   };
 }

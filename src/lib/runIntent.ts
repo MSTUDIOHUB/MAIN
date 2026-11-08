@@ -22,13 +22,11 @@ export type ResolvedUserIntent =
   | "execute"
   | "analyze"
   | "summarize"
-  | "report"
-  | "image_studio"
-  | "goal";
+  | "report";
 export type ResolvedRunIntent = ResolvedUserIntent;
 
 export function isMutationRuntimeIntent(intent: ResolvedUserIntent | string | null | undefined): boolean {
-  return intent === "execute" || intent === "goal";
+  return intent === "execute";
 }
 export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion";
@@ -300,36 +298,6 @@ const RUN_INTENT_POLICIES: Record<ResolvedUserIntent, RunIntentPolicy> = {
     description: {
       zh: "在普通聊天流中整理结构化 Markdown 报告。",
       en: "Use the chat flow to produce a structured Markdown report.",
-    },
-  },
-  image_studio: {
-    intent: "image_studio",
-    workflowMode: "chat",
-    uiCategory: "workflow_mode",
-    toolPolicy: "none",
-    requiresPlanApproval: false,
-    generatesPlanArtifacts: false,
-    allowsSourceWritesBeforePlanApproval: false,
-    label: { zh: "图像生成", en: "Image Studio" },
-    categoryLabel: { zh: "图像工作室", en: "Image Studio" },
-    description: {
-      zh: "在对话中生成图片",
-      en: "Generate an image in the chat",
-    },
-  },
-  goal: {
-    intent: "goal",
-    workflowMode: "edit",
-    uiCategory: "workflow_mode",
-    toolPolicy: "write",
-    requiresPlanApproval: false,
-    generatesPlanArtifacts: false,
-    allowsSourceWritesBeforePlanApproval: true,
-    label: { zh: "目标", en: "Goal" },
-    categoryLabel: { zh: "流程模式", en: "Workflow Mode" },
-    description: {
-      zh: "设定一个长期目标，Agent 自主循环执行直到完成或达到预算上限。",
-      en: "Set a long-term goal. The agent iterates autonomously until the objective is met or the budget is exhausted.",
     },
   },
 };
@@ -612,7 +580,7 @@ export interface MainDebugShortcut {
 }
 
 const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
-  {
+{
     intent: "plan",
     command: "/计划",
     label: "计划",
@@ -621,106 +589,16 @@ const MAIN_INTENT_SHORTCUTS_ZH: MainIntentShortcutItem[] = [
     aliases: ["plan", "规划", "方案", "spec", "roadmap"],
     visibleInMenu: true,
   },
-  {
-    intent: "report",
-    command: "/报告",
-    label: "报告",
-    description: RUN_INTENT_POLICIES.report.description.zh,
-    category: RUN_INTENT_POLICIES.report.uiCategory,
-    aliases: ["report", "汇报", "分析报告"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "analyze",
-    command: "/分析",
-    label: "分析",
-    description: RUN_INTENT_POLICIES.analyze.description.zh,
-    category: RUN_INTENT_POLICIES.analyze.uiCategory,
-    aliases: ["analyze", "检查", "验证", "诊断", "review", "inspect"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "summarize",
-    command: "/总结",
-    label: "总结",
-    description: RUN_INTENT_POLICIES.summarize.description.zh,
-    category: RUN_INTENT_POLICIES.summarize.uiCategory,
-    aliases: ["summary", "summarize", "摘要", "概括", "归纳"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "image_studio" as any,
-    command: "/生图",
-    label: "生成图片",
-    description: "通过自然语言描述在当前对话中生成图片",
-    category: "workflow_mode",
-    aliases: ["draw", "image", "画图", "生图"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "goal" as MainIntentShortcut,
-    command: "/目标",
-    label: "目标",
-    description: "设定长期目标，Agent 自主循环执行直到完成或预算耗尽。",
-    category: "workflow_mode",
-    aliases: ["goal", "长任务", "自主执行", "autonomous"],
-    visibleInMenu: true,
-  },
 ];
 
 const MAIN_INTENT_SHORTCUTS_EN: MainIntentShortcutItem[] = [
-  {
+{
     intent: "plan",
     command: "/plan",
     label: "Plan",
     description: RUN_INTENT_POLICIES.plan.description.en,
     category: RUN_INTENT_POLICIES.plan.uiCategory,
     aliases: ["计划", "规划", "方案", "spec", "roadmap"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "report",
-    command: "/report",
-    label: "Report",
-    description: RUN_INTENT_POLICIES.report.description.en,
-    category: RUN_INTENT_POLICIES.report.uiCategory,
-    aliases: ["报告", "汇报", "analysis report"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "analyze",
-    command: "/analyze",
-    label: "Analyze",
-    description: RUN_INTENT_POLICIES.analyze.description.en,
-    category: RUN_INTENT_POLICIES.analyze.uiCategory,
-    aliases: ["分析", "检查", "验证", "诊断", "review", "inspect"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "summarize",
-    command: "/summarize",
-    label: "Summary",
-    description: RUN_INTENT_POLICIES.summarize.description.en,
-    category: RUN_INTENT_POLICIES.summarize.uiCategory,
-    aliases: ["总结", "摘要", "概括", "归纳", "summary"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "image_studio" as any,
-    command: "/draw",
-    label: "Generate Image",
-    description: "Generate an image in the current chat using natural language description.",
-    category: "workflow_mode",
-    aliases: ["draw", "image", "paint"],
-    visibleInMenu: true,
-  },
-  {
-    intent: "goal" as MainIntentShortcut,
-    command: "/goal",
-    label: "Goal",
-    description: "Set a long-term goal, letting the Agent execute autonomously until completion or budget exhaustion.",
-    category: "workflow_mode",
-    aliases: ["goal", "autonomous", "long task"],
     visibleInMenu: true,
   },
 ];
@@ -1197,8 +1075,7 @@ export function getMainIntentShortcuts(
   return visibleShortcuts.filter((item) => isMainIntentShortcutAllowedInMainMode(item.intent, mainModeKey));
 }
 
-export function isMainIntentShortcutAllowedInMainMode(_intent: MainIntentShortcut, mainModeKey: MainModeKey): boolean {
-  if (mainModeKey === "image_studio") return false;
+export function isMainIntentShortcutAllowedInMainMode(_intent: MainIntentShortcut, _mainModeKey: MainModeKey): boolean {
   return true;
 }
 
@@ -1303,18 +1180,6 @@ function createOption(intent: ResolvedUserIntent, language: "zh" | "en"): Pendin
       valueZh: "请整理成结构化正式报告输出",
       valueEn: "Please produce a structured report.",
     },
-    image_studio: {
-      zh: "生成图片",
-      en: "Generate Image",
-      valueZh: "在当前对话中生成图片",
-      valueEn: "Generate an image in the current chat.",
-    },
-    goal: {
-      zh: "设定目标（自主执行）",
-      en: "Set Goal (Autonomous)",
-      valueZh: "设定一个长期目标，Agent 将自主循环执行直到完成或预算耗尽",
-      valueEn: "Set a long-term goal. The agent will iterate autonomously until the objective is met or the budget runs out.",
-    },
   };
 
   const item = labels[intent];
@@ -1376,7 +1241,7 @@ export function createPendingDecisionCopy(
 }
 
 function isComposerSuggestibleIntent(intent: ResolvedUserIntent): intent is MainIntentShortcut {
-  return ["plan", "summarize", "report", "analyze"].includes(intent);
+  return intent === "plan";
 }
 
 export function resolveComposerIntentSuggestion(params: {
@@ -1630,10 +1495,10 @@ export function resolveTurnRunIntent(
         language,
         isWorkspaceTurn
           ? "检测到工作区报告请求；本轮进入只读报告流程。"
-          : "检测到报告输出语义，但未使用 /报告；本轮保持自然回复并让模型按请求组织内容。",
+          : "检测到报告请求；本轮按请求组织报告。",
         isWorkspaceTurn
           ? "Detected a workspace report request, so this turn enters the read-only report workflow."
-          : "Detected report wording without /report; this turn stays in natural response while following the requested format.",
+          : "Detected a report request; this turn follows the requested report format.",
       ),
       confidence: 0.86,
       bypassMainRouter: false,
@@ -1688,10 +1553,10 @@ export function resolveTurnRunIntent(
         language,
         isWorkspaceTurn
           ? "检测到工作区总结请求；本轮进入只读总结流程。"
-          : "检测到总结语义，但未使用 /总结；本轮保持自然回复并按请求提炼内容。",
+          : "检测到总结请求；本轮按请求提炼内容。",
         isWorkspaceTurn
           ? "Detected a workspace summary request, so this turn enters the read-only summary workflow."
-          : "Detected summary wording without /summarize; this turn stays in natural response while summarizing as requested.",
+          : "Detected a summary request; this turn summarizes as requested.",
       ),
       confidence: 0.86,
       bypassMainRouter: false,

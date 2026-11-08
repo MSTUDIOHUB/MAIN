@@ -41,6 +41,23 @@ function loadTs(sourcePath) {
   return loaded.exports;
 }
 
+test("Plan repair preserves full receipts and decisions before the shared budget is applied", () => {
+  const { synthesisPlanTranscript } = loadTs("src/store/runtimeV2/planModelProtocol.ts");
+  const full = "Skill reference\n" + "source text ".repeat(3_000);
+  const messages = [
+    { role: "assistant", content: "", tool_calls: [{ id: "skill", type: "function", function: { name: "load_skill", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "skill", content: full },
+    { role: "user", content: "Use a Play Mode check." },
+  ];
+  const request = synthesisPlanTranscript({ messages, evidence: [], evidenceContents: new Map(),
+    submissionRepairPending: true, compactRecovery: false, transport: "native_tool", canAskPlanQuestions: true });
+  assert.equal(messages[1].content, full);
+  assert.equal(request[1].tool_call_id, "skill");
+  assert.equal(request[1].content, full);
+  assert.deepEqual(request[2], messages[2]);
+  assert.match(request.at(-1).content, /Authorized read-only tools remain available/);
+});
+
 const protocol = loadTs(
   path.join(process.cwd(), "src/store/runtimeV2/planModelProtocol.ts"),
 );
@@ -142,6 +159,16 @@ test("Plan discovers Skill metadata without preloading the body and offers load_
     "Plan shares compact references and validates the admitted identity at execution");
 });
 
+test("Plan web tools follow captured network authority rather than a later live toggle", () => {
+  const context = { runSessionKey: "plan-network", networkRead: { enabled: true, provider: "bing" } };
+  const discovery = loadTs(path.join(process.cwd(), "src/lib/toolSearch.ts"));
+  discovery.unlockToolsForSession(context.runSessionKey, ["web_search", "web_fetch"]);
+  const names = (value) => value.map((tool) => tool.function.name);
+  assert.ok(names(protocol.planModelTools(context, { webSearchEnabled: false })).includes("web_search"));
+  assert.ok(names(protocol.planModelTools(context, { webSearchEnabled: false })).includes("web_fetch"));
+  assert.equal(names(protocol.planModelTools({ ...context, networkRead: undefined }, { webSearchEnabled: true })).includes("web_search"), false);
+});
+
 test("Plan exposes only bounded read-only collaboration tools from live capacity", () => {
   const withoutCollaboration = protocol.selectPlanModelTools({
     submissionStage: false,
@@ -210,8 +237,18 @@ test("Plan exposes only bounded read-only collaboration tools from live capacity
       remainingSubagentCapacity: 1,
       activeSubagentCount: 0,
     }).map((tool) => tool.function.name),
-    ["submit_runtime_v2_work_plan"],
+    withCapacity.map((tool) => tool.function.name),
   );
+  const repairTools = protocol.selectPlanModelTools({
+    submissionStage: true,
+    submissionRepairPending: true,
+    collaborationAllowed: false,
+    remainingSubagentCapacity: 0,
+    activeSubagentCount: 0,
+  }).map(tool => tool.function.name);
+  assert.ok(repairTools.includes("read_file"), "a rejected submission must retain authorized safe reads");
+  assert.ok(repairTools.includes("submit_runtime_v2_work_plan"));
+  assert.equal(repairTools.includes("write_file"), false);
 });
 
 test("typed required collaboration hard-admits spawn until the Plan requirement is met", () => {
@@ -222,9 +259,9 @@ test("typed required collaboration hard-admits spawn until the Plan requirement 
   const baseTools = [readFile, protocol.SUBMIT_WORK_PLAN_TOOL];
   const names = (tools) => tools.map((tool) => tool.function.name);
 
-  assert.deepEqual(
+  for (const submissionStage of [false, true]) assert.deepEqual(
     names(protocol.selectPlanModelTools({
-      submissionStage: false,
+      submissionStage,
       collaborationAllowed: true,
       collaborationRequired: true,
       collaborationRequirementMet: false,
@@ -292,6 +329,19 @@ test("Plan submission schema offers optional typed dependency and validation cov
   });
   const system = String(messages[0]?.content || "");
   assert.match(system, /submit_runtime_v2_work_plan/i);
+});
+
+test("Plan submission schema requires the validation list consumed by the admitted criteria gate", () => {
+  const tool = protocol.SUBMIT_WORK_PLAN_TOOL.function;
+  const schema = tool.parameters;
+  assert.ok(schema.required.includes("validations"));
+  assert.equal(schema.properties.validations.minItems, 1);
+  assert.doesNotMatch(tool.description, /可选的验证方式/);
+  const validation = schema.properties.validations.items;
+  assert.ok(validation.properties.kind.enum.includes("assertion"), "a Plan need not authorize future shell execution");
+  assert.equal(validation.required.includes("command"), false);
+  assert.equal(validation.required.includes("required"), false, "the compiler owns the existing default");
+  assert.equal(validation.required.includes("criterionIds"), false, "omitted criteria already map to admitted IDs");
 });
 
 function singletonSubmission(overrides = {}) {

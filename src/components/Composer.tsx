@@ -1,12 +1,14 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconGlobe, IconShield, IconSubagent } from "./Icons";
-import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import MainOnboardingPanel from "./MainOnboardingPanel";
 import ProjectInitReviewModal from "./ProjectInitReviewModal";
+import KnowledgePicker from "./KnowledgePicker";
+import { getKnowledgePickerSession, applyKnowledgePickerSelection } from "../lib/knowledgePicker";
+import { knowledgeReferenceIdentity, type KnowledgeReference } from "../lib/knowledgeReferences";
+import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
 import ToggleSwitch from "./ToggleSwitch";
 import type { ProjectInitReviewPhase } from "./ProjectInitReviewModal";
-import MainModeSwitcher from "./composer/MainModeSwitcher";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
 import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
 import { estimateTokens } from "../lib/contextTrim";
@@ -15,7 +17,6 @@ import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/agentMessages";
 import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
 import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcutForMode, resolveComposerIntentSuggestion } from "../lib/runIntent";
-import { isImageModelName } from "../lib/imageStudio";
 import { isPlanTaskTrustedComplete } from "../lib/workflowModels";
 import {
   classifyAttachment,
@@ -31,7 +32,8 @@ import type { TurnIngressMode } from "../lib/turnIngress";
 import {
   commitProjectInitPreview,
   parseProjectInitCommand,
-  prepareProjectInitPreview,
+  buildProjectRulesPreview,
+  updateProjectRulesPreview,
 } from "../lib/projectInit";
 import type { ProjectInitPreview } from "../lib/projectInit";
 import { projectInitIpcIo } from "../lib/projectInitIpc";
@@ -118,7 +120,7 @@ function getSlashSession(value: string, cursorPos: number): { anchor: number; qu
   if (!/[\s\n]/.test(charBefore)) return null;
 
   const query = beforeCursor.slice(slashIndex + 1);
-  if (/[\s\n]/.test(query)) return { anchor: slashIndex, query: "" };
+  if (/[\s\n]/.test(query)) return null;
   return { anchor: slashIndex, query };
 }
 
@@ -194,10 +196,6 @@ export default function Composer({
   attachedFiles,
   setAttachedFiles,
   onAttachFile,
-  showAgentPicker,
-  setShowAgentPicker,
-  selectedMainModeKey,
-  mainModes,
   currentWorkspace,
   t,
   activeDiffTask,
@@ -227,6 +225,20 @@ export default function Composer({
   const [slashQuery, setSlashQuery] = useState("");
   const [highlightedSlashIndex, setHighlightedSlashIndex] = useState(0);
   const [showSkillMenu, setShowSkillMenu] = useState(false);
+  const [knowledgeSession, setKnowledgeSession] = useState(null);
+  const [knowledgeReferences, setKnowledgeReferences] = useState<readonly KnowledgeReference[]>([]);
+  const knowledgePickerRef = useRef(null);
+  const knowledgeSessionEpoch = useAppStore(state => state.sessionsByWorkspace[resolveSessionWorkspaceKey(currentWorkspace)]
+    ?.find(session => session.id === state.currentSessionId)?.planLifecycleEpoch ||
+    (state.planLifecycle?.sessionKey === activeSessionKey ? state.planLifecycle.sessionEpoch : "draft"));
+  const knowledgeOwnerKey = `${currentWorkspace || "global"}:${activeSessionKey || "draft"}:${knowledgeSessionEpoch}`;
+  const knowledgeOwnerRef = useRef(knowledgeOwnerKey);
+  knowledgeOwnerRef.current = knowledgeOwnerKey;
+  useEffect(() => {
+    setKnowledgeSession(null); setKnowledgeReferences([]);
+    projectInitRequestIdRef.current++;
+    setProjectInitReview(null);
+  }, [knowledgeOwnerKey]);
   const [skillSession, setSkillSession] = useState<{ anchor: number; query: string } | null>(null);
   const [skillCandidates, setSkillCandidates] = useState<SkillPickerCandidate[]>([]);
   const [highlightedSkillIndex, setHighlightedSkillIndex] = useState(0);
@@ -239,6 +251,7 @@ export default function Composer({
     errorMessage: string | null;
     commandText: string;
     workspace: string;
+    documentRef?: import("../lib/planDocuments").PlanDocumentRef;
   } | null>(null);
   const [showWebSearchPanel, setShowWebSearchPanel] = useState(false);
   const [allFiles, setAllFiles] = useState<string[]>([]);
@@ -255,12 +268,10 @@ export default function Composer({
   const skillMenuOpenRef = useRef(false);
   const skillLoadRequestIdRef = useRef(0);
   const skillLoadOwnerRef = useRef(null);
-  const mainFocusPickerRef = useRef<HTMLDivElement>(null);
   const webSearchPanelRef = useRef<HTMLDivElement>(null);
   const composerShellRef = useRef<HTMLDivElement>(null);
   const helpButtonRef = useRef<HTMLButtonElement>(null);
   const slashAnchorRef = useRef(-1);
-  const previousMainModeRef = useRef(selectedMainModeKey);
   const submitPendingRef = useRef(false);
   const isComposingRef = useRef(false);
   const compositionEndedAtRef = useRef(0);
@@ -280,7 +291,6 @@ export default function Composer({
   const contextLimit = useAppStore((s) => s.config.local.contextLimit);
   const language = useAppStore((s) => s.config.language);
   const storeInput = useAppStore((s) => s.input);
-  const currentSessionId = useAppStore((s) => s.currentSessionId);
   const setStoreInput = useAppStore((s) => s.setInput);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
   const bumpWorkspaceContentVersion = useAppStore((s) => s.bumpWorkspaceContentVersion);
@@ -291,32 +301,23 @@ export default function Composer({
   const isPlanApproved = useAppStore((s) => s.isPlanApproved);
   const planTasks = useAppStore((s) => s.planTasks);
   const planStage = useAppStore((s) => s.planStage);
-  const conversationTurns = useAppStore((s) => s.conversationTurns);
   const queuedUserMessage = useAppStore((s) => s.queuedUserMessage);
   const activeGuidance = useAppStore((s) => s.activeGuidance);
+  const rulesDraftReview = useAppStore((s) => s.rulesDraftReview);
   const workspaceTurnQueue = useAppStore((s) => s.workspaceTurnQueue);
   const clearActiveGuidance = useAppStore((s) => s.clearActiveGuidance);
   const lockedComposerIntent = useAppStore((s) => s.lockedComposerIntent);
   const setLockedComposerIntent = useAppStore((s) => s.setLockedComposerIntent);
-  const imageStudio = useAppStore((s) => s.imageStudio);
-  const setImageStudioConfig = useAppStore((s) => s.setImageStudioConfig);
-  const setImageStudioSetupGuideOpen = useAppStore((s) => s.setImageStudioSetupGuideOpen);
-  const checkImageStudioEngine = useAppStore((s) => s.checkImageStudioEngine);
-  const switchMainModeWithIsolation = useAppStore((s) => s.switchMainModeWithIsolation);
   const webSearchEnabled = useAppStore((s) => s.webSearchEnabled);
   const webSearchProvider = useAppStore((s) => s.webSearchProvider);
   const setWebSearchEnabled = useAppStore((s) => s.setWebSearchEnabled);
   const setWebSearchProvider = useAppStore((s) => s.setWebSearchProvider);
   const [draftInput, setDraftInput] = useState(storeInput);
   const [debouncedInput, setDebouncedInput] = useState(storeInput);
-  const [showImageStudioAdvanced, setShowImageStudioAdvanced] = useState(false);
   const mainIntentShortcuts = useMemo(
-    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "main_mode" })
-      .filter((item) => currentWorkspace || item.intent !== "goal"),
-    [currentWorkspace, language],
+    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "main_mode" }),
+    [language],
   );
-  const isMainMode = selectedMainModeKey === "main_mode";
-  const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isLightTheme = themeMode === "light";
   const composerCanStop = typeof isRunActive === "boolean" ? isRunActive : isStreaming;
   const resolvedTurnIngressMode: TurnIngressMode = turnIngressMode || (
@@ -329,24 +330,13 @@ export default function Composer({
     !!(guidanceTarget as CanonicalRunIdentity | null | undefined);
   const isComposerSubmitting = isSubmitPending;
   const resolvedComposerFontSize = Math.min(20, Math.max(10, Number(chatFontSize ?? useAppStore.getState().config.chatFontSize) || 13));
-  const showExecutionProgress =
-    planTasks.length > 0 &&
-    (planStage === "ready_to_execute" || planStage === "executing" || planStage === "completed" || isPlanApproved);
   const mainIntentSearchLabel = slashQuery
     ? (language === "en" ? `Shortcut: ${slashQuery}` : `快捷入口：${slashQuery}`)
-    : (language === "en" ? "Type / for workflows, output styles, and workspace commands" : "输入 / 选择工作流、输出方式和工作区命令");
+    : (language === "en" ? "Use /plan or /rules; select reference material with #" : "使用 /计划、/规则；输入 # 选择参考资料");
   const mainIntentEmptyLabel = language === "en" ? "No matching commands" : "没有匹配的命令";
   const mainIntentHint = language === "en"
     ? "Use natural language for direct execution; shortcuts are optional."
     : "直接用自然语言下达执行任务；快捷入口是可选的。";
-  const mainModeDescriptions = {
-    main_mode: language === "en"
-      ? "Ask naturally for summaries, analysis, reports, extraction, plans, or execution in one place."
-      : "直接用自然语言提出总结、分析、报告、提炼、计划或执行需求。",
-    image_studio: language === "en"
-      ? "Generate images in a dedicated studio with local-first image runtime and an optional HiDream Web fallback."
-      : "在独立图像工作室里进行本地优先的图片生成，并可按需切到 HiDream Web fallback。",
-  };
   const mentionSearchLabel = mentionQuery
     ? (language === "en" ? `Search: ${mentionQuery}` : `搜索：${mentionQuery}`)
     : (language === "en" ? "Type to search files..." : "输入关键词搜索文件...");
@@ -380,12 +370,18 @@ export default function Composer({
     : "本轮已捕获子智能体协作设置，执行停止后才能更改。";
   const hasDraftPayload =
     draftInput.trim().length > 0 ||
+    knowledgeReferences.length > 0 ||
     contextMentions.length > 0 ||
     attachedFiles.length > 0 ||
     pendingImages.length > 0;
-  const streamingPrimarySubmitsMessage = composerRunActive && hasDraftPayload;
-  const queuedWorkspaceEntries = (workspaceTurnQueue?.entries || []).filter((entry) =>
-    entry?.status === "persisting" || entry?.status === "queued" || entry?.status === "dispatching"
+  const workspaceQueueEntries = workspaceTurnQueue?.sessionKey === activeSessionKey
+    ? workspaceTurnQueue?.entries || []
+    : [];
+  // The idle head passes through durable admission before it starts. Only
+  // entries waiting behind another turn belong in the visible queue.
+  const queuedWorkspaceEntries = workspaceQueueEntries.filter((entry, index) =>
+    (entry.status === "persisting" || entry.status === "queued") &&
+    (index > 0 || composerRunActive)
   );
   const workspaceComposer = Boolean(String(currentWorkspace || "").trim());
   const visibleLegacyQueuedMessage = workspaceComposer ? null : queuedUserMessage;
@@ -400,13 +396,13 @@ export default function Composer({
     parseProjectInitCommand(draftInput) ||
     lockedComposerIntent ||
     parseMainDebugShortcut(draftInput) ||
-    parseMainIntentShortcutForMode(draftInput, selectedMainModeKey),
+    parseMainIntentShortcutForMode(draftInput, "main_mode"),
   );
   const guidanceEligible = Boolean(
     composerGuidanceAvailable &&
-    !isImageStudioMode &&
     draftInput.trim() &&
     !hasGuidanceUnsupportedPayload &&
+    knowledgeReferences.length === 0 &&
     !draftHasExplicitTurnIntent &&
     !activeGuidance,
   );
@@ -416,14 +412,14 @@ export default function Composer({
       : hasGuidanceUnsupportedPayload
         ? "Guidance is text-only. Queue this input to preserve files, attachments, and images."
         : draftHasExplicitTurnIntent
-          ? "Plan, Goal, and other explicit intents must be queued as their own Turn."
+          ? "Plan and other explicit intents must be queued as their own Turn."
           : "Guide the current run at its next model iteration without creating a new Turn."
     : activeGuidance
       ? "已有一条引导等待下一次模型迭代；请先撤销或等待它被消费。"
       : hasGuidanceUnsupportedPayload
         ? "引导仅支持文本；请排队以保留文件、附件和图片。"
         : draftHasExplicitTurnIntent
-          ? "计划、目标等显式意图必须排队为独立回合。"
+          ? "计划等显式意图必须排队为独立回合。"
           : "在下一次模型迭代引导当前执行，不创建新回合。";
   const autoReviewToggleDisabled = Boolean(autoApproveTools && composerRunActive);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
@@ -433,6 +429,16 @@ export default function Composer({
     : subagentPreferenceTitle;
   const webSearchProviderOptions = useMemo(
     () => [
+      {
+        id: "yahoo",
+        label: "Yahoo",
+        detail: language === "en" ? "Free web results" : "免费网页结果",
+      },
+      {
+        id: "quark",
+        label: language === "en" ? "Quark" : "夸克",
+        detail: language === "en" ? "Free web compatibility source" : "免费网页兼容源",
+      },
       {
         id: "duckduckgo",
         label: "DuckDuckGo",
@@ -452,7 +458,7 @@ export default function Composer({
     [language],
   );
   const activeWebSearchProviderLabel =
-    webSearchProviderOptions.find((item) => item.id === webSearchProvider)?.label || "DuckDuckGo";
+    webSearchProviderOptions.find((item) => item.id === webSearchProvider)?.label || "Yahoo";
   const webSearchButtonTitle = webSearchEnabled
     ? `${language === "en" ? "Web search enabled" : "网络搜索已开启"}: ${activeWebSearchProviderLabel}`
     : "开启后允许模型在网络上搜索答案";
@@ -460,14 +466,14 @@ export default function Composer({
     return resolveComposerIntentSuggestion({
       input: draftInput,
       language: language === "en" ? "en" : "zh",
-      mainModeKey: selectedMainModeKey,
+      mainModeKey: "main_mode",
       lockedComposerIntent,
       dismissedSuggestedIntentKey,
       hasPlanArtifacts: planTasks.length > 0 || planStage !== "idle",
       planStage,
       isPlanApproved,
     });
-  }, [dismissedSuggestedIntentKey, draftInput, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, selectedMainModeKey]);
+  }, [dismissedSuggestedIntentKey, draftInput, isPlanApproved, language, lockedComposerIntent, planStage, planTasks.length, "main_mode"]);
   const suggestedComposerIntent = composerIntentSuggestion?.intent ?? null;
   const explicitComposerIntent = composerIntentSuggestion?.explicitIntent ?? null;
   const composerIntentSuggestionKind = composerIntentSuggestion?.kind ?? null;
@@ -486,79 +492,6 @@ export default function Composer({
   const lockedComposerIntentCategoryLabel = lockedComposerIntent
     ? getRunIntentCategoryLabel(lockedComposerIntent, language === "en" ? "en" : "zh")
     : null;
-  const imageStudioAspectOptions = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9", "9:21", "9:7", "7:9"] as const;
-  const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
-  const isLocalImageEngine = imageStudio.config.provider === "local_image_service";
-  const imageStudioSupportsReferenceImages = imageStudio.status.capabilities?.imageToImage === true;
-  const imageStudioLocalFamilyLabel = imageStudio.config.local.serviceFamily === "ollama"
-    ? "Ollama"
-    : imageStudio.config.local.serviceFamily === "omlx"
-    ? "OMLX"
-    : (language === "en" ? "OpenAI-compatible" : "OpenAI 兼容");
-  const imageStudioProviderLabel = isWebFallbackImageEngine
-    ? (language === "en" ? "HiDream Web" : "HiDream 网页")
-    : (language === "en" ? "Local Image Service" : "本地图片服务");
-  const imageStudioProviderDetail = isWebFallbackImageEngine
-    ? (language === "en" ? "Hosted fallback inside Image Studio" : "图像工作室内置托管 fallback")
-    : `${imageStudioLocalFamilyLabel} · ${imageStudio.status.activeModel || imageStudio.config.local.model || imageStudio.config.local.endpoint}`;
-
-  const activeModel = imageStudio.status.activeModel || imageStudio.config.local.model || "";
-  const isLocalActiveModelTextLLM = isLocalImageEngine && activeModel !== "" && !isImageModelName(activeModel);
-  const isLocalActiveModelFlux = activeModel.toLowerCase().includes("flux");
-
-  const [cooldownSec, setCooldownSec] = useState(0);
-
-  useEffect(() => {
-    if (!isImageStudioMode || !isWebFallbackImageEngine || !imageStudio.cooldownUntil) {
-      setCooldownSec(0);
-      return;
-    }
-    const interval = setInterval(() => {
-      const remaining = Math.max(0, Math.ceil((imageStudio.cooldownUntil - Date.now()) / 1000));
-      setCooldownSec(remaining);
-      if (remaining === 0) {
-        clearInterval(interval);
-      }
-    }, 200);
-    return () => clearInterval(interval);
-  }, [isImageStudioMode, isWebFallbackImageEngine, imageStudio.cooldownUntil]);
-  const imageStudioStatusLabel = imageStudio.status.state === "ready"
-    ? (language === "en" ? "Ready" : "已就绪")
-    : imageStudio.status.state === "error"
-    ? (language === "en" ? "Error" : "错误")
-    : (language === "en" ? "Setup" : "设置");
-  const imageStudioStatusDotClass = imageStudio.status.state === "ready"
-    ? "bg-emerald-400 shadow-[0_0_5px_#34d399]"
-    : imageStudio.status.state === "error"
-    ? "bg-red-400 shadow-[0_0_5px_#f87171]"
-    : "bg-zinc-500";
-  const imageStudioPanelStyle = isLightTheme
-    ? {
-        borderColor: "var(--accent-subtle-border)",
-        backgroundColor: "#ffffff",
-      }
-    : {
-        borderColor: "var(--accent-subtle-border)",
-        backgroundColor: themeMode === "black" ? "#000000" : "#09090b",
-      };
-  const imageStudioFieldStyle = isLightTheme
-    ? {
-        borderColor: "#d4d4d8",
-        backgroundColor: "#f8fafc",
-        color: "#111827",
-      }
-    : {
-        borderColor: "#27272a",
-        backgroundColor: "#050507",
-        color: "#e4e4e7",
-      };
-  const imageStudioMutedStyle = {
-    color: isLightTheme ? "#52525b" : "#a1a1aa",
-  };
-  const handleCheckImageStudioEngine = useCallback(() => {
-    void checkImageStudioEngine();
-  }, [checkImageStudioEngine]);
-
   // Debounce input for token estimation (300ms)
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedInput(draftInput), 300);
@@ -575,36 +508,8 @@ export default function Composer({
       submitPendingRef.current = false;
     };
   }, []);
-
-  const showReferenceImagesUnavailableNotice = useCallback(() => {
-    setAttachmentNotice(
-      language === "en"
-        ? "This image provider currently supports prompt-only generation. Reference images are hidden until image-to-image is available."
-        : "当前图片 provider 只支持 prompt 生图，参考图入口会在支持 image-to-image 后再显示。",
-    );
-  }, [language]);
-
   useEffect(() => {
-    const previousMode = previousMainModeRef.current;
-    const enteredImageStudio = isImageStudioMode && previousMode !== "image_studio";
-
-    if (enteredImageStudio && imageStudio.status.state !== "ready") {
-      setImageStudioSetupGuideOpen(true);
-    }
-
-    previousMainModeRef.current = selectedMainModeKey;
-  }, [imageStudio.status.state, isImageStudioMode, selectedMainModeKey, setImageStudioSetupGuideOpen]);
-
-  useEffect(() => {
-    if (!currentWorkspace && lockedComposerIntent === "goal") {
-      setLockedComposerIntent(null);
-    }
   }, [currentWorkspace, lockedComposerIntent, setLockedComposerIntent]);
-
-  useEffect(() => {
-    if (isImageStudioMode) setShowMainOnboarding(false);
-  }, [isImageStudioMode]);
-
   useEffect(() => {
     if (!projectInitReview?.workspace) return;
     if (projectInitReview.workspace === currentWorkspace) return;
@@ -681,7 +586,7 @@ export default function Composer({
 
   const filteredSlashItems = useMemo(() => {
     const normalizedQuery = slashQuery.trim().toLowerCase();
-    if (!isMainMode) return [];
+
     return mainIntentShortcuts.filter((item) => {
       if (!normalizedQuery) return true;
       const categoryLabel = getRunIntentCategoryLabel(item.intent, language === "en" ? "en" : "zh");
@@ -690,21 +595,21 @@ export default function Composer({
         .toLowerCase();
       return haystacks.includes(normalizedQuery);
     });
-  }, [isMainMode, language, mainIntentShortcuts, slashQuery]);
+  }, [language, mainIntentShortcuts, slashQuery]);
 
   const projectInitSlashItems = useMemo(() => {
-    if (!isMainMode) return [];
+
     const item = {
       kind: "workspace_command" as const,
-      key: "workspace:init",
-      command: "/init",
-      label: language === "en" ? "Generate / refresh project notes" : "生成／刷新项目说明",
+      key: "workspace:rules",
+      command: language === "en" ? "/rules" : "/规则",
+      label: language === "en" ? "Write project rules" : "编写项目规则",
       description: !currentWorkspace
-        ? (language === "en" ? "Open a workspace before generating AGENTS.md project notes." : "请先打开工作区，再生成 AGENTS.md 项目说明。")
+        ? (language === "en" ? "Open a project to write AGENTS.md rules." : "请先打开项目，再编写 AGENTS.md 规则。")
         : composerRunActive
           ? (language === "en" ? "Available after the current run stops." : "当前执行结束后可用。")
-          : (language === "en" ? "Optional: generate / refresh project notes in AGENTS.md after review. Use /init --refresh to update an existing snapshot." : "可选：生成／刷新项目说明（AGENTS.md），审阅后写入；已有事实快照时使用 /init --refresh 更新。"),
-      aliases: ["init", "initialize", "agents", "project", "notes", "refresh", "初始化", "项目", "说明", "刷新"],
+          : (language === "en" ? "Investigate, choose constraints, then review and save AGENTS.md." : "调查项目、确认约束，审阅并保存 AGENTS.md。"),
+      aliases: ["rules", "agents", "规则", "约束"],
       disabled: !currentWorkspace || composerRunActive,
     };
     const query = slashQuery.trim().toLowerCase();
@@ -713,10 +618,10 @@ export default function Composer({
       .join(" ")
       .toLowerCase();
     return haystack.includes(query) ? [item] : [];
-  }, [composerRunActive, currentWorkspace, isMainMode, language, slashQuery]);
+  }, [composerRunActive, currentWorkspace, language, slashQuery]);
 
   const mainIntentSlashGroups = useMemo(() => {
-    if (!isMainMode || filteredSlashItems.length === 0) return [];
+    if (filteredSlashItems.length === 0) return [];
     const workflowItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "workflow_mode");
     const outputItems = filteredSlashItems.filter((item) => getIntentPolicy(item.intent).uiCategory === "output_style");
     const otherItems = filteredSlashItems.filter((item) => {
@@ -728,17 +633,17 @@ export default function Composer({
       outputItems.length > 0 ? [language === "en" ? "Output Styles" : "输出方式", outputItems] : null,
       otherItems.length > 0 ? [language === "en" ? "Other" : "其他", otherItems] : null,
     ].filter(Boolean);
-  }, [filteredSlashItems, isMainMode, language]);
+  }, [filteredSlashItems, language]);
 
   const visibleMainIntentSlashItems = useMemo(() => {
-    if (!isMainMode) return [];
+
     return mainIntentSlashGroups.flatMap(([, items]) => items.map((item) => ({
       kind: "main_intent" as const,
       key: `intent:${item.intent}`,
       item,
       disabled: false,
     })));
-  }, [isMainMode, mainIntentSlashGroups]);
+  }, [mainIntentSlashGroups]);
 
   const visibleSlashItems = useMemo(() => [
     ...visibleMainIntentSlashItems,
@@ -747,7 +652,7 @@ export default function Composer({
 
   const groupedSlashItems = useMemo(() => {
     const groups = [];
-    if (isMainMode && mainIntentSlashGroups.length > 0) {
+    if (mainIntentSlashGroups.length > 0) {
       groups.push({
         kind: "main_intent",
         heading: language === "en" ? "MAIN Shortcuts" : "MAIN 快捷入口",
@@ -762,7 +667,7 @@ export default function Composer({
         ]),
       });
     }
-    if (isMainMode && projectInitSlashItems.length > 0) {
+    if (projectInitSlashItems.length > 0) {
       const commandGroup = [
         language === "en" ? "Workspace Commands" : "工作区命令",
         projectInitSlashItems,
@@ -778,7 +683,7 @@ export default function Composer({
       }
     }
     return groups;
-  }, [isMainMode, language, mainIntentSlashGroups, projectInitSlashItems]);
+  }, [language, mainIntentSlashGroups, projectInitSlashItems]);
 
   const closeMentionMenu = useCallback(() => {
     setShowMentionMenu(false);
@@ -810,12 +715,6 @@ export default function Composer({
       state.currentSessionId === owner.sessionId && state.skills === owner.skills &&
       state.externalSkillSelections === owner.externalSkillSelections && state.externalSkillSources === owner.externalSkillSources;
   }, []);
-
-  useEffect(() => {
-    closeSkillMenu();
-    setSkillCandidates([]);
-  }, [activeSessionKey, currentWorkspace, currentSessionId, isImageStudioMode, closeSkillMenu]);
-
   useEffect(() => {
     if (!showSkillMenu || !skillMenuOpenRef.current) return;
     const requestId = ++skillLoadRequestIdRef.current;
@@ -864,47 +763,22 @@ export default function Composer({
         }
       }
       if (skillMenuRef.current && !skillMenuRef.current.contains(target) && target !== textareaRef.current) closeSkillMenu();
-      if (showAgentPicker && mainFocusPickerRef.current && !mainFocusPickerRef.current.contains(target)) {
-        setShowAgentPicker(false);
-      }
       if (showWebSearchPanel && webSearchPanelRef.current && !webSearchPanelRef.current.contains(target)) {
         setShowWebSearchPanel(false);
       }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [closeMentionMenu, closeSlashMenu, closeSkillMenu, setShowAgentPicker, showAgentPicker, showWebSearchPanel]);
-
-  useEffect(() => {
-    if (isMainMode) return;
-    closeSlashMenu();
-    setShowMainOnboarding(false);
-  }, [closeSlashMenu, isMainMode]);
+  }, [closeMentionMenu, closeSlashMenu, closeSkillMenu, showWebSearchPanel]);
 
   useEffect(() => {
     setShowMainOnboarding(false);
   }, [activeSessionKey, currentWorkspace]);
-
-  useEffect(() => {
-    if (!isImageStudioMode) return;
-    closeMentionMenu();
-    closeSlashMenu();
-    closeSkillMenu();
-    setShowWebSearchPanel(false);
-    setContextMentions([]);
-    setAttachedFiles([]);
-    setLockedComposerIntent(null);
-  }, [closeMentionMenu, closeSlashMenu, closeSkillMenu, isImageStudioMode, setAttachedFiles, setContextMentions, setLockedComposerIntent]);
-
   // ── Image paste handler ──
   const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
     const imageFiles = getImageFilesFromClipboard(e.nativeEvent);
     if (imageFiles.length === 0) return;
-    if (isImageStudioMode && !imageStudioSupportsReferenceImages) {
-      e.preventDefault();
-      showReferenceImagesUnavailableNotice();
-      return;
-    }
+
 
     // Prevent default paste (image data, not text)
     e.preventDefault();
@@ -916,7 +790,7 @@ export default function Composer({
         console.error("Failed to process pasted image:", err);
       }
     }
-  }, [imageStudioSupportsReferenceImages, isImageStudioMode, showReferenceImagesUnavailableNotice]);
+  }, [  ]);
 
   const buildAttachmentNotice = useCallback((skipped: Array<{ name: string; reason: string }> = []) => {
     if (!skipped.length) return null;
@@ -947,10 +821,7 @@ export default function Composer({
   }, [attachedFiles, setAttachedFiles]);
 
   const handleAttachButtonClick = useCallback(async () => {
-    if (isImageStudioMode && !imageStudioSupportsReferenceImages) {
-      showReferenceImagesUnavailableNotice();
-      return;
-    }
+
     if (!onAttachFile) return;
     const result = await onAttachFile();
     if (!result) return;
@@ -971,21 +842,21 @@ export default function Composer({
   }, [
     addAttachmentDescriptors,
     buildAttachmentNotice,
-    imageStudioSupportsReferenceImages,
-    isImageStudioMode,
+
+
     onAttachFile,
-    showReferenceImagesUnavailableNotice,
+
   ]);
 
   // ── File drag-and-drop handlers ──
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (e.dataTransfer.types.includes("Files")) {
-      if (isImageStudioMode && !imageStudioSupportsReferenceImages) return;
+
       e.preventDefault();
       e.stopPropagation();
       setIsDragOver(true);
     }
-  }, [imageStudioSupportsReferenceImages, isImageStudioMode]);
+  }, [ ]);
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -994,13 +865,7 @@ export default function Composer({
   }, []);
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
-    if (isImageStudioMode && !imageStudioSupportsReferenceImages) {
-      e.preventDefault();
-      e.stopPropagation();
-      setIsDragOver(false);
-      showReferenceImagesUnavailableNotice();
-      return;
-    }
+
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
@@ -1074,14 +939,14 @@ export default function Composer({
     activeSessionKey,
     addAttachmentDescriptors,
     buildAttachmentNotice,
-    imageStudioSupportsReferenceImages,
-    isImageStudioMode,
-    showReferenceImagesUnavailableNotice,
+
+
+
   ]);
 
   // ── Insert @ from the @ button click ──
   const handleAtButtonClick = () => {
-    if (isImageStudioMode) return;
+
     closeSkillMenu();
     const ta = textareaRef.current;
     if (!ta) return;
@@ -1121,10 +986,9 @@ export default function Composer({
     setSlashQuery("");
     setHighlightedSlashIndex(0);
     setShowWebSearchPanel(false);
-    setShowAgentPicker(false);
     slashAnchorRef.current = -1;
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [closeMentionMenu, closeSkillMenu, setShowAgentPicker]);
+  }, [closeMentionMenu, closeSkillMenu, ]);
 
   const dismissMainOnboarding = useCallback(() => {
     setShowMainOnboarding(false);
@@ -1139,93 +1003,38 @@ export default function Composer({
     closeMentionMenu();
     closeSlashMenu();
     setShowWebSearchPanel(false);
-    setShowAgentPicker(false);
     setShowMainOnboarding(true);
-  }, [closeMentionMenu, closeSlashMenu, dismissMainOnboarding, setShowAgentPicker, showMainOnboarding]);
+  }, [closeMentionMenu, closeSlashMenu, dismissMainOnboarding,  showMainOnboarding]);
 
   const closeProjectInitReview = useCallback(() => {
     projectInitRequestIdRef.current += 1;
     setProjectInitReview(null);
+    const draft = useAppStore.getState().rulesDraftReview;
+    if (draft?.documentRef.owner.sessionKey === activeSessionKey && draft.documentRef.documentId === projectInitReview?.documentRef?.documentId) {
+      useAppStore.setState({ rulesDraftReview: null });
+      useAppStore.getState().saveCurrentRuntimeToSession();
+    }
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, []);
+  }, [activeSessionKey, projectInitReview?.documentRef?.documentId]);
 
-  const handleBeginProjectInit = useCallback(async (
-    commandText: string,
-    draftCleanup?: { before: string; after: string },
-  ) => {
-    const command = parseProjectInitCommand(commandText);
-    if (!command) return;
-    if (!currentWorkspace) {
-      window.alert(language === "en" ? "Open a workspace before using /init." : "请先打开工作区，再使用 /init。");
-      return;
-    }
-    if (composerRunActive) {
-      window.alert(language === "en" ? "/init is available after the current run stops." : "请等待当前执行结束后再使用 /init。");
-      return;
-    }
-
-    const capturedWorkspace = currentWorkspace;
-    const requestId = projectInitRequestIdRef.current + 1;
-    projectInitRequestIdRef.current = requestId;
-    closeMentionMenu();
-    closeSlashMenu();
-    setShowMainOnboarding(false);
-    setShowWebSearchPanel(false);
-    setProjectInitReview({
-      phase: "loading",
-      preview: null,
-      errorMessage: null,
-      commandText,
-      workspace: capturedWorkspace,
-    });
+  useEffect(() => {
+    if (!rulesDraftReview || composerRunActive || rulesDraftReview.documentRef.owner.sessionKey !== activeSessionKey || rulesDraftReview.documentRef.owner.sessionEpoch !== knowledgeSessionEpoch || !currentWorkspace) return;
     try {
-      const preview = await prepareProjectInitPreview({
-        command: commandText,
-        workspace: capturedWorkspace,
-        locale: language === "en" ? "en" : "zh",
-        io: projectInitIpcIo,
-      });
-      if (projectInitRequestIdRef.current !== requestId) return;
-      if (useAppStore.getState().currentWorkspace !== capturedWorkspace) {
-        setProjectInitReview({
-          phase: "error",
-          preview,
-          errorMessage: "PROJECT_INIT_WORKSPACE_STALE",
-          commandText,
-          workspace: capturedWorkspace,
-        });
-        return;
-      }
-      setProjectInitReview({
-        phase: "review",
-        preview,
-        errorMessage: null,
-        commandText,
-        workspace: capturedWorkspace,
-      });
-      if (draftCleanup) {
-        setDraftInput((current) => current === draftCleanup.before ? draftCleanup.after : current);
-        const latest = useAppStore.getState();
-        if (latest.input === draftCleanup.before) {
-          setStoreInput(draftCleanup.after, { preserveLockedComposerIntent: true });
-        }
-      }
+      setProjectInitReview({ phase: "review", preview: buildProjectRulesPreview(rulesDraftReview.inspection, rulesDraftReview.markdown, language === "en" ? "en" : "zh"),
+        errorMessage: null, commandText: language === "en" ? "/rules" : "/规则", workspace: currentWorkspace, documentRef: rulesDraftReview.documentRef });
     } catch (error) {
-      if (projectInitRequestIdRef.current !== requestId) return;
-      setProjectInitReview({
-        phase: "error",
-        preview: null,
-        errorMessage: error instanceof Error ? error.message : String(error),
-        commandText,
-        workspace: capturedWorkspace,
-      });
+      setProjectInitReview({ phase: "error", preview: null, errorMessage: error instanceof Error ? error.message : String(error), commandText: "/规则", workspace: currentWorkspace });
     }
-  }, [closeMentionMenu, closeSlashMenu, composerRunActive, currentWorkspace, language, setStoreInput]);
+  }, [rulesDraftReview?.documentRef.documentId, rulesDraftReview?.documentRef.revision, composerRunActive, activeSessionKey, knowledgeSessionEpoch, currentWorkspace, language]);
 
-  const handleRegenerateProjectInit = useCallback(() => {
-    if (!projectInitReview) return;
-    void handleBeginProjectInit(projectInitReview.commandText);
-  }, [handleBeginProjectInit, projectInitReview]);
+  const handleRegenerateProjectInit = useCallback(async () => {
+    if (composerRunActive || !currentWorkspace) return;
+    const accepted = await onSendMessage(language === "en" ? "/rules" : "/规则", undefined, {
+      workspaceComposerIntentSnapshot: { mainModeKey: "main_mode", lockedComposerIntent: "plan", subagentPreference: preferSubagents ? "preferred" : "unspecified" },
+      workspaceSubmissionPayloadSnapshot: { contextMentions: [], attachedFiles: [], knowledgeReferences: [] },
+    });
+    if (accepted) closeProjectInitReview();
+  }, [composerRunActive, currentWorkspace, onSendMessage, language, preferSubagents, closeProjectInitReview]);
 
   const handleConfirmProjectInit = useCallback(async () => {
     const review = projectInitReview;
@@ -1279,6 +1088,8 @@ export default function Composer({
       }
       if (projectInitRequestIdRef.current !== requestId) return;
       setProjectInitReview({ ...review, phase: "success", errorMessage: null });
+      if (useAppStore.getState().rulesDraftReview?.documentRef.documentId === review.documentRef?.documentId) useAppStore.setState({ rulesDraftReview: null });
+      useAppStore.getState().saveCurrentRuntimeToSession();
     } catch (error) {
       if (projectInitRequestIdRef.current !== requestId) return;
       setProjectInitReview({
@@ -1292,7 +1103,7 @@ export default function Composer({
   }, [bumpWorkspaceContentVersion, composerRunActive, language, projectInitReview, refreshInstructionAndHookState]);
 
   const handleSelectMainIntentShortcut = (item) => {
-    const parsed = parseMainIntentShortcutForMode(draftInput, selectedMainModeKey);
+    const parsed = parseMainIntentShortcutForMode(draftInput, "main_mode");
     const slashAnchor = slashAnchorRef.current;
     const nextInput = slashAnchor >= 0
       ? removeSlashSessionToken(draftInput, slashAnchor)
@@ -1300,15 +1111,9 @@ export default function Composer({
       ? parsed.rest.trimStart()
       : draftInput.replace(/^\s*\/[^\s]*\s*/, "");
     closeSlashMenu();
-    if (item.intent === "image_studio") {
-      const finalInput = `${item.command} ${nextInput}`;
-      setDraftInput(finalInput);
-      setStoreInput(finalInput, { preserveLockedComposerIntent: true });
-    } else {
-      setDraftInput(nextInput);
-      setStoreInput(nextInput, { preserveLockedComposerIntent: true });
-      setLockedComposerIntent(item.intent);
-    }
+    setLockedComposerIntent(item.intent);
+    setDraftInput(nextInput);
+    setStoreInput(nextInput, { preserveLockedComposerIntent: true });
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
@@ -1322,7 +1127,12 @@ export default function Composer({
         : parseProjectInitCommand(before)
           ? ""
           : before;
-      void handleBeginProjectInit(entry.command, { before, after });
+      const next = `${entry.command}${after.trim() ? ` ${after.trim()}` : " "}`;
+      setDraftInput(next);
+      setStoreInput(next, { preserveLockedComposerIntent: true });
+      setLockedComposerIntent(null);
+      closeSlashMenu();
+      requestAnimationFrame(() => textareaRef.current?.focus());
       return;
     }
     handleSelectMainIntentShortcut(entry.item);
@@ -1366,14 +1176,13 @@ export default function Composer({
     const imagesToSend = [...pendingImages];
     const contextMentionsToSend = [...contextMentions];
     const attachedFilesToSend = attachedFiles.map((file) => normalizeAttachedFile(file));
+    const knowledgeToSend = knowledgeReferences.map(reference => ({ ...reference }));
+    const knowledgeOwnerToSend = knowledgeOwnerKey;
     const lockedIntentToConsume = lockedComposerIntent;
-    if (parseProjectInitCommand(textToSend)) {
-      if (submitPendingRef.current) return;
-      await handleBeginProjectInit(textToSend, { before: textToSend, after: "" });
-      return;
-    }
+    if (parseProjectInitCommand(textToSend) && !currentWorkspace) { setAttachmentNotice(language === "en" ? "Open a project to write AGENTS.md rules." : "请先打开项目，再编写 AGENTS.md 规则。"); return; }
     const hasPayload =
       textToSend.trim().length > 0 ||
+      knowledgeToSend.length > 0 ||
       contextMentions.length > 0 ||
       attachedFiles.length > 0 ||
       imagesToSend.length > 0;
@@ -1381,31 +1190,22 @@ export default function Composer({
     if (!hasPayload || submitPendingRef.current) {
       return;
     }
-
-    const explicitIntent = parseMainIntentShortcutForMode(textToSend, selectedMainModeKey)?.intent;
-    if (!currentWorkspace && (lockedComposerIntent === "goal" || explicitIntent === "goal")) {
-      window.alert(
-        language === "en"
-          ? "Goal mode needs a workspace so its runtime state can be saved and deleted safely. Open a workspace first."
-          : "Goal 模式需要工作区来安全保存和删除运行状态，请先打开一个工作区。",
-      );
-      return;
-    }
-
     submitPendingRef.current = true;
     setIsSubmitPending(true);
     closeSlashMenu();
     closeSkillMenu();
+    setKnowledgeSession(null);
     try {
       const accepted = await Promise.resolve(onSendMessage(textToSend, imagesToSend, {
         workspaceComposerIntentSnapshot: {
-          mainModeKey: selectedMainModeKey,
+          mainModeKey: "main_mode",
           lockedComposerIntent: lockedIntentToConsume,
           subagentPreference: preferSubagents ? "preferred" : "unspecified",
         },
         workspaceSubmissionPayloadSnapshot: {
           contextMentions: contextMentionsToSend,
           attachedFiles: attachedFilesToSend,
+          knowledgeReferences: knowledgeToSend,
         },
       }));
       if (accepted !== true) {
@@ -1413,6 +1213,8 @@ export default function Composer({
       }
 
       setDraftInput((currentDraft) => currentDraft === textToSend ? "" : currentDraft);
+      setKnowledgeReferences(current => knowledgeOwnerRef.current === knowledgeOwnerToSend &&
+        JSON.stringify(current) === JSON.stringify(knowledgeToSend) ? [] : current);
 
       const latestState = useAppStore.getState();
       // A locked intent is a one-shot capability owned by this exact accepted
@@ -1424,14 +1226,6 @@ export default function Composer({
       ) {
         setLockedComposerIntent(null);
       }
-      if (latestState.input === textToSend) {
-        if (lockedIntentToConsume === "goal") {
-          setStoreInput("", { preserveLockedComposerIntent: true });
-        } else {
-          setStoreInput("", { preserveLockedComposerIntent: true });
-        }
-      }
-
       setPendingImages((currentImages) => (
         currentImages.length === imagesToSend.length &&
         currentImages.every((image, index) => image === imagesToSend[index])
@@ -1461,7 +1255,7 @@ export default function Composer({
       submitPendingRef.current = false;
       setIsSubmitPending(false);
     }
-  }, [attachedFiles, closeSlashMenu, closeSkillMenu, contextMentions, currentWorkspace, draftInput, handleBeginProjectInit, language, lockedComposerIntent, onSendMessage, pendingImages, preferSubagents, selectedMainModeKey, setLockedComposerIntent, setStoreInput]);
+  }, [attachedFiles, closeSlashMenu, closeSkillMenu, contextMentions, currentWorkspace, draftInput, knowledgeReferences, knowledgeOwnerKey, language, lockedComposerIntent, onSendMessage, pendingImages, preferSubagents, setLockedComposerIntent, setStoreInput]);
 
   const handleGuideCurrentRun = useCallback(() => {
     const guidanceText = draftInput.trim();
@@ -1520,8 +1314,11 @@ export default function Composer({
     }
 
     const cursorPos = e.target.selectionStart ?? value.length;
+    const nextKnowledgeSession = getKnowledgePickerSession(value, cursorPos);
+    setKnowledgeSession(nextKnowledgeSession);
+    if (nextKnowledgeSession) { closeMentionMenu(); closeSlashMenu(); closeSkillMenu(); return; }
     const textBeforeCursor = value.slice(0, cursorPos);
-    const nextSkillSession = isImageStudioMode ? null : getSkillPickerSession(value, cursorPos);
+    const nextSkillSession = getSkillPickerSession(value, cursorPos);
     if (nextSkillSession) {
       if (!skillMenuOpenRef.current) {
         setSkillCandidates([]);
@@ -1538,10 +1335,10 @@ export default function Composer({
     if (showSkillMenu) closeSkillMenu();
     const slashSession = getSlashSession(value, cursorPos);
 
-    if (isMainMode && parseMainDebugShortcut(value)) {
+    if (parseMainDebugShortcut(value)) {
       slashAnchorRef.current = -1;
       closeSlashMenu();
-    } else if (isMainMode && slashSession) {
+    } else if (slashSession) {
       slashAnchorRef.current = slashSession.anchor;
       setSlashQuery(slashSession.query);
       setShowSlashMenu(true);
@@ -1550,7 +1347,7 @@ export default function Composer({
     }
 
     // Find the last @ before cursor
-    const lastAtIndex = isImageStudioMode ? -1 : textBeforeCursor.lastIndexOf("@");
+    const lastAtIndex = textBeforeCursor.lastIndexOf("@");
     if (lastAtIndex !== -1) {
       const charBefore = lastAtIndex > 0 ? textBeforeCursor[lastAtIndex - 1] : " ";
       const textAfterAt = textBeforeCursor.slice(lastAtIndex + 1);
@@ -1576,8 +1373,7 @@ export default function Composer({
 
   const handleSelectSkill = (candidate: SkillPickerCandidate) => {
     const textarea = textareaRef.current;
-    if (!textarea || isImageStudioMode || useAppStore.getState().selectedMainModeKey === "image_studio" ||
-      isComposingRef.current || Date.now() - compositionEndedAtRef.current < 140 ||
+    if (!textarea || false || isComposingRef.current || Date.now() - compositionEndedAtRef.current < 140 ||
       isSkillsLoading || skillPickerError || !skillMenuOpenRef.current ||
       !isCurrentSkillOwner(skillLoadOwnerRef.current) || textarea.selectionStart !== textarea.selectionEnd ||
       !visibleSkillItems.some((item) => item.id === candidate.id && item.insertText === candidate.insertText)) return;
@@ -1645,8 +1441,8 @@ export default function Composer({
     const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean };
     const justFinishedComposition = Date.now() - compositionEndedAtRef.current < 140;
     const isImeKeyInput = isComposingRef.current || nativeEvent.isComposing || e.keyCode === 229 || justFinishedComposition;
+    if (!isImeKeyInput && knowledgePickerRef.current?.handleKeyDown(e)) return;
     if (
-      isMainMode &&
       !activeDiffTask &&
       e.key === "Tab" &&
       e.shiftKey &&
@@ -1724,7 +1520,7 @@ export default function Composer({
         parseProjectInitCommand(draftInput)
       ) {
         e.preventDefault();
-        void handleBeginProjectInit(draftInput, { before: draftInput, after: "" });
+        void handleSubmitComposerMessage();
         return;
       }
       if (e.key === "ArrowDown") {
@@ -1769,11 +1565,9 @@ export default function Composer({
   const displayName = (path: any) => normalizeAttachedFile(path).displayName || String(path).split("/").pop() || String(path);
   const composerPlaceholder = activeDiffTask
     ? "..."
-    : isImageStudioMode
-    ? (language === "en" ? "Describe the image you want to generate..." : "描述你想生成的图片...")
     : language === "en"
-    ? "Describe what you need, or type / for workflows and workspace commands..."
-    : "输入需求，或输入 / 选择工作流、输出方式和工作区命令...";
+          ? "Describe what you need; / for plans or rules, # for references..."
+          : "输入需求，/ 选择计划或规则，# 选择资料...";
 
   // region: Composer 高度同步
   useEffect(() => {
@@ -1806,6 +1600,11 @@ export default function Composer({
           onConfirm={handleConfirmProjectInit}
           onCancel={closeProjectInitReview}
           onRegenerate={handleRegenerateProjectInit}
+          onEditDraft={content => setProjectInitReview(review => {
+            if (!review?.preview || review.phase !== "review") return review;
+            try { return { ...review, preview: updateProjectRulesPreview(review.preview, content), errorMessage: null }; }
+            catch (error) { return { ...review, errorMessage: error instanceof Error ? error.message : String(error) }; }
+          })}
         />
       )}
       <div
@@ -1819,46 +1618,12 @@ export default function Composer({
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
         >
-        {false && showExecutionProgress && (
-          <ExecutionProgressCard
-            tasks={planTasks}
-            stage={planStage === "completed" ? "completed" : planStage === "ready_to_execute" ? "ready" : "executing"}
-          />
-        )}
+
 
         {/* Action Diff Card */}
-        {false && activeDiffTask && (
-          <div className="bg-[#09090b] border border-[#27272a] border-b-0 rounded-t-xl p-3.5 flex flex-col gap-3 z-10 relative">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-[12px] font-semibold text-[#a1a1aa] uppercase tracking-wider pl-1"><IconChevronUpIcon className="w-4 h-4" /> Edited 1 File</div>
-              <div className="flex items-center gap-3">
-                <button onClick={() => handleRejectInline(activeDiffTask.id)} className="text-[#f48771] text-[12px] font-semibold hover:text-red-400 transition-colors px-2 py-1">{t.reject}</button>
-                <button onClick={() => handleAcceptInline(activeDiffTask.id)} className="theme-bg theme-bg-hover text-[12px] font-bold px-4 py-1.5 rounded-md shadow-sm transition-colors">{t.accept}</button>
-              </div>
-            </div>
-            <div className="flex items-center gap-2 pl-1 mb-1">
-              <div className="bg-[#000000] border border-[#27272a] rounded-full w-6 h-6 flex items-center justify-center text-[#a1a1aa]"><IconAt className="w-3.5 h-3.5" /></div>
-              <button onClick={() => setShowDiff(true)} className="bg-[#000000] border border-[#27272a] text-[#e4e4e7] text-[12px] px-3 py-1 rounded-full flex items-center gap-1.5 hover:bg-[#18181b] transition-colors font-mono"><IconCode className="w-3.5 h-3.5" /> {activeDiffTask.target}</button>
-            </div>
-            {/* Auto-approve toggle */}
-            {onToggleAutoApprove && (
-              <div className="pt-2 border-t border-[#27272a] flex items-center gap-2 pl-1">
-                <label className="flex items-center gap-2 cursor-pointer select-none group">
-                  <ToggleSwitch
-                    checked={!!autoApproveTools}
-                    onCheckedChange={onToggleAutoApprove}
-                    aria-label={language === "en" ? "Auto-approve all session commands" : "本次会话内自动允许后续所有命令"}
-                  />
-                  <span className="text-[11px] text-[#71717a] group-hover:text-[#a1a1aa] transition-colors">
-                    本次会话内自动允许后续所有命令 (Auto-approve all)
-                  </span>
-                </label>
-              </div>
-            )}
-          </div>
-        )}
 
-        {showMainOnboarding && isMainMode && (
+
+        {showMainOnboarding && (
           <MainOnboardingPanel
             language={language === "en" ? "en" : "zh"}
             themeMode={themeMode}
@@ -1867,7 +1632,7 @@ export default function Composer({
           />
         )}
 
-        {suggestedComposerIntent && suggestedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !composerRunActive && (
+        {suggestedComposerIntent && suggestedComposerIntentLabel && !activeDiffTask && !composerRunActive && (
           <div className="relative z-30 mb-2 flex justify-center px-3">
             <div className="flex max-w-full items-center justify-between gap-3 rounded-full border border-[#27272a] bg-[#050507] px-3 py-2 text-[11px] text-[#d4d4d8]">
               <span className="truncate">
@@ -1914,7 +1679,7 @@ export default function Composer({
           </div>
         )}
 
-        <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${composerRunActive ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`} style={isImageStudioMode ? imageStudioPanelStyle : undefined}>
+        <div className={`bg-[#09090b] border border-[#27272a] transition-all flex flex-col relative z-20 ${activeDiffTask ? 'rounded-b-xl border-t-0' : 'rounded-xl'} ${composerRunActive ? 'border-[#3f3f46]' : 'focus-within:border-[#3f3f46]'}`} style={undefined}>
 
           {attachmentNotice && (
             <div className="flex items-center justify-between gap-3 px-4 pt-3 text-[11px] text-[#fbbf24]">
@@ -1930,194 +1695,10 @@ export default function Composer({
             </div>
           )}
 
-          {isImageStudioMode && (
-            <div data-testid="image-studio-controls" className="border-b px-3 py-3" style={{ borderColor: isLightTheme ? "#e4e4e7" : "#27272a" }}>
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] text-[var(--accent-light)]">
-                    <IconImageIcon className="h-3.5 w-3.5" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="text-[12px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>
-                      {language === "en" ? "Image Studio" : "图像工作室"}
-                    </div>
-                    <div className="truncate text-[10px]" style={imageStudioMutedStyle}>
-                      {imageStudioProviderLabel} · {imageStudioProviderDetail}
-                    </div>
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleCheckImageStudioEngine}
-                    className="inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[10px] transition-colors hover:bg-[#18181b]"
-                    style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", color: isLightTheme ? "#374151" : "#d4d4d8" }}
-                    title={language === "en" ? "Check image provider" : "检测图片 provider"}
-                  >
-                    <span className={`h-1.5 w-1.5 rounded-full ${imageStudioStatusDotClass}`} />
-                    {imageStudioStatusLabel}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowImageStudioAdvanced((value) => !value)}
-                    className="inline-flex h-7 items-center gap-1.5 rounded-md border px-2.5 text-[10px] transition-colors hover:bg-[#18181b]"
-                    style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", color: isLightTheme ? "#374151" : "#d4d4d8" }}
-                  >
-                    <IconZap className="h-3.5 w-3.5" />
-                    {language === "en" ? (showImageStudioAdvanced ? "Hide Advanced" : "Advanced") : (showImageStudioAdvanced ? "收起高级项" : "高级项")}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setImageStudioSetupGuideOpen(true)}
-                    className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--accent-subtle-border)] px-2.5 text-[10px] font-semibold text-[var(--accent-light)] transition-colors hover:bg-[var(--accent-subtle)]"
-                    title={language === "en" ? "Image Studio setup" : "图像工作室设置"}
-                  >
-                    <IconSettings className="h-3.5 w-3.5" />
-                    {language === "en" ? "Setup" : "设置"}
-                  </button>
-                </div>
-              </div>
 
-              {isLocalActiveModelTextLLM && (
-                <div className="mb-3 rounded-lg border border-[rgba(250,204,21,0.24)] bg-[rgba(250,204,21,0.08)] px-3 py-2 text-[11px] leading-relaxed text-[#facc15]">
-                  {language === "en"
-                    ? "⚠️ The current local model may be a text model instead of an image generation model. Please ensure your service supports image generation."
-                    : "⚠️ 当前本地模型可能是文本模型而非生图模型，请确保您的服务支持生图计算。"}
-                </div>
-              )}
-
-              <div className="grid gap-3 md:grid-cols-[minmax(220px,1.25fr)_minmax(170px,0.75fr)]">
-                <div>
-                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                    {language === "en" ? "Aspect" : "比例"}
-                  </div>
-                  <div className="grid grid-cols-4 gap-1 sm:grid-cols-6">
-                    {imageStudioAspectOptions.map((ratio) => (
-                      <button
-                        key={ratio}
-                        type="button"
-                        onClick={() => setImageStudioConfig({ aspectRatio: ratio })}
-                        className="h-7 rounded-md border text-[10px] font-semibold transition-colors"
-                        style={{
-                          borderColor: imageStudio.config.aspectRatio === ratio ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
-                          backgroundColor: imageStudio.config.aspectRatio === ratio ? "var(--accent-subtle)" : (isLightTheme ? "#f8fafc" : "#050507"),
-                          color: imageStudio.config.aspectRatio === ratio ? (isLightTheme ? "var(--accent-hover)" : "var(--accent-light)") : (isLightTheme ? "#374151" : "#a1a1aa"),
-                        }}
-                      >
-                        {ratio}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>Seed</div>
-                  <div className="grid grid-cols-[auto_1fr] gap-1">
-                    <button
-                      type="button"
-                      onClick={() => setImageStudioConfig({ seedMode: imageStudio.config.seedMode === "fixed" ? "random" : "fixed" })}
-                      className="h-8 rounded-md border px-2 text-[10px] font-semibold transition-colors"
-                      style={{
-                        borderColor: imageStudio.config.seedMode === "fixed" ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
-                        backgroundColor: imageStudio.config.seedMode === "fixed" ? "var(--accent-subtle)" : (isLightTheme ? "#f8fafc" : "#050507"),
-                        color: imageStudio.config.seedMode === "fixed" ? (isLightTheme ? "var(--accent-hover)" : "var(--accent-light)") : (isLightTheme ? "#374151" : "#a1a1aa"),
-                      }}
-                    >
-                      {imageStudio.config.seedMode === "fixed" ? (language === "en" ? "Fixed" : "固定") : (language === "en" ? "Random" : "随机")}
-                    </button>
-                    <input
-                      type="number"
-                      min="0"
-                      max="2147483647"
-                      value={imageStudio.config.seed}
-                      disabled={imageStudio.config.seedMode !== "fixed"}
-                      onChange={(event) => setImageStudioConfig({ seed: Number(event.target.value) })}
-                      className="h-8 min-w-0 rounded-md border px-2 text-[11px] outline-none disabled:opacity-45"
-                      style={imageStudioFieldStyle}
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-3 flex flex-wrap gap-2 text-[10px]" style={imageStudioMutedStyle}>
-                <span className="rounded-md border px-2 py-1" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a" }}>
-                  {isWebFallbackImageEngine ? "HiDream Web" : (language === "en" ? "Local Service" : "本地服务")}
-                </span>
-                <span className="rounded-md border px-2 py-1" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a" }}>
-                  {imageStudio.status.activeModel || imageStudio.config.local.model || (language === "en" ? "Prompt-first" : "Prompt 优先")}
-                </span>
-                <span className="rounded-md border px-2 py-1" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a" }}>
-                  {imageStudioSupportsReferenceImages
-                    ? (language === "en" ? "Ref images on" : "参考图已开启")
-                    : (language === "en" ? "Prompt only" : "仅文本生图")}
-                </span>
-              </div>
-
-              {showImageStudioAdvanced && (
-                <div className="mt-3 grid gap-3 rounded-xl border p-3 md:grid-cols-2" style={{ borderColor: isLightTheme ? "#d4d4d8" : "#27272a", backgroundColor: isLightTheme ? "#f8fafc" : "#050507" }}>
-                  {isWebFallbackImageEngine ? (
-                    <label
-                      className="flex items-center justify-between gap-3 rounded-lg border px-3 py-3 text-left transition-colors"
-                      style={{
-                        borderColor: imageStudio.config.web.promptRefine ? "var(--accent)" : (isLightTheme ? "#d4d4d8" : "#27272a"),
-                        backgroundColor: imageStudio.config.web.promptRefine ? "var(--accent-subtle)" : "transparent",
-                      }}
-                    >
-                      <span>
-                        <span className="block text-[11px] font-semibold" style={{ color: isLightTheme ? "#18181b" : "#f4f4f5" }}>HiDream Web</span>
-                        <span className="mt-1 block text-[10px]" style={imageStudioMutedStyle}>
-                          {language === "en"
-                            ? `Prompt refine ${imageStudio.config.web.promptRefine ? "enabled" : "disabled"}`
-                            : `提示词润色${imageStudio.config.web.promptRefine ? "已开启" : "已关闭"}`}
-                        </span>
-                      </span>
-                      <ToggleSwitch
-                        checked={imageStudio.config.web.promptRefine}
-                        onCheckedChange={(promptRefine) => setImageStudioConfig({ web: { ...imageStudio.config.web, promptRefine } })}
-                        aria-label={language === "en" ? "Prompt refinement" : "提示词润色"}
-                      />
-                    </label>
-                  ) : (
-                    <>
-                      <label className="min-w-0">
-                        <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                          {language === "en" ? "Steps" : "步数"} · {imageStudio.config.steps}
-                        </span>
-                        <input
-                          type="range"
-                          min="1"
-                          max="80"
-                          step="1"
-                          value={imageStudio.config.steps}
-                          onChange={(event) => setImageStudioConfig({ steps: Number(event.target.value) })}
-                          className="w-full accent-[var(--accent)]"
-                        />
-                      </label>
-                      {!isLocalActiveModelFlux && (
-                        <label className="min-w-0">
-                          <span className="mb-1 block text-[10px] font-semibold uppercase tracking-[0.14em]" style={imageStudioMutedStyle}>
-                            CFG · {imageStudio.config.guidanceScale}
-                          </span>
-                          <input
-                            type="range"
-                            min="0"
-                            max="20"
-                            step="0.5"
-                            value={imageStudio.config.guidanceScale}
-                            onChange={(event) => setImageStudioConfig({ guidanceScale: Number(event.target.value) })}
-                            className="w-full accent-[var(--accent)]"
-                          />
-                        </label>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
 
           {/* Attached files tags */}
-          {!isImageStudioMode && attachedFiles.length > 0 && (
+          {attachedFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
               {attachedFiles.map((filePath: any) => (
                 <div key={attachmentIdentity(filePath)} className="flex items-center gap-1.5 bg-[#000000] border border-[var(--accent-subtle-border,#27272a)] text-[var(--accent-light,#a855f7)] text-[11px] font-mono px-2 py-1 rounded-md">
@@ -2129,7 +1710,7 @@ export default function Composer({
           )}
 
           {/* Context mentions (@-mentions) tags */}
-          {!isImageStudioMode && contextMentions.length > 0 && (
+          {contextMentions.length > 0 && (
             <div className={`flex flex-wrap gap-2 px-4 ${attachedFiles.length > 0 ? 'pt-2' : 'pt-3'}`}>
               {contextMentions.map((mention: string) => (
                 <div key={mention} className="flex items-center gap-1.5 bg-[#000000] border border-[#27272a] text-[#e4e4e7] text-[11px] font-mono px-2 py-1 rounded-md">
@@ -2161,6 +1742,12 @@ export default function Composer({
             </div>
           )}
 
+          {knowledgeReferences.length > 0 && <div className="flex flex-wrap gap-2 px-4 pt-2" data-testid="knowledge-selection-chips">
+            {knowledgeReferences.map(reference => <span key={knowledgeReferenceIdentity(reference)} className="inline-flex max-w-full items-center gap-2 rounded-md border px-2 py-1 text-xs" style={{ color: "var(--surface-text)", borderColor: "var(--surface-border)", background: "var(--surface-2)" }}>
+              <span className="truncate"># {reference.label || (reference.kind === "base" ? reference.kbId : reference.sourceId)}</span>
+              <button type="button" aria-label={language === "en" ? "Remove knowledge source" : "移除知识资料"} onClick={() => setKnowledgeReferences(current => current.filter(item => knowledgeReferenceIdentity(item) !== knowledgeReferenceIdentity(reference)))}><IconClose className="h-3 w-3" /></button>
+            </span>)}
+          </div>}
           <div className="relative">
             <textarea
               ref={handleTextareaRef}
@@ -2173,7 +1760,7 @@ export default function Composer({
                 showSkillMenu && !isSkillsLoading && visibleSkillItems[highlightedSkillIndex]
                   ? `main-skill-picker-option-${highlightedSkillIndex}`
                   : showSlashMenu && visibleSlashItems[highlightedSlashIndex]
-                  ? `main-shortcut-option-${visibleSlashItems[highlightedSlashIndex].kind === "workspace_command" ? "init" : visibleSlashItems[highlightedSlashIndex].item.intent}`
+                  ? `main-shortcut-option-${visibleSlashItems[highlightedSlashIndex].kind === "workspace_command" ? "rules" : visibleSlashItems[highlightedSlashIndex].item.intent}`
                   : undefined
               }
               aria-autocomplete={showSkillMenu || showSlashMenu ? "list" : undefined}
@@ -2185,6 +1772,12 @@ export default function Composer({
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
               onSelect={(event) => {
+                if (knowledgeSession) {
+                  const textarea = event.currentTarget;
+                  const current = getKnowledgePickerSession(textarea.value, textarea.selectionStart);
+                  if (!current || textarea.selectionStart !== textarea.selectionEnd || current.anchor !== knowledgeSession.anchor) setKnowledgeSession(null);
+                  else setKnowledgeSession(current);
+                }
                 if (!showSkillMenu) return;
                 const textarea = event.currentTarget;
                 const session = getSkillPickerSession(textarea.value, textarea.selectionStart);
@@ -2200,6 +1793,20 @@ export default function Composer({
               }}
               onPaste={handlePaste}
             />
+
+            <KnowledgePicker ref={knowledgePickerRef} session={knowledgeSession} ownerKey={knowledgeOwnerKey} selected={knowledgeReferences} language={language === "en" ? "en" : "zh"}
+              onClose={() => setKnowledgeSession(null)} onComplete={(references, session) => {
+                const textarea = textareaRef.current;
+                if (!textarea || isComposingRef.current || Date.now() - compositionEndedAtRef.current < 140 || textarea.selectionStart !== textarea.selectionEnd) return;
+                const applied = applyKnowledgePickerSelection(textarea.value, textarea.selectionStart, session);
+                if (!applied) { setKnowledgeSession(null); return; }
+                setKnowledgeReferences(references);
+                setDraftInput(applied.value);
+                setStoreInput(applied.value, { preserveLockedComposerIntent: true });
+                setKnowledgeSession(null);
+                textarea.focus();
+                requestAnimationFrame(() => { if (textareaRef.current === textarea && textarea.value === applied.value) textarea.selectionStart = textarea.selectionEnd = applied.cursor; });
+              }} />
 
             {showSkillMenu && (
               <div
@@ -2309,7 +1916,7 @@ export default function Composer({
               </div>
             )}
 
-            {showSlashMenu && isMainMode && (
+            {showSlashMenu && (
               <div
                 id="main-slash-command-menu"
                 ref={slashMenuRef}
@@ -2350,7 +1957,7 @@ export default function Composer({
                           const displayItem = item.kind === "main_intent" ? item.item : item;
                           const index = visibleSlashItems.findIndex((candidate) => candidate.key === item.key);
                           const isActive = index === highlightedSlashIndex;
-                          const optionId = item.kind === "workspace_command" ? "init" : displayItem.intent;
+                          const optionId = item.kind === "workspace_command" ? "rules" : displayItem.intent;
                           return (
                             <button
                               key={item.key}
@@ -2406,7 +2013,7 @@ export default function Composer({
 
           </div>
 
-          {!isImageStudioMode && (queuedTurnCount > 0 || activeGuidance) && (
+          {(queuedTurnCount > 0 || activeGuidance) && (
             <div className={`border-t px-3 py-2 ${isLightTheme ? "border-[#e4e4e7] bg-[#fafafa]" : "border-[#27272a] bg-[#070709]"}`}>
               {queuedTurnCount > 0 && (
                 <div
@@ -2463,154 +2070,133 @@ export default function Composer({
 
               {/* Context Usage Indicator */}
               <div className="flex items-center gap-1.5 text-[#71717a] font-mono text-[11px] font-semibold select-none">
-                {isImageStudioMode ? (
-                  <div className="flex items-center gap-1.5 ml-0.5" title={language === "en" ? "Image Studio bypasses LLM context and tool execution" : "图像工作室不占用 LLM 上下文，也不进入工具执行"}>
-                    <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-                    <span>{isWebFallbackImageEngine ? "HiDream Web" : `${imageStudio.config.steps} steps`}</span>
-                  </div>
-                ) : activeProfile === "cloud" ? (
-                  <div className="flex items-center gap-1.5 ml-0.5" title={cloudTokenTitle}>
-                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#60a5fa]" />
-                    <span>{cloudTokenLabel}</span>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1.5 ml-0.5" title={`${currentTokens} / ${contextLimit} Tokens`}>
-                    <ContextRing percentage={usagePercent} themeMode={themeMode} />
-                    <span>{usagePercent.toFixed(1)}%</span>
-                  </div>
-                )}
+                {activeProfile === "cloud" ? (
+                                                    <div className="flex items-center gap-1.5 ml-0.5" title={cloudTokenTitle}>
+                                                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#60a5fa]" />
+                                                      <span>{cloudTokenLabel}</span>
+                                                    </div>
+                                                  ) : (
+                                                    <div className="flex items-center gap-1.5 ml-0.5" title={`${currentTokens} / ${contextLimit} Tokens`}>
+                                                      <ContextRing percentage={usagePercent} themeMode={themeMode} />
+                                                      <span>{usagePercent.toFixed(1)}%</span>
+                                                    </div>
+                                                  )}
               </div>
 
               <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
 
-              {/* MAIN mode switcher */}
-              <MainModeSwitcher
-                pickerRef={mainFocusPickerRef}
-                isOpen={showAgentPicker}
-                selectedModeKey={selectedMainModeKey}
-                modeKeys={mainModes}
-                modeLabels={t}
-                modeDescriptions={mainModeDescriptions}
-                switchLabel={t.switchMainMode}
-                themeMode={themeMode}
-                onOpenChange={setShowAgentPicker}
-                onSelect={switchMainModeWithIsolation}
-              />
-
-              <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
-
-              {isMainMode && (
-                <button
-                  ref={helpButtonRef}
-                  type="button"
-                  data-testid="composer-help-button"
-                  onClick={toggleMainOnboarding}
-                  className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 text-[14px] font-semibold transition-all duration-150 ${showMainOnboarding ? "is-active" : ""}`}
-                  title={language === "en" ? "Open the MAIN quick guide" : "打开 MAIN 使用指南"}
-                  aria-label={language === "en" ? "Open the MAIN quick guide" : "打开 MAIN 使用指南"}
-                  aria-controls="main-onboarding-panel"
-                  aria-expanded={showMainOnboarding}
-                >
-                  ?
-                </button>
-              )}
+              {(
+                                              <button
+                                                ref={helpButtonRef}
+                                                type="button"
+                                                data-testid="composer-help-button"
+                                                onClick={toggleMainOnboarding}
+                                                className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 text-[14px] font-semibold transition-all duration-150 ${showMainOnboarding ? "is-active" : ""}`}
+                                                title={language === "en" ? "Open the MAIN quick guide" : "打开 MAIN 使用指南"}
+                                                aria-label={language === "en" ? "Open the MAIN quick guide" : "打开 MAIN 使用指南"}
+                                                aria-controls="main-onboarding-panel"
+                                                aria-expanded={showMainOnboarding}
+                                              >
+                                                ?
+                                              </button>
+                                            )}
 
               {/* @ Mention button — inserts @ and opens the same menu */}
-              {!isImageStudioMode && (
-                <>
-                  <button
-                    onClick={handleAtButtonClick}
-                    className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${showMentionMenu ? "is-active" : ""}`}
-                    title={language === "en" ? "Reference file" : "引用文件"}
-                  >
-                    <IconAt className="w-3.5 h-3.5" />
-                  </button>
+              {(
+                                              <>
+                                                <button
+                                                  onClick={handleAtButtonClick}
+                                                  className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${showMentionMenu ? "is-active" : ""}`}
+                                                  title={language === "en" ? "Reference file" : "引用文件"}
+                                                >
+                                                  <IconAt className="w-3.5 h-3.5" />
+                                                </button>
 
-                  <button
-                    onClick={handleAttachButtonClick}
-                    className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
-                    title={language === "en" ? "Attach file" : "附加文件"}
-                  >
-                    <IconPlus className="w-4 h-4" />
-                  </button>
+                                                <button
+                                                  onClick={handleAttachButtonClick}
+                                                  className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
+                                                  title={language === "en" ? "Attach file" : "附加文件"}
+                                                >
+                                                  <IconPlus className="w-4 h-4" />
+                                                </button>
 
-                  <div className="relative" ref={webSearchPanelRef}>
-                    <button
-                      type="button"
-                      data-testid="composer-web-search-toggle"
-                      onClick={handleToggleWebSearch}
-                      className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${webSearchEnabled ? "is-active" : ""}`}
-                      title={webSearchButtonTitle}
-                      aria-pressed={webSearchEnabled}
-                    >
-                      <IconGlobe className="w-4 h-4" />
-                    </button>
-                    {showWebSearchPanel && (
-                      <div
-                        className={`absolute bottom-[calc(100%+10px)] left-0 z-50 w-[300px] overflow-hidden rounded-xl border shadow-2xl ${
-                          isLightTheme
-                            ? "border-[#d4d4d8] bg-white text-[#18181b] shadow-[0_20px_60px_rgba(15,23,42,0.18)]"
-                            : "border-[#27272a] bg-[#18181b] text-[#f4f4f5] shadow-[0_20px_60px_rgba(0,0,0,0.45)]"
-                        }`}
-                      >
-                        <div className={`border-b px-3 py-2 text-[11px] font-semibold ${isLightTheme ? "border-[#e4e4e7] text-[#52525b]" : "border-[#27272a] text-[#a1a1aa]"}`}>
-                          {language === "en" ? "Web Search" : "网络搜索"}
-                        </div>
-                        <div className="p-1.5">
-                          {webSearchProviderOptions.map((option) => {
-                            const selected = webSearchProvider === option.id;
-                            return (
-                              <button
-                                key={option.id}
-                                type="button"
-                                onClick={() => handleSelectWebSearchProvider(option.id)}
-                                className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors ${
-                                  selected
-                                    ? isLightTheme
-                                      ? "bg-[var(--accent-subtle)] text-[var(--accent-hover)]"
-                                      : "bg-[rgba(255,255,255,0.08)] text-white"
-                                    : isLightTheme
-                                    ? "text-[#374151] hover:bg-[#f4f4f5]"
-                                    : "text-[#d4d4d8] hover:bg-[#27272a]"
-                                }`}
-                              >
-                                <IconGlobe className={`h-4 w-4 ${selected ? "" : "opacity-70"}`} />
-                                <span className="min-w-0 flex-1">
-                                  <span className="block truncate text-[13px] font-semibold">{option.label}</span>
-                                  <span className={`block truncate text-[11px] ${selected ? "opacity-75" : isLightTheme ? "text-[#71717a]" : "text-[#71717a]"}`}>
-                                    {option.detail}
-                                  </span>
-                                </span>
-                                <span className={`text-[11px] ${selected ? "opacity-90" : "opacity-50"}`}>
-                                  {language === "en" ? "Free" : "免费"}
-                                </span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                        <label
-                          className={`flex w-full items-center justify-between gap-3 border-t px-3 py-2 text-left text-[12px] ${
-                            isLightTheme
-                              ? "border-[#e4e4e7] text-[#71717a]"
-                              : "border-[#27272a] text-[#a1a1aa]"
-                          }`}
-                        >
-                          <span>{language === "en" ? "Web Search" : "网络搜索"}</span>
-                          <ToggleSwitch
-                            checked={webSearchEnabled}
-                            onCheckedChange={(enabled) => {
-                              setWebSearchEnabled(enabled);
-                              if (!enabled) setShowWebSearchPanel(false);
-                            }}
-                            aria-label={language === "en" ? "Web Search" : "网络搜索"}
-                          />
-                        </label>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
-              {!isImageStudioMode && onTogglePreferSubagents && (
+                                                <div className="relative" ref={webSearchPanelRef}>
+                                                  <button
+                                                    type="button"
+                                                    data-testid="composer-web-search-toggle"
+                                                    onClick={handleToggleWebSearch}
+                                                    className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 ${webSearchEnabled ? "is-active" : ""}`}
+                                                    title={webSearchButtonTitle}
+                                                    aria-pressed={webSearchEnabled}
+                                                  >
+                                                    <IconGlobe className="w-4 h-4" />
+                                                  </button>
+                                                  {showWebSearchPanel && (
+                                                    <div
+                                                      className={`absolute bottom-[calc(100%+10px)] left-0 z-50 w-[300px] overflow-hidden rounded-xl border shadow-2xl ${
+                                                        isLightTheme
+                                                          ? "border-[#d4d4d8] bg-white text-[#18181b] shadow-[0_20px_60px_rgba(15,23,42,0.18)]"
+                                                          : "border-[#27272a] bg-[#18181b] text-[#f4f4f5] shadow-[0_20px_60px_rgba(0,0,0,0.45)]"
+                                                      }`}
+                                                    >
+                                                      <div className={`border-b px-3 py-2 text-[11px] font-semibold ${isLightTheme ? "border-[#e4e4e7] text-[#52525b]" : "border-[#27272a] text-[#a1a1aa]"}`}>
+                                                        {language === "en" ? "Web Search" : "网络搜索"}
+                                                      </div>
+                                                      <div className="p-1.5">
+                                                        {webSearchProviderOptions.map((option) => {
+                                                          const selected = webSearchProvider === option.id;
+                                                          return (
+                                                            <button
+                                                              key={option.id}
+                                                              type="button"
+                                                              onClick={() => handleSelectWebSearchProvider(option.id)}
+                                                              className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors ${
+                                                                selected
+                                                                  ? isLightTheme
+                                                                    ? "bg-[var(--accent-subtle)] text-[var(--accent-hover)]"
+                                                                    : "bg-[rgba(255,255,255,0.08)] text-white"
+                                                                  : isLightTheme
+                                                                  ? "text-[#374151] hover:bg-[#f4f4f5]"
+                                                                  : "text-[#d4d4d8] hover:bg-[#27272a]"
+                                                              }`}
+                                                            >
+                                                              <IconGlobe className={`h-4 w-4 ${selected ? "" : "opacity-70"}`} />
+                                                              <span className="min-w-0 flex-1">
+                                                                <span className="block truncate text-[13px] font-semibold">{option.label}</span>
+                                                                <span className={`block truncate text-[11px] ${selected ? "opacity-75" : isLightTheme ? "text-[#71717a]" : "text-[#71717a]"}`}>
+                                                                  {option.detail}
+                                                                </span>
+                                                              </span>
+                                                              <span className={`text-[11px] ${selected ? "opacity-90" : "opacity-50"}`}>
+                                                                {language === "en" ? "Free" : "免费"}
+                                                              </span>
+                                                            </button>
+                                                          );
+                                                        })}
+                                                      </div>
+                                                      <label
+                                                        className={`flex w-full items-center justify-between gap-3 border-t px-3 py-2 text-left text-[12px] ${
+                                                          isLightTheme
+                                                            ? "border-[#e4e4e7] text-[#71717a]"
+                                                            : "border-[#27272a] text-[#a1a1aa]"
+                                                        }`}
+                                                      >
+                                                        <span>{language === "en" ? "Web Search" : "网络搜索"}</span>
+                                                        <ToggleSwitch
+                                                          checked={webSearchEnabled}
+                                                          onCheckedChange={(enabled) => {
+                                                            setWebSearchEnabled(enabled);
+                                                            if (!enabled) setShowWebSearchPanel(false);
+                                                          }}
+                                                          aria-label={language === "en" ? "Web Search" : "网络搜索"}
+                                                        />
+                                                      </label>
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              </>
+                                            )}
+              {onTogglePreferSubagents && (
                 <button
                   type="button"
                   data-testid="composer-subagent-preference-toggle"
@@ -2632,7 +2218,7 @@ export default function Composer({
                   )}
                 </button>
               )}
-              {!isImageStudioMode && onToggleAutoApprove && (
+              {onToggleAutoApprove && (
                 <button
                   type="button"
                   data-testid="composer-auto-review-toggle"
@@ -2645,19 +2231,11 @@ export default function Composer({
                   <IconShield className="h-4 w-4" />
                 </button>
               )}
-              {isImageStudioMode && imageStudioSupportsReferenceImages && (
-                <button
-                  onClick={handleAttachButtonClick}
-                  className="panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150"
-                  title={language === "en" ? "Add reference image" : "添加参考图"}
-                >
-                  <IconImageIcon className="w-3.5 h-3.5" />
-                </button>
-              )}
+
             </div>
 
             <div className="flex items-center gap-2">
-              {lockedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !composerRunActive && (
+              {lockedComposerIntentLabel && !activeDiffTask && !composerRunActive && (
                 <button
                   type="button"
                   onClick={() => setLockedComposerIntent(null)}
@@ -2674,85 +2252,65 @@ export default function Composer({
               {/* Send / Stop button */}
               {!activeDiffTask && (
                 composerRunActive ? (
-                  isImageStudioMode ? (
-                    streamingPrimarySubmitsMessage || composerCanStop ? (
-                      <button
-                        data-testid={streamingPrimarySubmitsMessage ? "composer-send-button" : "composer-stop-button"}
-                        disabled={streamingPrimarySubmitsMessage ? (isSubmitPending || cooldownSec > 0) : false}
-                        onClick={streamingPrimarySubmitsMessage ? handleSubmitComposerMessage : onStopGeneration}
-                        className={`flex h-8 w-8 items-center justify-center rounded-md border shadow-sm transition-colors disabled:opacity-50 ${
-                          streamingPrimarySubmitsMessage
-                            ? "border-[#27272a] bg-[#09090b] text-[#d4d4d8] hover:bg-white hover:text-black"
-                            : "border-[#7f1d1d] bg-[#09090b] text-[#f48771] hover:bg-[#7f1d1d] hover:text-white"
-                        }`}
-                        title={streamingPrimarySubmitsMessage ? concurrentSubmitButtonTitle : (language === "en" ? "Stop current run" : "停止当前执行")}
-                      >
-                        {streamingPrimarySubmitsMessage ? <IconArrowUp className="w-4 h-4" /> : <IconStop className="w-4 h-4" />}
-                      </button>
-                    ) : null
-                  ) : (
-                    <>
-                      {hasDraftPayload && (
-                        <>
-                          {composerGuidanceAvailable && (
-                            <button
-                              type="button"
-                              data-testid="composer-guidance-button"
-                              disabled={!guidanceEligible}
-                              onClick={handleGuideCurrentRun}
-                              className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
-                                isLightTheme
-                                  ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
-                                  : "border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] text-[#bbf7d0] hover:bg-[rgba(16,185,129,0.18)]"
-                              }`}
-                              title={guidanceButtonTitle}
-                            >
-                              <IconZap className="h-3.5 w-3.5" />
-                              {language === "en" ? "Guide" : "引导"}
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            data-testid="composer-queue-button"
-                            disabled={isSubmitPending || cooldownSec > 0}
-                            onClick={handleSubmitComposerMessage}
-                            className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:opacity-50 ${
-                              isLightTheme
-                                ? "border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100"
-                                : "border-[rgba(96,165,250,0.30)] bg-[rgba(37,99,235,0.10)] text-[#bfdbfe] hover:bg-[rgba(37,99,235,0.18)]"
-                            }`}
-                            title={concurrentSubmitButtonTitle}
-                          >
-                            <IconArrowUp className="h-3.5 w-3.5" />
-                            {language === "en" ? "Queue" : "排队"}
-                          </button>
-                        </>
-                      )}
-                      {composerCanStop && (
-                        <button
-                          type="button"
-                          data-testid="composer-stop-button"
-                          onClick={onStopGeneration}
-                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[#7f1d1d] bg-[#09090b] text-[#f48771] shadow-sm transition-colors hover:bg-[#7f1d1d] hover:text-white"
-                          title={language === "en" ? "Stop current run" : "停止当前执行"}
-                        >
-                          <IconStop className="h-4 w-4" />
-                        </button>
-                      )}
-                    </>
-                  )
+                  (
+                                                          <>
+                                                            {hasDraftPayload && (
+                                                              <>
+                                                                {composerGuidanceAvailable && (
+                                                                  <button
+                                                                    type="button"
+                                                                    data-testid="composer-guidance-button"
+                                                                    disabled={!guidanceEligible}
+                                                                    onClick={handleGuideCurrentRun}
+                                                                    className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                                                                      isLightTheme
+                                                                        ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
+                                                                        : "border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] text-[#bbf7d0] hover:bg-[rgba(16,185,129,0.18)]"
+                                                                    }`}
+                                                                    title={guidanceButtonTitle}
+                                                                  >
+                                                                    <IconZap className="h-3.5 w-3.5" />
+                                                                    {language === "en" ? "Guide" : "引导"}
+                                                                  </button>
+                                                                )}
+                                                                <button
+                                                                  type="button"
+                                                                  data-testid="composer-queue-button"
+                                                                  disabled={isSubmitPending}
+                                                                  onClick={handleSubmitComposerMessage}
+                                                                  className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:opacity-50 ${
+                                                                    isLightTheme
+                                                                      ? "border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100"
+                                                                      : "border-[rgba(96,165,250,0.30)] bg-[rgba(37,99,235,0.10)] text-[#bfdbfe] hover:bg-[rgba(37,99,235,0.18)]"
+                                                                  }`}
+                                                                  title={concurrentSubmitButtonTitle}
+                                                                >
+                                                                  <IconArrowUp className="h-3.5 w-3.5" />
+                                                                  {language === "en" ? "Queue" : "排队"}
+                                                                </button>
+                                                              </>
+                                                            )}
+                                                            {composerCanStop && (
+                                                              <button
+                                                                type="button"
+                                                                data-testid="composer-stop-button"
+                                                                onClick={onStopGeneration}
+                                                                className="flex h-8 w-8 items-center justify-center rounded-md border border-[#7f1d1d] bg-[#09090b] text-[#f48771] shadow-sm transition-colors hover:bg-[#7f1d1d] hover:text-white"
+                                                                title={language === "en" ? "Stop current run" : "停止当前执行"}
+                                                              >
+                                                                <IconStop className="h-4 w-4" />
+                                                              </button>
+                                                            )}
+                                                          </>
+                                                        )
                 ) : (
                   <button
                     data-testid="composer-send-button"
-                    disabled={isComposerSubmitting || cooldownSec > 0 || (!draftInput.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
+                    disabled={isComposerSubmitting || (!draftInput.trim() && contextMentions.length === 0 && attachedFiles.length === 0 && pendingImages.length === 0)}
                     onClick={handleSubmitComposerMessage}
                     className="bg-[#09090b] border border-[#27272a] text-[#a1a1aa] hover:bg-white hover:text-black w-8 h-8 flex items-center justify-center rounded-md transition-colors disabled:opacity-50 shadow-sm"
                   >
-                    {cooldownSec > 0 ? (
-                      <span className="text-[10px] font-semibold text-amber-500 tabular-nums">{cooldownSec}s</span>
-                    ) : (
-                      <IconArrowUp className="w-4 h-4" />
-                    )}
+                    <IconArrowUp className="w-4 h-4" />
                   </button>
                 )
               )}
@@ -2761,7 +2319,7 @@ export default function Composer({
         </div>
         </div>
       </div>
-      <ImageStudioSetupModal />
+
     </>
   );
 }

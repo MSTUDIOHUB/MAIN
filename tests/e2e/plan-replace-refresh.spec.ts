@@ -40,16 +40,22 @@ test("plan panel refreshes when tasks.md is updated through replace_in_file", as
         if (!event) return null;
         return {
           statuses: event.statuses,
+          approvalRetained: event.approvalRetained,
           artifactIncludesCompletedLine: String(event.artifactContent || "").includes("[x] 保存方案供用户留档（已完成）"),
         };
       }),
     )
     .toEqual({
-      statuses: ["completed", "completed", "in_progress"],
+      // Revising the artifact retires its previous approval/evidence epoch.
+      // Markdown checkboxes alone cannot re-certify completed work.
+      statuses: ["in_progress", "in_progress", "pending"],
+      approvalRetained: false,
       artifactIncludesCompletedLine: true,
     });
 
-  await expect(page.getByText("2/3", { exact: true })).toBeVisible();
+  // The revised artifact is readable immediately, while the retired
+  // approval must no longer present an approved execution-progress card.
+  await expect(page.getByTestId("plan-task-progress")).toHaveCount(0);
   await expect(page.getByText("保存方案供用户留档（已完成）").first()).toBeVisible();
 });
 

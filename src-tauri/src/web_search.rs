@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::time::Duration;
 use url::Url;
 
-const DEFAULT_SEARCH_PROVIDER: &str = "duckduckgo";
+const DEFAULT_SEARCH_PROVIDER: &str = "yahoo";
 const DEFAULT_MAX_RESULTS: usize = 5;
 const MAX_SEARCH_RESULTS: usize = 8;
 const DEFAULT_MAX_CHARS: usize = 12_000;
@@ -235,6 +235,9 @@ fn normalize_provider(provider: Option<&str>) -> String {
         .to_lowercase()
         .as_str()
     {
+        "quark" => "quark".to_string(),
+        "yahoo" => "yahoo".to_string(),
+        "duckduckgo" => "duckduckgo".to_string(),
         "bing" => "bing".to_string(),
         "baidu" => "baidu".to_string(),
         _ => DEFAULT_SEARCH_PROVIDER.to_string(),
@@ -292,14 +295,21 @@ async fn search_provider(provider: &str, query: &str) -> Result<SearchAttempt, S
 
 fn search_url(provider: &str, query: &str) -> String {
     match provider {
+        "quark" => format!("https://quark.sm.cn/s?q={}", encode_query(query)),
+        "yahoo" => format!("https://search.yahoo.com/search?p={}", encode_query(query)),
         "bing" => format!("https://www.bing.com/search?q={}", encode_query(query)),
         "baidu" => format!("https://www.baidu.com/s?wd={}", encode_query(query)),
-        _ => format!("https://duckduckgo.com/html/?q={}", encode_query(query)),
+        _ => format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            encode_query(query)
+        ),
     }
 }
 
 fn parse_search_results(provider: &str, html: &str) -> Vec<WebSearchResultItem> {
     match provider {
+        "quark" => parse_quark_results(html),
+        "yahoo" => parse_yahoo_results(html),
         "duckduckgo" => parse_duckduckgo_results(html),
         "bing" => parse_bing_results(html),
         "baidu" => parse_baidu_results(html),
@@ -309,6 +319,8 @@ fn parse_search_results(provider: &str, html: &str) -> Vec<WebSearchResultItem> 
 
 fn fallback_providers(provider: &str) -> Vec<&'static str> {
     match provider {
+        "quark" => vec!["yahoo", "duckduckgo", "bing"],
+        "yahoo" => vec!["quark", "duckduckgo", "bing"],
         "baidu" => vec!["duckduckgo", "bing"],
         "duckduckgo" => vec!["bing"],
         "bing" => vec!["duckduckgo"],
@@ -634,25 +646,149 @@ fn normalize_bing_url(raw: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-fn parse_baidu_results(html: &str) -> Vec<WebSearchResultItem> {
-    let block_re = Regex::new(
-        r#"(?is)<div[^>]+class=["'][^"']*(?:result|c-container)[^"']*["'][^>]*>(.*?)</div>"#,
-    )
-    .unwrap();
+fn parse_yahoo_results(html: &str) -> Vec<WebSearchResultItem> {
+    let block_re = Regex::new(r"(?is)<li\b[^>]*>(.*?)</li>").unwrap();
+    let organic_re = Regex::new(r#"(?is)class=["'][^"']*\balgo-sr\b[^"']*["']"#).unwrap();
     let link_re = Regex::new(r#"(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
-    let content_re = Regex::new(r#"(?is)<div[^>]+class=["'][^"']*(?:c-abstract|content-right|result-desc)[^"']*["'][^>]*>(.*?)</div>"#).unwrap();
+    let heading_re = Regex::new(r"(?is)<h3\b[^>]*>(.*?)</h3>").unwrap();
+    let snippet_re =
+        Regex::new(r#"(?is)<div[^>]+class=["'][^"']*\bcompText\b[^"']*["'][^>]*>(.*?)</div>"#)
+            .unwrap();
     block_re
         .captures_iter(html)
         .filter_map(|caps| {
             let block = caps.get(1)?.as_str();
-            let link = link_re.captures(block)?;
-            let url = cleanup_url(link.get(1)?.as_str());
-            let title = cleanup_html_fragment(link.get(2)?.as_str());
-            if title.is_empty() || url.is_empty() {
+            if !organic_re.is_match(block) {
                 return None;
             }
-            let snippet = content_re
+            // The title anchor also contains the site's name and breadcrumb.
+            // Extract its h3 rather than treating the entire anchor as a title.
+            let (url, heading) = link_re.captures_iter(block).find_map(|link| {
+                let heading = heading_re.captures(link.get(2)?.as_str())?;
+                Some((
+                    normalize_yahoo_url(link.get(1)?.as_str())?,
+                    cleanup_html_fragment(heading.get(1)?.as_str()),
+                ))
+            })?;
+            if heading.is_empty() {
+                return None;
+            }
+            let snippet = snippet_re
                 .captures(block)
+                .and_then(|m| m.get(1).map(|v| cleanup_html_fragment(v.as_str())))
+                .unwrap_or_default();
+            Some(WebSearchResultItem {
+                title: heading,
+                url,
+                snippet,
+                source: "Yahoo".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_yahoo_url(raw: &str) -> Option<String> {
+    let mut url = validate_http_url(&cleanup_url(raw)).ok()?;
+    if url.host_str() == Some("r.search.yahoo.com") {
+        let encoded = url
+            .path_segments()?
+            .find_map(|segment| segment.strip_prefix("RU="))?;
+        // RU is a percent-encoded path segment, not form data. Preserve any
+        // literal plus and decode exactly once so target query escapes survive.
+        let form = format!("url={}", encoded.replace('+', "%2B"));
+        let target = url::form_urlencoded::parse(form.as_bytes())
+            .next()?
+            .1
+            .into_owned();
+        url = validate_http_url(&target).ok()?;
+    }
+    Some(url.to_string())
+}
+
+fn parse_quark_results(html: &str) -> Vec<WebSearchResultItem> {
+    let link_re = Regex::new(r#"(?is)<a\b[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
+    let title_re = Regex::new(r#"(?is)<(?:div|span)\b[^>]+class=["'](?:[^"']*\s)?qk-title-text(?:\s[^"']*)?["'][^>]*>(.*?)</(?:div|span)>"#).unwrap();
+    let summary_re = Regex::new(r#"(?is)<(?:div|span)\b[^>]+class=["'](?:[^"']*\s)?qk-paragraph-text(?:\s[^"']*)?["'][^>]*>(.*?)</(?:div|span)>"#).unwrap();
+    let links = link_re.captures_iter(html).collect::<Vec<_>>();
+    let mut seen = std::collections::HashSet::new();
+    links
+        .iter()
+        .enumerate()
+        .filter_map(|(index, link)| {
+            let body = link.get(2)?.as_str();
+            let title = cleanup_html_fragment(title_re.captures(body)?.get(1)?.as_str());
+            let url = normalize_quark_url(link.get(1)?.as_str())?;
+            if title.is_empty() || !seen.insert(url.clone()) {
+                return None;
+            }
+            // Some SSR cards put the title and summary in separate anchors.
+            // Only accept a summary with the same destination before the next title.
+            let snippet = links[index..]
+                .iter()
+                .enumerate()
+                .take_while(|(offset, next)| {
+                    *offset == 0 || !title_re.is_match(next.get(2).unwrap().as_str())
+                })
+                .find_map(|(_, next)| {
+                    if normalize_quark_url(next.get(1)?.as_str()).as_deref() != Some(url.as_str()) {
+                        return None;
+                    }
+                    summary_re
+                        .captures(next.get(2)?.as_str())
+                        .and_then(|summary| summary.get(1))
+                        .map(|summary| cleanup_html_fragment(summary.as_str()))
+                })
+                .unwrap_or_default();
+            Some(WebSearchResultItem {
+                title,
+                url,
+                snippet,
+                source: "Quark".to_string(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_quark_url(raw: &str) -> Option<String> {
+    let url = validate_http_url(&cleanup_url(raw)).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "sm.cn" || host.ends_with(".sm.cn") || host == "so.quark.cn" {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+fn parse_baidu_results(html: &str) -> Vec<WebSearchResultItem> {
+    let heading_re = Regex::new(r"(?is)<h3\b[^>]*>(.*?)</h3>").unwrap();
+    let link_re = Regex::new(r#"(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
+    let content_re = Regex::new(r#"(?is)<div[^>]+class=["'][^"']*(?:c-abstract|content-right|result-desc)[^"']*["'][^>]*>(.*?)</div>"#).unwrap();
+    let summary_re =
+        Regex::new(r#"(?is)<span[^>]+class=["'][^"']*summary-text[^"']*["'][^>]*>(.*?)</span>"#)
+            .unwrap();
+    // Result cards contain nested divs, while navigation also uses `result-*`
+    // classes. Start at the result's heading rather than its first div/anchor.
+    let headings = heading_re.captures_iter(html).collect::<Vec<_>>();
+    headings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, caps)| {
+            let heading = caps.get(0)?;
+            let link = link_re.captures(caps.get(1)?.as_str())?;
+            let url = validate_http_url(&cleanup_url(link.get(1)?.as_str()))
+                .ok()?
+                .to_string();
+            let title = cleanup_html_fragment(link.get(2)?.as_str());
+            if title.is_empty() {
+                return None;
+            }
+            let end = headings
+                .get(index + 1)
+                .and_then(|next| next.get(0))
+                .map_or(html.len(), |next| next.start());
+            let body = &html[heading.end()..end];
+            let snippet = summary_re
+                .captures(body)
+                .or_else(|| content_re.captures(body))
                 .and_then(|m| m.get(1).map(|v| cleanup_html_fragment(v.as_str())))
                 .unwrap_or_default();
             Some(WebSearchResultItem {
@@ -1051,9 +1187,64 @@ mod tests {
     }
 
     #[test]
+    fn quark_parses_ssr_titles_and_matching_summaries_without_ads_or_navigation() {
+        let html = r#"
+          <a href="https://quark.sm.cn/s?q=fund"><div class="qk-title-text">Search navigation</div></a>
+          <a href="https://quark.sm.cn/adclick?disguise_click_url=ad"><div class="qk-title-text">Advertisement</div></a>
+          <a class="qk-link-wrapper" href="https://example.com/fund" data-log="1">
+            <div class="qk-title-text-wrapper"><div class="qk-title-text qk-font-bold">Fund <em>020629</em></div></div>
+            <div class="qk-paragraph-text">Current <em>fund</em> value</div>
+          </a>
+          <a class="qk-link-wrapper" href="https://example.com/fund">Example source</a>
+          <a href="https://example.com/history"><div class="qk-title-text">Historical values</div></a>
+          <a href="https://example.com/unrelated"><div class="qk-paragraph-text">Wrong source summary</div></a>
+          <a href="https://example.com/history"><div class="qk-paragraph-text">Previous values</div></a>
+          <a href="https://www.quark.cn/documents/help/get-started"><div class="qk-title-text">Official product documentation</div></a>
+          <a href="javascript:alert(1)"><div class="qk-title-text">Invalid link</div></a>
+          <a href="https://example.com/empty"><div class="qk-title-text-wrapper">Only a wrapper</div></a>
+        "#;
+        let results = parse_search_results("quark", html);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].title, "Fund 020629");
+        assert_eq!(results[0].url, "https://example.com/fund");
+        assert_eq!(results[0].snippet, "Current fund value");
+        assert_eq!(results[0].source, "Quark");
+        assert_eq!(results[1].title, "Historical values");
+        assert_eq!(results[1].snippet, "Previous values");
+        assert_eq!(
+            results[2].url,
+            "https://www.quark.cn/documents/help/get-started"
+        );
+    }
+
+    #[test]
+    fn baidu_uses_result_headings_and_excludes_navigation_and_logo_links() {
+        let html = r#"
+          <div class="result-tabs"><a href="https://chat.baidu.com/search">Chat</a></div>
+          <div class="result c-container">
+            <a href="https://example.com/logo">Example logo</a>
+            <div class="title-wrapper"><h3 class="t"><a href="https://example.com/fund">Fund <em>020629</em></a></h3></div>
+            <div data-module="abstract"><div><span class="summary-text_abc">Current <em>fund</em> value</span></div></div>
+          </div>
+          <div class="result c-container"><h3><a href="javascript:alert(1)">Invalid link</a></h3></div>
+          <div class="result c-container"><h3><a href="https://example.com/history">Historical values</a></h3>
+            <div class="c-abstract">Previous values</div>
+          </div>
+          <div class="result-pagination"><a href="/s?pn=10">Next page</a></div>
+        "#;
+        let results = parse_baidu_results(html);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Fund 020629");
+        assert_eq!(results[0].url, "https://example.com/fund");
+        assert_eq!(results[0].snippet, "Current fund value");
+        assert_eq!(results[1].title, "Historical values");
+        assert_eq!(results[1].snippet, "Previous values");
+    }
+
+    #[test]
     fn empty_selected_provider_pages_return_failure_without_fallback() {
         let html = r#"<html><head><title>Search results</title></head><body><main><p>No matching documents.</p></main></body></html>"#;
-        for provider in ["bing", "duckduckgo", "baidu"] {
+        for provider in ["quark", "yahoo", "bing", "duckduckgo", "baidu"] {
             let attempt = SearchAttempt {
                 provider: provider.to_string(),
                 source_url: search_url(provider, "missing result"),
@@ -1229,10 +1420,14 @@ mod tests {
 
     #[test]
     fn normalizes_search_provider() {
+        assert_eq!(normalize_provider(None), "yahoo");
+        assert_eq!(normalize_provider(Some("QUARK")), "quark");
+        assert_eq!(normalize_provider(Some("yahoo")), "yahoo");
+        assert_eq!(normalize_provider(Some("duckduckgo")), "duckduckgo");
         assert_eq!(normalize_provider(Some("BING")), "bing");
-        assert_eq!(normalize_provider(Some("reader")), "duckduckgo");
-        assert_eq!(normalize_provider(Some("jina")), "duckduckgo");
-        assert_eq!(normalize_provider(Some("google")), "duckduckgo");
+        assert_eq!(normalize_provider(Some("reader")), "yahoo");
+        assert_eq!(normalize_provider(Some("jina")), "yahoo");
+        assert_eq!(normalize_provider(Some("google")), "yahoo");
     }
 
     #[test]
@@ -1261,6 +1456,59 @@ mod tests {
         assert!(links.contains(
             &Url::parse("https://docs.unity3d.com/ScriptReference/GameObject.html").unwrap()
         ));
+    }
+
+    #[test]
+    fn yahoo_extracts_organic_titles_snippets_and_decoded_destinations() {
+        let html = r#"
+          <li><a href="https://search.yahoo.com/news"><h3>Navigation</h3></a></li>
+          <li><div class="dd fst algo algo-sr relsrch Sr">
+            <a href="https://example.com/logo">Site logo</a>
+            <div class="compTitle options-toggle"><a href="https://r.search.yahoo.com/_ylt=tracking/RV=2/RU=https%3a%2f%2ffund.eastmoney.com%2f020629.html/RK=2/RS=tracking">
+              <div>Eastmoney fund.eastmoney.com &gt; 020629</div>
+              <h3 class="title"><span>汇添富科创芯片ETF联接C <b>(020629)</b></span></h3>
+            </a></div>
+            <div class="compText aAbs"><p>Current <b>fund</b> value &amp; history</p></div>
+          </div></li>
+          <li><div class="dd lst algo algo-sr relsrch Sr">
+            <div class="compTitle"><a href="https://docs.rs/tokio/latest/tokio/time/fn.timeout.html"><h3>timeout in tokio::time - Rust</h3></a></div>
+            <div class="compText aAbs"><p>Requires a Future to complete before the deadline.</p></div>
+          </div></li>
+          <li><div class="algo-sr"><a href="javascript:alert(1)"><h3>Invalid target</h3></a></div></li>
+          <li><div class="algo-sr"><a href="https://r.search.yahoo.com/RV=2/RK=2"><h3>Unresolved tracking</h3></a></div></li>
+        "#;
+        let results = parse_yahoo_results(html);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "汇添富科创芯片ETF联接C (020629)");
+        assert_eq!(results[0].url, "https://fund.eastmoney.com/020629.html");
+        assert_eq!(results[0].snippet, "Current fund value & history");
+        assert_eq!(results[0].source, "Yahoo");
+        assert_eq!(results[1].title, "timeout in tokio::time - Rust");
+        assert_eq!(
+            results[1].url,
+            "https://docs.rs/tokio/latest/tokio/time/fn.timeout.html"
+        );
+        assert_eq!(
+            results[1].snippet,
+            "Requires a Future to complete before the deadline."
+        );
+    }
+
+    #[test]
+    fn yahoo_decodes_redirects_once_without_corrupting_target_queries() {
+        assert_eq!(
+            normalize_yahoo_url("https://r.search.yahoo.com/RU=https%3A%2F%2Fexample.com%2Fpath%2Ba%3Fq%3Da%252Fb%26x%3D1/RK=2").as_deref(),
+            Some("https://example.com/path+a?q=a%2Fb&x=1")
+        );
+        assert_eq!(
+            normalize_yahoo_url("https://example.com/path?a=1&amp;b=2").as_deref(),
+            Some("https://example.com/path?a=1&b=2")
+        );
+        assert!(normalize_yahoo_url(
+            "https://r.search.yahoo.com/RU=javascript%3Aalert%281%29/RK=2"
+        )
+        .is_none());
+        assert!(normalize_yahoo_url("https://r.search.yahoo.com/RU=/RK=2").is_none());
     }
 
     #[test]

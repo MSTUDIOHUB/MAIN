@@ -15,6 +15,11 @@ test("stream error clears the lingering thinking notice", async ({ page }) => {
   const activityNotice = page.getByTestId("turn-activity-notice");
   await expect(activityNotice).toHaveCount(0);
 
+  const failedStep = page.getByTestId("live-turn-step").filter({
+    hasText: "模型服务在传输回复时中断或返回了无法解析的数据。",
+  });
+  await expect(failedStep).toHaveAttribute("data-status", "failed");
+  await failedStep.getByTestId("turn-archive-step-toggle").click();
   const errorCard = page.getByRole("button", { name: /连接中断，回复可能不完整/ });
   await expect(errorCard).toBeVisible();
   await errorCard.click();

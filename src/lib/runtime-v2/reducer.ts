@@ -1,5 +1,6 @@
 import type { RuntimeV2RunState, TurnAggregateV1 } from "./aggregate";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../turnCapabilities";
+import { normalizeUserQuestionnaire, validateUserChoiceAnswer } from "../userQuestions";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2Command, type RuntimeV2CommandReceipt,
@@ -23,6 +24,8 @@ import {
 import {
   appendNovelRuntimeV2Evidence,
   hasMatchingRuntimeV2SealedPlanAuthority,
+  isValidRuntimeV2PlanDraftSourceAdmission,
+  isValidRuntimeV2PlanDraftSourceObservation,
   isValidRuntimeV2SubagentCompletion,
   isValidRuntimeV2SubagentJob,
 } from "./reducerGuards";
@@ -176,6 +179,9 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
     schemaVersion: "turn-aggregate.v1",
     turn: event.turn,
     strategy: event.strategy,
+    ...(event.planPurpose ? { planPurpose: event.planPurpose } : {}),
+    ...(typeof event.workspaceInstructionContext === "string" ? { workspaceInstructionContext: event.workspaceInstructionContext } : {}),
+    ...(event.knowledgeContext ? { knowledgeContext: event.knowledgeContext } : {}),
     ...(event.networkRead ? { networkRead: event.networkRead } : {}),
     ...(event.subagentRequirement
       ? { subagentRequirement: event.subagentRequirement }
@@ -314,6 +320,9 @@ export function tryTransition(
     if (event.type !== "turn.admitted" || event.sequence !== 0 || !isValidTurnIdentity(event.turn)) {
       return rejection(null, "initial_event_required");
     }
+    if ((event.workspaceInstructionContext !== undefined && typeof event.workspaceInstructionContext !== "string") ||
+      (event.planPurpose !== undefined && event.planPurpose !== "plan" && event.planPurpose !== "rules")) return rejection(null, "invalid_event_schema");
+    if (!isValidRuntimeV2PlanDraftSourceAdmission(event)) return rejection(null, "invalid_event_schema");
     return { disposition: "applied", state: createInitialAggregate(event) };
   }
 
@@ -360,6 +369,7 @@ export function tryTransition(
     case "run.wait_ended":
       return { disposition: "applied", state: append(state, event) };
     case "run.paused": {
+      if ((event.blocker.reasonCode === "user_questionnaire") !== !!event.blocker.questionnaire || (event.blocker.questionnaire && !normalizeUserQuestionnaire(event.blocker.questionnaire))) return rejection(state, "invalid_event_schema");
       if (!state.run || state.run.status === "paused" || state.scheduledCommands.length || state.pendingToolCalls.length ||
         !event.blocker.requestId || !event.blocker.options.includes("stop") ||
         (event.blocker.options.includes("continue") && !event.blocker.independentWork?.length) ||
@@ -370,7 +380,11 @@ export function tryTransition(
       const blocker = state.run?.blocker;
       if (state.run?.status !== "paused" || !blocker || blocker.requestId !== event.requestId || blocker.decision || !blocker.options.includes(event.choice)) return rejection(state, "run_not_active");
       if (blocker.clarification && event.choice !== "stop" && !event.reply?.trim()) return rejection(state, "run_not_active");
-      return { disposition: "applied", state: append(state, event, { run: { ...state.run, blocker: { ...blocker, decision: event.choice, ...(event.reply ? { decisionReply: event.reply } : {}) } } }) };
+      if (event.answer && !blocker.questionnaire) return rejection(state, "invalid_event_schema");
+      const checked = blocker.questionnaire && event.choice !== "stop" ? validateUserChoiceAnswer(blocker.questionnaire, event.answer, blocker.requestId) : null;
+      if (checked && !checked.ok) return rejection(state, "invalid_event_schema");
+      const decision = checked?.ok ? { ...event, answer: checked.answer } : event;
+      return { disposition: "applied", state: append(state, decision, { run: { ...state.run, blocker: { ...blocker, decision: event.choice, ...(event.reply ? { decisionReply: event.reply } : {}), ...(decision.answer ? { decisionAnswer: decision.answer } : {}) } } }) };
     }
     case "run.resumed": {
       if (state.run?.status !== "paused" || state.run.blocker?.requestId !== event.requestId || !state.run.blocker.decision || state.run.blocker.decision === "stop") return rejection(state, "run_not_active");
@@ -403,6 +417,8 @@ export function tryTransition(
       };
     }
     case "observation.recorded":
+      if ((event.sourcePlanDraft !== undefined || event.evidence.id === "plan-draft-source") &&
+        !isValidRuntimeV2PlanDraftSourceObservation(state, event)) return rejection(state, "invalid_event_schema");
       return {
         disposition: "applied",
         state: append(state, event, {
@@ -602,19 +618,10 @@ export function tryTransition(
     case "soft_signal.observed":
       return { disposition: "applied", state: append(state, event) };
     case "subagents.scheduled": {
-      const runSubagents = state.subagents.filter((job) =>
-        job.parentRunId === event.run.runId
-      );
-      const activeCount = runSubagents.filter((job) =>
-        job.status === "queued" || job.status === "running").length;
       const maxActiveSubagents = Math.floor(Number(event.maxActiveSubagents) || 0);
       if (
         event.jobs.length === 0 ||
         maxActiveSubagents <= 0 ||
-        runSubagents.length + event.jobs.length >
-          maxActiveSubagents ||
-        activeCount + event.jobs.length >
-          maxActiveSubagents ||
         event.jobs.some((job) =>
           !isValidRuntimeV2SubagentJob(job, event.run)
         )

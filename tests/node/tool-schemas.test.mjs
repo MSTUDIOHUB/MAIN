@@ -327,7 +327,7 @@ test("web search schemas expose free external read tools", () => {
   assert.match(webFetch.function.description, /GitHub/);
 });
 
-test("knowledge base schemas expose local RAG search tools", () => {
+test("knowledge schemas query frozen message scope without allowing model-selected libraries", () => {
   const tools = buildToolDefinitions([]);
   const knowledgeSearch = tools.find((tool) => tool.function.name === "knowledge_search");
   const knowledgeExcerpt = tools.find((tool) => tool.function.name === "knowledge_get_excerpt");
@@ -335,9 +335,13 @@ test("knowledge base schemas expose local RAG search tools", () => {
   assert.ok(knowledgeSearch);
   assert.ok(knowledgeExcerpt);
   assert.deepEqual(knowledgeSearch.function.parameters.required, ["query"]);
-  assert.ok(knowledgeSearch.function.parameters.properties.kb_ids);
+  // Scope moved from model arguments to the explicitly selected Turn payload.
+  assert.deepEqual(Object.keys(knowledgeSearch.function.parameters.properties).sort(), ["limit", "query"]);
+  assert.equal(knowledgeSearch.function.parameters.properties.kb_ids, undefined);
+  assert.equal(knowledgeSearch.function.parameters.properties.references, undefined);
   assert.ok(knowledgeSearch.function.parameters.properties.limit);
   assert.deepEqual(knowledgeExcerpt.function.parameters.required, ["source_id", "chunk_id"]);
+  assert.deepEqual(Object.keys(knowledgeExcerpt.function.parameters.properties).sort(), ["chunk_id", "source_id"]);
 });
 
 test("pty observation schemas expose wait controls", () => {

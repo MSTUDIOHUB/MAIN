@@ -44,6 +44,7 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
 export function runtimeV2ToolDefinitions(
   state?: any,
   skillCatalog?: SkillCatalogSnapshot | null,
+  knowledgeContext?: import("../../lib/knowledgeReferences").KnowledgeContextPacket,
 ): ToolDefinition[] {
   const includeNetwork = state?.webSearchEnabled === true;
   const loadSkillDefinition = buildLoadSkillToolDefinition(skillCatalog);
@@ -54,6 +55,7 @@ export function runtimeV2ToolDefinitions(
   ].filter((definition) => {
     const name = definition.function.name;
     return RUNTIME_V2_CORE_TOOL_NAMES.has(name) ||
+      (!!knowledgeContext?.references.length && knowledgeContext.state !== "stale" && knowledgeContext.state !== "error" && ["knowledge_search", "knowledge_get_excerpt"].includes(name)) ||
       (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
   }).map((definition) => {
     if (definition.function.name === "spawn_subagent") {

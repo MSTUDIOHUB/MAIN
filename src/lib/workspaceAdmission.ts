@@ -97,6 +97,7 @@ export interface ResolveWorkspaceAdmissionInput {
   readonly associatedPaths?: readonly string[];
   readonly userPrompt?: string;
   readonly io: WorkspaceAdmissionIo;
+  readonly includeProjectBaseline?: boolean;
   readonly baselineLimits?: Partial<ProjectBaselineLimits>;
   /** Narrow test/integration seam. Production uses the concrete loaders. */
   readonly loaders?: Partial<WorkspaceAdmissionLoaders>;
@@ -377,7 +378,7 @@ export async function resolveWorkspaceAdmissionSnapshot(
       externalSkillSelections,
       externalSkillSources,
     ),
-    baselineLoader({
+    input.includeProjectBaseline === false ? Promise.resolve(null) : baselineLoader({
       workspace: canonicalWorkspace,
       io: shared.baselineIo,
       ...(input.baselineLimits ? { limits: input.baselineLimits } : {}),

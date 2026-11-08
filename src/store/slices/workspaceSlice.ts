@@ -34,12 +34,11 @@ export function normalizePendingDecisionInputKey(input: string): string {
 
 export function normalizeStoredRightPanelTab(
   value: unknown,
-): "diff" | "terminal" | "plan" | "goal" | "subagents" {
+): "diff" | "terminal" | "plan" | "subagents" {
   if (
     value === "diff" ||
     value === "terminal" ||
     value === "plan" ||
-    value === "goal" ||
     value === "subagents"
   ) {
     return value;

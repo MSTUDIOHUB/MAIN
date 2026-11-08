@@ -55,6 +55,7 @@ export type RuntimeV2Event =
       readonly requestId: string;
       readonly choice: "recheck" | "continue" | "stop";
       readonly reply?: string;
+      readonly answer?: import("../userQuestions").UserChoiceAnswer;
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.resumed";
@@ -63,6 +64,11 @@ export type RuntimeV2Event =
     })
   | (RuntimeV2EventBase & {
       readonly type: "turn.admitted";
+      readonly planPurpose?: "plan" | "rules";
+      /** Exact prior saved draft selected for a new completion Turn; data only. */
+      readonly sourcePlanDraft?: import("../planDrafts").PlanDraftRecord;
+      readonly workspaceInstructionContext?: string;
+      readonly knowledgeContext?: import("../knowledgeReferences").KnowledgeContextPacket;
       readonly networkRead?: import("../networkRead").NetworkReadPolicy;
       readonly turn: RuntimeV2TurnIdentity;
       readonly strategy: RuntimeV2Strategy;
@@ -91,6 +97,8 @@ export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "observation.recorded";
       readonly modelContent?: string;
+      /** Runtime receipt after validating the admitted draft and its saved bytes. */
+      readonly sourcePlanDraft?: import("../planDrafts").PlanDraftRecord;
       readonly run: RuntimeV2RunIdentity;
       readonly evidence: RuntimeV2EvidenceReference;
     })

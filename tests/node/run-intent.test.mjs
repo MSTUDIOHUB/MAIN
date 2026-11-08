@@ -100,11 +100,11 @@ function createContext(overrides = {}) {
 }
 
 test("MAIN mode keys exclude removed modes and migrate old values", () => {
-  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode", "image_studio"]);
+  assert.deepEqual([...MAIN_MODE_KEYS], ["main_mode"]);
   assert.equal(mapLegacyNexusModeToMainMode("task_center"), "main_mode");
   assert.equal(mapLegacyNexusModeToMainMode("game_studio"), "main_mode");
   assert.equal(mapLegacyNexusModeToMainMode("nexus_game_studio"), "main_mode");
-  assert.equal(mapLegacyNexusModeToMainMode("image_studio"), "image_studio");
+  assert.equal(mapLegacyNexusModeToMainMode("image_studio"), "main_mode");
 });
 
 test("plain Chinese planning wording stays natural without slash lock", () => {
@@ -726,11 +726,10 @@ test("MAIN intent shortcuts parse slash command and remaining prompt", () => {
     command: "/计划",
     rest: "帮我设计功能",
   });
-  assert.deepEqual(parseMainIntentShortcut("/分析 check this flow"), {
-    intent: "analyze",
-    command: "/分析",
-    rest: "check this flow",
-  });
+  for (const retired of ["/分析", "/总结", "/报告", "/目标", "/生图", "/draw"]) {
+    assert.equal(parseMainIntentShortcut(`${retired} check this flow`), null);
+  }
+  assert.deepEqual(getMainIntentShortcuts("zh").map(item => item.intent), ["plan"]);
   assert.equal(parseMainIntentShortcut("/setup-engine unity"), null);
 });
 

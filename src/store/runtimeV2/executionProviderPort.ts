@@ -1,3 +1,4 @@
+import { runtimeV2ProviderOmittedKnowledgeCanReplay } from "./providerReadReceipts";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
@@ -317,6 +318,15 @@ export function createRuntimeV2ProviderPort(
           const rejectedIdentities = new Set(
             providerEffectFacts.rejectedActionIdentities,
           );
+          const knowledgeReadShare = Math.floor((input.context.runtimeContextBudget?.readWindowChars ?? 12_000) / runtimeV2ParallelReadCount(schedulingCalls));
+          for (const call of schedulingCalls) {
+            if (runtimeV2ProviderOmittedKnowledgeCanReplay(call, input.live.messages,
+              input.context.knowledgeContext?.references || [], knowledgeReadShare)) {
+              const identity = runtimeV2ProviderToolCallIdentity(call);
+              completedIdentities.delete(identity);
+              rejectedIdentities.delete(identity);
+            }
+          }
           for (const call of schedulingCalls) {
             if (
               coveredReadReceipts.has(
@@ -345,12 +355,10 @@ export function createRuntimeV2ProviderPort(
             rejectedIdentities,
             {
               allowMixedObservationShellBatch: true,
-              maxSpawnSubagents: Math.max(
-                0,
-                Math.floor(
-                  Number(command.payload.remainingSubagentCapacity) || 0,
-                ),
-              ),
+              maxSpawnSubagents:
+                Number(command.payload.remainingSubagentCapacity) > 0
+                  ? schedulingCalls.filter((call) => call.name === "spawn_subagent").length
+                  : 0,
             },
           );
           const runtimeRejectedReason =

@@ -1,4 +1,5 @@
 import { RuntimeV2LifecycleDeadlineError } from "../../lib/runtime-v2";
+import { beginCapsuleToolActivity } from "../../lib/capsuleLiveActivity";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { withRuntimeV2HardDeadline } from "./hardDeadline";
 
@@ -25,6 +26,7 @@ export function runtimeV2ToolDeadlineMs(toolName: string): number | null {
 export async function executeRuntimeV2ToolWithDeadline<T>(input: {
   readonly toolName: string;
   readonly task: () => Promise<T>;
+  readonly activity?: Parameters<typeof beginCapsuleToolActivity>[0];
   readonly lifecycleDeadlineAt?: number;
   readonly now?: () => number;
   readonly onTimeout?: (
@@ -41,9 +43,6 @@ export async function executeRuntimeV2ToolWithDeadline<T>(input: {
     input.onTimeout?.(0, "lifecycle");
     throw new RuntimeV2LifecycleDeadlineError();
   }
-  if (!configuredTimeoutMs && lifecycleRemainingMs === null) {
-    return input.task();
-  }
   const lifecycleOwnsDeadline =
     lifecycleRemainingMs !== null &&
     (
@@ -57,7 +56,16 @@ export async function executeRuntimeV2ToolWithDeadline<T>(input: {
       : configuredTimeoutMs!,
   );
   let timedOut = false;
+  let finishActivity: (() => void) | undefined;
+  const activity = input.activity;
+  const task = activity ? () => {
+    finishActivity = beginCapsuleToolActivity(activity);
+    return input.task();
+  } : input.task;
   try {
+    if (!configuredTimeoutMs && lifecycleRemainingMs === null) {
+      return await task();
+    }
     return await withRuntimeV2HardDeadline({
       timeoutMs,
       timeoutError: `RUNTIME_V2_TOOL_TIMEOUT:${input.toolName}`,
@@ -68,12 +76,14 @@ export async function executeRuntimeV2ToolWithDeadline<T>(input: {
           lifecycleOwnsDeadline ? "lifecycle" : "tool",
         );
       },
-      task: input.task,
+      task,
     });
   } catch (error) {
     if (timedOut && lifecycleOwnsDeadline) {
       throw new RuntimeV2LifecycleDeadlineError();
     }
     throw error;
+  } finally {
+    finishActivity?.();
   }
 }

@@ -4,7 +4,7 @@ import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 
 const load = createTsModuleLoader();
 const runtime = load("src/lib/runtime-v2/index.ts");
-const { resolveRuntimeV2ExecutionBlocker: resolve, deriveRuntimeV2ExecutionBlocker: derive,
+const { resolveRuntimeV2ExecutionBlocker: resolve,
   projectRuntimeV2ExecutionBlocker: project } = load("src/store/runtimeV2/executionBlocker.ts");
 const { installRuntimeV2ExecutionDecisionReplay: installReplay } = load("src/store/runtimeV2/executionDecisionReplay.ts");
 const { toUserChoiceResolutionIdentity } = load("src/lib/actionRequest.ts");
@@ -107,20 +107,6 @@ test("cold ledger restore replays an already committed decision exactly once", a
   assert.equal(tasks.length, 1); assert.equal(f.counts().dispatched, 1);
   assert.equal(f.get().runtimeV2Checkpoints.turn.aggregate.events.filter(event => event.type === "run.decision_recorded").length, 1);
   unsubscribe();
-});
-
-test("a cycle pauses only when the exact rejection was visible to the model", () => {
-  const f = fixture();
-  const aggregate = f.get().runtimeV2Checkpoints.turn.aggregate;
-  const receipt = { call: { id: "call", name: "read_skill", arguments: {} }, actionIdentity: "hash", status: "rejected", reasonCode: "tool_surface_rejected", feedback: "INTERNAL_CODE", priorFeedbackObserved: false };
-  const response = { type: "provider.responded", sequence: 9, result: { actionReceipts: [receipt] } };
-  const state = { ...aggregate, events: [...aggregate.events, response] };
-  assert.equal(derive(state, "choice-2", "zh"), null);
-  receipt.priorFeedbackObserved = true;
-  const blocker = derive(state, "choice-2", "zh");
-  assert.equal(blocker.reasonCode, "rejected_action_cycle");
-  assert.deepEqual(blocker.options, ["recheck", "stop"]);
-  assert.doesNotMatch(blocker.message, /INTERNAL_CODE/);
 });
 
 test("recheck can reopen a pre-execution denial but cannot replay a command that already ran and failed", () => {

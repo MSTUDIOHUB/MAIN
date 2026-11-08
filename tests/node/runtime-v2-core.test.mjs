@@ -1339,7 +1339,9 @@ test("command-only Execute can continue with another tool after one successful c
 
 test("source, skill, replay, or control-plane receipts cannot supply command-only completion evidence", () => {
   for (const name of ["read_file", "get_project_skeleton", "load_skill", "web_fetch"]) {
-    let state = operationReceipt(executeAggregate("observing", [null]), name, { name });
+    let state = operationReceipt(executeAggregate("observing", [null]), name, { name,
+      ...(name === "web_fetch" ? { evidence: [] } : {}),
+    });
     state = providerResult(state, { visibleText: "Done." });
     assert.equal(commandOnlyOutcome(state), null, name);
   }
@@ -2026,7 +2028,7 @@ test("preferred collaboration remains available after a failed child", () => {
   })[0];
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.collaborationAction, "optional");
-  assert.equal(next.payload.remainingSubagentCapacity, 1);
+  assert.equal(next.payload.remainingSubagentCapacity, 2);
   assert.equal(next.payload.failedSubagents[0].id, "review-main");
 
   state = {
@@ -2046,7 +2048,7 @@ test("preferred collaboration remains available after a failed child", () => {
     subagentPreference: "preferred",
     subagentCapacity: 2,
   })[0];
-  assert.equal(next.payload.remainingSubagentCapacity, 0);
+  assert.equal(next.payload.remainingSubagentCapacity, 2);
 });
 
 test("enabled collaboration never gates the first mutation", () => {
@@ -2087,7 +2089,7 @@ test("enabled collaboration never gates the first mutation", () => {
   assert.equal(mutation.payload.maxActiveSubagents, 2);
 });
 
-test("a Run may grow its bounded child budget when overlap capacity is proven", () => {
+test("a Run reports growing request capacity without deriving a total task quota", () => {
   let state = executeAggregate();
   const firstRequest = runtime.decideNextCommands(state, {
     subagentPreference: "preferred",
@@ -2333,7 +2335,7 @@ test("a child with evidence but no report degrades without disabling later deleg
   })[0];
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.collaborationAction, "optional");
-  assert.equal(next.payload.remainingSubagentCapacity, 1);
+  assert.equal(next.payload.remainingSubagentCapacity, 2);
   assert.equal(next.payload.failedSubagents[0].id, "review-main");
 
   state = runtime.transition(state, event(

@@ -79,6 +79,14 @@ function logRuntimeV2ToolDeadline(input: {
 export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): ToolPort {
   return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
+      const activity = (toolName: string, target: string) => ({
+        run: command.run,
+        commandKey: command.idempotencyKey,
+        signal,
+        toolName,
+        target,
+        validation: command.kind === "execute_validation",
+      });
       if (command.kind === "collect_observation") {
         const deferred = runtimeV2AutomaticObservationDeferredReceipt(input, command);
         if (deferred) return deferred;
@@ -93,6 +101,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           const overview = boundedToolContent(
             await executeRuntimeV2ToolWithDeadline({
               toolName: "get_project_skeleton",
+              activity: activity("get_project_skeleton", input.context.runWorkspace || ""),
               lifecycleDeadlineAt: input.lifecycleDeadlineAt,
               now: input.now,
               onTimeout: (timeoutMs, boundary) =>
@@ -309,9 +318,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
       try {
         let diffPreview;
         const toolExecutionOptions: ToolExecutionOptions = {
-          ...(isReadOnlyContext(input) ? { networkRead: readOnlyNetworkPolicy(input) } : {}),
+          networkRead: readOnlyNetworkPolicy(input),
           toolCatalog: authorizationFor(input).toolCatalog,
           skillCatalog: input.context.skillCatalog,
+          knowledgeReferences: input.context.knowledgeContext?.references || [],
           allowExternalLocalRead: authorization.allowExternalLocalRead,
           ...(authorization.shellPermissionApproval
             ? { shellPermissionApproval: authorization.shellPermissionApproval }
@@ -362,6 +372,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               })
             : await executeRuntimeV2ToolWithDeadline({
                 toolName,
+                activity: activity(toolName, target),
                 lifecycleDeadlineAt: input.lifecycleDeadlineAt,
                 now: input.now,
                 onTimeout: (timeoutMs, boundary) =>
@@ -388,6 +399,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               output: rawOutput,
               readExactFile: () => executeRuntimeV2ToolWithDeadline({
                 toolName: "read_file",
+                activity: activity("read_file", target),
                 lifecycleDeadlineAt: input.lifecycleDeadlineAt,
                 now: input.now,
                 onTimeout: (timeoutMs, boundary) =>

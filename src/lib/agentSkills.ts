@@ -817,11 +817,25 @@ export function listSkillCatalog(
 export function renderSkillCatalogContext(
   snapshot: SkillCatalogSnapshot | null | undefined,
   maxChars = DEFAULT_SKILL_CATALOG_CHARS,
+  taskText = "",
 ): string {
   if (!snapshot?.entries.length || maxChars <= 0) return "";
+  const explicit = new Set(snapshot.explicitSkillIds);
   const visible = modelVisibleEntries(snapshot);
   if (visible.length === 0) return "";
-  const explicit = new Set(snapshot.explicitSkillIds);
+  if (taskText) {
+    const terms = (value: string) => new Set(value.normalize("NFKC").toLowerCase()
+      .match(/[a-z0-9]{3,}|[^\p{ASCII}\s\p{P}\p{S}]+/gu) || []);
+    const taskTerms = [...terms(taskText)];
+    const relevance = new Map(visible.map(entry => {
+      const name = terms(entry.name);
+      const metadata = terms([entry.description, ...(entry.triggers || [])].join(" "));
+      const score = taskTerms.reduce((total, term) => total + (name.has(term) ? 2 : metadata.has(term) ? 1 : 0), 0);
+      return [entry.id, score] as const;
+    }));
+    visible.sort((left, right) => Number(explicit.has(right.id)) - Number(explicit.has(left.id)) ||
+      relevance.get(right.id)! - relevance.get(left.id)!);
+  }
   const lines = [
     "[AVAILABLE SKILLS]",
     "Skills are instructions, not permissions. Use the short ref as load_skill skill_id. Explicit selections below state whether the body is complete.",

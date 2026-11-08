@@ -9,6 +9,7 @@ import {
   deriveRuntimeV2PlanSourceFreshness,
   runtimeV2DirectExecuteContractCoverage,
   type ProviderLaneProfileV1,
+  type RuntimeV2Event,
 } from "../../lib/runtime-v2";
 import {
   aggregateForCurrentTurn,
@@ -51,14 +52,54 @@ export function baseProviderProfile(state: any): ProviderLaneProfileV1 {
 export function recordApprovedPlanContext(
   input: RuntimeV2ExecutionPortsInput,
 ): void {
+  // This keyed model projection is rebuilt from current canonical authority.
+  // An invalidated or replaced Plan must not retain a previous approval claim.
+  for (let index = input.live.messages.length - 1; index >= 0; index -= 1) {
+    const message = input.live.messages[index];
+    if (message.role === "system" && typeof message.content === "string" &&
+      message.content.startsWith("[runtime-v2 context: approved-work-plan]")) {
+      input.live.messages.splice(index, 1);
+    }
+  }
   const aggregate = aggregateForCurrentTurn(input);
   const approved = approvedPlanForCurrentTurn(input);
   if (!aggregate || !approved) return;
+  const approvalEvent = [...aggregate.events].reverse().find(
+    (event): event is Extract<RuntimeV2Event, { type: "work_plan.approved" }> =>
+      event.type === "work_plan.approved" &&
+      event.run.sessionKey === approved.commit.review.sessionKey &&
+      event.run.sessionEpoch === approved.commit.review.sessionEpoch &&
+      event.run.turnId === approved.commit.review.turnId &&
+      event.run.runId === approved.commit.review.runId &&
+      event.run.parentRunId === approved.commit.review.parentRunId &&
+      event.workPlan.id === approved.commit.authority.id &&
+      event.workPlan.revision === approved.commit.authority.revision &&
+      event.workPlan.digest === approved.commit.authority.digest &&
+      event.workPlan.projectionHash === approved.commit.authority.projectionHash,
+  );
+  if (!approvalEvent) return;
   const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
   const frontier = deriveRuntimeV2PlanExecutionFrontier(aggregate);
   const content = [
-    "This sealed WorkPlan is the mutation and validation authority for the current Run.",
+    "The user has already separately approved this exact WorkPlan through MAIN's plan-review request. This independent plan-review approval is effective now: execute only its bounded steps and validations. Earlier interview answers supplied information, not execution approval. Changed plans, out-of-scope actions and separately gated high-risk operations still require their own approval. Existing source leases and tool permission checks remain in force.",
     JSON.stringify({
+      status: "approved_for_execution",
+      approvalReceipt: {
+        eventType: approvalEvent.type,
+        eventId: approvalEvent.eventId,
+        sequence: approvalEvent.sequence,
+        at: approvalEvent.at,
+        requestId: approved.commit.review.requestId,
+        owner: {
+          sessionKey: approvalEvent.run.sessionKey,
+          sessionEpoch: approvalEvent.run.sessionEpoch,
+          turnId: approvalEvent.run.turnId,
+          runId: approvalEvent.run.runId,
+          parentRunId: approvalEvent.run.parentRunId,
+        },
+        authority: approved.commit.authority,
+        documentRef: approved.commit.artifact.documentRef ?? null,
+      },
       authority: approved.commit.authority,
       objective: approved.plan.draft.objective,
       summary: approved.plan.draft.summary,

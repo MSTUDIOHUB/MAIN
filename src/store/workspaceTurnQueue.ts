@@ -1,4 +1,5 @@
 import { normalizeNetworkRead } from "../lib/networkRead";
+import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
 import {
   WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
   WORKSPACE_INSTRUCTION_SOURCES,
@@ -244,7 +245,8 @@ function normalizeInstructionPayload(value: unknown): WorkspaceInstructionPayloa
   const images = normalizeOptionalStringArray(value.images);
   const contextMentions = normalizeOptionalStringArray(value.contextMentions);
   const attachedFiles = normalizeOptionalAttachments(value.attachedFiles);
-  if (!images || !contextMentions || !attachedFiles) return null;
+  const knowledgeReferences = normalizeKnowledgeReferences(value.knowledgeReferences);
+  if (!images || !contextMentions || !attachedFiles || !knowledgeReferences) return null;
   const dispatchHints = value.dispatchHints === undefined
     ? undefined
     : normalizeJsonObject(value.dispatchHints);
@@ -253,13 +255,14 @@ function normalizeInstructionPayload(value: unknown): WorkspaceInstructionPayloa
     !value.text.trim() &&
     images.length === 0 &&
     contextMentions.length === 0 &&
-    attachedFiles.length === 0
+    attachedFiles.length === 0 && knowledgeReferences.length === 0
   ) return null;
   return Object.freeze({
     text: value.text,
     ...(images.length > 0 ? { images } : {}),
     ...(contextMentions.length > 0 ? { contextMentions } : {}),
     ...(attachedFiles.length > 0 ? { attachedFiles } : {}),
+    ...(knowledgeReferences.length > 0 ? { knowledgeReferences } : {}),
     ...(dispatchHints ? { dispatchHints } : {}),
   });
 }

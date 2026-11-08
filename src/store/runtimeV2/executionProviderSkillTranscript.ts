@@ -30,48 +30,55 @@ function safeString(value: unknown): value is string {
 /** Parse only actual, typed load_skill receipts. An empty/index-only result
  * may identify a newer revision, but carries no instruction bytes. This is
  * deliberately separate from read_file source/mutation authority. */
+export function runtimeV2SkillGuidanceReceipt(
+  call: RuntimeV2TranscriptToolGroup["calls"][number],
+  content: unknown,
+): Omit<RuntimeV2TranscriptSkillGuidanceWindow, "order"> | null {
+  if (call.function.name !== "load_skill") return null;
+  const args = parsedRecord(call.function.arguments);
+  const body = typeof content === "string" ? parsedRecord(content) : null;
+  if (!args || !body || String(args.operation || "load").trim() !== "load") return null;
+  const resource = body.type === "skill.resource";
+  if (!resource && body.type !== "skill.loaded") return null;
+  const target = record(body.readTarget);
+  const range = record(body.returnedRange);
+  if (!target || !range || !safeString(body.id) || !safeString(body.ref) ||
+    !safeString(body.version) || target.skill_id !== body.ref || target.expected_version !== body.version ||
+    !safeString(String(args.skill_id || "").trim()) ||
+    (args.expected_version !== undefined && args.expected_version !== body.version) ||
+    typeof body.content !== "string" ||
+    !["full", "overview", "window"].includes(body.disclosure as string)) return null;
+  if (resource) {
+    if (!safeString(body.resource) || body.resource !== target.resource || body.resource !== args.resource ||
+      body.resource.startsWith("/") || body.resource.includes("\\") ||
+      body.resource.split("/").some((part) => !part || part === "." || part === "..") ||
+      body.effect !== "resource_guidance_no_additional_permissions") return null;
+  } else if (body.resource !== undefined || target.resource !== undefined || args.resource !== undefined ||
+    !["instructions_loaded_no_additional_permissions", "instructions_partially_read_no_additional_permissions"].includes(body.effect as string)) return null;
+  const { startLine, endLine, startChar, endChar } = range;
+  if (![startLine, endLine, startChar, endChar, body.totalLines, body.totalChars]
+    .every((value) => Number.isSafeInteger(value)) ||
+    Number(startLine) < 0 || Number(endLine) < 0 || Number(endLine) > Number(body.totalLines) ||
+    (body.content.length > 0 && (Number(startLine) < 1 || Number(endLine) < Number(startLine))) ||
+    Number(startChar) < 0 || Number(endChar) < Number(startChar) || Number(endChar) > Number(body.totalChars) ||
+    Number(endChar) - Number(startChar) !== body.content.length) return null;
+  return {
+    callId: call.id, call,
+    documentKey: JSON.stringify([body.id, resource ? body.resource : null]),
+    version: body.version,
+    readTarget: { skill_id: body.ref, expected_version: body.version, ...(resource ? { resource: body.resource as string } : {}) },
+    returnedRange: { startLine: Number(startLine), endLine: Number(endLine), startChar: Number(startChar), endChar: Number(endChar) },
+    content: body.content,
+  };
+}
+
 export function runtimeV2TranscriptSkillDocumentReads(
   messages: readonly AgentMessage[],
 ): RuntimeV2TranscriptSkillGuidanceWindow[] {
   return collectTranscriptToolGroups(messages).flatMap((group) =>
     group.calls.flatMap((call) => {
-      if (call.function.name !== "load_skill") return [];
-      const args = parsedRecord(call.function.arguments);
-      const result = group.resultsByCallId.get(call.id);
-      const body = typeof result?.content === "string" ? parsedRecord(result.content) : null;
-      if (!args || !body || String(args.operation || "load").trim() !== "load") return [];
-      const resource = body.type === "skill.resource";
-      if (!resource && body.type !== "skill.loaded") return [];
-      const target = record(body.readTarget);
-      const range = record(body.returnedRange);
-      if (!target || !range || !safeString(body.id) || !safeString(body.ref) ||
-        !safeString(body.version) || target.skill_id !== body.ref || target.expected_version !== body.version ||
-        !safeString(String(args.skill_id || "").trim()) ||
-        (args.expected_version !== undefined && args.expected_version !== body.version) ||
-        typeof body.content !== "string" ||
-        !["full", "overview", "window"].includes(body.disclosure as string)) return [];
-      if (resource) {
-        if (!safeString(body.resource) || body.resource !== target.resource || body.resource !== args.resource ||
-          body.resource.startsWith("/") || body.resource.includes("\\") ||
-          body.resource.split("/").some((part) => !part || part === "." || part === "..") ||
-          body.effect !== "resource_guidance_no_additional_permissions") return [];
-      } else if (body.resource !== undefined || target.resource !== undefined || args.resource !== undefined ||
-        !["instructions_loaded_no_additional_permissions", "instructions_partially_read_no_additional_permissions"].includes(body.effect as string)) return [];
-      const { startLine, endLine, startChar, endChar } = range;
-      if (![startLine, endLine, startChar, endChar, body.totalLines, body.totalChars]
-        .every((value) => Number.isSafeInteger(value)) ||
-        Number(startLine) < 0 || Number(endLine) < 0 || Number(endLine) > Number(body.totalLines) ||
-        (body.content.length > 0 && (Number(startLine) < 1 || Number(endLine) < Number(startLine))) ||
-        Number(startChar) < 0 || Number(endChar) < Number(startChar) || Number(endChar) > Number(body.totalChars) ||
-        Number(endChar) - Number(startChar) !== body.content.length) return [];
-      return [{
-        callId: call.id, order: group.order, call,
-        documentKey: JSON.stringify([body.id, resource ? body.resource : null]),
-        version: body.version,
-        readTarget: { skill_id: body.ref, expected_version: body.version, ...(resource ? { resource: body.resource as string } : {}) },
-        returnedRange: { startLine: Number(startLine), endLine: Number(endLine), startChar: Number(startChar), endChar: Number(endChar) },
-        content: body.content,
-      }];
+      const window = runtimeV2SkillGuidanceReceipt(call, group.resultsByCallId.get(call.id)?.content);
+      return window ? [{ ...window, order: group.order }] : [];
     }),
   );
 }

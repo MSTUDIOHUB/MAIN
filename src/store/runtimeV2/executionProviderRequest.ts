@@ -1,4 +1,5 @@
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
@@ -67,7 +68,7 @@ export {
   runtimeV2EditableSourceAnchor,
 } from "./executionProviderInstruction";
 
-export async function requestRuntimeV2ProviderOnce(input: {
+interface RuntimeV2ProviderRequestInput {
   live: RuntimeV2LiveExecutionState;
   ports: RuntimeV2ExecutionPortsInput;
   command: RuntimeV2Command;
@@ -76,7 +77,23 @@ export async function requestRuntimeV2ProviderOnce(input: {
   toolChoice: OpenAiToolChoice | null;
   signal: AbortSignal;
   timeoutMs?: number;
-}): Promise<RuntimeV2NormalizedProviderResult> {
+}
+
+export async function requestRuntimeV2ProviderOnce(
+  input: RuntimeV2ProviderRequestInput,
+): Promise<RuntimeV2NormalizedProviderResult> {
+  const activity = beginCapsuleModelActivity(input.command.run, input.command.idempotencyKey, input.signal);
+  try {
+    return await performRuntimeV2ProviderRequest(input, activity);
+  } finally {
+    activity.finish();
+  }
+}
+
+async function performRuntimeV2ProviderRequest(
+  input: RuntimeV2ProviderRequestInput,
+  activity: ReturnType<typeof beginCapsuleModelActivity>,
+): Promise<RuntimeV2NormalizedProviderResult> {
   const state = input.ports.get();
   const budget = input.ports.context.runtimeContextBudget;
   const settings = deriveBudgetedStreamSettings(state.config, budget);
@@ -411,6 +428,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
       ) / 4,
     ) + maxOutputTokens,
   );
+  activity.acquiringLane();
   const lane = await acquireModelLane({
     config: state.config,
     contextLimit: budget?.contextLimit,
@@ -427,6 +445,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   let result: Awaited<ReturnType<typeof streamChatCompletion>>;
   let reasoningFallbackApplied = false;
   try {
+    activity.preparing();
     result = await streamChatCompletion(
       messages,
       requestSettings,
@@ -437,6 +456,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         },
         onDone: () => undefined,
         onError: () => undefined,
+        onRequestDispatched: activity.requestDispatched,
         onLifecycle: (event) => {
           if (event.phase === "model_progress") lane.markFirstToken();
         },
@@ -469,6 +489,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         structuredActionRequired,
       })
     ) {
+      activity.preparing();
       reasoningFallbackApplied = true;
       input.ports.logStoreEvent(
         "runtime_v2_provider_reasoning_truncated",
@@ -556,6 +577,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
           },
           onDone: () => undefined,
           onError: () => undefined,
+          onRequestDispatched: activity.requestDispatched,
           onLifecycle: (event) => {
             if (event.phase === "model_progress") lane.markFirstToken();
           },

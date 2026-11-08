@@ -9,9 +9,7 @@ import {
   visualPayloadIdentitiesFromContent,
 } from "../lib/visualContext";
 import {
-  buildSubmitHarnessRunMarkerDraft,
-  isGoalCreationAuthorization,
-  type GoalCreationAuthorization,
+  buildSubmitHarnessRunMarkerDraft
 } from "../lib/submit/turnSubmission";
 
 export interface SubmitRunLeaseRuntimeSnapshot {
@@ -26,7 +24,7 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   /** Exact text visible in the chat area, before turn-intake/recovery wrapping. */
   canonicalUserText?: string;
   /** Bounded prior-turn context assembled before appending the current message. */
-  goalSourceContext?: string;
+
   currentImages: string[];
   runSessionKey: string;
   runWorkspace?: string | null;
@@ -34,10 +32,10 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   turnId: string;
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
-  /** Continue the identity-validated active Goal instead of creating a new one. */
-  continueExistingGoal?: boolean;
+
+
   /** Consumed by this lease only; callers cannot infer it from resolvedIntent. */
-  goalCreationAuthorization?: GoalCreationAuthorization | null;
+
   subagentPreference?: SubagentDelegationPreference;
   /** Exact paused run that an action continuation resumes. */
   parentRunIdOverride?: string;
@@ -47,7 +45,7 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   appendAgentMessage: (message: AgentMessage) => void;
   createAbortController: () => TAbortController;
   setAbortController: (abortController: TAbortController) => void;
-  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
+
   getCurrentHarnessInstanceId: () => string;
   /** Exact global marker snapshot captured when bootstrap began. */
   expectedHarnessRunMarker: HarnessRunMarker | null;
@@ -120,9 +118,7 @@ export function startSubmitRunLease<TAbortController>(
     currentImages: input.currentImages,
     runtimeTurnId: input.turnId,
   });
-  const hasExplicitGoalCreationAuthorization = isGoalCreationAuthorization(
-    input.goalCreationAuthorization,
-  );
+
   const startedAtMs = (input.nowMs || Date.now)();
   const runId = String(input.runIdOverride || "").trim() || createSubmitHarnessRunId(startedAtMs);
   const lineage = resolveSubmitRunLineage({
@@ -150,7 +146,7 @@ export function startSubmitRunLease<TAbortController>(
     }),
     parentRunId,
     turnStartMessageIndex: lineage.turnStartMessageIndex,
-    lastGoalSliceRunId: null,
+
   };
   const harnessRunMarker = input.acquireHarnessRunMarker(
     harnessRunMarkerDraft,
@@ -168,25 +164,6 @@ export function startSubmitRunLease<TAbortController>(
   const abortController = input.createAbortController();
   input.setAbortController(abortController);
 
-  if (
-    input.effectiveRunIntent === "goal" &&
-    input.runtimeRunIntent === "goal" &&
-    input.continueExistingGoal !== true &&
-    hasExplicitGoalCreationAuthorization
-  ) {
-    const canonicalObjective = String(input.canonicalUserText || "").trim() || input.userContent.trim();
-    input.startGoal(
-      canonicalObjective,
-      {
-        sessionKey: input.runSessionKey,
-        sourceContext: input.goalSourceContext,
-        ownerTurnId: input.turnId,
-        ...(input.subagentPreference
-          ? { subagentPreference: input.subagentPreference }
-          : {}),
-      },
-    );
-  }
 
   return {
     turnAgentMessagesStart,

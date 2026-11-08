@@ -28,7 +28,6 @@ export function resolveTurnStrategyFromIntent(
 ): TurnStrategy {
   const normalized = String(intent || legacyMode || "").trim();
   if (normalized === "plan") return "plan";
-  if (normalized === "goal") return "goal";
   if (normalized === "execute" || normalized === "studio_workflow" || legacyMode === "edit") {
     return "execute";
   }

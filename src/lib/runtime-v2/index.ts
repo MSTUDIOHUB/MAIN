@@ -9,7 +9,6 @@ export * from "./emergencyTerminal";
 export * from "./evidenceFacts";
 export * from "./events";
 export * from "./evidenceVersion";
-export * from "./goalSaga";
 export * from "./lifecycle";
 export * from "./phaseTransition";
 export * from "./planExecution";

@@ -33,6 +33,44 @@ function messageText(message: AgentMessage): string {
     .join("\n");
 }
 
+const EMPTY_ASSISTANT_PROTOCOL_KEYS = new Set([
+  "role", "content", "tool_calls", "reasoning_content", "reasoning",
+]);
+
+/** UI feedback keeps an empty assistant boundary in canonical history so an
+ * error cannot attach to an unrelated draft. It carries no provider input.
+ * Preserve opaque metadata and every nonempty protocol field conservatively. */
+function runtimeDecisionMessageCopy(
+  messages: readonly AgentMessage[],
+): AgentMessage[] {
+  const selected: AgentMessage[] = [];
+  const feedbackSeen = new Set<string>();
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    if (
+      message.role === "assistant" &&
+      (message.content === "" ||
+        (Array.isArray(message.content) && message.content.length === 0)) &&
+      (message.tool_calls === undefined ||
+        (Array.isArray(message.tool_calls) && message.tool_calls.length === 0)) &&
+      (message.reasoning_content === undefined || message.reasoning_content === "") &&
+      (message.reasoning === undefined || message.reasoning === "") &&
+      Object.keys(message).every((key) => EMPTY_ASSISTANT_PROTOCOL_KEYS.has(key))
+    ) continue;
+    if (
+      message.role === "system" &&
+      typeof message.content === "string" &&
+      /^\[runtime-v2 provider feedback: [^\]\r\n]+\](?:\n|$)/.test(message.content) &&
+      Object.keys(message).every((key) => key === "role" || key === "content")
+    ) {
+      if (feedbackSeen.has(message.content)) continue;
+      feedbackSeen.add(message.content);
+    }
+    selected.push(message);
+  }
+  return selected.reverse();
+}
+
 function parsedToolArguments(value: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(value);
@@ -398,6 +436,7 @@ function runtimeDecisionAnchorIndices(
   if (runtimeSystemIndex >= 0) selected.add(runtimeSystemIndex);
 
   let currentUserIndex = -1;
+  let latestFeedbackSelected = false;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]!;
     if (
@@ -460,11 +499,13 @@ function runtimeDecisionAnchorIndices(
       )
     ) {
       selected.add(index);
-      const draft = messages[index - 1];
-      if (draft?.role === "assistant" && !draft.tool_calls?.length) {
-        selected.add(index - 1);
+      if (!latestFeedbackSelected) {
+        const draft = messages[index - 1];
+        if (draft?.role === "assistant" && !draft.tool_calls?.length) {
+          selected.add(index - 1);
+        }
       }
-      break;
+      latestFeedbackSelected = true;
     }
   }
   for (let index = 0; index < messages.length; index += 1) {
@@ -492,6 +533,7 @@ export function buildRuntimeV2DecisionView(
   messages: readonly AgentMessage[],
   effects?: RuntimeV2ProviderEffectFacts,
 ): AgentMessage[] {
+  messages = runtimeDecisionMessageCopy(messages);
   const groups = collectTranscriptToolGroups(messages);
   const frontier = groups[groups.length - 1] || null;
   const frontierIds = new Set(
@@ -659,8 +701,11 @@ export function buildRuntimeV2DecisionView(
 }
 
 /**
- * Canonical history remains verbatim while it fits. Under real input pressure,
- * select the semantic workset and evict complete groups without cropping bytes.
+ * Canonical history remains verbatim while it fits, including the latest
+ * redacted rejected assistant/tool exchange. Empty UI reply boundaries are
+ * omitted, and identical Runtime feedback keeps its latest position. Under
+ * real input pressure, select the semantic workset and evict complete groups
+ * without cropping bytes.
  */
 export function boundRuntimeV2ProviderConversation(
   messages: readonly AgentMessage[],
@@ -671,6 +716,7 @@ export function boundRuntimeV2ProviderConversation(
   },
   effects?: RuntimeV2ProviderEffectFacts,
 ): AgentMessage[] {
+  messages = runtimeDecisionMessageCopy(messages);
   const inputBudget = options.inputBudget ?? computeContextBudgets(
     options.contextLimit, options.reservedOutputTokens,
   ).inputBudget;

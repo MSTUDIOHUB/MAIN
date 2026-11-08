@@ -177,6 +177,24 @@ test.beforeEach(async ({ page }) => {
             }),
           });
         }
+        if (body.includes("Interpret MAIN's current user request.")) {
+          // This fixture interprets the follow-up as a read-only answer about
+          // the prior task. It must not inherit the old blocked Execute route.
+          return JSON.stringify({
+            output_text: JSON.stringify({
+              semantic: {
+                objective: "读取 README.md 并说明当前检查结果",
+                workType: "answer",
+                answerFormat: "answer",
+                requiredCapabilities: [],
+                forbiddenCapabilities: [],
+                approvalRequiredCapabilities: [],
+              },
+              confidence: 0.95,
+              needsUserChoice: false,
+            }),
+          });
+        }
         requests.push({ hasTools, body });
 
         if (scenario === "cloud-tool-fallback") {
@@ -447,7 +465,7 @@ test("global chat without explicit files does not expose workspace tools", async
       }),
     )
     .toEqual({
-      names: [],
+      names: ["tool_search"],
       leakedWorkspaceTools: [],
       listDirectoryCalls: [],
       getProjectSkeletonCalls: 0,
@@ -455,7 +473,7 @@ test("global chat without explicit files does not expose workspace tools", async
     });
 });
 
-test("global chat with an attachment only exposes attachment read tools", async ({
+test("global chat with an attachment only exposes attachment reads and tool discovery", async ({
   page,
 }) => {
   await page.goto("/?e2eScenario=global-chat-attachment-read");
@@ -498,12 +516,9 @@ test("global chat with an attachment only exposes attachment read tools", async 
               .filter(Boolean);
           });
         if (toolNameSets.length === 0) return null;
-        const allowedAttachmentReadTools = [
-          "read_file",
-          "read_document",
-          "analyze_tabular_document",
-          "query_tabular_document",
-        ];
+        // Specialized document readers are discovered progressively. A plain
+        // log attachment starts with its exact reader and catalog discovery.
+        const allowedAttachmentReadTools = ["read_file", "tool_search"];
         const names = [...new Set(toolNameSets.flat())];
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         return {
@@ -525,12 +540,7 @@ test("global chat with an attachment only exposes attachment read tools", async 
       }),
     )
     .toEqual({
-      names: [
-        "analyze_tabular_document",
-        "query_tabular_document",
-        "read_document",
-        "read_file",
-      ],
+      names: ["read_file", "tool_search"],
       onlyAttachmentReadTools: true,
       ingestedAttachments: [
         {
@@ -578,10 +588,10 @@ test("ordinary continue after a canonical blocked execute terminal starts a new 
       previousBlockCount: 3,
     });
 
-  const sent = await page.evaluate(() =>
-    (window as any).__CODELY_E2E__?.sendCloudMessage?.("继续"),
-  );
-  expect(sent).toBe(true);
+  // Natural workspace submissions enter through Composer so the semantic
+  // preflight receives the real durable Turn/FIFO ownership claim.
+  await page.getByRole("textbox").fill("继续");
+  await page.getByTestId("composer-send-button").click();
 
   await expect
     .poll(

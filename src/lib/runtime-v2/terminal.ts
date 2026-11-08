@@ -73,7 +73,8 @@ export async function finishRuntimeV2CheckpointTerminal(
         kind: "finalize_turn" as const,
         run: input.run,
         phase,
-        payload: { runtimeControlPlane: true, resultKind: input.resultKind, resultReason: input.reason, finalMarkdown: input.finalMarkdown },
+        payload: { runtimeControlPlane: true, resultKind: input.resultKind, resultReason: input.reason,
+          ...(input.finalMarkdown !== undefined ? { finalMarkdown: input.finalMarkdown } : {}) },
       };
       await append({ type: "command.scheduled", run: input.run, command });
       await append({ type: "command.completed", run: input.run, idempotencyKey: command.idempotencyKey, status: "succeeded" });

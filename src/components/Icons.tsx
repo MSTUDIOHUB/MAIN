@@ -50,7 +50,6 @@ export const IconTool = createIcon(<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 
 export const IconStop = createIcon(<rect x="6" y="6" width="12" height="12" rx="1" />);
 export const IconPlay = createIcon(<polygon points="8 5 19 12 8 19 8 5" />);
 export const IconPause = createIcon(<><rect x="7" y="5" width="3" height="14" rx="1" /><rect x="14" y="5" width="3" height="14" rx="1" /></>);
-export const IconGoal = createIcon(<><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="5" /><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" /><path d="M12 3V1" /><path d="M21 12h2" /></>);
 export const IconRefresh = createIcon(<><polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10" /><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14" /></>);
 export const IconGitBranch = createIcon(<><line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="M18 9a9 9 0 0 1-9 9" /></>);
 export const IconGitCommit = createIcon(<><circle cx="12" cy="12" r="3" /><line x1="3" y1="12" x2="9" y2="12" /><line x1="15" y1="12" x2="21" y2="12" /></>);

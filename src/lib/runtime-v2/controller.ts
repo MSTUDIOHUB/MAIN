@@ -41,6 +41,8 @@ type RuntimeV2SoftSignal = Extract<
   { readonly type: "soft_signal.observed" }
 >["signal"];
 export interface RuntimeV2Admission {
+  readonly workspaceInstructionContext?: string;
+  readonly knowledgeContext?: import("../knowledgeReferences").KnowledgeContextPacket;
   readonly networkRead?: import("../networkRead").NetworkReadPolicy;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -118,6 +120,8 @@ export class RuntimeV2Controller {
     await this.apply(asEvent({
       ...this.eventBase(),
       type: "turn.admitted",
+      ...(typeof input.workspaceInstructionContext === "string" ? { workspaceInstructionContext: input.workspaceInstructionContext } : {}),
+      ...(input.knowledgeContext ? { knowledgeContext: input.knowledgeContext } : {}),
       ...(input.networkRead ? { networkRead: input.networkRead } : {}),
       turn: input.turn,
       strategy: input.strategy,

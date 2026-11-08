@@ -8,11 +8,6 @@ import type { PlanApprovalHandoff, ProviderCompatibilityRuntimeLaneState } from 
 import type { TaskBlock } from "./taskTypes";
 import type { TurnInputContextSignals } from "./turnIntake";
 import type { DurableTurnContext } from "./workflowModels";
-import type {
-  GoalContinuationAuthorization,
-  GoalCreationAuthorization,
-} from "./submit/turnSubmission";
-
 type SubmissionStoreState = any;
 
 export interface SubmissionRuntimeStorePorts {
@@ -73,8 +68,8 @@ export interface SubmissionRuntimeContext {
   approvalRequiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
   intentClarification?: import("./turnClarification").TurnClarification;
-  goalCreationAuthorization: GoalCreationAuthorization | null;
-  goalContinuationAuthorization: GoalContinuationAuthorization | null;
+
+
   effectiveCommandDirective: CommandDirective | null;
   options: any; // sendMessage options
   attachedFilesSnapshot: Array<AttachedFile | string>;
@@ -84,6 +79,10 @@ export interface SubmissionRuntimeContext {
   /** Exact live workspace instructions captured before Run admission.
    * Conversation summaries and legacy session memory never populate it. */
   workspaceInstructionContext?: string;
+  planPurpose?: "rules";
+  sourcePlanDraft?: import("./planDrafts").PlanDraftRecord;
+  knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
+  knowledgeContext?: import("./knowledgeReferences").KnowledgeContextPacket;
   /** Rebuildable workspace facts captured once for this Run. */
   projectBaselineContext?: ProjectBaselineContext | null;
   /** Exact Skill catalog frozen at Turn admission. Full bodies remain outside

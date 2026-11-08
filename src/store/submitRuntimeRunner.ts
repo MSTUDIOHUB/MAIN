@@ -11,11 +11,12 @@ import {
 import { resolveRuntimeContextBudget } from "../lib/runtimeContextBudget";
 import { runSubmitRuntimeV2Chat } from "./runtimeV2/chatRunner";
 import { runSubmitRuntimeV2Execute } from "./runtimeV2/executeRunner";
-import { runSubmitRuntimeV2Goal } from "./runtimeV2/goalProductionRunner";
 import { runSubmitRuntimeV2Plan } from "./runtimeV2/planRunner";
 import { runSubmitRuntimeV2WorkspaceRead } from "./runtimeV2/workspaceReadRunner";
 import { withRuntimeV2ContextBudget } from "./runtimeV2/submissionContext";
 import { handleRuntimeV2IntentClarification } from "./runtimeV2/intentClarification";
+import { prepareKnowledgeContext } from "./prepareKnowledgeContext";
+import { estimateMessagesTokens } from "../lib/contextTrim";
 
 type SubmitRuntimeStoreGet = () => any;
 type SubmitRuntimeStoreSet = any;
@@ -63,10 +64,18 @@ export async function runSubmitRuntime(
   const runtimeContextBudget = await resolveRuntimeContextBudget(
     input.get().config || {},
   );
-  const runtimeContext = withRuntimeV2ContextBudget(
+  const budgetedContext = withRuntimeV2ContextBudget(
     input.context,
     runtimeContextBudget,
   );
+  const knowledgeContext = await prepareKnowledgeContext({
+    references: input.context.knowledgeReferences || input.context.options?.knowledgeReferencesSnapshot || [],
+    query: turn?.userPrompt || "",
+    budget: runtimeContextBudget,
+    reservedInputTokens: estimateMessagesTokens(input.get().agentMessages || []),
+    signal: input.context.abortCtrl.signal,
+  });
+  const runtimeContext = { ...budgetedContext, knowledgeContext };
   input.logStoreEvent("runtime_v2_context_budget_resolved", {
     turnId: input.context.turnId,
     runId: input.context.harnessRunId,
@@ -102,19 +111,6 @@ export async function runSubmitRuntime(
   }
   if (runtimeV2RunnerKind === "plan") {
     return runSubmitRuntimeV2Plan({
-      get: input.get,
-      set: input.set,
-      context: runtimeContext,
-      getSessionRevisionToken: input.getSessionRevisionToken,
-      sanitizeTaskBlocksForPersist: input.sanitizeTaskBlocksForPersist,
-      buildSessionRuntimeSnapshot: input.buildSessionRuntimeSnapshot,
-      publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
-      persistSessionRecord: input.persistSessionRecord || saveProjectSession,
-      logStoreEvent: input.logStoreEvent,
-    });
-  }
-  if (runtimeV2RunnerKind === "goal") {
-    return runSubmitRuntimeV2Goal({
       get: input.get,
       set: input.set,
       context: runtimeContext,

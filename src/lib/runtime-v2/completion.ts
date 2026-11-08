@@ -8,7 +8,7 @@ import {
 } from "./executionContract";
 import { latestRuntimeV2DirectExecuteValidationSequence, runtimeV2DirectExecuteReadyForConclusion, summarizeRuntimeV2ExecuteEvidence } from "./phaseTransition";
 import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
-import { isRuntimeV2ReadOnlyToolName } from "./workspaceReadPolicy";
+import { isRuntimeV2ReadOnlyToolName, RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "./workspaceReadPolicy";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 
 /** Facts supplied by a store adapter after it has inspected actual tool and
@@ -45,7 +45,7 @@ function completedRuntimeV2ActionFacts(
       ? Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)))
       : value,
   );
-  const commands = new Map<string, { key: string; operation: boolean; readOnly: boolean }>();
+  const commands = new Map<string, { key: string; operation: boolean; readOnly: boolean; networkRead: boolean }>();
   const completedKeys = new Set<string>();
   const results = new Map<string, { settled: boolean; operation: boolean }>();
   for (const event of aggregate.events) {
@@ -59,7 +59,8 @@ function completedRuntimeV2ActionFacts(
       const operation = !!name && !readOnly &&
         name !== RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
         !isWorkspaceMutationToolName(name);
-      commands.set(command.idempotencyKey, { key, operation, readOnly });
+      commands.set(command.idempotencyKey, { key, operation, readOnly,
+        networkRead: RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name) });
       continue;
     }
     if (event.type !== "tool.completed" && event.type !== "validation.completed") continue;
@@ -79,9 +80,11 @@ function completedRuntimeV2ActionFacts(
     const hasEffect = executed && event.evidence.some((evidence) =>
       evidence.kind === "tool" || evidence.kind === "mutation" || evidence.kind === "validation",
     );
+    const hasNetworkResult = command.networkRead && executed &&
+      event.evidence.some(evidence => evidence.kind === "tool");
     results.set(command.key, {
-      settled: succeeded && (command.readOnly || hasEffect),
-      operation: succeeded && command.operation && hasEffect,
+      settled: succeeded && (command.networkRead ? hasNetworkResult : command.readOnly || hasEffect),
+      operation: succeeded && (command.operation && hasEffect || hasNetworkResult),
     });
   }
   return {
@@ -91,7 +94,7 @@ function completedRuntimeV2ActionFacts(
   };
 }
 
-/** Ordinary command tasks have no file artifact to mutate or validate. Their
+/** Ordinary commands and network reads have no file artifact to validate. Their
  * real effect receipts may support a later natural final, without switching
  * the next request to `conclude` or withdrawing Execute tools. */
 export function runtimeV2CommandTaskReadyForConclusion(

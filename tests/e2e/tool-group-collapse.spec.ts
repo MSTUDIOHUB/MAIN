@@ -47,19 +47,25 @@ test("MAIN live steps show concise progress with tool details collapsed", async 
 
   const steps = page.getByTestId("live-turn-step");
   await expect(steps).toHaveCount(4);
-  await expect(steps.nth(0)).toContainText("定位配置加载入口");
-  await expect(steps.nth(1)).toContainText("核对当前配置加载参数");
-  await expect(steps.nth(2)).toContainText("运行配置加载验证");
-  await expect(steps.nth(3)).toContainText("继续检查配置加载顺序");
-  await expect(steps.nth(3)).toContainText("加载顺序 需要用工具结果确认后再继续");
-  await expect(steps.nth(3)).not.toContainText("因为：");
-  await expect(steps.nth(3)).not.toContainText("**加载顺序**");
-  await expect(steps.nth(3).getByTestId("turn-archive-step-intent")).toContainText("加载顺序");
+  await expect(steps.nth(0)).toContainText("src/config.ts");
+  await expect(steps.nth(1)).toContainText("node scripts/inspect-config.mjs");
+  await expect(steps.nth(2)).toContainText("http://localhost/config");
+  await expect(steps.nth(3).getByTestId("turn-archive-step-intent")).toContainText("config.ts");
+  await expect(steps.nth(3).getByTestId("turn-archive-step-intent")).not.toContainText("**");
   await expect(steps.nth(3)).toContainText("进行中");
   await expect(steps.nth(3).getByTestId("turn-archive-step-toggle")).toHaveAttribute("aria-expanded", "false");
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
   await expect(page.getByTestId("tool-status-label").filter({ hasText: "执行中" })).toHaveCount(0);
   await expect(page.getByTestId("turn-archive-step-details")).toHaveCount(0);
+  // Compact activity rows describe the concrete action. Model-authored
+  // purpose remains available through the separately disclosed operation.
+  await steps.nth(3).getByTestId("turn-archive-step-toggle").click();
+  const activeDetails = steps.nth(3).getByTestId("turn-archive-step-details");
+  await expect(activeDetails).toContainText("继续检查配置加载顺序");
+  // ActionCard's disclosed purpose is verbatim model text; compact summary
+  // labels above remain free of raw Markdown syntax.
+  await expect(activeDetails).toContainText("**加载顺序** 需要用工具结果确认后再继续");
+  await expect(activeDetails).not.toContainText("因为：");
 });
 
 test("MAIN awaiting_input state does not keep showing running tool activity", async ({ page }) => {

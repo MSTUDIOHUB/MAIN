@@ -466,3 +466,66 @@ test("real OMLX collaboration projection rejects arbitrary sibling reviewers for
     { scopeKey: "src-tauri", spawned: false, joined: false, consumed: false },
   ]);
 });
+
+
+const directFixture = loadTranspiledModuleSync(path.join(workspaceRoot, "tests/e2e/realOmlxDirectEditFixture.ts"));
+
+async function directRepairWorkspace(t, source) {
+  const workspace = await createTempWorkspace(t);
+  await writeFixtureFile(workspace, "package.json", JSON.stringify({ type: "module", scripts: { test: "node tests/creator-mapping.test.mjs" } }));
+  await writeFixtureFile(workspace, "tests/creator-mapping.test.mjs", "import assert from 'node:assert/strict';\nimport { normalizeCsvOrder } from '../src/hooks/useCsvParser.ts';\nassert.equal(normalizeCsvOrder({ creator: 'alice' }).creatorName, 'alice');\n");
+  await writeFixtureFile(workspace, "src/hooks/useCsvParser.ts", source);
+  await directFixture.prepareCsvDirectEditRepairFixture(workspace);
+  return workspace;
+}
+
+function correctDirectParser(sourceType = "source?: 'csv'", returnedSource = "'csv'") {
+  return `export interface CsvOrder { creatorName?: string; ${sourceType}; }\nexport function normalizeCsvOrder(row: Record<string, string>): CsvOrder { return { creatorName: row.creator || row['创建者'] || '', source: ${returnedSource} }; }\n`;
+}
+
+test("Direct Edit fixture accepts optional literal and string contracts through real behavior and TypeScript", async t => {
+  for (const sourceType of ["source?: 'csv'", "source: 'csv'", "source?: string"]) {
+    const workspace = await directRepairWorkspace(t, correctDirectParser(sourceType));
+    const checked = await directFixture.verifyCsvDirectEditRepairFixture(workspace);
+    assert.equal(checked.passed, true, JSON.stringify(checked));
+    const command = await proxy.runRealOmlxWorkspaceCommand(workspace, "npm test");
+    assert.equal(command.exitCode, 0, command.stdout + command.stderr);
+    assert.match(JSON.parse(await fs.readFile(path.join(workspace, "package.json"), "utf8")).scripts.test, /&& node tests\/typecheck-parser\.cjs/);
+  }
+});
+
+test("Direct Edit fixture exposes a real source behavior failure, then passes after an actual parser repair", async t => {
+  const workspace = await directRepairWorkspace(t, "export interface CsvOrder { creatorName?: string; }\nexport function normalizeCsvOrder(row: Record<string, string>): CsvOrder { return { creatorName: row.creator || row['创建者'] || '' }; }\n");
+  const before = await proxy.runRealOmlxWorkspaceCommand(workspace, "npm test");
+  assert.notEqual(before.exitCode, 0);
+  assert.match(before.stderr, /CSV source provenance behavior/);
+  const independent = await directFixture.verifyCsvDirectEditRepairFixture(workspace);
+  assert.equal(independent.behavior.exitCode === 0, false);
+  assert.notEqual(independent.typecheck.exitCode, 0);
+  assert.match(independent.typecheck.stdout, /TS2339/);
+  await writeFixtureFile(workspace, "src/hooks/useCsvParser.ts", correctDirectParser());
+  assert.equal((await proxy.runRealOmlxWorkspaceCommand(workspace, "npm test")).exitCode, 0);
+  assert.equal((await directFixture.verifyCsvDirectEditRepairFixture(workspace)).passed, true);
+});
+
+test("Direct Edit acceptance rejects wrong runtime provenance and missing public interface declarations", async t => {
+  const wrong = await directRepairWorkspace(t, correctDirectParser("source?: string", "'api'"));
+  const wrongResult = await directFixture.verifyCsvDirectEditRepairFixture(wrong);
+  assert.equal(wrongResult.behavior.exitCode === 0, false);
+  assert.equal(wrongResult.typecheck.exitCode, 0, "valid TS alone cannot replace behavior acceptance");
+  const missing = await directRepairWorkspace(t, "export interface CsvOrder { creatorName?: string; }\nexport function normalizeCsvOrder(row: Record<string, string>): CsvOrder { const result = { creatorName: row.creator || row['创建者'] || '', source: 'csv' }; return result; }\n");
+  const missingResult = await directFixture.verifyCsvDirectEditRepairFixture(missing);
+  assert.equal(missingResult.behavior.exitCode, 0, "structurally compatible runtime output is independent of the public interface");
+  assert.notEqual(missingResult.typecheck.exitCode, 0);
+  assert.match(missingResult.typecheck.stdout, /TS2339/);
+  const npmTypeFailure = await proxy.runRealOmlxWorkspaceCommand(missing, "npm test");
+  assert.notEqual(npmTypeFailure.exitCode, 0, "npm test must invoke the real compiler after behavior passes");
+  assert.match(npmTypeFailure.stdout + npmTypeFailure.stderr, /TS2339/);
+});
+
+test("independent Direct Edit acceptance cannot be replaced by a fixture npm script that only exits zero", async t => {
+  const workspace = await directRepairWorkspace(t, correctDirectParser("source?: string", "'api'"));
+  await writeFixtureFile(workspace, "package.json", JSON.stringify({ scripts: { test: "node -e 'process.exit(0)'" } }));
+  assert.equal((await proxy.runRealOmlxWorkspaceCommand(workspace, "npm test")).exitCode, 0);
+  assert.equal((await directFixture.verifyCsvDirectEditRepairFixture(workspace)).passed, false);
+});

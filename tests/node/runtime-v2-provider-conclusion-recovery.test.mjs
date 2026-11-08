@@ -169,12 +169,16 @@ const completedStream = () => ({ content: "A complete answer from SOURCE_RECEIPT
 
 function assertOutboundRecoveryPair(messages, draft) {
   const drafts = messages.filter((message) => message.role === "assistant" && message.content === draft);
-  assert.equal(drafts.length, 1, "the exact failed draft remains once in canonical wire history");
+  assert.equal(drafts.length, draft === "" ? 0 : 1,
+    draft === "" ? "an empty UI ownership boundary carries no outbound protocol data"
+      : "the exact nonempty failed draft remains once in wire history");
   const feedbackIndices = messages.flatMap((message, index) =>
     message.role === "system" && message.content.startsWith("[runtime-v2 provider feedback: output_truncated]") ? [index] : []);
   assert.equal(feedbackIndices.length, 1, "one causal feedback entry owns the failed draft");
   const index = feedbackIndices[0];
-  assert.equal(messages[index - 1], drafts[0], "feedback immediately follows its original assistant draft");
+  if (draft !== "") {
+    assert.equal(messages[index - 1], drafts[0], "feedback immediately follows its original assistant draft");
+  }
   const authority = messages.slice(index + 1).filter((message) => message.role === "system" && message.content.includes("CURRENT_TOOL_SURFACE:"));
   assert.equal(authority.length, 1, "current phase authority follows the preserved recovery pair");
   return { feedback: messages[index], authority: authority[0] };
@@ -311,6 +315,10 @@ test("client action guards retain canonical recovery and accurately distinguish 
       assert.equal(event.clientStopReason, clientStopReason);
       assert.equal(result.toolCalls[0].name, "read_file");
       assert.deepEqual(result.diagnostics, []);
+      assert.deepEqual(fixture.live.messages, [...canonical,
+        { role: "assistant", content: "" },
+        { role: "system", content: feedback.content },
+      ], "the client guard retains its empty ownership boundary and exact feedback canonically");
     });
   }
 });
@@ -508,7 +516,7 @@ test("a complete Validate reply cannot close inspection solely from recovery occ
   assert.equal(actionWindows.runtimeV2ProviderActionWindowFor({ ...input, effects: { replayedSourceReceiptCountSinceMutation: 1 } }), null, "replay evidence cannot independently revoke safe reads");
 });
 
-test("empty protocol feedback cannot bind an older unrelated assistant draft on the actual wire", async () => {
+test("empty protocol feedback preserves canonical ownership while omitting the blank wire boundary", async () => {
   const tools = [{ type: "function", function: { name: "read_file", description: "read", parameters: { type: "object", properties: {} } } }];
   await withStreamFixture("ollama", completedStream, async (fixture, calls) => {
     fixture.context.runtimeRunIntent = "execute";
@@ -525,9 +533,13 @@ test("empty protocol feedback cannot bind an older unrelated assistant draft on 
     assert.equal(calls[0].options.toolChoice, "required");
     const index = calls[0].messages.findIndex((message) => message.role === "system" && message.content.startsWith("[runtime-v2 provider feedback: native_tool_calls_invalid]"));
     assert.ok(index > 0);
-    assert.equal(calls[0].messages[index - 1].content, "");
-    assert.deepEqual(calls[0].messages.slice(0, canonical.length), canonical);
+    const projectedCanonical = [...canonical.slice(0, -2), canonical.at(-1)];
+    assert.deepEqual(calls[0].messages.slice(0, projectedCanonical.length), projectedCanonical,
+      "only this known empty UI boundary is omitted from the outbound copy");
+    assert.equal(calls[0].messages.filter((message) => message.role === "system" && message.content === canonical.at(-1).content).length, 1);
+    assert.ok(calls[0].messages.slice(index + 1).some((message) => message.role === "system" && message.content.includes("CURRENT_TOOL_SURFACE:")));
     assert.equal(calls[0].messages.filter((message) => message.content === "OLDER_UNRELATED_REPLY").length, 1, "retain earlier history once while the empty newest response owns its feedback");
+    assert.deepEqual(fixture.live.messages, canonical, "the original empty response still owns canonical feedback");
   });
 });
 
@@ -548,12 +560,17 @@ test("a truly empty Execute reply retains its own feedback and required decoding
     history.rememberRuntimeV2ProviderResult(fixture, { visibleText: "", toolCalls: [], diagnostics: [] }, command("execute"), tools);
     assert.equal(fixture.live.messages.at(-2).content, "");
     assert.match(fixture.live.messages.at(-1).content, /empty_response/);
+    const canonical = structuredClone(fixture.live.messages);
     await request.requestRuntimeV2ProviderOnce({ live: fixture.live, ports: fixture, command: command("execute", { recoveryPressure: { reason: "empty_response", occurrence: 1, stage: "reconsider" } }), tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
     assert.equal(calls[0].options.toolChoice, "required");
     const index = calls[0].messages.findIndex((message) => message.role === "system" && message.content.startsWith("[runtime-v2 provider feedback: empty_response]"));
     assert.ok(index > 0);
-    assert.equal(calls[0].messages[index - 1].content, "");
+    const projectedCanonical = [...canonical.slice(0, -2), canonical.at(-1)];
+    assert.deepEqual(calls[0].messages.slice(0, projectedCanonical.length), projectedCanonical);
+    assert.equal(calls[0].messages.filter((message) => message.role === "system" && message.content === canonical.at(-1).content).length, 1);
+    assert.ok(calls[0].messages.slice(index + 1).some((message) => message.role === "system" && message.content.includes("CURRENT_TOOL_SURFACE:")));
     assert.match(calls[0].messages[index].content, /no visible reply and no structured tool action/);
+    assert.deepEqual(fixture.live.messages, canonical, "canonical empty ownership remains intact");
   });
 });
 

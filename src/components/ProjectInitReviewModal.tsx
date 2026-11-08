@@ -19,6 +19,7 @@ export interface ProjectInitReviewModalProps {
   onConfirm: () => void | Promise<void>;
   onCancel: () => void;
   onRegenerate: () => void | Promise<void>;
+  onEditDraft?: (content: string) => void;
 }
 
 type PreviewStatus = ProjectInitPreview["status"];
@@ -157,6 +158,7 @@ export default function ProjectInitReviewModal({
   onConfirm,
   onCancel,
   onRegenerate,
+  onEditDraft,
 }: ProjectInitReviewModalProps) {
   const cancelButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
@@ -164,7 +166,7 @@ export default function ProjectInitReviewModal({
   const isLight = themeMode === "light";
   const isBlack = themeMode === "black";
   const status = preview?.status ?? null;
-  const isReady = phase === "review" && (status === "ready_create" || status === "ready_update");
+  const isReady = phase === "review" && !!preview?.proposed.trim() && (status === "ready_create" || status === "ready_update");
   const isNoChange = status === "already_initialized" || status === "no_changes";
   const isCommitting = phase === "committing";
   const isTerminal = phase === "success" || (phase === "review" && isNoChange);
@@ -176,9 +178,9 @@ export default function ProjectInitReviewModal({
 
   const copy = isEnglish
     ? {
-        eyebrow: "PROJECT NOTES · AGENTS.md",
-        title: "Generate / refresh project notes",
-        description: "MAIN generates a deterministic project-facts snapshot for AGENTS.md and writes it only after you confirm. This is optional: MAIN reads the project baseline on every Turn. Use /init --refresh to update an existing managed section.",
+        eyebrow: "PROJECT RULES · AGENTS.md",
+        title: "Review project rules",
+        description: "Review and edit the draft based on the project investigation and your confirmed choices. AGENTS.md changes only after you confirm; a concurrent file change requires a fresh review.",
         workspace: "Captured workspace",
         target: "Target file",
         operation: "Operation",
@@ -187,11 +189,9 @@ export default function ProjectInitReviewModal({
         noWrite: "No write needed",
         fingerprint: "Baseline fingerprint",
         diff: "Proposed diff",
-        emptyDiff: status === "already_initialized"
-          ? "A project-facts snapshot already exists. Use /init --refresh to rescan and review an update; human rules outside the managed section are preserved."
-          : "There are no file changes to display.",
-        loading: "Scanning bounded project metadata and preparing a deterministic preview…",
-        success: "The project-facts snapshot has been saved to AGENTS.md. New Turns will read the saved project notes.",
+        emptyDiff: "There are no file changes to display. Edit the draft to revise the project rules.",
+        loading: "Preparing the investigated rules draft for review…",
+        success: "The reviewed project rules have been saved to AGENTS.md. New Turns will read them.",
         invalidBlock: "The managed markers in AGENTS.md are missing or ambiguous. MAIN will not guess which content it may replace.",
         confirm: "Confirm and write",
         committing: "Writing…",
@@ -200,9 +200,9 @@ export default function ProjectInitReviewModal({
         regenerate: "Regenerate preview",
       }
     : {
-        eyebrow: "项目说明 · AGENTS.md",
-        title: "生成／刷新项目说明",
-        description: "MAIN 根据项目元数据确定性生成 AGENTS.md 事实快照，只有确认后才写入。此操作可选：MAIN 每轮都会自动读取项目基线。已有托管区块时，使用 /init --refresh 更新。",
+        eyebrow: "项目规则 · AGENTS.md",
+        title: "审阅项目规则",
+        description: "草稿依据项目调查和你已确认的选择形成，可在下方编辑。确认后才写入 AGENTS.md；文件若已被其他操作修改，需要重新审阅。",
         workspace: "已捕获的工作区",
         target: "目标文件",
         operation: "操作",
@@ -211,11 +211,9 @@ export default function ProjectInitReviewModal({
         noWrite: "无需写入",
         fingerprint: "基线指纹",
         diff: "拟议变更",
-        emptyDiff: status === "already_initialized"
-          ? "已有项目事实快照。使用 /init --refresh 可重新扫描并审阅更新，托管区块外的人工规则会保留。"
-          : "没有需要展示的文件变更。",
-        loading: "正在扫描有界的项目元数据，并生成确定性预览…",
-        success: "项目事实快照已保存到 AGENTS.md。后续回合会读取这份项目说明。",
+        emptyDiff: "没有需要展示的文件变更。可编辑草稿来调整项目规则。",
+        loading: "正在准备已调查的规则草稿…",
+        success: "已审阅的项目规则已保存到 AGENTS.md。后续回合会读取这些规则。",
         invalidBlock: "AGENTS.md 中的托管标记缺失或存在歧义。MAIN 不会猜测可以替换哪一段内容。",
         confirm: "确认并写入",
         committing: "正在写入…",
@@ -427,7 +425,7 @@ export default function ProjectInitReviewModal({
             </div>
           </div>
 
-          <div
+          {!preview?.editableDraft && <div
             className="mt-3 rounded-xl border px-3 py-2.5"
             style={{ borderColor: palette.subtleBorder, backgroundColor: palette.panel }}
           >
@@ -442,7 +440,7 @@ export default function ProjectInitReviewModal({
             >
               {String(fingerprintLabel)}
             </div>
-          </div>
+          </div>}
 
           {phase === "loading" && (
             <div
@@ -486,11 +484,18 @@ export default function ProjectInitReviewModal({
 
           {phase !== "loading" && (
             <div className="mt-4">
+              {onEditDraft && preview && phase === "review" && <label className="mb-4 block text-[12px]" style={{ color: palette.text }}>
+                {isEnglish ? "Editable draft" : "可编辑草稿"}
+                <textarea data-testid="rules-draft-editor" aria-label={isEnglish ? "AGENTS.md draft" : "AGENTS.md 草稿"}
+                  value={preview.proposed} onChange={event => onEditDraft(event.target.value)}
+                  className="mt-2 min-h-56 w-full rounded-xl border p-3 font-mono text-[12px] outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                  style={{ color: palette.text, background: palette.code, borderColor: palette.subtleBorder }} />
+              </label>}
               <div className="mb-2 flex items-center justify-between gap-3">
                 <h3 className="text-[11px] font-semibold uppercase tracking-[0.12em]" style={{ color: palette.faint }}>
                   {copy.diff}
                 </h3>
-                {preview?.refresh && (
+                {!preview?.editableDraft && preview?.refresh && (
                   <span
                     data-testid="project-init-review-refresh-badge"
                     className="rounded-full border px-2 py-0.5 text-[10px] font-medium"

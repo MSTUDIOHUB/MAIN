@@ -1,5 +1,5 @@
 // @ts-nocheck
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   knowledgeCreateBase,
@@ -11,13 +11,13 @@ import {
   knowledgeListSources,
   knowledgeRebuildBase,
   knowledgeSearch,
-  knowledgeSetBaseEnabled,
   type KnowledgeBase,
   type KnowledgeSearchHit,
   type KnowledgeSource,
 } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import ToggleSwitch from "./ToggleSwitch";
+import KnowledgeEvidence from "./KnowledgeEvidence";
 import {
   IconBook,
   IconClose,
@@ -31,7 +31,7 @@ import {
 const COPY = {
   zh: {
     title: "知识库",
-    subtitle: "启用的知识库会在发送指令时按需检索，不会把全文塞进上下文。",
+    subtitle: "在聊天中输入 # 选择整库或单篇资料，仅本条消息检索。资料保存在个人知识库，不会把全文塞进上下文。",
     create: "新建知识库",
     namePlaceholder: "例如 Python 官方标准库",
     descPlaceholder: "用途说明，可选",
@@ -57,7 +57,7 @@ const COPY = {
   },
   en: {
     title: "Knowledge",
-    subtitle: "Enabled knowledge bases are searched on demand when you send a prompt; full documents are not injected.",
+    subtitle: "Type # in chat to select libraries or documents for that message only. Your personal sources are searched locally; full documents are not injected.",
     create: "New Knowledge Base",
     namePlaceholder: "e.g. Python Standard Library Docs",
     descPlaceholder: "Optional description",
@@ -143,6 +143,11 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
     [knowledgeBases, selectedId],
   );
 
+  const ownerKey = `${isOpen}:${selectedBase?.id || ""}:${selectedBase?.indexRevision || ""}`;
+  const ownerRef = useRef({ key: ownerKey, generation: 0 });
+  if (ownerRef.current.key !== ownerKey) ownerRef.current = { key: ownerKey, generation: ownerRef.current.generation + 1 };
+  useEffect(() => { setHits([]); setBusy(current => current === "search" ? "" : current); }, [ownerKey]);
+
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
@@ -170,6 +175,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
       return;
     }
     let cancelled = false;
+    setSources([]);
     knowledgeListSources(selectedBase.id)
       .then((items) => {
         if (!cancelled) setSources(items);
@@ -232,18 +238,6 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
       setSelectedId(base.id);
       setName("");
       setDescription("");
-    } catch (err) {
-      setError(friendlyErrorMessage(err, copy));
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const toggleBase = async (base: KnowledgeBase) => {
-    setBusy(`toggle:${base.id}`);
-    setError("");
-    try {
-      upsertKnowledgeBase(await knowledgeSetBaseEnabled(base.id, !base.enabled));
     } catch (err) {
       setError(friendlyErrorMessage(err, copy));
     } finally {
@@ -351,15 +345,16 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
 
   const runSearch = async () => {
     if (!selectedBase || !searchQuery.trim() || busy) return;
+    const requestOwner = ownerRef.current.generation;
     setBusy("search");
     setError("");
     try {
-      const result = await knowledgeSearch(searchQuery.trim(), [selectedBase.id], 6);
-      setHits(result.hits || []);
+      const result = await knowledgeSearch(searchQuery.trim(), [{ kind: "base", kbId: selectedBase.id, indexRevision: selectedBase.indexRevision }], 6);
+      if (ownerRef.current.generation === requestOwner) setHits(result.hits || []);
     } catch (err) {
-      setError(friendlyErrorMessage(err, copy));
+      if (ownerRef.current.generation === requestOwner) setError(friendlyErrorMessage(err, copy));
     } finally {
-      setBusy("");
+      if (ownerRef.current.generation === requestOwner) setBusy("");
     }
   };
 
@@ -406,6 +401,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                 {knowledgeBases.map((base) => (
                   <button
                     key={base.id}
+                    disabled={!!busy}
                     onClick={() => setSelectedId(base.id)}
                     className={`w-full rounded-lg border p-3 text-left transition-colors ${
                       selectedBase?.id === base.id
@@ -415,9 +411,6 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                   >
                     <div className="flex items-center gap-2">
                       <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#f4f4f5]">{base.name}</span>
-                      <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${base.enabled ? "bg-[#0f2e0f] text-[#86d9a3]" : "bg-[#18181b] text-[#71717a]"}`}>
-                        {base.enabled ? copy.enabled : copy.disabled}
-                      </span>
                     </div>
                     <div className="mt-1 text-[10px] text-[#71717a]">
                       {base.sourceCount} {copy.sources} · {base.indexStatus}
@@ -440,13 +433,9 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div className="min-w-0">
                   <h3 className="truncate text-base font-bold text-white">{selectedBase.name}</h3>
-                  <p className="mt-1 text-xs text-[#a1a1aa]">{selectedBase.description || selectedBase.embeddingProfile}</p>
+                  <p className="mt-1 text-xs text-[#a1a1aa]">{selectedBase.description || (language === "en" ? "Local keyword retrieval" : "本地关键词检索")}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <label className="flex items-center gap-2 text-xs text-[#e4e4e7]">
-                    <ToggleSwitch checked={selectedBase.enabled} onCheckedChange={() => void toggleBase(selectedBase)} disabled={!!busy} aria-label={`${copy.enableBase}: ${selectedBase.name}`} />
-                    <span>{selectedBase.enabled ? copy.enabled : copy.disabled}</span>
-                  </label>
                   <div className="relative">
                     <button
                       onClick={() => setShowImportMenu(!showImportMenu)}
@@ -654,9 +643,9 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                           {hit.citation.sourceTitle}
                           {hit.citation.page ? ` · p.${hit.citation.page}` : ""}
                           {hit.citation.block ? ` · ${hit.citation.block}` : ""}
-                          {` · ${(hit.citation.score * 100).toFixed(0)}%`}
+
                         </div>
-                        <p className="text-xs leading-relaxed text-[#d4d4d8]">{hit.excerpt}</p>
+                        <KnowledgeEvidence packet={{ state: "retrieved", query: searchQuery, references: selectedBase ? [{ kind: "base", kbId: selectedBase.id, indexRevision: selectedBase.indexRevision }] : [], hits: [hit], note: "" }} language={language === "en" ? "en" : "zh"} />
                       </div>
                     ))}
                   </div>

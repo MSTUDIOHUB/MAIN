@@ -32,6 +32,8 @@ export const RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES = new Set([
   "query_tabular_document",
 ]);
 
+export const RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES = new Set(["knowledge_search", "knowledge_get_excerpt"]);
+
 export const RUNTIME_V2_SOURCE_READ_TOOL_NAMES = new Set([
   ...RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
   ...RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES,
@@ -45,5 +47,6 @@ export function isRuntimeV2WorkspaceReadToolName(toolName: string): boolean {
 export function isRuntimeV2ReadOnlyToolName(toolName: string): boolean {
   return RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName) ||
     RUNTIME_V2_SKILL_READ_TOOL_NAMES.has(toolName) ||
-    RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(toolName);
+    RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(toolName) ||
+    RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES.has(toolName);
 }

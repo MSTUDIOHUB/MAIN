@@ -136,23 +136,25 @@ test("substantive stage conclusions stay visible outside the process archive", a
 test("diff summary exposes concrete files and remains clickable after reload", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
-  const processDisclosure = page.getByTestId("turn-process-disclosure");
+  // A completed Turn without intermediate public updates keeps its concrete
+  // changes in the durable archive rather than the continuous live timeline.
+  const processDisclosure = page.getByTestId("turn-process-archive-toggle");
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
-  await expect(processDisclosure).toContainText("3 个文件");
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
-  await expect(page.getByTestId("live-turn-process-toggle")).toHaveAttribute("aria-expanded", "true");
-  const editStep = page.getByTestId("live-turn-step").filter({ hasText: "本轮改动" });
+  await expect(page.getByTestId("turn-changes-toggle")).toContainText("3 个文件");
+  await expect(page.getByTestId("turn-process-disclosure")).toHaveCount(0);
+  await expect(page.getByTestId("live-turn-process-toggle")).toHaveCount(0);
+  const editStep = page.getByTestId("turn-archive-step").filter({ hasText: "本轮改动" });
   await expect(editStep.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "true");
   await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toBeVisible();
   await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
   await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "generated.ts" })).toBeVisible();
-  await expect(page.getByTestId("live-turn-step").filter({ hasText: "npm test -- --runInBand" })).toBeVisible();
+  await expect(page.getByTestId("turn-archive-step").filter({ hasText: "npm test -- --runInBand" })).toBeVisible();
   await expect(page.getByText("已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。")).toBeVisible();
   await expect
     .poll(async () =>
       page.evaluate(() => {
         const changes = document.querySelector('[data-testid="turn-changes-toggle"]');
-        const disclosure = document.querySelector('[data-testid="turn-process-disclosure"]');
+        const disclosure = document.querySelector('[data-testid="turn-process-archive-toggle"]');
         const conclusion = Array.from(document.querySelectorAll(".chat-agent-content"))
           .find((node) => node.textContent?.includes("已完成三个文件的修改"));
         if (!changes || !disclosure || !conclusion) return false;
@@ -183,8 +185,8 @@ test("diff summary exposes concrete files and remains clickable after reload", a
 
   await page.reload();
 
-  await expect(page.getByTestId("turn-process-disclosure")).toContainText("3 个文件");
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("turn-changes-toggle")).toContainText("3 个文件");
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "true");
 
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
@@ -214,7 +216,7 @@ test("diff panel reverts one file with confirmation and updates the summary", as
       "  return 'old main';",
       "}",
     ].join("\n"));
-  await expect(page.getByTestId("turn-process-disclosure")).toContainText("2 个文件");
+  await expect(page.getByTestId("turn-changes-toggle")).toContainText("2 个文件");
   await expect(page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toHaveCount(0);
 });
 

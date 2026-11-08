@@ -1965,6 +1965,7 @@ test("Runtime v2 collaboration schema exposes read investigations and transactio
   const spawn = executionToolDefinitions.runtimeV2ToolDefinitions().find(tool => tool.function.name === "spawn_subagent");
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 1,
       lifecycleDeadlineAt: 200_000,
     },
@@ -2037,6 +2038,7 @@ test("Execute hides late spawn while retaining wait and rejects a raced spawn be
   };
   const atAdmission = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 10,
       lifecycleDeadlineAt: 10 + minimum,
     },
@@ -2047,6 +2049,7 @@ test("Execute hides late spawn while retaining wait and rejects a raced spawn be
 
   const afterBoundary = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 11,
       lifecycleDeadlineAt: 10 + minimum,
     },
@@ -2073,7 +2076,7 @@ test("Execute hides late spawn while retaining wait and rejects a raced spawn be
   const logged = [];
   const port = schedulerPort.createRuntimeV2SchedulerPort({
     get: () => ({ runtimeV2Checkpoints: {} }),
-    context: { turnId: run.turnId },
+    context: { runWorkspace: "/fixture",  turnId: run.turnId },
     live,
     nextId: () => {
       nextIdCalls += 1;
@@ -2189,7 +2192,7 @@ test("multi-owner direct Execute may edit directly while a recorded contract rem
     get: () => ({
       runtimeV2Checkpoints: { [turn.turnId]: beforeCheckpoint },
     }),
-    context: { turnId: turn.turnId },
+    context: { runWorkspace: "/fixture",  turnId: turn.turnId },
     now: () => 1,
   };
   const available = executionToolDefinitions.runtimeV2ToolDefinitions({})
@@ -3842,7 +3845,7 @@ test("parallel implementation children require disjoint exclusive scopes", () =>
         allowedPaths: ["SRC/COMPONENTS/TOOLBAR.JS"],
       },
     ],
-    maxActiveJobs: 4,
+    maxActiveJobs: 1,
     requestedAt: 1,
     nextId: () => `child-${++id}`,
   });
@@ -3962,7 +3965,7 @@ test("active child write ownership blocks overlapping parent writes and final va
   const rejected = authorization.validateToolAgainstPhaseAndPlan({
     ports: {
       get: () => ({}),
-      context: { turnId: "turn" },
+      context: { runWorkspace: "/fixture",  turnId: "turn" },
       live,
     },
     command: {
@@ -4153,6 +4156,7 @@ test("Observe, Act, and Validate share one safe inspect-edit-verify surface", ()
     "browser_evaluate",
   ].map(definition);
   const ports = {
+    context: { runWorkspace: "/fixture" },
     now: () => 1,
     lifecycleDeadlineAt: 100_000,
   };
@@ -4199,6 +4203,7 @@ test("recovery preserves the current executable surface without a count-based st
     },
   };
   const ports = {
+    context: { runWorkspace: "/fixture" },
     now: () => 1,
     lifecycleDeadlineAt: 200_000,
   };
@@ -4323,6 +4328,7 @@ test("recovery does not confiscate safe reads or admitted collaboration", () => 
   ].map(definition);
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 1,
       lifecycleDeadlineAt: 200_000,
     },
@@ -4358,6 +4364,7 @@ test("missing source guidance preserves ordinary reads without manufacturing pat
   ].map(definition);
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 1,
       lifecycleDeadlineAt: 200_000,
     },
@@ -4373,6 +4380,7 @@ test("missing source guidance preserves ordinary reads without manufacturing pat
 
   const validating = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 1,
       lifecycleDeadlineAt: 200_000,
     },
@@ -4399,6 +4407,7 @@ test("corrective failure leaves source and validation tools available", () => {
   toolDiscovery.unlockToolsForSession(undefined, ["apply_patch", "delete_workspace_path", "browser_evaluate"]);
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 1,
       lifecycleDeadlineAt: 200_000,
     },
@@ -5003,6 +5012,7 @@ test("global attachment analysis exposes only bounded attachment readers", () =>
 test("direct Execute validators keep the canonical tool schema", () => {
   const selected = providerTools.selectRuntimeV2ProviderToolDefinitions({
     ports: {
+      context: { runWorkspace: "/fixture" },
       now: () => 1,
       lifecycleDeadlineAt: 100_000,
     },
@@ -5100,6 +5110,7 @@ test("a rejected action leaves one non-executable causal feedback anchor", () =>
   const selected =
     providerTools.selectRuntimeV2ProviderToolDefinitions({
       ports: {
+        context: { runWorkspace: "/fixture" },
         live,
         now: () => 1,
         lifecycleDeadlineAt: 200_000,
@@ -5670,6 +5681,7 @@ test("a cached source range never excludes later windows from read_file", () => 
   const select = () =>
     providerTools.selectRuntimeV2ProviderToolDefinitions({
       ports: {
+        context: { runWorkspace: "/fixture" },
         live,
         now: () => 1,
         lifecycleDeadlineAt: 200_000,
@@ -6823,7 +6835,8 @@ test("preferred collaboration keeps the user's deliverable authoritative instead
   });
 
   assert.match(prompt, /explicitly prefers collaboration/i);
-  assert.match(prompt, /2 new child slot/i);
+  assert.match(prompt, /current child-request capacity is 2/i);
+  assert.match(prompt, /independent tasks may queue/i);
   assert.match(prompt, /requested deliverable and depth/i);
   assert.match(prompt, /independent result.*benefit/i);
   assert.doesNotMatch(prompt, /prioritize issuing|up to 2 spawn_subagent calls|as many/i);
@@ -6906,7 +6919,8 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
     }],
   });
 
-  assert.match(prompt, /no recorded file mutation/i);
+  assert.doesNotMatch(prompt, /no recorded file mutation/i);
+  assert.match(prompt, /Source evidence alone does not make its files mandatory edit targets/);
   assert.match(prompt, /advance the user's complete objective/i);
   assert.match(prompt, /specific missing fact that blocks the next authorized action/i);
   assert.match(prompt, /Safe reads remain available/i);
@@ -6919,6 +6933,26 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
   assert.doesNotMatch(prompt, /write_file/);
   assert.doesNotMatch(prompt, /prefix|tail/);
   assert.doesNotMatch(prompt, /round|attempt|Gemma|Qwen/i);
+});
+
+test("a fresh source frontier after a committed mutation never denies the historical effect", () => {
+  const aggregate = { events: [
+    { type: "tool.completed", status: "succeeded", sequence: 11, evidence: [{ id: "E3", kind: "mutation", target: "src/main.js" }] },
+    { type: "validation.completed", passed: false, sequence: 14, evidence: [] },
+    { type: "tool.completed", status: "succeeded", sequence: 17, evidence: [{ id: "E6", kind: "source", target: "src/main.js", version: "post-mutation-v1" }] },
+  ] };
+  const pressure = runtime.deriveRuntimeV2EffectPressure(aggregate);
+  assert.equal(pressure.reason, "source_only_frontier");
+  assert.equal(pressure.mutationBoundarySequence, 11, "a new source frontier can coexist with an actual committed mutation");
+  const prompt = providerRequest.providerModeInstruction({ payload: { mode: "execute", effectPressure: pressure } }, "", {
+    hasReadFile: true, hasMutation: true, hasMaterializedSourceEvidence: true, sourceOnlyFrontier: true,
+    validationCorrectionActive: true,
+  });
+  assert.doesNotMatch(prompt, /no recorded file mutation/i);
+  assert.match(prompt, /Source evidence alone does not make its files mandatory edit targets/);
+  assert.match(prompt, /specific missing fact that blocks the next authorized action/);
+  assert.match(prompt, /VALIDATION_CORRECTION/);
+  assert.match(prompt, /Re-verify after the correction/);
 });
 
 test("ordinary reasoning preserves its configuration without a recovery boundary", () => {
@@ -10601,6 +10635,201 @@ test("provider conversation keeps every original command batch while the Run inp
   assert.deepEqual(bounded, messages, "prior command facts and reasoning are canonical input, not pressure garbage");
 });
 
+test("outbound decisions omit 23 empty UI boundaries and coalesce only identical Runtime feedback at any budget", () => {
+  const feedback = "[runtime-v2 provider feedback: empty_response]\nThe previous provider response contained no visible reply and no structured tool action. No effect ran.";
+  const differentFeedback = "[runtime-v2 provider feedback: non_actionable_response]\nA complete reply was received, but verification remains outstanding.";
+  const source = `${feedback}\nexport const owner = true;\n`;
+  const sourceCall = { id: "placeholder-source", type: "function", function: { name: "read_file", arguments: '{"path":"src/current.ts"}' } };
+  const messages = [
+    { role: "system", content: "[MAIN RUNTIME V2] Preserve source and permission authority." },
+    { role: "user", runtimeTurnId: "t1", content: "Complete the approved plan, then verify the change." },
+    { role: "assistant", content: "Earlier irrelevant draft. ".repeat(2_000) },
+    { role: "assistant", content: "", tool_calls: [sourceCall] },
+    { role: "tool", tool_call_id: sourceCall.id, content: source },
+  ];
+  const oldDifferentFeedback = { role: "system", content: differentFeedback };
+  const changedFeedback = { role: "system", content: "[runtime-v2 provider feedback: empty_response]\nA different exact failure fact remains relevant." };
+  messages.push(oldDifferentFeedback, changedFeedback);
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.messages = messages;
+  for (let index = 0; index < 23; index += 1) {
+    providerHistory.appendRuntimeV2ProviderFeedbackHistory(live, { visibleText: "", code: "empty_response", feedback: feedback.split("\n").slice(1).join("\n") });
+    providerHistory.upsertRuntimeV2ContextAnchor(live, { key: "approved-work-plan", content: "Authority remains unchanged." });
+  }
+  const latestFeedback = messages.at(-2);
+  const latestDifferentFeedback = { role: "system", content: differentFeedback };
+  messages.push(latestDifferentFeedback);
+  const canonical = structuredClone(messages);
+  const effects = { committedMutationTargetsByToolCallId: new Map(), replayedToolCallIds: new Set(),
+    sourceReadVersionsByToolCallId: new Map([[sourceCall.id, { target: "src/current.ts", version: "current-source" }]]) };
+  for (const inputBudget of [98_304, 2_000]) {
+    const bounded = providerHistory.boundRuntimeV2ProviderConversation(messages, { contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget }, effects);
+    assert.equal(bounded.filter((message) => message.role === "assistant" && message.content === "" && !message.tool_calls?.length).length, 0);
+    assert.deepEqual(bounded.filter((message) => message.role === "system" && message.content === feedback), [latestFeedback]);
+    assert.deepEqual(bounded.filter((message) => message.role === "system" && message.content === differentFeedback), [latestDifferentFeedback], "different Runtime feedback remains available");
+    assert.ok(bounded.includes(latestFeedback));
+    assert.ok(bounded.includes(latestDifferentFeedback));
+    assert.ok(bounded.includes(changedFeedback), "feedback with the same code but different facts remains available");
+    assert.equal(bounded.includes(oldDifferentFeedback), false);
+    assert.ok(bounded.indexOf(latestFeedback) < bounded.indexOf(latestDifferentFeedback), "keep each exact feedback at its latest causal position");
+    assert.equal(bounded.find((message) => message.tool_call_id === sourceCall.id)?.content, source, "source text containing the feedback prefix is never cleaned as Runtime feedback");
+    assert.ok(bounded.some((message) => message.tool_calls?.some((call) => call.id === sourceCall.id)));
+  }
+  assert.deepEqual(messages, canonical, "the complete canonical empty-response history remains unchanged");
+});
+
+test("empty-assistant cleanup preserves tools, reasoning, image parts and unknown metadata", () => {
+  const feedback = "[runtime-v2 provider feedback: empty_response]\nNo visible reply or tool action was received.";
+  const preserved = [
+    { role: "assistant", content: "", reasoning_content: "Provider-required reasoning continuity." },
+    { role: "assistant", content: "", reasoning: "Alternate immediate reasoning field." },
+    { role: "assistant", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,aW1hZ2U=" } }] },
+    { role: "assistant", content: "", provider_signature: "opaque-provider-state" },
+    { role: "assistant", content: "", runtimeTurnId: "t1" },
+    { role: "assistant", content: " " },
+    { role: "user", content: feedback },
+    { role: "user", content: feedback },
+    { role: "system", content: feedback, provider_signature: "opaque-provider-state" },
+    { role: "system", content: feedback, provider_signature: "opaque-provider-state" },
+  ];
+  const call = { id: "metadata-source", type: "function", function: { name: "read_file", arguments: '{"path":"src/current.ts"}' } };
+  const frontier = { role: "assistant", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,aW1hZ2U=" } }], tool_calls: [call], reasoning_content: "Immediate tool reasoning.", reasoning: "Alternate provider field.", provider_signature: "opaque-current-state" };
+  const receipt = { role: "tool", tool_call_id: call.id, content: feedback };
+  const messages = [{ role: "system", content: "[MAIN RUNTIME V2] fixture" }, { role: "user", runtimeTurnId: "t1", content: "Inspect the current source." }, ...preserved, { role: "assistant", content: "" }, { role: "assistant", content: [], tool_calls: [], reasoning_content: "", reasoning: "" }, frontier, receipt];
+  const canonical = structuredClone(messages);
+  const underBudget = providerHistory.boundRuntimeV2ProviderConversation(messages, { contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget: 98_304 });
+  assert.deepEqual(underBudget, messages.filter((message) => ![messages.at(-4), messages.at(-3)].includes(message)));
+  const pressured = providerHistory.boundRuntimeV2ProviderConversation([messages[0], messages[1], { role: "assistant", content: "old draft ".repeat(2_000) }, frontier, receipt], { contextLimit: 122_880, reservedOutputTokens: 4_096, inputBudget: 1_500 });
+  assert.deepEqual(pressured.find((message) => message.tool_calls?.some((entry) => entry.id === call.id)), frontier);
+  assert.deepEqual(pressured.find((message) => message.tool_call_id === call.id), receipt);
+  assert.deepEqual(messages, canonical);
+});
+
+test("Execute decision copies preserve the redacted rejected native exchange at any budget", () => {
+  const rejected = { id: "rejected-copy", name: "replace_in_file", arguments: { path: "src/main.ts", search_text: "old", replace_text: "REJECTED_PATCH_BODY_SENTINEL" } };
+  const actionIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity(rejected);
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.messages = [
+    { role: "system", content: "[MAIN RUNTIME V2] Preserve permissions and validation debt." },
+    { role: "user", runtimeTurnId: "t1", content: "Repair the source and run its test." },
+    { role: "assistant", content: "old progress ".repeat(500) },
+    { role: "assistant", content: "", tool_calls: [{ id: "committed", type: "function", function: { name: "replace_in_file", arguments: '{"path":"src/main.ts","search_text":"old","replace_text":"current"}' } }] },
+    { role: "tool", tool_call_id: "committed", content: "File updated successfully." },
+    { role: "assistant", content: "", tool_calls: [{ id: "current-source", type: "function", function: { name: "read_file", arguments: '{"path":"src/main.ts"}' } }] },
+    { role: "tool", tool_call_id: "current-source", content: "export const current = true;\n" },
+  ];
+  providerHistory.appendRuntimeV2RejectedToolCallHistory(live, { call: rejected, actionIdentity, feedback: "ACTION_NOT_EXECUTED: already completed; verify the committed mutation before reporting completion." });
+  const canonical = structuredClone(live.messages);
+  const effects = {
+    committedMutationTargetsByToolCallId: new Map([["committed", ["src/main.ts"]]]),
+    replayedToolCallIds: new Set(), sourceReadVersionsByToolCallId: new Map([["current-source", { target: "src/main.ts", version: "current-version" }]]),
+    rejectedActionIdentities: new Set([actionIdentity]),
+  };
+  for (const inputBudget of [98_304, 650]) {
+    const bounded = providerHistory.boundRuntimeV2ProviderConversation(live.messages, { contextLimit: 122_880, reservedOutputTokens: 4096, inputBudget }, effects);
+    const rejectedAssistant = bounded.find((message) => message.tool_calls?.some((call) => call.id === rejected.id));
+    assert.ok(rejectedAssistant, "the model must observe its rejected native action before deciding again");
+    assert.deepEqual(JSON.parse(rejectedAssistant.tool_calls.find((call) => call.id === rejected.id).function.arguments), { runtime_v2_rejected_action: actionIdentity, effect: "none" });
+    assert.ok(bounded.some((message) => message.tool_call_id === rejected.id && message.content.includes("ACTION_NOT_EXECUTED")), "close the native action with its actual no-effect result");
+    const rendered = JSON.stringify(bounded);
+    assert.match(rendered, /already completed; verify the committed mutation/);
+    assert.match(rendered, new RegExp(actionIdentity));
+    assert.doesNotMatch(rendered, /REJECTED_PATCH_BODY_SENTINEL/);
+    assert.doesNotMatch(rendered, /\[runtime-v2 rejected action facts\]/, "the tool receipt already carries these facts");
+    assert.ok(bounded.some((message) => message.tool_call_id === "current-source" && message.content === "export const current = true;\n"));
+    assert.ok(bounded.some((message) => message.tool_call_id === "committed"), "keep the real committed result");
+  }
+  assert.deepEqual(live.messages, canonical, "canonical causal pairs are never removed or rewritten");
+});
+
+test("rejection projection preserves a successful source inside a mixed assistant batch", () => {
+  const sourceCall = { id: "actual-source", type: "function", function: { name: "read_file", arguments: '{"path":"src/current.ts"}' } };
+  const sourceIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity({ name: "read_file", arguments: { path: "src/current.ts" } });
+  const rejectedCall = { id: "closed-command", type: "function", function: { name: "run_command", arguments: '{"command":"already-run"}' } };
+  const rejectedIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity({ name: "run_command", arguments: { command: "already-run" } });
+  const sourceText = `[runtime-v2 rejected action: ${sourceIdentity}]\nThis is actual file data containing a marker, not Runtime feedback.`;
+  const messages = [
+    { role: "user", runtimeTurnId: "t1", content: "Inspect the file and keep the committed command result." },
+    { role: "assistant", content: "", tool_calls: [sourceCall, rejectedCall] },
+    { role: "tool", tool_call_id: sourceCall.id, content: sourceText },
+    { role: "tool", tool_call_id: rejectedCall.id, content: `[runtime-v2 rejected action: ${rejectedIdentity}]\nACTION_NOT_EXECUTED: already completed.` },
+  ];
+  const effects = { committedMutationTargetsByToolCallId: new Map(), replayedToolCallIds: new Set(),
+    sourceReadVersionsByToolCallId: new Map([[sourceCall.id, { target: "src/current.ts", version: "source-current" }]]),
+    rejectedActionIdentities: new Set([rejectedIdentity]) };
+  const bounded = providerHistory.boundRuntimeV2ProviderConversation(messages, { contextLimit: 32_768, reservedOutputTokens: 4096 }, effects);
+  assert.deepEqual(bounded.find((message) => message.role === "assistant").tool_calls, [sourceCall, rejectedCall]);
+  assert.equal(bounded.find((message) => message.tool_call_id === sourceCall.id).content, sourceText);
+  assert.ok(bounded.some((message) => message.tool_call_id === rejectedCall.id && message.content.includes("ACTION_NOT_EXECUTED")));
+  assert.equal(messages[1].tool_calls.length, 2);
+});
+
+test("Execute wire retains the latest real rejection exchange after success and cold restore", async () => {
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const trim = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
+  const originalStream = streaming.streamChatCompletion;
+  const originalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts;
+  const rejected = { id: "latest-rejected", name: "replace_in_file", arguments: { path: "src/main.ts", search_text: "old", replace_text: "REJECTED_PATCH_BODY_SENTINEL" } };
+  const actionIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity(rejected);
+  const feedback = "ACTION_NOT_EXECUTED: the matching mutation already committed; verify the latest workspace version. No new effect ran.";
+  const facts = { ...originalFacts(null), committedMutationTargetsByToolCallId: new Map([["committed", ["src/main.ts"]]]), rejectedActionIdentities: new Set([actionIdentity]) };
+  providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = () => facts;
+  let wire;
+  streaming.streamChatCompletion = async (messages, _settings, _callbacks, _signal, tools, _maxOutput, options) => {
+    wire = { messages, tools, options };
+    return { content: "Validation remains pending.", semanticContent: "Validation remains pending.", finishReason: "stop", toolCalls: [], reasoning: null, usage: null, diagnostics: [] };
+  };
+  const tools = ["read_file", "replace_in_file", "run_command"].map(definition);
+  const invoke = async (inputBudget, restored) => {
+    const live = executionTypes.createRuntimeV2LiveExecutionState();
+    live.messages = [
+      { role: "system", content: "[MAIN RUNTIME V2] Preserve permissions and validation debt." },
+      { role: "user", runtimeTurnId: "t1", content: "Repair the source and run its test." },
+      { role: "assistant", content: "Earlier progress. ".repeat(1_000) },
+      { role: "assistant", content: "", tool_calls: [{ id: "committed", type: "function", function: { name: "replace_in_file", arguments: '{"path":"src/main.ts","search_text":"old","replace_text":"current"}' } }] },
+      { role: "tool", tool_call_id: "committed", content: "File updated successfully." },
+    ];
+    if (restored) {
+      providerHistory.restoreRuntimeV2ExecutionHistory(live, { events: [{ type: "provider.responded", result: { toolCalls: [], actionReceipts: [{ call: { ...rejected, arguments: { runtime_v2_rejected_action: actionIdentity, effect: "none" } }, actionIdentity, status: "rejected", reasonCode: "already_completed", feedback }] } }], evidence: [] });
+    } else {
+      providerHistory.appendRuntimeV2RejectedToolCallHistory(live, { call: { ...rejected, id: "superseded-rejection" }, actionIdentity, feedback });
+      providerHistory.appendRuntimeV2RejectedToolCallHistory(live, { call: rejected, actionIdentity, feedback });
+      providerHistory.appendRuntimeV2ProviderFeedbackHistory(live, { code: "repeated_action_rejected", feedback });
+    }
+    const canonical = structuredClone(live.messages);
+    const events = [];
+    const ports = {
+      get: () => ({ agentMessages: [], conversationTurns: [], config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid", model: "fixture", contextLimit: 122_880, provider: "omlx", toolProtocol: "native" } } }),
+      context: { turnId: "t1", runWorkspace: "/fixture", phaseLanguage: "en", runtimeContextBudget: { contextLimit: 122_880, inputBudget, outputBudget: 24_576 } }, live,
+      logStoreEvent: (name, data) => events.push({ name, data }),
+    };
+    await providerRequest.requestRuntimeV2ProviderOnce({ live, ports, command: { kind: "request_model", phase: "validating", run: { turnId: "t1", runId: "r1" }, payload: { mode: "validate", recoveryPressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason: "repeated_action_rejected", occurrence: 8, stage: "alternative" } } }, tools, textEnvelope: false, toolChoice: null, signal: new AbortController().signal });
+    const assistant = wire.messages.find((message) => message.tool_calls?.some((call) => call.id === rejected.id));
+    assert.ok(assistant, "the actual next provider request must include the latest rejected call");
+    const result = wire.messages.find((message) => message.tool_call_id === rejected.id);
+    assert.equal(result?.content, `[runtime-v2 rejected action: ${actionIdentity}]\n${feedback}`);
+    assert.deepEqual(JSON.parse(assistant.tool_calls.find((call) => call.id === rejected.id).function.arguments), { runtime_v2_rejected_action: actionIdentity, effect: "none" });
+    assert.doesNotMatch(JSON.stringify(wire.messages), /REJECTED_PATCH_BODY_SENTINEL|superseded-rejection|\[runtime-v2 rejected action facts\]|try a different approach or smaller edit/);
+    assert.equal(wire.messages.filter((message) => message.tool_call_id === rejected.id).length, 1);
+    assert.ok(wire.messages.some((message) => message.tool_call_id === "committed"), "preserve the real successful mutation receipt");
+    assert.deepEqual(wire.tools, tools, "rejection feedback neither forces nor withdraws authorized tools");
+    assert.equal(wire.options.toolChoice, undefined);
+    assert.deepEqual(live.messages, canonical, "outbound projection never rewrites canonical history");
+    return { ...wire, event: events.find((event) => event.name === "runtime_v2_context_prepared")?.data };
+  };
+  try {
+    for (const restored of [false, true]) {
+      const roomy = await invoke(98_304, restored);
+      const fullTokens = trim.estimateMessagesTokens(roomy.messages) + trim.estimateTokens(JSON.stringify(roomy.tools));
+      const pressured = await invoke(fullTokens - 100, restored);
+      assert.equal(pressured.event.decisionViewApplied, true, "exercise actual full-wire budget pressure");
+    }
+  } finally {
+    streaming.streamChatCompletion = originalStream;
+    providerEffectFacts.deriveRuntimeV2ProviderEffectFacts = originalFacts;
+  }
+});
+
 test("provider conversation applies semantic workset only after its explicit input allowance is exceeded", () => {
   const messages = twoBatchCommandHistory();
   messages[3] = { ...messages[3], content: `${messages[3].content}${"old-output ".repeat(1_000)}` };
@@ -10977,6 +11206,37 @@ test("mixed observation shell freshness follows retained shell positions, not wh
   assert.deepEqual(repeatedShell.freshReadCalls || [], []);
   const write = { id: "write", name: "replace_in_file", arguments: { path: "state.json", search_text: "old", replace_text: "new" } };
   assert.deepEqual(providerToolSurface.boundRuntimeV2ProviderToolCalls([before, shell, write], new Set(), new Set(), { allowMixedObservationShellBatch: true }).accepted, [before], "same-batch source reads never authorize a proposed source edit");
+});
+
+test("Execute provider admission keeps three independent spawns when the lane initially admits one child request", async () => {
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.providerLaneProfile = { schemaVersion: "provider-lane.v1", nativeTools: true, requiredToolChoice: false, streaming: true, textToolEnvelope: true, reasoning: false, imageInput: false, toolResultRole: "tool" };
+  const calls = ["parser", "consumer", "contract"].map((scope) => ({
+    id: `spawn-${scope}`, name: "spawn_subagent", arguments: {
+      task_key: scope, name: scope, role: "reviewer", task_kind: "review", access_mode: "read",
+      objective: `Review the independent ${scope} boundary.`, success_criteria: "Return one source-backed fact.",
+      required_paths: `src/${scope}.js`, allowed_paths: `src/${scope}.js`,
+    },
+  }));
+  const originalSurface = Object.getOwnPropertyDescriptor(executionContext, "providerToolDefinitionsForCommand");
+  const originalRequest = providerRequest.requestRuntimeV2ProviderOnce;
+  const spawn = executionToolDefinitions.runtimeV2ToolDefinitions().find((tool) => tool.function.name === "spawn_subagent");
+  Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", { configurable: true, enumerable: true, value: () => [spawn] });
+  providerRequest.requestRuntimeV2ProviderOnce = async () => runtime.normalizeProviderResponseV1({ tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })) });
+  let nextId = 0;
+  try {
+    const result = await providerPort.createRuntimeV2ProviderPort({
+      get: () => ({}), context: { turnId: "turn", runWorkspace: "/fixture", phaseLanguage: "en" }, live,
+      nextId: (scope) => `${scope}-${++nextId}`, now: () => 100, logStoreEvent() {},
+    }).request({ command: { ...command("acting"), payload: { mode: "execute", collaborationAllowed: true, maxActiveSubagents: 1, maxChildRuns: 1, remainingSubagentCapacity: 1 } }, signal: new AbortController().signal });
+    assert.equal(result.toolCalls.length, 3, "native proposals queue independently of active HTTP capacity");
+    assert.deepEqual(result.toolCalls.map((call) => call.arguments.task_key), ["parser", "consumer", "contract"]);
+    assert.equal(new Set(result.toolCalls.map((call) => call.id)).size, 3);
+    assert.equal(live.messages.at(-1).tool_calls.length, 3, "every admitted native proposal retains its canonical correlation id");
+  } finally {
+    providerRequest.requestRuntimeV2ProviderOnce = originalRequest;
+    Object.defineProperty(executionContext, "providerToolDefinitionsForCommand", originalSurface);
+  }
 });
 
 test("mixed observation shell provider admission replays only the pre-command read and executes the later read fresh", async () => {

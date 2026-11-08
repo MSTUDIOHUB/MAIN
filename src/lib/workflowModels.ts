@@ -25,7 +25,7 @@ import {
 
 // region: 共享类型
 
-export type RightPanelTab = "plan" | "diff" | "terminal" | "goal" | "subagents";
+export type RightPanelTab = "plan" | "diff" | "terminal" | "subagents";
 
 export type ResponseLanguagePolicy =
   | "follow_input_language"
@@ -682,6 +682,10 @@ export interface DurableTurnContext {
 }
 
 export interface ConversationTurn {
+  planDraft?: import("./planDrafts").PlanDraftRecord;
+  /** Exact data source for a new Plan Turn; never approval authority. */
+  sourcePlanDraft?: import("./planDrafts").PlanDraftRecord;
+  planDocument?: import("./planDocuments").PlanDocumentRef;
   id: string;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   /** Stable admission id for one workspace-visible user submission. */

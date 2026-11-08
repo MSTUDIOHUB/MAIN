@@ -16,7 +16,6 @@ import {
 import {
   runtimeV2ModelSelectedSubagentCandidate,
   runtimeV2SubagentCapacityFromCommand,
-  runtimeV2SubagentTotalBudgetFromCommand,
 } from "./executionSubagentCandidate";
 import { startRuntimeV2Child } from "./executionSubagentRunner";
 import { commitCompletedRuntimeV2ChildTransaction } from "./executionSubagentJoin";
@@ -48,12 +47,10 @@ export function createRuntimeV2SchedulerPort(
         (aggregateForCurrentTurn(input)?.subagents || []).filter((job) =>
           job.parentRunId === command.run.runId
         );
-      const turnChildLimit =
-        runtimeV2SubagentTotalBudgetFromCommand(command);
-      if (existingJobs.length >= turnChildLimit) {
+      const requestCapacity = runtimeV2SubagentCapacityFromCommand(command);
+      if (requestCapacity <= 0) {
         const detail =
-          `This Run has already used its bounded collaboration budget of ` +
-          `${turnChildLimit} child task(s). Continue the parent task directly.`;
+          "The current provider lane does not admit child requests. Continue the parent task directly.";
         closeCollaborationToolCall(
           input,
           command,
@@ -62,9 +59,8 @@ export function createRuntimeV2SchedulerPort(
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
           turnId: command.run.turnId,
           runId: command.run.runId,
-          reason: "turn_child_budget_exhausted",
-          childRuns: existingJobs.length,
-          turnChildLimit,
+          reason: "child_request_capacity_unavailable",
+          requestCapacity,
         });
         throw new Error(detail);
       }
@@ -120,8 +116,7 @@ export function createRuntimeV2SchedulerPort(
           parentRun: command.run,
           candidates: [candidate],
           existingJobs,
-          maxActiveJobs:
-            turnChildLimit,
+          maxActiveJobs: requestCapacity,
           requestedAt: input.now(),
           nextId: input.nextId,
         });
@@ -137,8 +132,8 @@ export function createRuntimeV2SchedulerPort(
       }
       if (decision.jobs.length !== 1) {
         const detail =
-          `The requested child duplicates an existing semantic task, exceeds ` +
-          `the current provider-lane capacity, or violates the access/scope contract: ${
+          `The requested child duplicates an existing semantic task ` +
+          `or violates the access/scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
           }. If required collaboration is still pending, delegate a genuinely different task; otherwise continue the parent task.`;
         closeCollaborationToolCall(

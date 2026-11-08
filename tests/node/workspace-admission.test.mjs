@@ -379,6 +379,24 @@ test("a defensive rule-anchor mismatch retains instructions and discards only ba
   }]);
 });
 
+test("retaining a Plan baseline still refreshes instructions and skill metadata", async () => {
+  const { snapshot: fixture } = await buildFixtureSnapshot();
+  let instructionCalls = 0;
+  let baselineCalls = 0;
+  const result = await admission.resolveWorkspaceAdmissionSnapshot({
+    workspace: "/fixture/repo", skills: [], io: createMemoryIo({}), includeProjectBaseline: false,
+    loaders: {
+      loadResolvedInstructions: async () => { instructionCalls++; return fixture.instructions; },
+      buildProjectBaselineContext: async () => { baselineCalls++; return fixture.baseline; },
+    },
+  });
+  assert.equal(instructionCalls, 1);
+  assert.equal(baselineCalls, 0);
+  assert.deepEqual(result.instructions.skillCatalog, fixture.instructions.skillCatalog);
+  assert.equal(result.baseline, null);
+  assert.deepEqual(result.warnings, []);
+});
+
 test("baseline rendering is deterministic, bounded, and explicitly non-authoritative", async () => {
   const { snapshot } = await buildFixtureSnapshot();
   const rendered = admission.renderProjectBaselineContext(snapshot.baseline);

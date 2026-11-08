@@ -1,14 +1,15 @@
+pub mod migration;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const EMBEDDING_DIMS: usize = 32;
+const LEXICAL_PROFILE: &str = "fts5_cjk_bigram_v2";
 const CHUNK_TARGET_CHARS: usize = 2_800;
 const CHUNK_OVERLAP_CHARS: usize = 400;
 
@@ -22,6 +23,7 @@ pub struct KnowledgeBase {
     pub source_count: usize,
     pub index_status: String,
     pub embedding_profile: String,
+    pub index_revision: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -40,6 +42,7 @@ pub struct KnowledgeSource {
     pub status: String,
     pub metadata: Value,
     pub last_indexed_at_ms: u64,
+    pub source_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +70,10 @@ pub struct KnowledgeCitation {
     pub chunk_id: String,
     pub page: Option<usize>,
     pub block: Option<String>,
+    pub source_url: Option<String>,
     pub score: f32,
+    pub index_revision: String,
+    pub source_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +82,11 @@ pub struct KnowledgeSearchHit {
     pub text: String,
     pub excerpt: String,
     pub citation: KnowledgeCitation,
+    pub returned_char_range: KnowledgeCharRange,
+    pub total_chars: usize,
+    pub complete: bool,
+    pub retrieval_kind: String,
+    pub source_overview: Option<KnowledgeSourceOverview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,8 +132,98 @@ struct CandidateHit {
     text: String,
     page: Option<usize>,
     block: Option<String>,
-    bm25_score: f32,
-    vector_score: f32,
+    source_url: Option<String>,
+    rank: f64,
+    source_revision: String,
+    index_revision: String,
+}
+
+/// Frozen, explicit authority for one submitted message. Empty means no access.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
+pub enum KnowledgeReference {
+    Base {
+        kb_id: String,
+        index_revision: String,
+    },
+    Source {
+        kb_id: String,
+        source_id: String,
+        source_revision: String,
+    },
+}
+
+fn validate_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err("KNOWLEDGE_INVALID_ID".to_string());
+    }
+    Ok(())
+}
+
+fn version_hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn source_revision(conn: &Connection, source_id: &str) -> Result<String, String> {
+    let head: (String, String, String, String) = conn
+        .query_row(
+            "SELECT hash, status, title, metadata FROM sources WHERE id = ?1",
+            params![source_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT hash, page, block, heading FROM chunks WHERE source_id = ?1 ORDER BY chunk_index").map_err(|e| e.to_string())?;
+    let chunks = stmt
+        .query_map(params![source_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(version_hash(
+        &serde_json::json!([LEXICAL_PROFILE, source_id, head, chunks]).to_string(),
+    ))
+}
+
+fn index_revision(conn: &Connection) -> Result<String, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM sources ORDER BY id")
+        .map_err(|e| e.to_string())?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let revisions = ids
+        .iter()
+        .map(|id| source_revision(conn, id).map(|revision| (id, revision)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(version_hash(
+        &serde_json::json!([LEXICAL_PROFILE, revisions]).to_string(),
+    ))
+}
+
+fn hydrate_source(
+    conn: &Connection,
+    mut source: KnowledgeSource,
+) -> Result<KnowledgeSource, String> {
+    source.source_revision = source_revision(conn, &source.id)?;
+    Ok(source)
 }
 
 pub fn knowledge_root(app_data_dir: &Path) -> PathBuf {
@@ -189,12 +290,23 @@ fn make_id(prefix: &str, seed: &str) -> String {
 }
 
 fn open_db(app_data_dir: &Path, kb_id: &str) -> Result<Connection, String> {
+    validate_id(kb_id)?;
+    if fs::symlink_metadata(knowledge_root(app_data_dir)).is_ok_and(|m| m.file_type().is_symlink())
+        || fs::symlink_metadata(db_path(app_data_dir, kb_id))
+            .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err("KNOWLEDGE_UNTRUSTED_PATH".into());
+    }
     let dir = kb_dir(app_data_dir, kb_id);
+    if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("KNOWLEDGE_UNTRUSTED_PATH".to_string());
+    }
     fs::create_dir_all(&dir)
         .map_err(|error| format!("创建知识库目录失败 {}: {error}", dir.display()))?;
     let conn = Connection::open(db_path(app_data_dir, kb_id))
         .map_err(|error| format!("打开知识库索引失败: {error}"))?;
     init_db(&conn)?;
+    ensure_lexical_index(&conn)?;
     Ok(conn)
 }
 
@@ -254,7 +366,67 @@ fn init_db(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_lexical_index(conn: &Connection) -> Result<(), String> {
+    let profile: Option<String> = conn
+        .query_row(
+            "SELECT embedding_profile FROM knowledge_base LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if profile
+        .as_deref()
+        .is_none_or(|value| value == LEXICAL_PROFILE)
+    {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let rows = {
+        let mut stmt = tx.prepare("SELECT c.text, s.title, c.source_id, c.id FROM chunks c JOIN sources s ON s.id=c.source_id ORDER BY c.id").map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        rows
+    };
+    tx.execute("DELETE FROM chunks_fts", [])
+        .map_err(|e| e.to_string())?;
+    for (text, title, source, chunk) in rows {
+        tx.execute(
+            "INSERT INTO chunks_fts(text,title,source_id,chunk_id) VALUES (?1,?2,?3,?4)",
+            params![
+                lexical_index_text(&text),
+                lexical_index_text(&title),
+                source,
+                chunk
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "UPDATE chunks SET embedding_status='not_required',embedding='[]'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE knowledge_base SET embedding_profile=?1",
+        params![LEXICAL_PROFILE],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 fn base_from_row(conn: &Connection) -> Result<KnowledgeBase, String> {
+    let revision = index_revision(conn)?;
     conn.query_row(
         "SELECT id, name, description, enabled, index_status, embedding_profile, created_at_ms, updated_at_ms FROM knowledge_base LIMIT 1",
         [],
@@ -272,6 +444,7 @@ fn base_from_row(conn: &Connection) -> Result<KnowledgeBase, String> {
                 source_count,
                 index_status: row.get(4)?,
                 embedding_profile: row.get(5)?,
+                index_revision: revision.clone(),
                 created_at_ms: row.get::<_, i64>(6)?.max(0) as u64,
                 updated_at_ms: row.get::<_, i64>(7)?.max(0) as u64,
             })
@@ -294,6 +467,7 @@ fn source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeSource>
         status: row.get(8)?,
         metadata: serde_json::from_str(&metadata_text).unwrap_or(Value::Null),
         last_indexed_at_ms: row.get::<_, i64>(10)?.max(0) as u64,
+        source_revision: String::new(),
     })
 }
 
@@ -309,7 +483,7 @@ pub fn create_knowledge_base(
     let conn = open_db(app_data_dir, &id)?;
     let now = now_millis() as i64;
     conn.execute(
-        "INSERT INTO knowledge_base (id, name, description, enabled, index_status, embedding_profile, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, 1, 'empty', 'local_hash_v1+fts5', ?4, ?4)",
+        "INSERT INTO knowledge_base (id, name, description, enabled, index_status, embedding_profile, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, 1, 'empty', 'fts5_cjk_bigram_v2', ?4, ?4)",
         params![&id, name.trim(), description.trim(), now],
     )
     .map_err(|error| format!("创建知识库失败: {error}"))?;
@@ -324,7 +498,11 @@ pub fn list_knowledge_bases(app_data_dir: &Path) -> Result<Vec<KnowledgeBase>, S
     let mut bases = Vec::new();
     let entries = fs::read_dir(&root)
         .map_err(|error| format!("读取知识库目录失败 {}: {error}", root.display()))?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().map_err(|e| e.to_string())?.is_symlink() {
+            return Err("KNOWLEDGE_UNTRUSTED_PATH".into());
+        }
         let path = entry.path();
         if !path.is_dir() || !path.join("index.sqlite").exists() {
             continue;
@@ -332,11 +510,11 @@ pub fn list_knowledge_bases(app_data_dir: &Path) -> Result<Vec<KnowledgeBase>, S
         let Some(kb_id) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if let Ok(conn) = open_db(app_data_dir, kb_id) {
-            if let Ok(base) = base_from_row(&conn) {
-                bases.push(base);
-            }
+        if kb_id.starts_with('.') {
+            continue;
         }
+        let conn = open_db(app_data_dir, kb_id)?;
+        bases.push(base_from_row(&conn)?);
     }
     bases.sort_by(|a, b| {
         b.updated_at_ms
@@ -344,6 +522,14 @@ pub fn list_knowledge_bases(app_data_dir: &Path) -> Result<Vec<KnowledgeBase>, S
             .then(a.name.cmp(&b.name))
     });
     Ok(bases)
+}
+
+pub fn get_knowledge_base(app_data_dir: &Path, kb_id: &str) -> Result<KnowledgeBase, String> {
+    validate_id(kb_id)?;
+    if !db_path(app_data_dir, kb_id).is_file() {
+        return Err("知识库不存在".into());
+    }
+    base_from_row(&open_db(app_data_dir, kb_id)?)
 }
 
 pub fn list_sources(app_data_dir: &Path, kb_id: &str) -> Result<Vec<KnowledgeSource>, String> {
@@ -356,8 +542,11 @@ pub fn list_sources(app_data_dir: &Path, kb_id: &str) -> Result<Vec<KnowledgeSou
     let rows = stmt
         .query_map([], source_from_row)
         .map_err(|error| format!("读取知识库来源失败: {error}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("读取知识库来源失败: {error}"))
+    rows.map(|row| {
+        row.map_err(|error| error.to_string())
+            .and_then(|source| hydrate_source(&conn, source))
+    })
+    .collect()
 }
 
 pub fn stored_sources(app_data_dir: &Path, kb_id: &str) -> Result<Vec<StoredSource>, String> {
@@ -387,9 +576,8 @@ pub fn set_knowledge_base_enabled(
 }
 
 pub fn delete_knowledge_base(app_data_dir: &Path, kb_id: &str) -> Result<(), String> {
-    if kb_id.trim().is_empty() || kb_id.contains('/') || kb_id.contains('\\') {
-        return Err("知识库 ID 无效".to_string());
-    }
+    validate_id(kb_id)?;
+    validate_id(kb_id)?;
     let dir = kb_dir(app_data_dir, kb_id);
     if dir.exists() {
         fs::remove_dir_all(&dir)
@@ -513,48 +701,6 @@ fn estimate_tokens(text: &str) -> usize {
     (text.chars().count() / 3).max(1)
 }
 
-fn local_embedding(content: &str) -> Vec<f32> {
-    let mut vector = vec![0.0_f32; EMBEDDING_DIMS];
-    let mut token_count = 0.0_f32;
-    for token in content
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .filter(|token| token.chars().count() > 1)
-    {
-        token_count += 1.0;
-        let digest = Sha256::digest(token.to_ascii_lowercase().as_bytes());
-        let dim = digest[0] as usize % EMBEDDING_DIMS;
-        let sign = if digest[1] & 1 == 0 { 1.0 } else { -1.0 };
-        vector[dim] += sign;
-    }
-    if token_count > 0.0 {
-        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for value in &mut vector {
-                *value = (*value / norm * 10_000.0).round() / 10_000.0;
-            }
-        }
-    }
-    vector
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot = a
-        .iter()
-        .zip(b.iter())
-        .map(|(left, right)| left * right)
-        .sum::<f32>();
-    let norm_a = a.iter().map(|value| value * value).sum::<f32>().sqrt();
-    let norm_b = b.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm_a <= 0.0 || norm_b <= 0.0 {
-        0.0
-    } else {
-        dot / (norm_a * norm_b)
-    }
-}
-
 fn source_status(extracted: &Value, chunks: &[ChunkInput]) -> String {
     let warning = extracted
         .get("metadata")
@@ -581,7 +727,8 @@ fn get_existing_source_by_hash(
         source_from_row,
     )
     .optional()
-    .map_err(|error| format!("检查知识库重复来源失败: {error}"))
+    .map_err(|error| format!("检查知识库重复来源失败: {error}"))?
+    .map(|source| hydrate_source(conn, source)).transpose()
 }
 
 fn get_existing_source_by_storage_path(
@@ -595,7 +742,8 @@ fn get_existing_source_by_storage_path(
         source_from_row,
     )
     .optional()
-    .map_err(|error| format!("检查知识库来源路径失败: {error}"))
+    .map_err(|error| format!("检查知识库来源路径失败: {error}"))?
+    .map(|source| hydrate_source(conn, source)).transpose()
 }
 
 fn delete_source_chunks(conn: &Connection, source_id: &str) -> Result<(), String> {
@@ -623,6 +771,9 @@ pub fn index_extracted_source(
     let conn = open_db(app_data_dir, kb_id)?;
     let base = base_from_row(&conn)?;
     let hash = file_hash(storage_path)?;
+    let force = force
+        || get_existing_source_by_hash(&conn, kb_id, &hash)?
+            .is_some_and(|source| source.status == "failed");
     if !force {
         if let Some(source) = get_existing_source_by_hash(&conn, kb_id, &hash)? {
             return Ok(KnowledgeImportResult {
@@ -700,11 +851,9 @@ pub fn index_extracted_source(
     for chunk in &chunks {
         let chunk_id = format!("{source_id}:{}", chunk.index);
         let chunk_hash = short_hash(chunk.text.as_bytes());
-        let vector = local_embedding(&chunk.text);
-        let embedding = serde_json::to_string(&vector)
-            .map_err(|error| format!("序列化知识库向量失败: {error}"))?;
+        let embedding = "[]";
         tx.execute(
-            "INSERT INTO chunks (id, source_id, kb_id, chunk_index, text, hash, page, block, heading, token_count, embedding_status, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'local_hash_v1', ?11)",
+            "INSERT INTO chunks (id, source_id, kb_id, chunk_index, text, hash, page, block, heading, token_count, embedding_status, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'not_required', ?11)",
             params![
                 &chunk_id,
                 &source_id,
@@ -722,12 +871,17 @@ pub fn index_extracted_source(
         .map_err(|error| format!("写入知识库分块失败: {error}"))?;
         tx.execute(
             "INSERT INTO chunks_fts (text, title, source_id, chunk_id) VALUES (?1, ?2, ?3, ?4)",
-            params![&chunk.text, &title, &source_id, &chunk_id],
+            params![
+                lexical_index_text(&chunk.text),
+                lexical_index_text(&title),
+                &source_id,
+                &chunk_id
+            ],
         )
         .map_err(|error| format!("写入知识库全文索引失败: {error}"))?;
     }
 
-    let next_status = if chunks.is_empty() { "empty" } else { "ready" };
+    let next_status: String = tx.query_row("SELECT CASE WHEN EXISTS(SELECT 1 FROM sources WHERE status='failed') THEN 'error' WHEN EXISTS(SELECT 1 FROM chunks) THEN 'ready' WHEN EXISTS(SELECT 1 FROM sources WHERE status='needs_ocr') THEN 'needs_ocr' ELSE 'empty' END", [], |row| row.get(0)).map_err(|e| e.to_string())?;
     tx.execute(
         "UPDATE knowledge_base SET index_status = ?1, updated_at_ms = ?2 WHERE id = ?3",
         params![next_status, now as i64, kb_id],
@@ -748,77 +902,191 @@ pub fn index_extracted_source(
     })
 }
 
-fn normalize_fts_query(query: &str) -> String {
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    for ch in query.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af)
+}
+
+fn lexical_terms(value: &str, indexing: bool) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut run = String::new();
+    let mut cjk = false;
+    let flush = |run: &mut String, cjk: bool, result: &mut Vec<String>| {
+        if run.is_empty() {
+            return;
+        }
+        if cjk {
+            let chars: Vec<char> = run.chars().collect();
+            if indexing || chars.len() == 1 {
+                result.extend(chars.iter().map(char::to_string));
+            }
+            result.extend(chars.windows(2).map(|pair| pair.iter().collect::<String>()));
         } else {
-            if current.chars().count() >= 2 {
-                terms.push(current.clone());
+            result.push(run.to_lowercase());
+        }
+        run.clear();
+    };
+    for ch in value.chars() {
+        let next_cjk = is_cjk(ch);
+        if ch.is_alphanumeric() || ch == '_' {
+            if !run.is_empty() && cjk != next_cjk {
+                flush(&mut run, cjk, &mut result);
             }
-            current.clear();
-            if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
-                terms.push(ch.to_string());
-            }
+            cjk = next_cjk;
+            run.push(ch);
+        } else {
+            flush(&mut run, cjk, &mut result);
         }
     }
-    if current.chars().count() >= 2 {
-        terms.push(current);
-    }
-    terms.sort();
-    terms.dedup();
-    terms
+    flush(&mut run, cjk, &mut result);
+    result
+}
+
+fn lexical_index_text(value: &str) -> String {
+    lexical_terms(value, true).join(" ")
+}
+
+fn normalize_fts_query(query: &str) -> String {
+    let mut seen = HashSet::new();
+    lexical_terms(query, false)
         .into_iter()
-        .take(12)
+        .filter(|term| seen.insert(term.clone()))
+        .take(64)
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
 }
 
-fn load_enabled_or_selected_base_ids(
-    app_data_dir: &Path,
-    selected: &[String],
-) -> Result<Vec<KnowledgeBase>, String> {
-    let selected_set: HashSet<String> = selected.iter().cloned().collect();
-    Ok(list_knowledge_bases(app_data_dir)?
-        .into_iter()
-        .filter(|base| {
-            if selected_set.is_empty() {
-                base.enabled
-            } else {
-                selected_set.contains(&base.id)
+struct SelectedBase {
+    base: KnowledgeBase,
+    source_ids: Option<Vec<String>>,
+    source_revisions: HashMap<String, String>,
+}
+
+fn verify_selected_snapshot(
+    conn: &Connection,
+    selected: &SelectedBase,
+) -> Result<KnowledgeBase, String> {
+    let base = base_from_row(conn)?;
+    if selected.source_ids.is_none() {
+        if base.index_revision != selected.base.index_revision {
+            return Err(
+                "STALE_KNOWLEDGE_REFERENCE: selected library changed; select it again".into(),
+            );
+        }
+    } else {
+        for (source, revision) in &selected.source_revisions {
+            if source_revision(conn, source).ok().as_ref() != Some(revision) {
+                return Err(
+                    "STALE_KNOWLEDGE_REFERENCE: selected source changed; select it again".into(),
+                );
             }
-        })
-        .collect())
+        }
+    }
+    Ok(base)
+}
+
+fn resolve_selected_bases(
+    app_data_dir: &Path,
+    references: &[KnowledgeReference],
+) -> Result<Vec<SelectedBase>, String> {
+    // Do not enumerate or open any knowledge storage without explicit selections.
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut selected: HashMap<String, SelectedBase> = HashMap::new();
+    for reference in references {
+        let kb_id = match reference {
+            KnowledgeReference::Base { kb_id, .. } | KnowledgeReference::Source { kb_id, .. } => {
+                kb_id
+            }
+        };
+        validate_id(kb_id)?;
+        if !db_path(app_data_dir, kb_id).is_file() {
+            return Err("STALE_KNOWLEDGE_REFERENCE: knowledge base no longer exists".into());
+        }
+        let conn = open_db(app_data_dir, kb_id)?;
+        let base = base_from_row(&conn)?;
+        match reference {
+            KnowledgeReference::Base { index_revision, .. } => {
+                if *index_revision != base.index_revision {
+                    return Err(
+                        "STALE_KNOWLEDGE_REFERENCE: selected library changed; select it again"
+                            .into(),
+                    );
+                }
+                selected.insert(
+                    kb_id.clone(),
+                    SelectedBase {
+                        base,
+                        source_ids: None,
+                        source_revisions: HashMap::new(),
+                    },
+                );
+            }
+            KnowledgeReference::Source {
+                source_id,
+                source_revision: revision,
+                ..
+            } => {
+                let actual = source_revision(&conn, source_id).map_err(|_| {
+                    "STALE_KNOWLEDGE_REFERENCE: source no longer exists".to_string()
+                })?;
+                if *revision != actual {
+                    return Err(
+                        "STALE_KNOWLEDGE_REFERENCE: selected source changed; select it again"
+                            .into(),
+                    );
+                }
+                let entry = selected.entry(kb_id.clone()).or_insert(SelectedBase {
+                    base,
+                    source_ids: Some(Vec::new()),
+                    source_revisions: HashMap::new(),
+                });
+                if let Some(ids) = &mut entry.source_ids {
+                    if !ids.contains(source_id) {
+                        ids.push(source_id.clone());
+                    }
+                    entry
+                        .source_revisions
+                        .insert(source_id.clone(), revision.clone());
+                }
+            }
+        }
+    }
+    let mut result: Vec<_> = selected.into_values().collect();
+    result.sort_by(|a, b| a.base.id.cmp(&b.base.id));
+    Ok(result)
 }
 
 fn collect_bm25_hits(
     app_data_dir: &Path,
-    base: &KnowledgeBase,
+    selected: &SelectedBase,
     fts_query: &str,
     limit: usize,
 ) -> Result<Vec<CandidateHit>, String> {
     if fts_query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let conn = open_db(app_data_dir, &base.id)?;
+    let conn = open_db(app_data_dir, &selected.base.id)?;
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+    let base = verify_selected_snapshot(&conn, selected)?;
+    let filter = serde_json::to_string(&selected.source_ids).map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT c.id, c.source_id, s.title, c.text, c.page, c.block, bm25(chunks_fts) AS rank
+            SELECT c.id, c.source_id, s.title, c.text, c.page, c.block, bm25(chunks_fts) AS rank, s.metadata
             FROM chunks_fts
             JOIN chunks c ON c.id = chunks_fts.chunk_id
             JOIN sources s ON s.id = c.source_id
-            WHERE chunks_fts MATCH ?1
-            ORDER BY rank
+            WHERE chunks_fts MATCH ?1 AND s.status = 'indexed' AND (?3 = 'null' OR c.source_id IN (SELECT value FROM json_each(?3)))
+            ORDER BY rank, c.id
             LIMIT ?2
             "#,
         )
         .map_err(|error| format!("准备知识库全文检索失败: {error}"))?;
     let rows = stmt
-        .query_map(params![fts_query, limit as i64], |row| {
+        .query_map(params![fts_query, limit as i64, filter], |row| {
             let rank: f64 = row.get(6)?;
             Ok(CandidateHit {
                 kb_id: base.id.clone(),
@@ -831,69 +1099,26 @@ fn collect_bm25_hits(
                     .get::<_, Option<i64>>(4)?
                     .map(|value| value.max(0) as usize),
                 block: row.get(5)?,
-                bm25_score: (1.0 / (1.0 + rank.abs() as f32)).clamp(0.0, 1.0),
-                vector_score: 0.0,
+                source_url: serde_json::from_str::<Value>(&row.get::<_, String>(7)?)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("metadata")
+                            .and_then(|m| m.get("sourceUrl"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }),
+                rank,
+                source_revision: String::new(),
+                index_revision: base.index_revision.clone(),
             })
         })
         .map_err(|error| format!("执行知识库全文检索失败: {error}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("读取知识库全文检索结果失败: {error}"))
-}
-
-fn collect_vector_hits(
-    app_data_dir: &Path,
-    base: &KnowledgeBase,
-    query_vector: &[f32],
-    limit: usize,
-) -> Result<Vec<CandidateHit>, String> {
-    let conn = open_db(app_data_dir, &base.id)?;
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT c.id, c.source_id, s.title, c.text, c.page, c.block, c.embedding
-            FROM chunks c
-            JOIN sources s ON s.id = c.source_id
-            ORDER BY c.source_id, c.chunk_index
-            "#,
-        )
-        .map_err(|error| format!("准备知识库向量检索失败: {error}"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            let embedding_text: String = row.get(6)?;
-            let vector: Vec<f32> = serde_json::from_str(&embedding_text).unwrap_or_default();
-            Ok((
-                CandidateHit {
-                    kb_id: base.id.clone(),
-                    kb_name: base.name.clone(),
-                    chunk_id: row.get(0)?,
-                    source_id: row.get(1)?,
-                    source_title: row.get(2)?,
-                    text: row.get(3)?,
-                    page: row
-                        .get::<_, Option<i64>>(4)?
-                        .map(|value| value.max(0) as usize),
-                    block: row.get(5)?,
-                    bm25_score: 0.0,
-                    vector_score: cosine_similarity(query_vector, &vector).max(0.0),
-                },
-                vector,
-            ))
-        })
-        .map_err(|error| format!("执行知识库向量检索失败: {error}"))?;
-    let mut hits = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("读取知识库向量检索结果失败: {error}"))?
-        .into_iter()
-        .map(|(hit, _)| hit)
-        .filter(|hit| hit.vector_score > 0.05)
-        .collect::<Vec<_>>();
-    hits.sort_by(|a, b| {
-        b.vector_score
-            .partial_cmp(&a.vector_score)
-            .unwrap_or(Ordering::Equal)
-    });
-    hits.truncate(limit);
-    Ok(hits)
+    rows.map(|row| {
+        let mut hit = row.map_err(|e| e.to_string())?;
+        hit.source_revision = source_revision(&conn, &hit.source_id)?;
+        Ok(hit)
+    })
+    .collect()
 }
 
 fn excerpt(text: &str, max_chars: usize) -> String {
@@ -909,72 +1134,185 @@ fn excerpt(text: &str, max_chars: usize) -> String {
     result
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeCharRange {
+    pub start: usize,
+    pub end: usize,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeSourceOverview {
+    pub total_chunks: usize,
+    pub total_chars: usize,
+    pub next_chunk_id: Option<String>,
+}
+
+fn matched_window(
+    text: &str,
+    query: &str,
+    max_chars: usize,
+) -> (String, KnowledgeCharRange, usize, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len();
+    let folded: Vec<(char, usize)> = chars
+        .iter()
+        .enumerate()
+        .flat_map(|(index, ch)| ch.to_lowercase().map(move |lower| (lower, index)))
+        .collect();
+    let lower: String = folded.iter().map(|(ch, _)| ch).collect();
+    let positions: Vec<usize> = lexical_terms(query, false)
+        .iter()
+        .filter_map(|term| {
+            lower
+                .find(term)
+                .map(|byte| folded[lower[..byte].chars().count()].1)
+        })
+        .collect();
+    let mut start = 0;
+    let mut best = 0;
+    for position in &positions {
+        let candidate = position
+            .saturating_sub(max_chars / 3)
+            .min(total.saturating_sub(max_chars));
+        let coverage = positions
+            .iter()
+            .filter(|position| {
+                **position >= candidate && **position < candidate.saturating_add(max_chars)
+            })
+            .count();
+        if coverage > best {
+            best = coverage;
+            start = candidate;
+        }
+    }
+    let end = start.saturating_add(max_chars).min(total);
+    let content = chars[start..end].iter().collect();
+    (
+        content,
+        KnowledgeCharRange { start, end },
+        total,
+        start == 0 && end == total,
+    )
+}
+
+fn candidate_hit(hit: CandidateHit, query: &str) -> KnowledgeSearchHit {
+    let (text, returned_char_range, total_chars, complete) = matched_window(&hit.text, query, 1600);
+    KnowledgeSearchHit {
+        excerpt: excerpt(&text, 700),
+        text,
+        returned_char_range,
+        total_chars,
+        complete,
+        retrieval_kind: "lexical_match".into(),
+        source_overview: None,
+        citation: KnowledgeCitation {
+            kb_id: hit.kb_id,
+            kb_name: hit.kb_name,
+            source_id: hit.source_id,
+            source_title: hit.source_title,
+            chunk_id: hit.chunk_id,
+            page: hit.page,
+            block: hit.block,
+            source_url: hit.source_url,
+            score: (-hit.rank).max(0.0) as f32,
+            index_revision: hit.index_revision,
+            source_revision: hit.source_revision,
+        },
+    }
+}
+
+/// Explicit single-source selection can start from an opening chunk even when
+/// the user's request contains no source keywords. This is not a search match.
+fn selected_source_overview(
+    app_data_dir: &Path,
+    references: &[KnowledgeReference],
+) -> Result<Option<KnowledgeSearchHit>, String> {
+    let unique: HashSet<(String, String)> = references
+        .iter()
+        .filter_map(|reference| match reference {
+            KnowledgeReference::Source {
+                kb_id, source_id, ..
+            } => Some((kb_id.clone(), source_id.clone())),
+            _ => None,
+        })
+        .collect();
+    if unique.len() != 1
+        || references
+            .iter()
+            .any(|r| matches!(r, KnowledgeReference::Base { .. }))
+    {
+        return Ok(None);
+    }
+    let (kb_id, source_id) = unique.into_iter().next().expect("one selected source");
+    let selected = resolve_selected_bases(app_data_dir, references)?;
+    let conn = open_db(app_data_dir, &kb_id)?;
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+    verify_selected_snapshot(&conn, &selected[0])?;
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT id FROM chunks WHERE source_id=?1 ORDER BY chunk_index LIMIT 1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(first) = first else { return Ok(None) };
+    // get_excerpt rechecks the exact same frozen selection before returning bytes.
+    let Some(mut hit) = get_excerpt(app_data_dir, &source_id, &first, references)? else {
+        return Ok(None);
+    };
+    let (text, range, total, complete) = matched_window(&hit.text, "", 1600);
+    hit.text = text;
+    hit.excerpt = excerpt(&hit.text, 700);
+    hit.returned_char_range = range;
+    hit.total_chars = total;
+    hit.complete = complete;
+    hit.retrieval_kind = "source_overview".into();
+    hit.citation.score = 0.0;
+    Ok(Some(hit))
+}
+
 pub fn search(
     app_data_dir: &Path,
     query: &str,
-    kb_ids: &[String],
+    references: &[KnowledgeReference],
     limit: usize,
 ) -> Result<KnowledgeSearchResult, String> {
     let query = query.trim();
     if query.is_empty() {
-        return Err("knowledge_search 缺少 query".to_string());
+        return Err("knowledge_search 缺少 query".into());
     }
-    let bases = load_enabled_or_selected_base_ids(app_data_dir, kb_ids)?;
+    let bases = resolve_selected_bases(app_data_dir, references)?;
     let fts_query = normalize_fts_query(query);
-    let query_vector = local_embedding(query);
-    let mut merged: HashMap<String, CandidateHit> = HashMap::new();
-
-    for base in &bases {
-        for hit in collect_bm25_hits(app_data_dir, base, &fts_query, 60)? {
-            merged
-                .entry(hit.chunk_id.clone())
-                .and_modify(|existing| {
-                    existing.bm25_score = existing.bm25_score.max(hit.bm25_score)
-                })
-                .or_insert(hit);
-        }
-        for hit in collect_vector_hits(app_data_dir, base, &query_vector, 60)? {
-            merged
-                .entry(hit.chunk_id.clone())
-                .and_modify(|existing| {
-                    existing.vector_score = existing.vector_score.max(hit.vector_score)
-                })
-                .or_insert(hit);
+    let mut candidates = Vec::new();
+    for selected in &bases {
+        candidates.extend(collect_bm25_hits(app_data_dir, selected, &fts_query, 60)?);
+    }
+    candidates.sort_by(|a, b| {
+        a.rank
+            .total_cmp(&b.rank)
+            .then(a.kb_id.cmp(&b.kb_id))
+            .then(a.chunk_id.cmp(&b.chunk_id))
+    });
+    candidates.truncate(limit.clamp(1, 16));
+    let mut hits: Vec<_> = candidates
+        .into_iter()
+        .map(|hit| candidate_hit(hit, query))
+        .collect();
+    let mut note="Local lexical matches within this message's selected materials only; no semantic or synonym recall is implied. Empty hits means no supporting indexed evidence was found in that scope.".to_string();
+    if hits.is_empty() {
+        if let Some(overview) = selected_source_overview(app_data_dir, references)? {
+            hits.push(overview);
+            note="NO_LEXICAL_MATCH: the explicitly selected single document's opening chunk is supplied as a limited source_overview, not a search match or a complete-document summary. Range metadata is zero-based/end-exclusive within the original chunk; sourceOverview reports total source chunks/chars and the next chunk for scoped continuation. Do not summarize unread parts.".into();
         }
     }
-
-    let mut hits = merged.into_values().collect::<Vec<_>>();
-    hits.sort_by(|a, b| {
-        let score_a = a.bm25_score * 0.62 + a.vector_score * 0.38;
-        let score_b = b.bm25_score * 0.62 + b.vector_score * 0.38;
-        score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
-    });
-    hits.truncate(limit.clamp(1, 16));
-
     Ok(KnowledgeSearchResult {
-        query: query.to_string(),
-        searched_knowledge_base_ids: bases.iter().map(|base| base.id.clone()).collect(),
-        hits: hits
-            .into_iter()
-            .map(|hit| {
-                let score = (hit.bm25_score * 0.62 + hit.vector_score * 0.38).clamp(0.0, 1.0);
-                KnowledgeSearchHit {
-                    excerpt: excerpt(&hit.text, 700),
-                    text: excerpt(&hit.text, 1_600),
-                    citation: KnowledgeCitation {
-                        kb_id: hit.kb_id,
-                        kb_name: hit.kb_name,
-                        source_id: hit.source_id,
-                        source_title: hit.source_title,
-                        chunk_id: hit.chunk_id,
-                        page: hit.page,
-                        block: hit.block,
-                        score,
-                    },
-                }
-            })
-            .collect(),
-        note: "Use these retrieved snippets as the only knowledge-base evidence. If hits is empty, say the enabled knowledge bases did not contain supporting evidence.".to_string(),
+        query: query.into(),
+        searched_knowledge_base_ids: bases.iter().map(|item| item.base.id.clone()).collect(),
+        hits,
+        note,
     })
 }
 
@@ -982,51 +1320,444 @@ pub fn get_excerpt(
     app_data_dir: &Path,
     source_id: &str,
     chunk_id: &str,
+    references: &[KnowledgeReference],
 ) -> Result<Option<KnowledgeSearchHit>, String> {
-    for base in list_knowledge_bases(app_data_dir)? {
-        let conn = open_db(app_data_dir, &base.id)?;
-        let hit = conn
-            .query_row(
-                r#"
-                SELECT c.id, c.source_id, s.title, c.text, c.page, c.block
-                FROM chunks c
-                JOIN sources s ON s.id = c.source_id
-                WHERE c.source_id = ?1 AND c.id = ?2
-                LIMIT 1
-                "#,
-                params![source_id, chunk_id],
-                |row| {
-                    let text: String = row.get(3)?;
-                    Ok(KnowledgeSearchHit {
-                        excerpt: excerpt(&text, 700),
-                        text,
-                        citation: KnowledgeCitation {
-                            kb_id: base.id.clone(),
-                            kb_name: base.name.clone(),
-                            chunk_id: row.get(0)?,
-                            source_id: row.get(1)?,
-                            source_title: row.get(2)?,
-                            page: row
-                                .get::<_, Option<i64>>(4)?
-                                .map(|value| value.max(0) as usize),
-                            block: row.get(5)?,
-                            score: 1.0,
-                        },
-                    })
+    for selected in resolve_selected_bases(app_data_dir, references)? {
+        if selected
+            .source_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.iter().any(|id| id == source_id))
+        {
+            continue;
+        }
+        let conn = open_db(app_data_dir, &selected.base.id)?;
+        conn.execute_batch("BEGIN DEFERRED")
+            .map_err(|e| e.to_string())?;
+        let base = verify_selected_snapshot(&conn, &selected)?;
+        let row=conn.query_row("SELECT c.text,s.title,c.page,c.block,s.metadata,c.chunk_index FROM chunks c JOIN sources s ON s.id=c.source_id WHERE c.source_id=?1 AND c.id=?2 AND s.status='indexed'",params![source_id,chunk_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?))).optional().map_err(|e|e.to_string())?;
+        if let Some((text, title, page, block, metadata, index)) = row {
+            let total_chars = text.chars().count();
+            let (total_chunks, source_chars): (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(length(text)),0) FROM chunks WHERE source_id=?1",
+                    params![source_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| e.to_string())?;
+            let next=conn.query_row("SELECT id FROM chunks WHERE source_id=?1 AND chunk_index>?2 ORDER BY chunk_index LIMIT 1",params![source_id,index],|row|row.get::<_,String>(0)).optional().map_err(|e|e.to_string())?;
+            return Ok(Some(KnowledgeSearchHit {
+                excerpt: excerpt(&text, 700),
+                text,
+                returned_char_range: KnowledgeCharRange {
+                    start: 0,
+                    end: total_chars,
                 },
-            )
-            .optional()
-            .map_err(|error| format!("读取知识库摘录失败: {error}"))?;
-        if hit.is_some() {
-            return Ok(hit);
+                total_chars,
+                complete: true,
+                retrieval_kind: "source_excerpt".into(),
+                source_overview: Some(KnowledgeSourceOverview {
+                    total_chunks: total_chunks.max(0) as usize,
+                    total_chars: source_chars.max(0) as usize,
+                    next_chunk_id: next,
+                }),
+                citation: KnowledgeCitation {
+                    kb_id: base.id,
+                    kb_name: base.name,
+                    source_id: source_id.into(),
+                    source_title: title,
+                    chunk_id: chunk_id.into(),
+                    page: page.map(|n| n.max(0) as usize),
+                    block,
+                    source_url: serde_json::from_str::<Value>(&metadata).ok().and_then(|v| {
+                        v.get("metadata")
+                            .and_then(|m| m.get("sourceUrl"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }),
+                    score: 1.0,
+                    index_revision: base.index_revision,
+                    source_revision: source_revision(&conn, source_id)?,
+                },
+            }));
         }
     }
     Ok(None)
 }
 
+/// A failed rebuild keeps prior chunks recoverable but cannot advertise them as a successful current index.
+pub fn mark_source_failure(
+    app_data_dir: &Path,
+    kb_id: &str,
+    source_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let conn = open_db(app_data_dir, kb_id)?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute("UPDATE sources SET status='failed',metadata=json_set(metadata,'$.metadata.importError',?1) WHERE id=?2",params![error,source_id]).map_err(|e|e.to_string())?;
+    tx.execute("UPDATE knowledge_base SET index_status='error'", [])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+/// Persist a parse/import failure as a visible source, never an indexed success.
+pub fn record_source_failure(
+    app_data_dir: &Path,
+    kb_id: &str,
+    original_path: &Path,
+    storage_path: &Path,
+    error: &str,
+) -> Result<(), String> {
+    index_extracted_source(
+        app_data_dir,
+        kb_id,
+        original_path,
+        storage_path,
+        &serde_json::json!({"title":original_path.file_name().and_then(|n| n.to_str()).unwrap_or("Source"),"content":"","metadata":{"importError":error}}),
+        true,
+    )?;
+    let conn = open_db(app_data_dir, kb_id)?;
+    conn.execute(
+        "UPDATE sources SET status='failed' WHERE storage_path=?1",
+        params![storage_path.to_string_lossy().as_ref()],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute("UPDATE knowledge_base SET index_status='error'", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn add_source(root: &Path, kb: &str, name: &str, content: &str) -> KnowledgeImportResult {
+        let sources = source_storage_dir(root, kb);
+        fs::create_dir_all(&sources).unwrap();
+        let path = sources.join(name);
+        fs::write(&path, content).unwrap();
+        index_extracted_source(
+            root,
+            kb,
+            &path,
+            &path,
+            &serde_json::json!({"title":name,"content":content}),
+            false,
+        )
+        .unwrap()
+    }
+    fn base_ref(root: &Path, kb: &str) -> KnowledgeReference {
+        KnowledgeReference::Base {
+            kb_id: kb.into(),
+            index_revision: get_knowledge_base(root, kb).unwrap().index_revision,
+        }
+    }
+    fn source_ref(source: &KnowledgeSource) -> KnowledgeReference {
+        KnowledgeReference::Source {
+            kb_id: source.kb_id.clone(),
+            source_id: source.id.clone(),
+            source_revision: source.source_revision.clone(),
+        }
+    }
+    #[test]
+    fn empty_scope_does_not_enumerate_or_create_storage() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("not-created");
+        let result = search(&missing, "知识库", &[], 8).unwrap();
+        assert!(result.hits.is_empty());
+        assert!(result.searched_knowledge_base_ids.is_empty());
+        assert!(get_excerpt(&missing, "source", "chunk", &[])
+            .unwrap()
+            .is_none());
+        assert!(!missing.exists());
+    }
+    #[test]
+    fn selected_source_is_filtered_in_sql_and_other_sources_cannot_be_excerpted() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "scope", "").unwrap();
+        let a = add_source(root.path(), &base.id, "a.md", "中文知识库甲资料");
+        let b = add_source(root.path(), &base.id, "b.md", "中文知识库乙资料");
+        let references = [source_ref(&a.source)];
+        let hits = search(root.path(), "知识库", &references, 1).unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].citation.source_id, a.source.id);
+        assert!(get_excerpt(
+            root.path(),
+            &b.source.id,
+            &format!("{}:0", b.source.id),
+            &references
+        )
+        .unwrap()
+        .is_none());
+        let own = get_excerpt(
+            root.path(),
+            &a.source.id,
+            &format!("{}:0", a.source.id),
+            &references,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(own.citation.source_revision, a.source.source_revision);
+        let stale = [KnowledgeReference::Source {
+            kb_id: base.id,
+            source_id: a.source.id,
+            source_revision: "stale".into(),
+        }];
+        assert!(search(root.path(), "资料", &stale, 8)
+            .unwrap_err()
+            .contains("STALE_KNOWLEDGE_REFERENCE"));
+    }
+    #[test]
+    fn library_membership_revision_changes_but_unchanged_selected_source_remains_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "versions", "").unwrap();
+        let a = add_source(root.path(), &base.id, "a.md", "original alpha");
+        let library = base_ref(root.path(), &base.id);
+        let source = source_ref(&a.source);
+        add_source(root.path(), &base.id, "b.md", "new beta");
+        assert!(search(root.path(), "alpha", &[library], 8)
+            .unwrap_err()
+            .contains("STALE_KNOWLEDGE_REFERENCE"));
+        assert_eq!(
+            search(root.path(), "alpha", &[source.clone()], 8)
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
+        let path = PathBuf::from(a.source.storage_path);
+        fs::write(&path, "replacement gamma").unwrap();
+        index_extracted_source(
+            root.path(),
+            &base.id,
+            &path,
+            &path,
+            &serde_json::json!({"content":"replacement gamma"}),
+            true,
+        )
+        .unwrap();
+        assert!(search(root.path(), "alpha", &[source], 8)
+            .unwrap_err()
+            .contains("STALE_KNOWLEDGE_REFERENCE"));
+    }
+    #[test]
+    fn resolved_scope_is_rechecked_inside_the_query_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "race", "").unwrap();
+        let first = add_source(root.path(), &base.id, "a.md", "alpha original");
+        let resolved = resolve_selected_bases(root.path(), &[source_ref(&first.source)]).unwrap();
+        let path = PathBuf::from(first.source.storage_path);
+        fs::write(&path, "alpha replaced").unwrap();
+        index_extracted_source(
+            root.path(),
+            &base.id,
+            &path,
+            &path,
+            &serde_json::json!({"content":"alpha replaced"}),
+            true,
+        )
+        .unwrap();
+        assert!(
+            collect_bm25_hits(root.path(), &resolved[0], &normalize_fts_query("alpha"), 60)
+                .unwrap_err()
+                .contains("STALE_KNOWLEDGE_REFERENCE")
+        );
+    }
+    #[test]
+    fn search_windows_keep_the_actual_tail_match_and_report_exact_original_range() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "windows", "").unwrap();
+        let original = format!("{}specialneedle", "甲".repeat(2200));
+        let source = add_source(root.path(), &base.id, "long.md", &original);
+        let result = search(
+            root.path(),
+            "specialneedle",
+            &[source_ref(&source.source)],
+            8,
+        )
+        .unwrap();
+        let hit = &result.hits[0];
+        assert!(hit.text.contains("specialneedle"));
+        assert!(!hit.complete);
+        assert!(hit.returned_char_range.start > 0);
+        assert_eq!(hit.total_chars, original.chars().count());
+        assert_eq!(
+            hit.text,
+            original
+                .chars()
+                .skip(hit.returned_char_range.start)
+                .take(hit.returned_char_range.end - hit.returned_char_range.start)
+                .collect::<String>()
+        );
+        assert_eq!(hit.retrieval_kind, "lexical_match");
+    }
+    #[test]
+    fn single_selected_source_no_match_supplies_honest_opening_overview_only() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "overview", "").unwrap();
+        let source = add_source(
+            root.path(),
+            &base.id,
+            "selected.md",
+            &"中文原文。".repeat(700),
+        );
+        add_source(
+            root.path(),
+            &base.id,
+            "other.md",
+            "summaryxyz must not leak from this source",
+        );
+        let result = search(root.path(), "summaryxyz", &[source_ref(&source.source)], 8).unwrap();
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.citation.source_id, source.source.id);
+        assert_eq!(hit.citation.score, 0.0);
+        assert_eq!(hit.retrieval_kind, "source_overview");
+        assert!(result.note.contains("NO_LEXICAL_MATCH"));
+        assert!(!hit.complete);
+        let overview = hit.source_overview.as_ref().unwrap();
+        assert!(overview.total_chunks > 1);
+        assert!(overview.next_chunk_id.is_some());
+        assert!(overview.total_chars > hit.total_chars);
+        assert!(
+            search(
+                root.path(),
+                "unmatched_unique_query",
+                &[base_ref(root.path(), &base.id)],
+                8
+            )
+            .unwrap()
+            .hits
+            .is_empty(),
+            "whole-library no-match never falls back to unrelated openings"
+        );
+        let next = get_excerpt(
+            root.path(),
+            &source.source.id,
+            overview.next_chunk_id.as_ref().unwrap(),
+            &[source_ref(&source.source)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(next.retrieval_kind, "source_excerpt");
+        assert!(next.complete);
+    }
+
+    #[test]
+    fn references_serde_matches_frozen_message_wire_and_rejects_missing_version() {
+        let reference:KnowledgeReference=serde_json::from_value(serde_json::json!({"kind":"source","kbId":"kb_a","sourceId":"src_a","sourceRevision":"v1","label":"Display only"})).unwrap();
+        assert_eq!(
+            reference,
+            KnowledgeReference::Source {
+                kb_id: "kb_a".into(),
+                source_id: "src_a".into(),
+                source_revision: "v1".into()
+            }
+        );
+        assert!(serde_json::from_value::<KnowledgeReference>(
+            serde_json::json!({"kind":"base","kbId":"kb_a"})
+        )
+        .is_err());
+    }
+    #[test]
+    fn lexical_results_keep_bm25_direction_and_never_fall_back_to_hash_similarity() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "rank", "").unwrap();
+        add_source(root.path(), &base.id, "a.md", "alpha alpha alpha");
+        add_source(
+            root.path(),
+            &base.id,
+            "b.md",
+            "alpha beta beta beta beta beta beta",
+        );
+        add_source(root.path(), &base.id, "c.md", "beta gamma");
+        let refs = [base_ref(root.path(), &base.id)];
+        let hits = search(root.path(), "alpha", &refs, 8).unwrap().hits;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "alpha alpha alpha");
+        assert!(hits[0].citation.score >= hits[1].citation.score);
+        assert!(search(root.path(), "unrelatedxyz", &refs, 8)
+            .unwrap()
+            .hits
+            .is_empty());
+        let conn = open_db(root.path(), &base.id).unwrap();
+        let embeddings:i64=conn.query_row("SELECT COUNT(*) FROM chunks WHERE embedding!='[]' OR embedding_status!='not_required'",[],|row|row.get(0)).unwrap();
+        assert_eq!(embeddings, 0);
+    }
+    #[test]
+    fn old_unicode_index_rebuilds_from_original_chunks_without_source_parser() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "legacy", "").unwrap();
+        let added = add_source(root.path(), &base.id, "a.md", "MAIN支持中文知识库检索");
+        let conn = open_db(root.path(), &base.id).unwrap();
+        conn.execute(
+            "UPDATE knowledge_base SET embedding_profile='local_hash_v1+fts5'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM chunks_fts", []).unwrap();
+        conn.execute(
+            "INSERT INTO chunks_fts(text,title,source_id,chunk_id) VALUES (?1,'',?2,?3)",
+            params![
+                "MAIN支持中文知识库检索",
+                added.source.id,
+                format!("{}:0", added.source.id)
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        fs::remove_file(&added.source.storage_path).unwrap(); // Index migration uses the durable chunks, not parser/model/file access.
+        let refs = [base_ref(root.path(), &base.id)];
+        assert_eq!(
+            search(root.path(), "知识库", &refs, 8).unwrap().hits.len(),
+            1
+        );
+        assert_eq!(
+            get_knowledge_base(root.path(), &base.id)
+                .unwrap()
+                .embedding_profile,
+            LEXICAL_PROFILE
+        );
+    }
+    #[test]
+    fn parse_failure_and_ocr_are_truthful_and_failed_import_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "states", "").unwrap();
+        let dir = source_storage_dir(root.path(), &base.id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.pdf");
+        fs::write(&path, "pdf bytes").unwrap();
+        record_source_failure(root.path(), &base.id, &path, &path, "parser unavailable").unwrap();
+        assert_eq!(
+            get_knowledge_base(root.path(), &base.id)
+                .unwrap()
+                .index_status,
+            "error"
+        );
+        assert_eq!(
+            list_sources(root.path(), &base.id).unwrap()[0].status,
+            "failed"
+        );
+        let retried = index_extracted_source(
+            root.path(),
+            &base.id,
+            &path,
+            &path,
+            &serde_json::json!({"content":"可检索的资料"}),
+            false,
+        )
+        .unwrap();
+        assert!(!retried.deduped);
+        assert_eq!(retried.source.status, "indexed");
+        assert_eq!(retried.base.index_status, "ready");
+        let path = dir.join("scan.pdf");
+        fs::write(&path, "scan bytes").unwrap();
+        let ocr=index_extracted_source(root.path(),&base.id,&path,&path,&serde_json::json!({"content":"","metadata":{"warning":"No text extracted; requires OCR"}}),false).unwrap();
+        assert_eq!(ocr.source.status, "needs_ocr");
+        assert_eq!(
+            ocr.base.index_status, "ready",
+            "an empty later import must not hide indexed earlier sources"
+        );
+    }
 
     #[test]
     fn chunks_split_large_text_with_overlap() {
@@ -1034,6 +1765,33 @@ mod tests {
         let chunks = split_large_text(&text);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn chinese_lexical_query_indexes_substrings_without_embedding() {
+        let root = tempfile::tempdir().unwrap();
+        let base = create_knowledge_base(root.path(), "中文资料", "").unwrap();
+        let path = root.path().join("source.md");
+        fs::write(&path, "MAIN支持中文知识库检索。网络访问需要开启。").unwrap();
+        index_extracted_source(root.path(), &base.id, &path, &path,
+            &serde_json::json!({"title":"产品说明","content":"MAIN支持中文知识库检索。网络访问需要开启。"}), false).unwrap();
+        let selected = list_knowledge_bases(root.path()).unwrap().remove(0);
+        let result = search(
+            root.path(),
+            "知识库",
+            &[KnowledgeReference::Base {
+                kb_id: base.id,
+                index_revision: selected.index_revision,
+            }],
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "CJK substring must match indexed lexical terms"
+        );
+        assert!(normalize_fts_query("知识库").contains("\"知识\""));
     }
 
     #[test]
@@ -1070,7 +1828,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(imported.chunks, 1);
-        let result = search(&root, "Unity Transform position", &[], 8).unwrap();
+        let selected = list_knowledge_bases(&root).unwrap().remove(0);
+        let result = search(
+            &root,
+            "Unity Transform position",
+            &[KnowledgeReference::Base {
+                kb_id: base.id.clone(),
+                index_revision: selected.index_revision,
+            }],
+            8,
+        )
+        .unwrap();
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].citation.source_title, "Transform API");
         let _ = fs::remove_dir_all(root);
@@ -1107,9 +1875,14 @@ mod tests {
         });
         index_extracted_source(&root, &base.id, &source_path, &source_path, &second, true).unwrap();
 
-        let old_hits = search(&root, "Transform position", &[], 8).unwrap();
+        let selected = list_knowledge_bases(&root).unwrap().remove(0);
+        let references = [KnowledgeReference::Base {
+            kb_id: base.id.clone(),
+            index_revision: selected.index_revision,
+        }];
+        let old_hits = search(&root, "Transform position", &references, 8).unwrap();
         assert_eq!(old_hits.hits.len(), 0);
-        let new_hits = search(&root, "Rigidbody AddForce", &[], 8).unwrap();
+        let new_hits = search(&root, "Rigidbody AddForce", &references, 8).unwrap();
         assert_eq!(new_hits.hits.len(), 1);
         assert!(new_hits.hits[0].text.contains("Rigidbody"));
         let _ = fs::remove_dir_all(root);

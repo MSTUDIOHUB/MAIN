@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -10,6 +11,7 @@ import {
 } from "../../src/lib/workflowModels";
 import { isWorkspaceMutationToolName } from "../../src/lib/workspaceMutationTools";
 import {
+  normalizeRuntimeV2Checkpoint,
   validateWorkPlanDraftV1,
 } from "../../src/lib/runtime-v2";
 import {
@@ -21,7 +23,7 @@ import {
   validateSealedPlanCandidate,
 } from "../../src/lib/planContract";
 import { PLAN_AUTHORING_CONTRACT_VERSION } from "../../src/lib/planAuthoringContract";
-import { isAcceptanceCapableValidationSpec } from "../../src/lib/validationContract";
+import { analyzeValidationCommand, isAcceptanceCapableValidationSpec } from "../../src/lib/validationContract";
 import {
   collectBoundedRealOmlxWorkspaceFiles,
   checkRealOmlxSourceSyntax,
@@ -44,6 +46,11 @@ import {
 } from "./realOmlxMdViewerPlanOracle";
 import { expectRuntimeV2ReadOnlyCollaboration } from "./runtimeV2StructuralAssertions";
 import { invokeRuntimeToolBridge } from "./runtimeToolBridge";
+import { createCsvCreatorMappingOracle, prepareCsvDirectEditRepairFixture, useDefaultCsvBehaviorOracle, verifyCsvDirectEditRepairFixture } from "./realOmlxDirectEditFixture";
+import { createRealOmlxStreamCapture, createRealOmlxStreamInactivity } from "./realOmlxStreamHarness";
+import { validateRealOmlxPlannedPermission, type RealOmlxApprovedPlanBinding, type RealOmlxPlanPermissionObservation } from "./realOmlxPlanPermission";
+import { createRealOmlxChatTelemetry } from "./realOmlxChatTelemetry";
+import { canonicalChatNetworkRead, expectActualWebReadProviders, expectGlobalReadOnlyChatReply, type RealOmlxWebInvocation } from "./realOmlxChatReadOnlyAssertions";
 import { verifyUnityCollector } from "./realUnityCollectorOracle";
 import { observeRuntimeTask } from "./runtimeTaskObservation";
 
@@ -75,6 +82,74 @@ const realOmlxRequest =
   );
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
 const realOmlxPreferSubagents = process.env.REAL_OMLX_PREFER_SUBAGENTS === "1";
+const breakoutTask = "实现基本的打砖块游戏，使用2D Sprite做原型创作。UI使用legacy的unity ui，每次打掉砖块得到分数。如果有什么不清楚的向我提问";
+const breakoutReplayConfirmation = process.env.REAL_OMLX_BREAKOUT_REPLAY_CONFIRMATION === "1";
+const breakoutResumeSessionId = Number(process.env.REAL_OMLX_BREAKOUT_RESUME_SESSION_ID || 0);
+const breakoutLegacyClarifier = "项目缺少 TextMeshPro 包（com.unity.textmeshpro），无法使用 TextMeshProUGUI 组件。你希望如何处理分数文本？A) 使用 legacy Text 组件（com.unity.ugui 内置，无需额外包）；B) 我帮你安装 TextMeshPro 包（需要联网，可能耗时）。";
+const breakoutLegacyRestatement = "沿用原指令：UI使用legacy的unity ui。";
+// Public tool call and decisions from the Nov 8 incident. Sequence 71 is
+// replayed once at the provider boundary; sequence 79 is entered in the UI.
+const breakoutConfirmation = {
+  sessionId: "1794125357377",
+  providerSequence: 71,
+  decisionSequence: 79,
+  callId: "call_31bd8fec",
+  publicText: "我需要确认几个关键设计决策，以便制定准确的计划。",
+  arguments: {
+    title: "打砖块游戏设计确认",
+    questions: [
+      {
+        id: "verify_method", minSelections: 1, selectionMode: "single",
+        prompt: "游戏完成后，你希望用哪种方式验证？这决定了我们如何搭建测试流程。",
+        options: [
+          { id: "unity_pipeline", label: "Unity Editor 自动化验证（安装 unity-pipeline，编译+进入Play Mode跑逻辑+截图）" },
+          { id: "manual_play", label: "仅生成工程，由你在Unity里手动进入Play Mode测试" },
+          { id: "unit_test", label: "编写C#单元测试验证核心逻辑（如砖块击碎加分）" },
+        ],
+      },
+      {
+        id: "scene_approach", minSelections: 1, selectionMode: "single",
+        prompt: "打砖块游戏需要搭建场景（砖块、球、挡板、UI、相机、灯光）。你希望怎么组织？",
+        options: [
+          { id: "generate_scene", label: "用脚本自动生成完整场景（含所有GameObject、组件、UI、物理体）" },
+          { id: "reuse_existing", label: "在现有CollectorTest.unity场景上搭建" },
+          { id: "new_scene", label: "新建一个专门的Breakout场景" },
+        ],
+      },
+      {
+        id: "ball_paddle", minSelections: 1, selectionMode: "single",
+        prompt: "球和挡板的交互细节，你希望实现到什么程度？",
+        options: [
+          { id: "basic", label: "基础版：球按物理反弹，挡板固定或左右移动接球，掉出屏幕下方扣分/结束" },
+          { id: "angle_control", label: "加角度控制：球接触挡板不同位置改变反弹角度" },
+          { id: "lives", label: "加生命值：多次失误才结束，含Game Over和重新开始" },
+        ],
+      },
+    ],
+  },
+  answers: {
+    verify_method: "unity_pipeline",
+    scene_approach: "reuse_existing",
+    ball_paddle: "angle_control",
+    result_kind: "executable",
+  } as Readonly<Record<string, string>>,
+};
+
+function breakoutConfirmationStream(model: string): Response {
+  const chunks = [
+    { delta: { role: "assistant", content: breakoutConfirmation.publicText }, finish_reason: null },
+    { delta: { tool_calls: [{
+      index: 0, id: breakoutConfirmation.callId, type: "function",
+      function: { name: "ask_plan_questions", arguments: JSON.stringify(breakoutConfirmation.arguments) },
+    }] }, finish_reason: null },
+    { delta: {}, finish_reason: "tool_calls" },
+  ];
+  const body = chunks.map(choice => `data: ${JSON.stringify({
+    id: "breakout-recorded-confirmation", object: "chat.completion.chunk", model, choices: [{ index: 0, ...choice }],
+  })}\n\n`).join("") + "data: [DONE]\n\n";
+  return new Response(body, { headers: { "content-type": "text/event-stream" } });
+}
+
 const realOmlxImagePath = String(process.env.REAL_OMLX_IMAGE_PATH || "").trim();
 const runDirectEditRecovery = process.env.REAL_OMLX_DIRECT_EDIT_RECOVERY === "1";
 const runExecuteIncidentReplay = process.env.REAL_OMLX_EXECUTE_INCIDENT === "1";
@@ -96,6 +171,13 @@ const realOmlxMutationExpectation = new RegExp(
       : "creatorName\\s*:"),
   "i",
 );
+const useSemanticCsvMutationOracle = useDefaultCsvBehaviorOracle({
+  fixture: realOmlxFixture,
+  workspaceOverride: process.env.REAL_OMLX_WORKSPACE,
+  mutationExpectationOverride: process.env.REAL_OMLX_MUTATION_EXPECT,
+  mutationFile: realOmlxMutationFile,
+});
+const inspectCsvCreatorMapping = createCsvCreatorMappingOracle();
 const realOmlxDevServerUrl = String(
   process.env.REAL_OMLX_DEV_SERVER_URL ||
   (realOmlxFixture === "md-viewer" ? "http://localhost:1420/" : "http://localhost:5173/"),
@@ -477,6 +559,7 @@ async function readFixtureMutationContents(workspace: string): Promise<Record<st
 const PLAN_ONLY_FINGERPRINT_IGNORED_DIRECTORIES = new Set([
   ".git",
   ".MAIN",
+  ".MAIN-chat-attachments", // Host-owned attachment copies, not model source edits.
   "node_modules",
   "target",
   "dist",
@@ -556,8 +639,12 @@ async function inspectFixtureMutation(
       );
     }
   }
+  const csvCheck = useSemanticCsvMutationOracle ? await inspectCsvCreatorMapping(workspace) : null;
+  const csvSourceStillCurrent = csvCheck && csvCheck.sourceHash === createHash("sha256").update(contents[realOmlxMutationFile] || "").digest("hex") &&
+    csvCheck.sourceHash === createHash("sha256").update(await fs.readFile(path.join(workspace, realOmlxMutationFile), "utf8")).digest("hex");
   const satisfied = useSemanticMdViewerMutationOracle
     ? executionGaps.length === 0
+    : csvCheck ? csvCheck.passed && !!csvSourceStillCurrent
     : realOmlxMutationExpectation.test(contents[realOmlxMutationFile] || "");
   return {
     satisfied,
@@ -567,6 +654,10 @@ async function inspectFixtureMutation(
       ? executionGaps.length === 0
         ? "the pristine initial tab is replaced on open, programmatic loading stays clean, and save_file_content uses the active filePath"
         : executionGaps.join("\n")
+      : csvCheck ? csvCheck.passed && csvSourceStillCurrent
+        ? "all five CSV creator mappings and the public CsvOrder.creatorName TypeScript contract pass"
+        : csvCheck.sourceChangedDuringCheck || !csvSourceStillCurrent ? "CSV source changed while its independent behavior/type contract was checked; check the current version again"
+        : `CSV behavior/type contract failed:\n${csvCheck.behavior.stdout}${csvCheck.behavior.stderr}${csvCheck.typecheck.stdout}${csvCheck.typecheck.stderr}`
       : `${realOmlxMutationFile} matches ${realOmlxMutationExpectation.source}`,
   };
 }
@@ -624,6 +715,72 @@ async function approveInScopeBrowserPermission(
     bridge?.approvePendingTool?.();
     return true;
   }, request?.requestId);
+}
+
+async function inspectPlannedPermissionStore(
+  page: Page,
+  approval: { signature: string; identity: { sessionKey: string; turnId: string; runId: string; requestId: string; taskId: number } } | null = null,
+): Promise<{ observed: RealOmlxPlanPermissionObservation; signature: string; approved: boolean }> {
+  return await page.evaluate(async (approval) => {
+    const { useAppStore } = await import("/src/store/useAppStore.ts");
+    const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+    const state = useAppStore.getState();
+    const aggregate = state.currentTurnId
+      ? normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[state.currentTurnId])?.aggregate || null
+      : null;
+    const marker = state.harnessRunMarker;
+    const observed = {
+      currentWorkspace: state.currentWorkspace,
+      currentSessionKey: state.getCurrentSessionKey(),
+      currentTurnId: state.currentTurnId,
+      sessionEpoch: state.planLifecycle.sessionEpoch,
+      marker: marker ? { sessionKey: marker.sessionKey, turnId: marker.turnId, runId: marker.runId,
+        parentRunId: marker.parentRunId ?? null, status: marker.status } : null,
+      request: state.activeActionRequest,
+      pendingReviewTaskId: state.pendingReviewTaskId,
+      hasPendingResolver: typeof state.pendingReviewResolve === "function",
+      pendingToolCall: state.pendingToolCall,
+      aggregate,
+    };
+    const signature = JSON.stringify(observed);
+    if (!approval || signature !== approval.signature) return { observed, signature, approved: false };
+    // Same synchronous Store action used by Capsule's approve-once control.
+    // No persisted auto-review flag or capability requirement is changed.
+    state.approvePendingReviewOnce(approval.identity);
+    const after = useAppStore.getState();
+    return { observed, signature, approved: after.activeActionRequest?.requestId !== approval.identity.requestId };
+  }, approval) as any;
+}
+
+async function approveReviewedExecutionPermission(
+  page: Page,
+  testInfo: TestInfo,
+  workspace: string,
+  approved: RealOmlxApprovedPlanBinding,
+  seen: Set<string>,
+): Promise<boolean> {
+  const captured = await inspectPlannedPermissionStore(page);
+  const request = captured.observed.request;
+  if (request?.kind !== "tool_permission") return false;
+  if (await approveInScopeBrowserPermission(page, request, workspace)) {
+    seen.add(request.requestId);
+    return true;
+  }
+  const label = `planned-permission-${createHash("sha256").update(request.requestId).digest("hex").slice(0, 12)}.json`;
+  try {
+    const decision = await validateRealOmlxPlannedPermission(captured.observed, approved, workspace);
+    const dispatched = await inspectPlannedPermissionStore(page, { signature: captured.signature, identity: decision.identity });
+    if (!dispatched.approved) return false; // Exact request changed while the host checked its paths.
+    if (!seen.has(request.requestId)) {
+      seen.add(request.requestId);
+      console.log(`[real-omlx-planned-permission-approval] ${JSON.stringify({ requestId: request.requestId, toolName: request.toolName, ...decision })}`);
+      await fs.writeFile(testInfo.outputPath(label), JSON.stringify({ action: "approve_once", decision, observed: captured.observed }, null, 2));
+    }
+    return true;
+  } catch (error) {
+    await fs.writeFile(testInfo.outputPath(label), JSON.stringify({ action: "left_pending", error: String(error), observed: captured.observed }, null, 2));
+    throw error;
+  }
 }
 
 function summarizePlanDebugTail(entries: unknown[]): string[] {
@@ -1094,11 +1251,43 @@ function expectRuntimeV2PlanReviewContract(
     parentRunId: runtime.runIdentity.parentRunId ?? null,
   });
   expect(String(commit?.review?.requestId || "")).not.toBe("");
-  expect(commit?.artifact).toEqual({
-    path: ".MAIN/plans/plan.md",
-    content: sealed.markdown,
-    projectionHash: sealed.projectionHash,
-  });
+  const documentRef = commit?.artifact?.documentRef;
+  if (documentRef) {
+    expect(documentRef.kind).toBe("plan");
+    expect(documentRef.owner).toEqual({
+      workspace: snapshot.currentWorkspace || null,
+      sessionKey: runtime.turnIdentity.sessionKey,
+      sessionEpoch: runtime.turnIdentity.sessionEpoch,
+      turnId: expected.turnId,
+    });
+    expect(Number.isSafeInteger(documentRef.revision)).toBe(true);
+    expect(documentRef.revision).toBeGreaterThanOrEqual(1);
+    expect(String(documentRef.documentId || "").trim()).not.toBe("");
+    expect(path.isAbsolute(documentRef.path)).toBe(true);
+    expect(path.basename(documentRef.path)).toBe(`rev-${documentRef.revision}.md`);
+    expect(path.basename(path.dirname(documentRef.path))).toBe(documentRef.documentId);
+    if (documentRef.owner.workspace) {
+      expect(documentRef.path).toBe(path.join(documentRef.owner.workspace, ".MAIN", "plans", documentRef.documentId, `rev-${documentRef.revision}.md`));
+    }
+    expect(documentRef.contentHash).toBe(createHash("sha256").update(sealed.markdown).digest("hex"));
+    expect(commit.artifact).toEqual({ path: documentRef.path, documentRef,
+      content: sealed.markdown, projectionHash: sealed.projectionHash });
+    // The production review binding owns the exact owner + WorkPlan authority;
+    // the document ref lives in the artifact member of the same immutable commit.
+    if (commit.review.documentRef !== undefined) expect(commit.review.documentRef).toEqual(documentRef);
+    expect(snapshot?.activeActionRequest?.documentRef).toEqual(documentRef);
+  } else {
+    // Persisted pre-document WorkPlans retain their original precise contract.
+    expect(commit?.artifact).toEqual({ path: ".MAIN/plans/plan.md",
+      content: sealed.markdown, projectionHash: sealed.projectionHash });
+    expect(commit?.review?.documentRef).toBeUndefined();
+    expect(snapshot?.activeActionRequest?.documentRef).toBeUndefined();
+  }
+  const sealedEvent = events.find((event: any) => event.type === "work_plan.sealed");
+  expect(sealedEvent?.sealedPlan).toEqual(sealed);
+  expect(sealedEvent?.reviewCommit).toEqual(commit);
+  expect(events.filter((event: any) => event.type === "work_plan.approved")).toHaveLength(0);
+  expect((runtime.evidence || []).filter((item: any) => item.kind === "mutation")).toHaveLength(0);
   expect(commit?.panel).toMatchObject({
     audience: "plan_panel",
     status: "pending_review",
@@ -1124,7 +1313,7 @@ function expectRuntimeV2PlanReviewContract(
     parentRunId: commit.review.parentRunId,
     planRevision: sealed.revision,
     artifactHash: sealed.projectionHash,
-    artifactPaths: [".MAIN/plans/plan.md"],
+    artifactPaths: [commit.artifact.path],
   });
 
   const commands = Array.isArray(runtime?.commands) ? runtime.commands : [];
@@ -1145,31 +1334,27 @@ function expectRuntimeV2PlanReviewContract(
   expect(commands.every((command: { turnId?: string; runId?: string }) =>
     command.turnId === expected.turnId && command.runId === runtime.runId
   )).toBe(true);
-  const artifactWrites = commands.filter((command: {
-    kind?: string;
-    toolName?: string;
-    target?: string;
-    runtimeOwnedPlanArtifact?: boolean;
-  }) =>
-    command.kind === "execute_tool" &&
-    command.toolName === "write_file" &&
-    command.target === ".MAIN/plans/plan.md"
+  const artifactWrites = commands.filter((command: any) =>
+    command.kind === "execute_tool" && command.toolName === (documentRef ? "save_plan_document" : "write_file") &&
+    command.target === (documentRef ? documentRef.documentId : ".MAIN/plans/plan.md")
   );
   expect(artifactWrites).toHaveLength(1);
   expect(artifactWrites[0]?.runtimeOwnedPlanArtifact).toBe(true);
-  expect(commands.filter((command: {
-    kind?: string;
-    toolName?: string;
-    runtimeOwnedPlanArtifact?: boolean;
-    target?: string;
-  }) =>
-    command.kind === "execute_tool" &&
-    isWorkspaceMutationToolName(String(command.toolName || "")) &&
-    !(
-      command.toolName === "write_file" &&
-      command.target === ".MAIN/plans/plan.md" &&
-      command.runtimeOwnedPlanArtifact === true
-    )
+  expect(artifactWrites[0]?.status).toBe("succeeded");
+  const artifactReceipt = receipts.find((receipt: any) => receipt.idempotencyKey === artifactWrites[0].idempotencyKey);
+  expect(artifactReceipt).toMatchObject({ kind: "execute_tool", status: "succeeded" });
+  if (documentRef) {
+    const saved = events.find((event: any) => event.type === "tool.completed" && event.idempotencyKey === artifactWrites[0].idempotencyKey);
+    expect(saved?.status).toBe("succeeded");
+    expect(saved?.evidence).toEqual(expect.arrayContaining([{ id: `plan-artifact:${sealed.id}:${sealed.revision}`,
+      kind: "tool", target: documentRef.path, version: documentRef.contentHash }]));
+    const record = JSON.parse(saved?.modelContent || "null");
+    expect(record?.planDocument).toEqual(documentRef);
+    expect(record?.markdown).toBe(sealed.markdown);
+  }
+  expect(commands.filter((command: any) =>
+    command.kind === "execute_tool" && isWorkspaceMutationToolName(String(command.toolName || "")) &&
+    !(documentRef === undefined && command.toolName === "write_file" && command.target === ".MAIN/plans/plan.md" && command.runtimeOwnedPlanArtifact === true)
   )).toHaveLength(0);
 
   const committedProjections = (runtime?.projections || []).filter(
@@ -1185,6 +1370,19 @@ function expectRuntimeV2PlanReviewContract(
   );
   expect(visibleMilestones).toHaveLength(1);
   return runtime;
+}
+
+async function readRuntimeV2PlanReviewSnapshot(page: Page): Promise<any> {
+  return page.evaluate(() => {
+    const bridge = (window as any).__CODELY_E2E__;
+    const snapshot = bridge.getSnapshot();
+    const aggregate = bridge.readOnlySnapshot().aggregate;
+    if (!aggregate || aggregate.turn.turnId !== snapshot.runtimeV2?.turnId || aggregate.run?.identity.runId !== snapshot.runtimeV2?.runId) {
+      throw new Error("REAL_PLAN_REVIEW_SNAPSHOT_OWNER_MISMATCH");
+    }
+    return { ...snapshot, activeActionRequest: bridge.structuredChoiceSnapshot(),
+      runtimeV2: { ...snapshot.runtimeV2, events: aggregate.events } };
+  });
 }
 
 function assertFirstPlanWorkspaceTurnAdmission(snapshot: any): string {
@@ -1252,16 +1450,23 @@ test.describe.configure({
 });
 test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-flow validation.");
 
-test.beforeEach(async ({ page }) => {
+test.beforeEach(async ({ page }, testInfo) => {
+  const breakoutColdRestore = breakoutResumeSessionId > 0 && testInfo.title.startsWith("real OMLX Breakout incident Plan");
   const customWorkspace = process.env.REAL_OMLX_WORKSPACE;
-  const workspace = customWorkspace && process.env.MAIN_DETERMINISTIC_PAUSE_E2E === "1"
+  const workspacePath = customWorkspace && process.env.MAIN_DETERMINISTIC_PAUSE_E2E === "1"
     ? await fs.mkdtemp(path.join(path.resolve(customWorkspace), "independent-test-")) : customWorkspace
     ? path.resolve(customWorkspace)
     : await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
+  // The real project-open ingress canonicalizes the workspace before it
+  // constructs Session owners. Preserve that contract in the host fixture.
+  const workspace = await fs.realpath(workspacePath);
   (page as any).__realOmlxWorkspace = workspace;
   if (process.env.MAIN_DETERMINISTIC_PAUSE_E2E === "1") await fs.writeFile(path.join(workspace, "fixture.txt"), "Deterministic production boundary fixture.\n");
   const providerWire: any[] = [];
+  let breakoutConfirmationReplayed = false;
   (page as any).__realOmlxProviderWire = providerWire;
+  const webInvocations: RealOmlxWebInvocation[] = [];
+  (page as any).__realOmlxWebInvocations = webInvocations;
   const productionTools = realOmlxFixture === "unity";
   // This disposable database starts empty, unlike the already-running MAIN
   // installation being reproduced. Finish its schema bootstrap before UI
@@ -1283,15 +1488,18 @@ test.beforeEach(async ({ page }) => {
     }, null, 2) + "\n",
     "tests/creator-mapping.test.mjs": [
       "import assert from 'node:assert/strict';",
-      "import fs from 'node:fs';",
+      "import { normalizeCsvOrder } from '../src/hooks/useCsvParser.ts';",
       "",
-      "const source = fs.readFileSync('src/hooks/useCsvParser.ts', 'utf8');",
-      "const normalized = source.replace(/\\s+/g, '').replaceAll('\"', \"'\");",
-      "assert.equal(",
-      "  normalized.includes(\"creatorName:row.creator||row['创建者']||''\"),",
-      "  true,",
-      "  'normalizeCsvOrder must map the CSV creator column to creatorName',",
-      ");",
+      "// Check behavior so equivalent implementations remain valid.",
+      "for (const [row, expected] of [",
+      "  [{ creator: 'alice' }, 'alice'],",
+      "  [{ 创建者: '林' }, '林'],",
+      "  [{ creator: 'alice', 创建者: '林' }, 'alice'],",
+      "  [{ creator: '', 创建者: '林' }, '林'],",
+      "  [{}, ''],",
+      "]) {",
+      "  assert.equal(normalizeCsvOrder(row).creatorName, expected, 'normalizeCsvOrder must map CSV creator values to creatorName');",
+      "}",
       "",
     ].join("\n"),
     "src/hooks/useCsvParser.ts": [
@@ -1518,6 +1726,9 @@ test.beforeEach(async ({ page }) => {
   );
   let requireDirectEditRepair = false;
   await page.exposeFunction("__MAIN_E2E_REQUIRE_DIRECT_EDIT_REPAIR", async () => {
+    if (realOmlxFixture !== "csv") throw new Error("DIRECT_EDIT_REPAIR_REQUIRES_CSV_FIXTURE");
+    await prepareCsvDirectEditRepairFixture(workspace);
+    invalidateWorkspaceInventory();
     requireDirectEditRepair = true;
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
@@ -1525,6 +1736,13 @@ test.beforeEach(async ({ page }) => {
     console.log(`[real-omlx-validation-command] ${JSON.stringify({
       command: command.slice(0, 1_000),
     })}`);
+    if (!isFinitePlanValidationCommand(command)) {
+      // Ordinary authorized shell tools have process receipts, not CSV
+      // acceptance. Runtime independently decides whether a command can
+      // discharge validation debt; the fixture must preserve that distinction.
+      const result = await runRealOmlxWorkspaceCommand(workspace, command);
+      return JSON.stringify({ command, cwd: workspace, ...result, success: result.exitCode === 0 && !result.timedOut });
+    }
     const mutationState = await inspectFixtureMutation(
       workspace,
       fixtureMutationBaseline,
@@ -1533,25 +1751,20 @@ test.beforeEach(async ({ page }) => {
     const commandResult = isFiniteVerification
       ? await runRealOmlxWorkspaceCommand(workspace, command)
       : null;
-    const directEditSource = requireDirectEditRepair && realOmlxFixture === "csv"
-      ? await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8")
-      : "";
-    const directEditRepairSatisfied = !requireDirectEditRepair || (
-      /\bsource\??\s*:\s*string\b/.test(directEditSource) &&
-      /\bsource\s*:\s*["']csv["']/.test(directEditSource)
-    );
+    const directEditVerification = requireDirectEditRepair
+      ? await verifyCsvDirectEditRepairFixture(workspace)
+      : null;
     const exitCode = commandResult?.exitCode === 0 &&
       !commandResult.timedOut &&
-      mutationState.satisfied &&
-      isFiniteVerification &&
-      directEditRepairSatisfied
+      (directEditVerification ? directEditVerification.passed : mutationState.satisfied) &&
+      isFiniteVerification
       ? 0
       : commandResult?.exitCode || 1;
     const semanticSummary = exitCode === 0
-      ? `Fresh fixture verification passed: ${mutationState.detail}.`
+      ? directEditVerification ? "Fresh independent CSV behavior and TypeScript verification passed." : `Fresh fixture verification passed: ${mutationState.detail}.`
       : [
           "FRESH_FIXTURE_ACCEPTANCE_FAILED: the finite command ran, but the current source still violates these user-visible acceptance conditions:",
-          mutationState.detail,
+          directEditVerification ? "CSV behavior and the public parser type contract must both pass the real checks below." : mutationState.detail,
         ].join("\n");
     return JSON.stringify({
       command,
@@ -1567,10 +1780,12 @@ test.beforeEach(async ({ page }) => {
       stderr: [
         commandResult?.stderr || "",
         ...(exitCode === 0 ? [] : [semanticSummary]),
-        ...(requireDirectEditRepair && !directEditRepairSatisfied ? [[
-            "src/hooks/useCsvParser.ts:8:3 - error TS2741: Property 'source' is missing in normalized CsvOrder.",
-            "Declare source?: string on CsvOrder and return source: 'csv' from normalizeCsvOrder.",
-          ].join("\n")] : []),
+        ...(directEditVerification && !directEditVerification.passed ? [
+          directEditVerification.behavior.stdout,
+          directEditVerification.behavior.stderr,
+          directEditVerification.typecheck.stdout,
+          directEditVerification.typecheck.stderr,
+        ] : []),
       ].filter(Boolean).join("\n"),
     });
   });
@@ -1626,15 +1841,29 @@ test.beforeEach(async ({ page }) => {
     controller: AbortController;
     url: string;
     model: string;
-    chars: number;
-    chunks: number;
-    preview: string;
-    responseText: string;
-    timeoutMs: number | null;
-    deadlineAt: number | null;
-    protocolEvidencePath?: string;
+    canceled: boolean;
+    capture: ReturnType<typeof createRealOmlxStreamCapture>;
+    inactivity: ReturnType<typeof createRealOmlxStreamInactivity>;
   };
   const chatStreams = new Map<string, RealOmlxChatStream>();
+  const canceledBeforeOpen = new Set<string>();
+  const finishStreamEvidence = async (stream: RealOmlxChatStream, complete: boolean, reason: string | null) => {
+    try { await stream.capture.finish(complete, reason, stream.inactivity.phase); }
+    catch (error) { console.warn(`[real-omlx-stream-evidence-error] ${String(error)}`); }
+  };
+  const cancelChatStream = async (streamId: string, reason: string) => {
+    const stream = chatStreams.get(streamId);
+    if (!stream) { canceledBeforeOpen.add(streamId); return false; }
+    stream.canceled = true;
+    chatStreams.delete(streamId);
+    stream.controller.abort(reason);
+    void stream.reader?.cancel(reason).catch(() => {});
+    await finishStreamEvidence(stream, false, reason);
+    return true;
+  };
+  (page as any).__realOmlxCloseChatStreams = async () => {
+    await Promise.all([...chatStreams.keys()].map(id => cancelChatStream(id, "outer_test_finished")));
+  };
   const summarizeRuntimeV2ToolCalls = (text: string) => {
     const calls = new Map<number, { name: string; arguments: string }>();
     for (const line of text.split(/\r?\n/)) {
@@ -1761,11 +1990,24 @@ test.beforeEach(async ({ page }) => {
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
     }
+    const responseFormat = parsedBody?.response_format as { type?: string; json_schema?: { name?: string } } | undefined;
+    const toolNames: string[] = (parsedBody?.tools as any[] || []).map(tool => tool.function?.name);
+    const replayConfirmation = breakoutReplayConfirmation && !breakoutColdRestore && !breakoutConfirmationReplayed &&
+      testInfo.title.startsWith("real OMLX Breakout incident Plan") &&
+      toolNames.includes("ask_plan_questions") &&
+      (parsedBody?.messages as any[] || []).some(message =>
+        message.role === "user" && typeof message.content === "string" && message.content.includes(breakoutTask));
+    const responseOrigin = replayConfirmation ? "recorded_breakout_confirmation" : "real_omlx";
     providerWire.push({ at: new Date().toISOString(), streamId, model,
+      responseOrigin,
+      ...(replayConfirmation ? { sourceSessionId: breakoutConfirmation.sessionId, sourceProviderSequence: breakoutConfirmation.providerSequence } : {}),
+      responseFormat: responseFormat?.type, responseSchema: responseFormat?.json_schema?.name,
       toolChoice: parsedBody?.tool_choice, template: parsedBody?.chat_template_kwargs, maxTokens: parsedBody?.max_tokens,
       messageDigest: createHash("sha256").update(JSON.stringify(parsedBody?.messages)).digest("hex"),
+      selectedKnowledgeAnchors: (parsedBody?.messages as any[] || []).map(message => message.content)
+        .filter(content => typeof content === "string" && content.includes("[SELECTED KNOWLEDGE REFERENCE DATA]")),
       roles: (parsedBody?.messages as any[] || []).map(message => message.role),
-      tools: (parsedBody?.tools as any[] || []).map(tool => tool.function?.name) });
+      tools: toolNames });
     const protocolEvidenceDirectory = String(process.env.REAL_OMLX_PROTOCOL_EVIDENCE_DIR || "").trim();
     const protocolEvidencePath = protocolEvidenceDirectory
       ? path.join(protocolEvidenceDirectory, streamId.replace(/[^a-z0-9_-]/gi, "_"))
@@ -1895,110 +2137,71 @@ test.beforeEach(async ({ page }) => {
       controller,
       url,
       model,
-      chars: 0,
-      chunks: 0,
-      preview: "",
-      responseText: "",
-      timeoutMs,
-      deadlineAt: timeoutMs === null ? null : Date.now() + timeoutMs,
-      protocolEvidencePath,
+      canceled: false,
+      capture: createRealOmlxStreamCapture(protocolEvidencePath),
+      inactivity: createRealOmlxStreamInactivity(timeoutMs),
     };
     // Register the lease before waiting for response headers. OMLX can spend
     // substantial time in prefill, and cancellation must still reach that
     // in-flight fetch instead of becoming a no-op before a reader exists.
     chatStreams.set(streamId, stream);
-    let responseHeaderTimer: ReturnType<typeof setTimeout> | null = null;
     try {
-      const responsePromise = fetch(url, {
-        method: "POST",
-        headers: args.headers as Record<string, string>,
-        body: bodyText,
-        signal: controller.signal,
-      });
-      const response = stream.deadlineAt === null
-        ? await responsePromise
-        : await Promise.race([
-            responsePromise,
-            new Promise<never>((_resolve, reject) => {
-              responseHeaderTimer = setTimeout(() => {
-                reject(new Error(
-                  `STREAM_REQUEST_TIMEOUT: response_headers exceeded ${timeoutMs}ms`,
-                ));
-              }, Math.max(1, stream.deadlineAt! - Date.now()));
-            }),
-          ]);
+      if (canceledBeforeOpen.delete(streamId)) {
+        stream.canceled = true;
+        throw new Error("chat_stream_canceled_before_headers");
+      }
+      if (replayConfirmation) {
+        breakoutConfirmationReplayed = true;
+        console.log(`[real-omlx-recorded-confirmation] ${JSON.stringify({
+          sessionId: breakoutConfirmation.sessionId, providerSequence: breakoutConfirmation.providerSequence,
+          decisionSequence: breakoutConfirmation.decisionSequence, streamId,
+        })}`);
+      }
+      const response = replayConfirmation
+        ? breakoutConfirmationStream(model)
+        : await stream.inactivity.wait(() => fetch(url, {
+            method: "POST",
+            headers: args.headers as Record<string, string>,
+            body: bodyText,
+            signal: controller.signal,
+          }));
+      stream.inactivity.headersReceived();
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
       }
       if (!response.body) throw new Error(`HTTP ${response.status}: response body is not streamable`);
-      if (!chatStreams.has(streamId)) {
+      if (chatStreams.get(streamId) !== stream) {
         controller.abort();
         throw new Error("chat_stream_canceled_before_headers");
       }
       stream.reader = response.body.getReader();
       return { status: response.status };
     } catch (error) {
-      chatStreams.delete(streamId);
+      if (chatStreams.get(streamId) === stream) chatStreams.delete(streamId);
       controller.abort();
+      await finishStreamEvidence(stream, false, String(error));
+      if (stream.canceled) return { status: 0, canceled: true };
       throw error;
-    } finally {
-      if (responseHeaderTimer !== null) clearTimeout(responseHeaderTimer);
     }
   });
   await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_READ", async (streamId: string) => {
     const stream = chatStreams.get(String(streamId));
-    if (!stream?.reader) return { done: true, chunk: "" };
-    const phase = stream.chunks === 0 ? "first_chunk" : "idle_chunk";
-    const remainingMs = stream.deadlineAt === null
-      ? null
-      : stream.deadlineAt - Date.now();
-    if (remainingMs !== null && remainingMs <= 0) {
-      chatStreams.delete(String(streamId));
-      stream.controller.abort();
-      void stream.reader.cancel("runtime_v2_stream_request_timeout").catch(() => {});
-      throw new Error(
-        `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
-      );
-    }
-    let chunkTimer: ReturnType<typeof setTimeout> | null = null;
+    if (!stream?.reader) return { done: true, chunk: "", canceled: true };
     try {
-      const readPromise = stream.reader.read();
-      const { done, value } = remainingMs === null
-        ? await readPromise
-        : await Promise.race([
-            readPromise,
-            new Promise<never>((_resolve, reject) => {
-              chunkTimer = setTimeout(() => {
-                reject(new Error(
-                  `STREAM_REQUEST_TIMEOUT: ${phase} exceeded the ${stream.timeoutMs}ms request deadline`,
-                ));
-              }, Math.max(1, remainingMs));
-            }),
-          ]);
+      const { done, value } = await stream.inactivity.wait(() => stream.reader!.read());
+      // A cancelled lease may settle its pending read later. It cannot emit EOF
+      // or overwrite the incomplete evidence of that exact cancelled lease.
+      if (chatStreams.get(String(streamId)) !== stream) return { done: true, chunk: "", canceled: true };
+      stream.inactivity.observeChunk(value?.byteLength || 0);
       const chunk = stream.decoder.decode(value || new Uint8Array(), { stream: !done });
-      stream.chars += chunk.length;
-      stream.chunks += 1;
-      if (stream.preview.length < 180) stream.preview = `${stream.preview}${chunk}`.slice(0, 180);
-      if (stream.responseText.length < 200_000) {
-        stream.responseText = `${stream.responseText}${chunk}`.slice(
-          0,
-          200_000,
-        );
-      }
+      stream.capture.append(chunk, value?.byteLength || 0);
       if (done) {
-        if (stream.protocolEvidencePath) {
-          await fs.writeFile(`${stream.protocolEvidencePath}.response.sse`, stream.responseText);
-          await fs.writeFile(`${stream.protocolEvidencePath}.response-meta.json`, JSON.stringify({
-            totalChars: stream.chars,
-            recordedChars: stream.responseText.length,
-            truncated: stream.chars > stream.responseText.length,
-          }, null, 2));
-        }
-        chatStreams.delete(String(streamId));
-        console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
+        await finishStreamEvidence(stream, true, null);
+        if (chatStreams.get(String(streamId)) === stream) chatStreams.delete(String(streamId));
+        console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.capture.chars} ${stream.capture.preview.replace(/\s+/g, " ")}`);
         const toolCalls = summarizeRuntimeV2ToolCalls(
-          stream.responseText,
+          stream.capture.responseText,
         );
         if (toolCalls.length > 0) {
           console.log(
@@ -2007,13 +2210,13 @@ test.beforeEach(async ({ page }) => {
         }
         if (process.env.REAL_OMLX_LOG_REASONING_TAIL === "1") {
           const reasoningTail = summarizeRuntimeV2ReasoningTail(
-            stream.responseText,
+            stream.capture.responseText,
           );
           if (reasoningTail) {
             console.log(`[real-omlx-reasoning-tail] ${reasoningTail}`);
           }
           const contentTail = summarizeRuntimeV2ContentTail(
-            stream.responseText,
+            stream.capture.responseText,
           );
           console.log(
             `[real-omlx-content-tail] ${JSON.stringify(contentTail)}`,
@@ -2022,25 +2225,24 @@ test.beforeEach(async ({ page }) => {
       }
       return { done, chunk };
     } catch (error) {
-      chatStreams.delete(String(streamId));
+      if (chatStreams.get(String(streamId)) === stream) chatStreams.delete(String(streamId));
       stream.controller.abort();
       void stream.reader.cancel("runtime_v2_stream_request_timeout").catch(() => {});
+      await finishStreamEvidence(stream, false, String(error));
+      if (stream.canceled) return { done: true, chunk: "", canceled: true };
       throw error;
-    } finally {
-      if (chunkTimer !== null) clearTimeout(chunkTimer);
     }
   });
-  await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_CANCEL", async (streamId: string) => {
-    const stream = chatStreams.get(String(streamId));
-    if (!stream) return false;
-    stream.controller.abort();
-    chatStreams.delete(String(streamId));
-    return true;
-  });
+  await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_CANCEL", async (streamId: string) =>
+    cancelChatStream(String(streamId), "runtime_v2_stream_canceled"));
 
-  await page.exposeFunction("__MAIN_E2E_WEB_READ", async (cmd: string, args: unknown) => {
+  await page.exposeFunction("__MAIN_E2E_WEB_READ", async (cmd: string, args: Record<string, any>, metadata: any) => {
+    const invocation: RealOmlxWebInvocation = { cmd, args: structuredClone(args), owner: metadata?.owner || null,
+      commandKey: metadata?.commandKey || null, status: "pending", startedAt: Date.now() };
+    webInvocations.push(invocation);
     const binary = path.resolve("src-tauri/target/debug/examples/read_only_web_bridge");
-    return await new Promise((resolve, reject) => {
+    try {
+    const body: any = await new Promise((resolve, reject) => {
       const child = spawn(binary, [], { stdio: ["pipe", "pipe", "pipe"] });
       let output = "";
       let errors = "";
@@ -2053,9 +2255,18 @@ test.beforeEach(async ({ page }) => {
       });
       child.stdin.end(JSON.stringify({ cmd, args }));
     });
+    invocation.status = "fulfilled";
+    invocation.responseProvider = body?.provider;
+    invocation.fallbackProvider = body?.fallbackProvider;
+    return body;
+    } catch (error) {
+      invocation.status = "rejected";
+      invocation.error = String(error);
+      throw error;
+    } finally { invocation.finishedAt = Date.now(); }
   });
 
-  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture, limits, productionTools, skills }) => {
+  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture, limits, productionTools, skills, planOnly, breakoutColdRestore }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
     (window as any).__REAL_OMLX_ACCEPTANCE_STATE__ ??= {
       authoringContractIds: [],
@@ -2108,7 +2319,9 @@ test.beforeEach(async ({ page }) => {
     const writeText = async (path: string, content: string, createNew = false) => {
       await (window as any).__MAIN_E2E_DISK_WRITE(path, content, createNew);
     };
-    (window as any).__REAL_OMLX_WORKSPACE__ = workspace;
+    // A neutral startup scope avoids a fresh seeded epoch for the archived
+    // Session. The actual workspace picker then opens the saved project.
+    (window as any).__REAL_OMLX_WORKSPACE__ = breakoutColdRestore ? `${workspace}-cold-bootstrap` : workspace;
     (window as any).__REAL_OMLX_CONFIG__ = { endpoint, apiKey, productionTools, skills };
 
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
@@ -2177,11 +2390,57 @@ test.beforeEach(async ({ page }) => {
       tail: ptyBuffer.slice(-8_000),
     });
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (breakoutColdRestore && cmd === "plugin:dialog|open") return workspace;
+      if (breakoutColdRestore && ["list_project_sessions", "rebuild_project_sessions_index"].includes(cmd)) {
+        if (args?.workspace !== workspace) return [];
+        const sessions = await (window as any).__MAIN_E2E_NATIVE_TOOL("list_project_sessions", args);
+        return sessions.map(({ messages, runtimeSnapshot, ...metadata }: any) => ({ ...metadata, storageStatus: "ok" }));
+      }
+      if (breakoutColdRestore && cmd === "load_project_session_page") {
+        throw new Error("Test bridge exposes the production SessionStore full-snapshot fallback.");
+      }
+      if (cmd === "list_all_session_snapshots" || cmd === "list_legacy_session_files") return [];
+      if (cmd === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
+      if (["save_plan_document", "read_plan_document", "list_plan_documents", "inspect_project_init_target", "commit_project_init", "knowledge_list_bases", "knowledge_list_sources", "knowledge_create_base", "knowledge_import_source", "knowledge_search", "knowledge_get_excerpt"].includes(cmd)) {
+        return await (window as any).__MAIN_E2E_NATIVE_TOOL(cmd, args || {});
+      }
+      if (["ingest_attachment_file", "get_chat_temp_root"].includes(cmd)) {
+        return await (window as any).__MAIN_E2E_NATIVE_TOOL(cmd, args || {});
+      }
+      if ((window as any).__MAIN_E2E_NATIVE_SESSION_RESTORE__ === true &&
+          ["load_project_session", "load_project_session_meta", "load_project_session_page"].includes(cmd)) {
+        const calls = ((window as any).__MAIN_E2E_SESSION_RESTORE_CALLS__ ||= []);
+        const call: any = { cmd, args, status: "pending" };
+        calls.push(call);
+        try {
+          const result = await (window as any).__MAIN_E2E_NATIVE_TOOL(cmd, args || {});
+          call.status = "fulfilled";
+          call.sessionId = result?.id;
+          call.storageRevision = result?.storageRevision;
+          return result;
+        } catch (error) {
+          call.status = "rejected";
+          call.error = String(error);
+          throw error;
+        }
+      }
+      if (planOnly && ["run_command", "write_file", "write_file_atomic", "write_file_create_new", "replace_in_file", "spawn_pty", "write_pty"].includes(cmd)) {
+        throw new Error(`PLAN_ONLY_UNEXPECTED_EFFECT: ${cmd}`);
+      }
       if (productionTools && ["shell_permission_preflight", "run_command", "get_system_memory", "inspect_global_skill_package", "read_global_skill_package_file", "save_project_session", "load_project_session", "load_project_session_meta", "list_project_sessions"].includes(cmd)) {
         return await (window as any).__MAIN_E2E_NATIVE_TOOL(cmd, args || {});
       }
       if (productionTools && ["browser_evaluate", "spawn_pty", "write_pty"].includes(cmd)) throw new Error(`PRODUCTION_TEST_CAPABILITY_UNAVAILABLE: ${cmd}`);
-      if (cmd === "web_search" || cmd === "web_fetch") return await (window as any).__MAIN_E2E_WEB_READ(cmd, args);
+      if (cmd === "web_search" || cmd === "web_fetch") {
+        const aggregate = (window as any).__CODELY_E2E__?.readOnlySnapshot?.().aggregate;
+        const key = cmd === "web_search" ? "query" : "url";
+        const pending = (aggregate?.scheduledCommands || []).filter((command: any) =>
+          command.payload.toolName === cmd && command.payload.arguments?.[key] === args?.[key]);
+        return await (window as any).__MAIN_E2E_WEB_READ(cmd, args, {
+          owner: aggregate ? { turn: aggregate.turn, run: aggregate.run?.identity } : null,
+          commandKey: pending.length === 1 ? pending[0].idempotencyKey : null,
+        });
+      }
       if (cmd === "append_debug_log") {
         const raw = args || {};
         const message = String(raw.message || "");
@@ -2311,11 +2570,13 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "proxy_request_detailed") return await (window as any).__MAIN_E2E_PROXY_REQUEST_DETAILED(args || {});
       if (cmd === "start_chat_stream") {
         const streamId = String(args?.streamId || args?.stream_id || "");
-        canceledStreamIds.delete(streamId);
+        if (canceledStreamIds.has(streamId)) return null;
         try {
-          await (window as any).__MAIN_E2E_CHAT_STREAM_OPEN(args || {});
+          const opened = await (window as any).__MAIN_E2E_CHAT_STREAM_OPEN(args || {});
+          if (opened?.canceled) canceledStreamIds.add(streamId);
           while (!canceledStreamIds.has(streamId)) {
             const next = await (window as any).__MAIN_E2E_CHAT_STREAM_READ(streamId);
+            if (next?.canceled) { canceledStreamIds.add(streamId); break; }
             if (next?.chunk) {
               if (/"(?:content|reasoning_content|reasoning)"\s*:\s*"[^"\s]/.test(next.chunk)) {
                 (window as any).__MAIN_E2E_CHAT_TRANSPORT_CHUNKS = ((window as any).__MAIN_E2E_CHAT_TRANSPORT_CHUNKS || 0) + 1;
@@ -2330,7 +2591,7 @@ test.beforeEach(async ({ page }) => {
             error: null,
           });
         } catch (error) {
-          emitTauriEvent("chat-stream-done", {
+          if (!canceledStreamIds.has(streamId)) emitTauriEvent("chat-stream-done", {
             stream_id: streamId,
             status: "error",
             error: error instanceof Error ? error.message : String(error),
@@ -2782,7 +3043,7 @@ test.beforeEach(async ({ page }) => {
     devServerUrl: realOmlxDevServerUrl,
     fixture: realOmlxFixture,
     limits: REAL_OMLX_WORKSPACE_PROXY_LIMITS,
-    productionTools, skills,
+    productionTools, skills, planOnly: realOmlxPlanOnly, breakoutColdRestore,
   });
 });
 
@@ -2833,6 +3094,7 @@ async function attachRealOmlxFailureDiagnostics(
       pageInspectionError: error instanceof Error ? error.message : String(error),
     };
   }
+  await fs.writeFile(testInfo.outputPath("runtime-failure-snapshot.json"), JSON.stringify({ snapshot, presentation }, null, 2));
   try {
     await fs.access(workspace);
     const inspected = await inspectFixtureMutation(workspace);
@@ -2908,13 +3170,40 @@ async function attachRealOmlxFailureDiagnostics(
   }
 }
 
+async function expectRealWorkspaceTerminal(page: Page, testInfo: TestInfo, label: string, approveTools = false): Promise<any> {
+  let snapshot: any;
+  try {
+    await expect.poll(async () => {
+      snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      if (approveTools && snapshot.activeActionRequest?.kind === "tool_permission") {
+        await page.evaluate(() => (window as any).__CODELY_E2E__.approvePendingTool());
+      }
+      return !!snapshot.runtimeV2?.terminalOutcome && !snapshot.isGenerating;
+    }, { timeout: 120_000, intervals: [500] }).toBe(true);
+  } finally {
+    snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    await fs.writeFile(testInfo.outputPath(`${label}.json`), JSON.stringify(snapshot, null, 2));
+  }
+  expect(snapshot.runtimeV2.terminal.exactlyOnce).toBe(true);
+  expectWorkspaceConclusionOrder(snapshot);
+  return snapshot;
+}
+
+function realWorkspaceToolSucceeded(snapshot: any, toolName: string): boolean {
+  const keys = new Set((snapshot.runtimeV2?.commands || []).filter((command: any) => command.toolName === toolName).map((command: any) => command.idempotencyKey));
+  return (snapshot.runtimeV2?.events || []).some((event: any) => keys.has(event.idempotencyKey) &&
+    ((event.type === "tool.completed" && event.status === "succeeded") || (event.type === "validation.completed" && event.passed === true)));
+}
+
 // A caller-provided fixture is never owned by this test. Generated fixtures
 // are removed by default so repeated real-model runs do not leave a growing
 // collection of stale workspaces; opt in when a failed case needs inspection.
 test.afterEach(async ({ page }, testInfo) => {
   const workspace = String((page as any).__realOmlxWorkspace || "").trim();
-  if (workspace) {
-    await attachRealOmlxFailureDiagnostics(page, testInfo, workspace);
+  try {
+    if (workspace) await attachRealOmlxFailureDiagnostics(page, testInfo, workspace);
+  } finally {
+    await (page as any).__realOmlxCloseChatStreams?.();
   }
   if (String(process.env.REAL_OMLX_WORKSPACE || "").trim()) return;
   if (process.env.MAIN_KEEP_REAL_OMLX_FIXTURE === "1") return;
@@ -2922,7 +3211,62 @@ test.afterEach(async ({ page }, testInfo) => {
   await fs.rm(workspace, { recursive: true, force: true });
 });
 
+
+
 for (const model of models) {
+  test(`deterministic production repeated mutation rejections recover through validation with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
+    test.setTimeout(60_000);
+    page.on("console", message => { if (message.text().startsWith("[rejection-fixture]")) console.log(message.text()); });
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      let decisions = 0;
+      const streams = new Map<string, string[]>();
+      (window as any).__MAIN_E2E_CHAT_STREAM_OPEN = async (args: any) => {
+        const body = JSON.parse(args.body);
+        let content = "";
+        let call: any = null;
+        if (!(body.tools || []).length && body.messages[0]?.content.includes("Interpret MAIN")) {
+          content = JSON.stringify({ semantic: { objective: "Map creator to creatorName and validate", workType: "implement", answerFormat: "report", requiredCapabilities: ["workspace_read", "workspace_write", "command"], forbiddenCapabilities: [], approvalRequiredCapabilities: [] } });
+        } else {
+          decisions += 1;
+          if (decisions === 1) call = { name: "read_file", arguments: { path: "src/hooks/useCsvParser.ts" } };
+          else if (decisions <= 4) call = { name: "replace_in_file", arguments: { path: "src/hooks/useCsvParser.ts", search_text: "creator: row.creator || row['创建者'] || '',", replace_text: "creator: row.creator || row['创建者'] || '',\n    creatorName: row.creator || row['创建者'] || ''," } };
+          else if (decisions === 5) call = { name: "run_command", arguments: { command: "npm test", description: "Verify creator mapping after the committed mutation" } };
+          else content = "已完成 creatorName 映射，npm test 验证通过。";
+          console.log("[rejection-fixture]", decisions, call?.name || "final");
+
+        }
+        const delta = call ? { tool_calls: [{ index: 0, id: `duplicate-recovery-${decisions}`, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] } : { content };
+        streams.set(args.streamId, [`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }] })}\n\ndata: [DONE]\n\n`]);
+        return { status: 200 };
+      };
+      (window as any).__MAIN_E2E_CHAT_STREAM_READ = async (id: string) => {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        const chunk = streams.get(id)?.shift();
+        return chunk ? { chunk, done: false } : { chunk: "", done: true };
+      };
+      void (window as any).__CODELY_E2E__.sendDirectEditMessage("直接修复 src/hooks/useCsvParser.ts，将 creator 同时映射到 creatorName，保留 creator 并运行 npm test 验证。不要生成计划。");
+    });
+    await expect.poll(async () => {
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      await fs.writeFile(testInfo.outputPath("repeated-mutation-latest.json"), JSON.stringify(snapshot, null, 2));
+      return !!snapshot.runtimeV2?.terminalOutcome || snapshot.activeActionRequest?.kind === "user_choice";
+    }, { timeout: 45_000, intervals: [500] }).toBe(true);
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    await fs.writeFile(testInfo.outputPath("repeated-mutation-recovery.json"), JSON.stringify(snapshot, null, 2));
+    expect(snapshot.runtimeV2?.terminalOutcome?.resultKind).toBe("success");
+    expect(snapshot.runtimeV2.events.filter((event: any) => event.type === "run.paused")).toHaveLength(0);
+    const rejected = snapshot.runtimeV2.events.flatMap((event: any) => event.type === "provider.responded" ? event.actionReceipts || [] : []).filter((receipt: any) => receipt.status === "rejected");
+    expect(rejected.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(rejected.map((receipt: any) => receipt.actionIdentity)).size).toBe(1);
+    expect(rejected.some((receipt: any) => receipt.priorFeedbackObserved)).toBe(true);
+    expect(snapshot.runtimeV2.events.filter((event: any) => event.type === "tool.completed" && event.status === "succeeded" && event.evidence?.some((item: any) => item.kind === "mutation"))).toHaveLength(1);
+    expect(snapshot.runtimeV2.events.some((event: any) => event.type === "validation.completed" && event.passed)).toBe(true);
+    expect(snapshot.runtimeV2.terminal.exactlyOnce).toBe(true);
+    expectWorkspaceConclusionOrder(snapshot);
+  });
+
   test(`deterministic production unexecuted Skills recover without replaying failed effects with ${model}`, async ({ page }, testInfo) => {
     test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
     test.setTimeout(90_000);
@@ -3196,7 +3540,7 @@ for (const model of models) {
     expect(acceptance.userInteractionVerified, JSON.stringify(acceptance.gaps)).toBe(true);
   });
 
-  test(`real OMLX MAIN plan/approve/execute reaches one structural terminal outcome with ${model}`, async ({ page }) => {
+  test(`real OMLX MAIN plan/approve/execute reaches one structural terminal outcome with ${model}`, async ({ page }, testInfo) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
     const originalMutationContents = await readFixtureMutationContents(workspace);
     const originalPlanOnlyWorkspaceFingerprint = realOmlxPlanOnly
@@ -3235,6 +3579,11 @@ for (const model of models) {
     expect((immediateAdmissionSnapshot?.conversationTurnPreview || []).find(
       (turn: { id?: string }) => turn.id === admittedPlanTurnId,
     )?.runtimeEngineVersion).toBe("v2");
+
+    await settleVisiblePlanInterview(page, testInfo, "executable", {
+      label: "main-plan-executable-interview",
+      timeoutMs: realOmlxPlanTimeoutMs,
+    });
 
     let lastPlanPollSignature = "";
     let lastPlanTerminalSignature = "";
@@ -3319,15 +3668,21 @@ for (const model of models) {
       throw error;
     }
 
-    const planSnapshot = await page.evaluate(() =>
-      (window as any).__CODELY_E2E__?.getSnapshot?.()
-    );
+    const planSnapshot = await readRuntimeV2PlanReviewSnapshot(page);
     const planRuntime = expectRuntimeV2PlanReviewContract(planSnapshot, {
       turnId: admittedPlanTurnId,
     });
     const sealedWorkPlan = planRuntime.sealedWorkPlan;
     const reviewCommit = planRuntime.planReviewCommit;
     const plan = String(sealedWorkPlan.markdown || "");
+    if (reviewCommit.artifact.documentRef) {
+      const reference = reviewCommit.artifact.documentRef;
+      const saved = await page.evaluate(reference =>
+        (window as any).__MAIN_E2E_NATIVE_TOOL("read_plan_document", { reference }), reference);
+      expect(saved.markdown).toBe(plan);
+      expect(saved.contentHash).toBe(reference.contentHash);
+      expect(await fs.readFile(reference.path, "utf8")).toBe(plan);
+    }
     const planTaskQualityGaps = isMdViewerSavePathIncident
       ? getMdViewerWorkPlanGaps(sealedWorkPlan)
       : realOmlxFixture === "snake"
@@ -3429,7 +3784,7 @@ for (const model of models) {
       expectRuntimeV2ReadOnlyCollaboration(planRuntime);
     }
     const persistedPlan = await fs.readFile(
-      path.join(workspace, reviewCommit.artifact.path),
+      path.isAbsolute(reviewCommit.artifact.path) ? reviewCommit.artifact.path : path.join(workspace, reviewCommit.artifact.path),
       "utf8",
     );
     expect(persistedPlan).toBe(plan);
@@ -3502,7 +3857,7 @@ for (const model of models) {
         }
         return "running";
       }, { timeout: 120_000 }).toBe("pending_review");
-      const finalPlanSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      const finalPlanSnapshot = await readRuntimeV2PlanReviewSnapshot(page);
       expect(finalPlanSnapshot?.agentStatus).toBe("pending_review");
       expect(finalPlanSnapshot?.currentTurnStatus).toBe("awaiting_approval");
       expect(finalPlanSnapshot?.currentTurnId).toBe(admittedPlanTurnId);
@@ -3573,17 +3928,9 @@ for (const model of models) {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
         earlyExecutionSnapshot = snapshot;
         if (snapshot?.dispatchError) throw new Error(`dispatch_error:${snapshot.dispatchError}`);
-        if (
-          isInScopeBrowserPermission(snapshot?.activeActionRequest, workspace) &&
-          await approveInScopeBrowserPermission(page, snapshot.activeActionRequest, workspace)
-        ) {
-          const requestId = String(snapshot.activeActionRequest.requestId);
-          if (!approvedBrowserRequestIds.has(requestId)) {
-            approvedBrowserRequestIds.add(requestId);
-            console.log(`[real-omlx-browser-approval:${model}] ${requestId}`);
-          }
-          return "running";
-        }
+        if (await approveReviewedExecutionPermission(
+          page, testInfo, workspace, { plan: sealedWorkPlan, commit: reviewCommit }, approvedBrowserRequestIds,
+        )) return "running";
         const mutationState = await inspectFixtureMutation(workspace, originalMutationContents);
         if (mutationState.changedFiles.length > 0) return "mutated";
         if (snapshot?.runtimeV2?.terminal?.exactlyOnce === true) {
@@ -3628,6 +3975,7 @@ for (const model of models) {
         resultKind,
         gaps: [mutationAfterEarlyOutcome.detail],
       })}`);
+      if (requireSemanticTaskQuality) expect(mutationAfterEarlyOutcome.satisfied, mutationAfterEarlyOutcome.detail).toBe(true);
       return;
     }
 
@@ -3649,17 +3997,9 @@ for (const model of models) {
     await expect
       .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-        if (
-          isInScopeBrowserPermission(snapshot?.activeActionRequest, workspace) &&
-          await approveInScopeBrowserPermission(page, snapshot.activeActionRequest, workspace)
-        ) {
-          const requestId = String(snapshot.activeActionRequest.requestId);
-          if (!approvedBrowserRequestIds.has(requestId)) {
-            approvedBrowserRequestIds.add(requestId);
-            console.log(`[real-omlx-browser-approval:${model}] ${requestId}`);
-          }
-          return "running";
-        }
+        if (await approveReviewedExecutionPermission(
+          page, testInfo, workspace, { plan: sealedWorkPlan, commit: reviewCommit }, approvedBrowserRequestIds,
+        )) return "running";
         if (snapshot?.runtimeV2?.terminal?.exactlyOnce === true) {
           terminalExecutionSnapshot = snapshot;
           return "completed";
@@ -3682,6 +4022,7 @@ for (const model of models) {
         resultKind: executionResultKind,
         strategy: "plan",
       });
+      if (requireSemanticTaskQuality) expect(executionResultKind).toBe("success");
       return;
     }
 
@@ -3839,11 +4180,14 @@ for (const model of models) {
     test.skip(!runDirectEditRecovery || realOmlxFixture !== "csv");
     const workspace = (page as any).__realOmlxWorkspace as string;
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    if (process.env.REAL_OMLX_TOOL_PROTOCOL === "xml") {
+      await page.evaluate(() => (window as any).__CODELY_E2E__.setRealToolProtocol("xml"));
+    }
     await page.evaluate(async () => {
       await (window as any).__MAIN_E2E_REQUIRE_DIRECT_EDIT_REPAIR?.();
       const bridge = (window as any).__CODELY_E2E__;
       Promise.resolve(bridge?.sendDirectEditMessage?.(
-        "直接修改 src/hooks/useCsvParser.ts，把 CSV creator 映射为 Dashboard 使用的 creatorName，并用 npm test 验证直到通过。不要生成计划。",
+        "先运行 npm test 确认当前失败，再直接修改 src/hooks/useCsvParser.ts，把 CSV creator 映射为 Dashboard 使用的 creatorName，并保留测试要求的 CSV source 来源及公开类型契约。真实修复后再运行 npm test 验证直到通过。不要修改测试或 package.json，不要生成计划。",
       )).catch((error) => {
         bridge.dispatchError = error instanceof Error ? error.message : String(error);
       });
@@ -3852,8 +4196,9 @@ for (const model of models) {
     let terminalSnapshot: any = null;
     await expect.poll(async () => {
       const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      await fs.writeFile(testInfo.outputPath("direct-execute-latest.json"), JSON.stringify(snapshot, null, 2));
       if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
-      if (snapshot?.isGenerating === false) {
+      if (snapshot?.runtimeV2?.terminalOutcome && snapshot?.isGenerating === false) {
         terminalSnapshot = snapshot;
         return "terminal";
       }
@@ -3885,13 +4230,11 @@ for (const model of models) {
       String(block.content || "").trim().length > 0
     )).toBe(true);
 
-    const source = await fs.readFile(
-      path.join(workspace, "src/hooks/useCsvParser.ts"),
-      "utf8",
-    );
-    expect(source).toMatch(/\bcreatorName\s*:/);
-    expect(source).toMatch(/\bsource\??\s*:\s*string\b/);
-    expect(source).toMatch(/\bsource\s*:\s*["']csv["']/);
+    const independentVerification = await verifyCsvDirectEditRepairFixture(workspace);
+    await fs.writeFile(testInfo.outputPath("direct-edit-independent-verification.json"), JSON.stringify(independentVerification, null, 2));
+    expect(independentVerification.behavior.exitCode, independentVerification.behavior.stdout + independentVerification.behavior.stderr).toBe(0);
+    expect(independentVerification.typecheck.exitCode, independentVerification.typecheck.stdout + independentVerification.typecheck.stderr).toBe(0);
+    expect(independentVerification.passed).toBe(true);
 
     const snapshot = terminalSnapshot;
     const runtimeEvents = snapshot?.runtimeV2?.events || [];
@@ -4460,236 +4803,73 @@ for (const model of models) {
     );
   });
 
-  test(`real OMLX Goal Runtime completes with evidence or pauses safely with ${model}`, async ({ page }) => {
-    const workspace = (page as any).__realOmlxWorkspace as string;
-    page.on("console", (message) => {
-      const text = message.text();
-      if (text.includes("[real-omlx-invoke] append_debug_log")) return;
-      console.log(`[goal-browser:${message.type()}] ${text}`);
-    });
-    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
 
-    const dispatchResult = await page.evaluate(() => (window as any).__CODELY_E2E__?.sendGoalMessage?.(
-      "修改 src/hooks/useCsvParser.ts，将 CSV creator 字段映射到 Dashboard 使用的 creatorName。完成标准：源码已修改且运行测试或类型检查通过；约束：保持 creator 向后兼容。可以在存在不重叠范围时开启多个 subagent 协同工作。",
-    ));
-    await page.waitForTimeout(1_000);
-    const dispatchSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    console.log(`[real-omlx-goal-dispatch:${model}] ${JSON.stringify({
-      dispatchResult,
-      goalStatus: dispatchSnapshot?.goalStatus,
-      agentStatus: dispatchSnapshot?.agentStatus,
-      currentTurnStatus: dispatchSnapshot?.currentTurnStatus,
-      iterations: dispatchSnapshot?.goalIterations,
-      debug: dispatchSnapshot?.debugTail,
-    }).slice(0, 6000)}`);
-
-    await expect.poll(async () => {
-      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-      return ["completed", "paused", "failed", "budget_exceeded"].includes(snapshot?.goalStatus || "");
-    }, { timeout: 600_000 }).toBe(true);
-
-    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    console.log(`[real-omlx-goal:${model}] ${JSON.stringify({
-      status: snapshot?.goalStatus,
-      pauseReason: snapshot?.goalPauseReason,
-      lastError: snapshot?.goalLastError,
-      iterations: snapshot?.goalIterations,
-      evidence: snapshot?.goalEvidence,
-      taskFlow: snapshot?.taskFlowPreview,
-      debug: snapshot?.debugTail,
-    }).slice(0, 12000)}`);
-    expect(snapshot?.activeGoal).not.toBeNull();
-    expect(snapshot?.goalIterations).toBeGreaterThan(0);
-    expect(snapshot?.goalIterations).toBeLessThanOrEqual(6);
-
-    const goalDebug = ([
-      ...(dispatchSnapshot?.debugTail || []),
-      ...(snapshot?.debugTail || []),
-    ] as Array<{ source?: string; message?: string }>).map((entry) => {
-      try {
-        return { eventSource: entry.source, ...JSON.parse(entry.message || "{}") };
-      } catch {
-        return { eventSource: entry.source, message: entry.message };
-      }
-    });
-    const continuationStarts = goalDebug.filter((entry) => entry.eventSource === "goal_continuation_start");
-    const turnContext = goalDebug.find((entry) => entry.eventSource === "agent.turn_context_sources");
-    const intake = goalDebug.find((entry) =>
-      entry.eventSource === "agent.task_orchestrator_phase" && entry.phase === "INTAKE_PARSE"
-    );
-    expect(continuationStarts.length).toBeGreaterThan(0);
-    expect(continuationStarts.every((entry) => entry.phase === "execute")).toBe(true);
-    expect(turnContext).toEqual(expect.objectContaining({
-      source: "goal_contract_objective",
-    }));
-    expect(Number(turnContext?.goalObjectiveChars || 0)).toBeGreaterThan(0);
-    expect(intake).toEqual(expect.objectContaining({ subagentPreference: "preferred" }));
-
-    const hasGoalEvent = (name: string) => goalDebug.some((entry) =>
-      entry.eventSource === name || entry.eventSource === `agent.${name}`
-    );
-    expect(hasGoalEvent("goal_tool_result_checkpoint_completed")).toBe(true);
-    expect(hasGoalEvent("goal_inner_loop_evidence_boundary")).toBe(true);
-    const taskFlow = snapshot?.taskFlowPreview || [];
-    const validationIndex = taskFlow
-      .map((block: { toolName?: string }) => block.toolName || "")
-      .lastIndexOf("run_command");
-    expect(validationIndex).toBeGreaterThanOrEqual(0);
-    expect(taskFlow.slice(validationIndex + 1).some((block: { toolName?: string }) =>
-      block.toolName === "read_file" || block.toolName === "grep_search"
-    )).toBe(false);
-
-    if (process.env.REAL_OMLX_GOAL_REQUIRE_COMPLETION === "1") {
-      expect(snapshot?.goalStatus).toBe("completed");
-    }
-
-    const trigger = page.getByTestId("goal-capsule-trigger");
-    if (snapshot?.goalStatus === "completed") {
-      const parserOnDisk = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
-      expect(parserOnDisk).toMatch(/creatorName\s*:/);
-      expect(snapshot?.goalEvidence).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "file_change", status: "passed" }),
-      ]));
-      expect(snapshot?.goalEvidence.some((entry: { kind?: string; status?: string }) =>
-        (entry.kind === "test" || entry.kind === "build" || entry.kind === "browser") && entry.status === "passed"
-      )).toBe(true);
-      await expect(trigger).toHaveAttribute("data-goal-status", "completed");
-      await trigger.click();
-      await expect(page.getByTestId("goal-popover-panel")).toContainText("已完成");
-    } else {
-      expect(snapshot?.goalStatus).toBe("paused");
-      expect(`${snapshot?.goalPauseReason || ""} ${snapshot?.taskFlowPreview?.map((block: { content?: string }) => block.content).join(" ") || ""}`)
-        .toMatch(/STREAM_NO_VISIBLE_PROGRESS_TIMEOUT|stopped_no_action|execution_evidence_required|read.*repeat|agent_loop_error/i);
-      expect(snapshot?.goalEvidence.some((entry: { kind?: string; status?: string }) =>
-        entry.kind === "user_validation" && entry.status === "passed"
-      )).toBe(false);
-      await expect(trigger).toHaveAttribute("data-goal-status", "paused");
-      await trigger.click();
-      await expect(page.getByTestId("goal-popover-panel")).toContainText("已暂停");
-      await expect(page.getByTestId("goal-resume-button")).toBeVisible();
-    }
-  });
 }
 
 const explicitSubagentModel = String(process.env.OMLX_SUBAGENT_MODEL || "").trim();
 if (runRealOmlx && explicitSubagentModel && explicitSubagentModel !== models[0]) {
-  throw new Error(
-    "Real OMLX validation requires parent and subagents to share the one explicitly loaded model.",
-  );
+  throw new Error("Real OMLX validation requires parent and subagents to share the one explicitly loaded model.");
 }
 const subagentModel = explicitSubagentModel || models[0];
 
-test(`real OMLX starts semantic collaboration after runtime admission with ${subagentModel}`, async ({ page }) => {
+test(`real OMLX starts semantic collaboration after runtime admission with ${subagentModel}`, async ({ page }, testInfo) => {
   test.skip(realOmlxFixture !== "csv");
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.setPreferSubagents?.(true));
-
+  await page.evaluate(() => (window as any).__CODELY_E2E__.setPreferSubagents(true));
   const prompt = [
     "请比较 src/hooks/useCsvParser.ts 与 src/hooks/useChartData.ts 的 creatorName 数据契约，并生成一份只读整改计划。",
-    "先收集两个文件的独立证据，不修改工作区。",
+    "把 parser 的独立只读调查交给一个子智能体，主体调查 consumer；收集两个文件的证据并汇合后再形成计划，不修改工作区。",
   ].join("\n");
   await page.evaluate((text) => {
     const bridge = (window as any).__CODELY_E2E__;
-    Promise.resolve(bridge?.sendCloudMessage?.(text)).catch((error) => {
-      bridge.dispatchError = error instanceof Error ? error.message : String(error);
-    });
+    Promise.resolve(bridge.sendCloudMessage(text)).catch((error) => { bridge.dispatchError = String(error); });
   }, prompt);
-
-  await expect.poll(async () => page.evaluate(() => {
-    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-    const debugEntries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
-    const parsedDebug = debugEntries.map((entry: { source?: string; message?: string }) => {
-      try {
-        return { source: entry.source, ...JSON.parse(entry.message || "{}") };
-      } catch {
-        return { source: entry.source };
-      }
-    });
-    return {
-      dispatchError: snapshot?.dispatchError || null,
-      intakePreferred: parsedDebug.some((entry: { source?: string; subagentPreference?: string }) =>
-        entry.source === "agent.task_orchestrator_phase" && entry.subagentPreference === "preferred"
-      ),
-      admissionPreferred: parsedDebug.some((entry: {
-        source?: string;
-        preference?: string;
-        action?: string;
-      }) =>
-        entry.source === "agent.delegation_admission_decision" &&
-        entry.preference === "preferred" &&
-        entry.action === "admit"
-      ),
-      spawnToolExposed: parsedDebug.some((entry: {
-        source?: string;
-        preference?: string;
-        spawnToolExposed?: boolean;
-      }) =>
-        entry.source === "agent.delegation_admission_decision" &&
-        entry.preference === "preferred" &&
-        entry.spawnToolExposed === true
-      ),
-      requiredStartBoundary: parsedDebug.some((entry: {
-        source?: string;
-        preference?: string;
-        preferredDelegationRequired?: boolean;
-      }) =>
-        entry.source === "agent.delegation_admission_decision" &&
-        entry.preference === "preferred" &&
-        entry.preferredDelegationRequired === true
-      ),
-      childStarted: (snapshot?.subagentRuns || []).length > 0 &&
-        parsedDebug.some((entry: { source?: string }) =>
-          entry.source === "agent.semantic_collaboration_task_spawned" ||
-          entry.source === "subagent_started"
-        ),
-      assignmentPublished: parsedDebug.some((entry: { source?: string }) =>
-        entry.source === "store.collaboration_assignment_published"
-      ),
-      assignmentVisible: (snapshot?.taskFlowPreview || []).some(
-        (block: { type?: string; visibility?: string; content?: string }) =>
-          block.type === "agent" &&
-          block.visibility === "assistant_update" &&
-          /\*\*(?:分工|Assignment)\*\*/.test(String(block.content || "")) &&
-          /\*\*(?:授权范围|Authorized scope)\*\*/.test(String(block.content || "")),
-      ),
-      legacyForcedContract: parsedDebug.some((entry: { source?: string }) =>
-        entry.source === "agent.preferred_delegation_action_contract_injected" ||
-        entry.source === "agent.preferred_delegation_spawned"
-      ),
-    };
-  }), { timeout: 180_000 }).toEqual({
-    dispatchError: null,
-    intakePreferred: true,
-    admissionPreferred: true,
-    spawnToolExposed: true,
-    requiredStartBoundary: true,
-    childStarted: true,
-    assignmentPublished: true,
-    assignmentVisible: true,
-    legacyForcedContract: false,
+  await settleVisiblePlanInterview(page, testInfo, "executable", {
+    label: "collaboration-admission-interview",
+    timeoutMs: 180_000,
+    ready: snapshot => (snapshot.runtimeV2?.events || []).some((event: any) =>
+      event.type === "subagent.telemetry" && event.telemetry?.phase === "first_token"
+    ),
   });
-
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.stopGeneration?.());
-  await expect.poll(async () => page.evaluate(() =>
-    (window as any).__CODELY_E2E__?.getSnapshot?.().isGenerating === false
-  ), { timeout: 30_000 }).toBe(true);
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    if (snapshot.dispatchError) throw new Error(snapshot.dispatchError);
+    const runtime = snapshot.runtimeV2;
+    const started = (runtime?.events || []).some((event: any) =>
+      event.type === "subagent.telemetry" && event.telemetry?.phase === "first_token"
+    );
+    return started || !!runtime?.terminalOutcome || runtime?.phase === "reviewing";
+  }, { timeout: 180_000, intervals: [500] }).toBe(true);
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+  await fs.writeFile(testInfo.outputPath("collaboration-admission-v2.json"), JSON.stringify(snapshot, null, 2));
+  const runtime = snapshot.runtimeV2;
+  expect(runtime.strategy).toBe("plan");
+  expect(snapshot.preferSubagents).toBe(true);
+  const scheduled = runtime.events.filter((event: any) => event.type === "subagents.scheduled");
+  expect(scheduled.length).toBeGreaterThan(0);
+  expect(runtime.commands.some((command: any) => command.kind === "schedule_subagents" && command.status === "succeeded")).toBe(true);
+  expect(runtime.events.some((event: any) => event.type === "subagent.telemetry" && event.telemetry.phase === "first_token")).toBe(true);
+  expect(runtime.subagents.some((job: any) =>
+    job.parentRunId === runtime.runId && job.sourceToolCallId &&
+    job.accessMode === "read" && job.allowedPaths.length > 0 && Number.isFinite(job.firstTokenAt)
+  )).toBe(true);
+  expect(runtime.events[0].type).toBe("turn.admitted");
+  expect(runtime.events.findIndex((event: any) => event.type === "run.started"))
+    .toBeLessThan(runtime.events.findIndex((event: any) => event.type === "subagents.scheduled"));
+  await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+  await expect.poll(async () => {
+    const stopped = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    return !stopped.isGenerating && stopped.runtimeV2?.terminalOutcome?.resultKind === "canceled" && stopped.runtimeV2.terminal.exactlyOnce;
+  }, { timeout: 60_000 }).toBe(true);
 });
 
-test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }) => {
+test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }, testInfo) => {
   test.skip(realOmlxFixture !== "csv");
-  page.on("console", (message) => {
-    const text = message.text();
-    if (text.includes("[real-omlx-invoke] append_debug_log")) return;
-    console.log(`[subagent-browser:${message.type()}] ${text}`);
-  });
-  page.on("pageerror", (error) => {
-    console.log(`[subagent-browser:pageerror] ${error.message}`);
-  });
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
-
+  await page.evaluate(() => (window as any).__CODELY_E2E__.setPreferSubagents(true));
   const prompt = [
     "请为 CSV creatorName 数据链路生成一个可审批的整改计划。",
-    "这个任务有三个实质性且路径互不重叠的分析范围。必须先连续调用 spawn_subagent 三次；前两个按默认并发启动，第三个交给 runtime 在安全采样后弹性放行。不要在委派前读取这些文件：",
+    "把以下三个互不重叠的调查范围分别交给三个只读子智能体，由 runtime 按实测容量调度并汇合，不修改文件：",
     "1. Euler：scope_key=csv-parser，scope=只分析 CSV 字段归一化，allowed_paths=src/hooks/useCsvParser.ts，expected_output=指出字段映射缺口并给出文件证据。",
     "2. Mendel：scope_key=chart-consumer，scope=只分析图表消费 creatorName 的逻辑，allowed_paths=src/hooks/useChartData.ts,src/store/dashboardStore.ts，expected_output=说明消费端契约并给出文件证据。",
     "3. Herschel：scope_key=type-contract，scope=只分析订单类型中的 creatorName 契约，allowed_paths=src/types/order.ts，expected_output=说明类型约束并给出文件证据。",
@@ -4698,265 +4878,61 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
   ].join("\n");
   await page.evaluate((text) => {
     const bridge = (window as any).__CODELY_E2E__;
-    Promise.resolve(bridge?.sendCloudMessage?.(text)).catch((error) => {
-      bridge.dispatchError = error instanceof Error ? error.message : String(error);
-    });
+    Promise.resolve(bridge.sendCloudMessage(text)).catch((error) => { bridge.dispatchError = String(error); });
   }, prompt);
-
-  let maxActiveChildren = 0;
-  let maxRunningChildren = 0;
-  let terminalOutcome = "running";
-  let stableTerminalPolls = 0;
-  let sawRunActivity = false;
-  const logTerminalFailure = (snapshot: any) => {
-    console.log(`[real-omlx-subagents-terminal:${subagentModel}] ${JSON.stringify({
-      terminalOutcome,
-      agentStatus: snapshot?.agentStatus,
-      currentTurnStatus: snapshot?.currentTurnStatus,
-      planStage: snapshot?.planStage,
-      isGenerating: snapshot?.isGenerating,
-      runs: (snapshot?.subagentRuns || []).map((run: Record<string, unknown>) => ({
-        id: run.id,
-        scopeKey: run.scopeKey,
-        status: run.status,
-        evidenceCount: run.evidenceCount,
-        substantiveEvidenceCount: run.substantiveEvidenceCount,
-        closureState: run.closureState,
-        remainingWork: run.remainingWork,
-        parentHandoff: run.parentHandoff,
-        error: run.error,
-      })),
-      taskFlow: summarizeTaskFlowForFailure(snapshot?.taskFlowPreview),
-      debug: summarizeSubagentPlanFailureDebug(snapshot?.debugTail),
-    }).slice(-60_000)}`);
-  };
-  try {
-    await expect.poll(async () => {
-    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    if (snapshot?.dispatchError) {
-      terminalOutcome = `dispatch_error:${snapshot.dispatchError}`;
-      return true;
-    }
-    const runs = snapshot?.subagentRuns || [];
-    if (snapshot?.isGenerating === true || runs.length > 0) sawRunActivity = true;
-    maxActiveChildren = Math.max(
-      maxActiveChildren,
-      runs.filter((run: { status?: string }) => ["queued", "starting", "running", "summarizing"].includes(String(run.status))).length,
-    );
-    maxRunningChildren = Math.max(
-      maxRunningChildren,
-      runs.filter((run: { status?: string }) => ["starting", "running", "summarizing"].includes(String(run.status))).length,
-    );
-    if (
-      runs.length >= 3 &&
-      snapshot?.planArtifacts?.length > 0 &&
-      snapshot?.isGenerating === false &&
-      snapshot?.agentStatus === "pending_review" &&
-      snapshot?.currentTurnStatus === "awaiting_approval" &&
-      reviewablePlanStages.has(String(snapshot?.planStage || "")) &&
-      runs.every((run: { status?: string }) => !["queued", "starting", "running", "summarizing"].includes(String(run.status)))
-    ) {
-      terminalOutcome = "joined_plan_ready";
-      return true;
-    }
-    let observedTerminal = "";
-    if (sawRunActivity && snapshot?.isGenerating === false && runs.length < 3) {
-      observedTerminal = `terminal_without_three_subagents:${runs.length}:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
-    } else if (sawRunActivity && snapshot?.isGenerating === false && !snapshot?.planArtifacts?.length) {
-      observedTerminal = `terminal_without_plan:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
-    } else if (
-      sawRunActivity &&
-      snapshot?.isGenerating === false &&
-      runs.length >= 3 &&
-      snapshot?.planArtifacts?.length > 0 &&
-      runs.every((run: { status?: string }) => !["queued", "starting", "running", "summarizing"].includes(String(run.status))) &&
-      (
-        snapshot?.agentStatus !== "pending_review" ||
-        snapshot?.currentTurnStatus !== "awaiting_approval" ||
-        !reviewablePlanStages.has(String(snapshot?.planStage || ""))
-      )
-    ) {
-      observedTerminal = `terminal_invalid_plan_state:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${snapshot?.planStage}`;
-    }
-    if (observedTerminal) {
-      stableTerminalPolls += 1;
-      terminalOutcome = observedTerminal;
-      return stableTerminalPolls >= 3;
-    }
-    stableTerminalPolls = 0;
-    terminalOutcome = `running:${runs.length}:${maxActiveChildren}`;
-    return false;
-    }, { timeout: 600_000 }).toBe(true);
-  } catch (error) {
-    const timeoutSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    terminalOutcome = `poll_timeout:${timeoutSnapshot?.currentTurnStatus}:${timeoutSnapshot?.agentStatus}:${timeoutSnapshot?.planStage}`;
-    logTerminalFailure(timeoutSnapshot);
-    throw error;
-  }
-  const terminalSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-  if (terminalOutcome !== "joined_plan_ready") {
-    logTerminalFailure(terminalSnapshot);
-  }
-  expect(terminalOutcome).toBe("joined_plan_ready");
-
-  const snapshot = terminalSnapshot;
+  await settleVisiblePlanInterview(page, testInfo, "executable", {
+    label: "three-subagent-executable-interview",
+    timeoutMs: Math.min(600_000, realOmlxPlanTimeoutMs),
+  });
+  let maxInFlight = 0;
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    if (snapshot.dispatchError) throw new Error(snapshot.dispatchError);
+    const runtime = snapshot.runtimeV2;
+    maxInFlight = Math.max(maxInFlight, Number(runtime?.subagentConcurrency?.peakInFlight) || 0);
+    return (runtime?.phase === "reviewing" && runtime?.workPlan?.status === "pending_review" &&
+      !!runtime?.planReviewCommit && !snapshot.isGenerating) || !!runtime?.terminalOutcome;
+  }, { timeout: Math.min(600_000, realOmlxPlanTimeoutMs), intervals: [1000] }).toBe(true);
+  const snapshot = await readRuntimeV2PlanReviewSnapshot(page);
+  await fs.writeFile(testInfo.outputPath("three-subagent-plan-v2.json"), JSON.stringify(snapshot, null, 2));
+  const runtime = expectRuntimeV2PlanReviewContract(snapshot, { turnId: snapshot.currentTurnId });
   expect(snapshot.agentStatus).toBe("pending_review");
   expect(snapshot.currentTurnStatus).toBe("awaiting_approval");
-  expect(reviewablePlanStages.has(String(snapshot.planStage || ""))).toBe(true);
-  expect(snapshot.planArtifacts[0].candidate.ingress).toBe("typed_runtime");
-  expect(snapshot.planArtifacts[0].candidate.validations.some(
-    (validation: { primitive: Parameters<typeof isAcceptanceCapableValidationSpec>[0] }) =>
-      isAcceptanceCapableValidationSpec(validation.primitive),
-  )).toBe(true);
-  expect(validateSealedPlanCandidate({
-    candidate: snapshot.planArtifacts[0].candidate,
-    expectedContent: snapshot.planArtifacts[0].content,
-  })).toEqual([]);
-  expect(snapshot.planArtifacts[0].candidateHash).toBe(
-    hashPlanCandidate(snapshot.planArtifacts[0].candidate),
-  );
-  expect(snapshot.planArtifacts[0].authoringContractId).toBe(
-    snapshot.planArtifacts[0].candidate.authoringContractId,
-  );
-  const candidateEvidenceTargets = new Set(
-    snapshot.planArtifacts[0].candidate.evidence.map(
-      (entry: { target: string }) => entry.target,
-    ),
-  );
-  for (const target of [
-    "src/hooks/useCsvParser.ts",
-    "src/hooks/useChartData.ts",
-    "src/store/dashboardStore.ts",
-    "src/types/order.ts",
-  ]) {
+  expectRuntimeV2ReadOnlyCollaboration(runtime, { requireObservedChild: true, requireAdoptedChildEvidence: true });
+  const expectedScopeKeys = new Set(["csv-parser", "chart-consumer", "type-contract"]);
+  const selectedRuns = runtime.subagents.filter((job: any) => expectedScopeKeys.has(job.scopeKey));
+  expect(selectedRuns).toHaveLength(3);
+  expect(new Set(selectedRuns.map((job: any) => job.scopeKey))).toEqual(expectedScopeKeys);
+  expect(selectedRuns.every((job: any) => job.status === "completed" && job.reportSubmitted)).toBe(true);
+  for (const job of selectedRuns) {
+    const completion = runtime.events.find((event: any) => event.type === "subagent.completed" && event.jobId === job.id);
+    expect(completion.status).toBe("completed");
+    expect(completion.report).toBeTruthy();
+    expect(completion.evidence.length).toBeGreaterThan(0);
+    expect(completion.jobId === job.id && completion.evidence.every((entry: any) =>
+      entry.kind === "subagent" &&
+      typeof entry.id === "string" && entry.id.startsWith("child:") &&
+      job.allowedPaths.includes(entry.target) &&
+      typeof entry.version === "string" && entry.version.trim().length > 0 &&
+      runtime.evidence.some((canonical: any) =>
+        canonical.kind === "subagent" && canonical.id === entry.id &&
+        canonical.target === entry.target && canonical.version === entry.version
+      )
+    )).toBe(true);
+  }
+  expect(maxInFlight).toBeGreaterThanOrEqual(2);
+  expect(runtime.subagentConcurrency.peakInFlight).toBeLessThanOrEqual(3);
+  const candidateEvidenceTargets = new Set(runtime.sealedWorkPlan.evidence.map((entry: any) => entry.target));
+  for (const target of ["src/hooks/useCsvParser.ts", "src/hooks/useChartData.ts", "src/store/dashboardStore.ts", "src/types/order.ts"]) {
     expect(candidateEvidenceTargets.has(target)).toBe(true);
   }
-  const runs = snapshot.subagentRuns as Array<{
-    id: string;
-    scopeKey: string;
-    status: string;
-    createdAt: number;
-    startedAt: number | null;
-    completedAt: number | null;
-    closedAt: number | null;
-    summary: string;
-    evidenceCount: number;
-    observationCount: number;
-    substantiveEvidenceCount: number;
-    closureState: string;
-    remainingWork: string;
-    parentHandoff: string;
-    error: string;
-  }>;
-  const expectedScopeKeys = new Set(["csv-parser", "chart-consumer", "type-contract"]);
-  const selectedRuns = runs.filter((run) => expectedScopeKeys.has(run.scopeKey));
-  const debugEntries = (snapshot.debugTail || []) as Array<{ source?: string; message?: string }>;
-  const parsedDebugEntries = debugEntries.map((entry) => {
-    try {
-      return { source: entry.source, ...JSON.parse(entry.message || "{}") };
-    } catch {
-      return { source: entry.source, message: entry.message };
-    }
-  });
-  const diagnosticDebug = parsedDebugEntries.filter((entry) =>
-    /subagent|model_lane|parent_(?:wait|resume|join)/.test(String(entry.source || "")),
-  );
-  const debugText = JSON.stringify(debugEntries);
-  console.log(`[real-omlx-subagents:${subagentModel}] ${JSON.stringify({
-    maxActiveChildren,
-    maxRunningChildren,
-    runs: selectedRuns,
-    plan: snapshot.planArtifacts?.[0]?.content,
-    debug: diagnosticDebug,
-  }).slice(0, 20_000)}`);
-
-  expect(selectedRuns).toHaveLength(3);
-  expect(new Set(selectedRuns.map((run) => run.scopeKey))).toEqual(expectedScopeKeys);
-  expect(selectedRuns.every((run) => ["completed", "blocked", "degraded"].includes(run.status))).toBe(true);
-  expect(selectedRuns.every((run) => (
-    Number.isFinite(run.createdAt) &&
-    run.createdAt > 0 &&
-    !!run.startedAt &&
-    !!run.completedAt &&
-    run.createdAt <= run.startedAt &&
-    run.startedAt <= run.completedAt &&
-    (run.closedAt === null || run.completedAt <= run.closedAt) &&
-    run.summary.trim().length > 0
-  ))).toBe(true);
-  expect(selectedRuns.every((run) => run.evidenceCount === run.substantiveEvidenceCount)).toBe(true);
-  expect(selectedRuns.every((run) => (
-    run.status === "completed" &&
-    run.closureState === "satisfied" &&
-    run.evidenceCount > 0 &&
-    !run.remainingWork.trim()
-  ))).toBe(true);
-  expect(Math.max(...selectedRuns.map((run) => run.createdAt)))
-    .toBeLessThan(Math.min(...selectedRuns.map((run) => run.completedAt || Number.MAX_SAFE_INTEGER)));
-  expect(parsedDebugEntries.some((entry) =>
-    entry.source === "parent_join_required" ||
-    entry.source === "parent_wait" ||
-    (entry.source === "store.agent_loop_stop_summary" && entry.latestTool === "wait_subagents")
-  )).toBe(true);
-  expect(debugText).toMatch(/parent_wait/);
-  expect(debugText).toMatch(/parent_resume/);
-  const selectedRunIds = new Set(selectedRuns.map((run) => run.id));
-  expect(parsedDebugEntries.some((entry) => (
-    entry.source === "model_lane_admission" &&
-    Array.isArray(entry.liveRequests) &&
-    entry.liveRequests.some((request: { agentKind?: string }) => (
-      request.agentKind === "parent" || request.agentKind === "main"
-    )) &&
-    entry.liveRequests.some((request: { agentKind?: string }) => request.agentKind === "subagent")
-  ))).toBe(true);
-  expect(parsedDebugEntries.some((entry) => (
-    entry.source === "model_lane_admission" &&
-    Array.isArray(entry.liveRequests) &&
-    entry.liveRequests.filter((request: { agentKind?: string }) => request.agentKind === "subagent").length >= 2
-  ))).toBe(true);
-  const elasticBurstObserved = parsedDebugEntries.some((entry) => (
-    entry.source === "subagent_started" &&
-    selectedRunIds.has(String(entry.subagentId || "")) &&
-    entry.elasticAdmissionGranted === true &&
-    entry.burstAdmission?.allowed === true &&
-    Number(entry.burstAdmission?.safeOverlapSamples || 0) >= 2
-  ));
-  const safeCapacityFallbackObserved = parsedDebugEntries.some((entry) => (
-    entry.source === "subagent_elastic_admission" &&
-    selectedRunIds.has(String(entry.subagentId || "")) &&
-    entry.decision === "started_after_base_slot_released"
-  ));
-  expect(elasticBurstObserved || safeCapacityFallbackObserved).toBe(true);
-  expect(debugText).not.toMatch(/out of memory|\bOOM\b|uncaught|unhandled rejection/i);
-  const planAuthoringContractSnapshots = parsedDebugEntries.filter((entry) => (
-    entry.source === "agent.plan_authoring_contract_injected" &&
-    entry.contractVersion === PLAN_AUTHORING_CONTRACT_VERSION
-  )).map((entry) => ({
-    iteration: entry.iteration,
-    phase: entry.planRuntimePhase,
-    reusableEvidenceTargets: Array.isArray(entry.reusableEvidenceTargets)
-      ? entry.reusableEvidenceTargets
-      : [],
-  }));
-  expect(planAuthoringContractSnapshots.some((entry) => (
-    [
-      "src/hooks/useCsvParser.ts",
-      "src/hooks/useChartData.ts",
-      "src/store/dashboardStore.ts",
-      "src/types/order.ts",
-    ].every((target) => entry.reusableEvidenceTargets.includes(target))
-  )), `Plan contract snapshots: ${JSON.stringify(planAuthoringContractSnapshots)}`).toBe(true);
-  expect(parsedDebugEntries.some((entry) => (
-    ["agent.plan_evidence_bundle_ready", "agent.plan_evidence_bundle_injected"].includes(String(entry.source || "")) &&
-    Array.isArray(entry.contractMismatchKinds) &&
-    entry.contractMismatchKinds.includes("producer_missing_required_field:creatorName")
-  ))).toBe(true);
-  expect(snapshot.planArtifacts[0].content).toMatch(/useCsvParser|creatorName/);
-  expect(snapshot.planArtifacts[0].content).toMatch(/useChartData|dashboardStore/);
-  expect(snapshot.planArtifacts[0].content).toMatch(/src\/types\/order\.ts/);
-  expect(snapshot.planArtifacts[0].content).toMatch(/(?:normalizeCsvOrder|归一化)[^\n]{0,180}creatorName|creatorName[^\n]{0,180}(?:normalizeCsvOrder|归一化)/i);
-  expect(snapshot.planArtifacts[0].content).not.toMatch(/(?:移除|删除|去掉|remove|delete|drop)[^\n]{0,120}creatorName/i);
+  const plan = runtime.sealedWorkPlan.markdown;
+  expect(plan).toMatch(/useCsvParser|creatorName/);
+  expect(plan).toMatch(/useChartData|dashboardStore/);
+  expect(plan).toMatch(/src\/types\/order\.ts/);
+  expect(plan).toMatch(/(?:normalizeCsvOrder|归一化)[^\n]{0,180}creatorName|creatorName[^\n]{0,180}(?:normalizeCsvOrder|归一化)/i);
+  expect(plan).not.toMatch(/(?:移除|删除|去掉|remove|delete|drop)[^\n]{0,120}creatorName/i);
 });
-
 
 async function expectRealReadOnlyCancellation(page: Page, testInfo: TestInfo) {
   // Cancel while the real local provider is streaming, through the same
@@ -5149,7 +5125,7 @@ for (const model of models) {
           snapshot.runtimeV2.turnId === snapshot.currentTurnId &&
           ((!!snapshot.runtimeV2.terminalOutcome && !snapshot.isGenerating && snapshot.agentStatus === "idle") ||
             !!snapshot.activeActionRequest);
-      }, { timeout: 600_000, intervals: [1000] }).toBe(true);
+      }, { timeout: Math.min(600_000, realOmlxExecutionTimeoutMs), intervals: [1000] }).toBe(true);
       const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
       await fs.writeFile(testInfo.outputPath("workspace-scoped-discussion.json"), JSON.stringify(snapshot, null, 2));
       expect(snapshot.currentWorkspace).toBe(initial.currentWorkspace);
@@ -5203,7 +5179,7 @@ for (const model of models) {
           !!snapshot.runtimeV2?.runId && snapshot.runtimeV2.runId !== initial.runtimeV2?.runId &&
           snapshot.runtimeV2.turnId === snapshot.currentTurnId &&
           !!snapshot.runtimeV2.terminalOutcome && !snapshot.isGenerating && snapshot.agentStatus === "idle";
-      }, { timeout: 900_000, intervals: [1000] }).toBe(true);
+      }, { timeout: Math.min(900_000, realOmlxExecutionTimeoutMs), intervals: [1000] }).toBe(true);
       const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
       await fs.writeFile(testInfo.outputPath("workspace-explicit-edit.json"), JSON.stringify(snapshot, null, 2));
       expect(snapshot.currentTurnPrompt).toBe(prompt);
@@ -5253,18 +5229,33 @@ for (const model of models) {
     page.on("framenavigated", (frame) => { if (frame === page.mainFrame()) console.log(`[chat-test-navigation] ${frame.url()}`); });
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
     await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.prepareReadOnlyChat)).toBe(true);
-    const send = async (text: string) => {
-      const prior = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().turnCount);
-      await page.evaluate((text) => (window as any).__CODELY_E2E__.sendReadOnlyMessage(text), text);
+    const telemetry = await createRealOmlxChatTelemetry(page, testInfo);
+    let sendSequence = 0;
+    let expectWebReads = true;
+    try {
+    const send = async (text: string, interpretIntent = false) => {
+      const sendId = ++sendSequence;
+      const before = await telemetry.capture(`send-${sendId}-before`, { text, interpretIntent }, true);
+      const prior = before.readOnly.turnCount;
+      const dispatchAcknowledgement = await page.evaluate(({ text, interpretIntent }) => (window as any).__CODELY_E2E__.sendReadOnlyMessage(text, interpretIntent), { text, interpretIntent });
+      await telemetry.capture(`send-${sendId}-ack`, { text, interpretIntent, dispatchAcknowledgement }, true);
       await expect.poll(async () => {
-        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
-        return snapshot.turnCount > prior && !!snapshot.aggregate?.terminalOutcome && snapshot.agentStatus === "idle" && !snapshot.isGenerating;
-      }, { timeout: 900_000, intervals: [1000] }).toBe(true);
-      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot());
-      const artifact = testInfo.outputPath(`chat-${snapshot.aggregate.networkRead.enabled ? "web" : "offline"}-${snapshot.turnCount}.json`);
+        const snapshot = (await telemetry.capture(`send-${sendId}-poll`, { text, interpretIntent })).readOnly;
+        return !!snapshot.pendingRunDecision || (snapshot.turnCount > prior && !!snapshot.aggregate?.terminalOutcome && snapshot.agentStatus === "idle" && !snapshot.isGenerating);
+      }, { timeout: Math.min(900_000, realOmlxExecutionTimeoutMs), intervals: [1000] }).toBe(true);
+      const settled = await telemetry.capture(`send-${sendId}-settled`, { text, interpretIntent }, true);
+      const snapshot = settled.readOnly;
+      const policy = canonicalChatNetworkRead(snapshot.aggregate);
+      expect(policy.enabled).toBe(expectWebReads);
+      if (expectWebReads) expect(policy.provider).toBe("bing");
+      const artifact = testInfo.outputPath(`chat-${policy.enabled ? "web" : "offline"}-${snapshot.turnCount}.json`);
       await fs.writeFile(artifact, JSON.stringify(snapshot, null, 2));
       await testInfo.attach(path.basename(artifact), { path: artifact, contentType: "application/json" });
-      expect(snapshot.aggregate.strategy).toBe("chat");
+      expect(snapshot.pendingRunDecision, "semantic admission must complete without an unexpected mode/clarification choice").toBeNull();
+      const scopeEvidence = expectGlobalReadOnlyChatReply({ before, settled, interpretIntent });
+      await fs.writeFile(path.join(telemetry.directory, `send-${sendId}-read-only-scope.json`), JSON.stringify(scopeEvidence, null, 2));
+      const webEvidence = expectActualWebReadProviders(snapshot.aggregate, (page as any).__realOmlxWebInvocations);
+      await fs.writeFile(path.join(telemetry.directory, `send-${sendId}-web-provider.json`), JSON.stringify(webEvidence, null, 2));
       expect(snapshot.aggregate.terminalOutcome.resultKind).toBe("success");
       expect(snapshot.finals).toHaveLength(1);
       expect(snapshot.finals[0].trim().length).toBeGreaterThan(0);
@@ -5274,25 +5265,85 @@ for (const model of models) {
       return snapshot;
     };
     await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(true, "bing"));
-    const web = await send("请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。");
-    const searches = web.aggregate.events.filter((event: any) => event.type === "command.scheduled" && event.command.payload.toolName === "web_search");
+    // Keep the original live-finance query as a search capability diagnostic,
+    // then Stop it. Live prices/financial answer quality are not a success gate.
+    const marketText = "汇添富科创芯片ETF联接C（020629）今天上午的行情怎么样？";
+    const marketBefore = await telemetry.capture("market-search-before", { text: marketText, interpretIntent: true }, true);
+    const marketAck = await page.evaluate(text => (window as any).__CODELY_E2E__.sendReadOnlyMessage(text, true), marketText);
+    await telemetry.capture("market-search-ack", { dispatchAcknowledgement: marketAck }, true);
+    let searched: any = null;
+    await expect.poll(async () => {
+      const observed = await telemetry.capture("market-search-poll", { diagnostic: "search capability, not financial task success" });
+      const current = observed.readOnly;
+      expect(current.pendingRunDecision).toBeNull();
+      const aggregate = current.aggregate;
+      if (!aggregate) return false;
+      const searches = aggregate.events.filter((event: any) => event.type === "command.scheduled" && event.command.payload.toolName === "web_search");
+      const receipt = aggregate.events.find((event: any) => event.type === "tool.completed" && searches.some((entry: any) => entry.command.idempotencyKey === event.idempotencyKey));
+      const call = receipt && ((page as any).__realOmlxWebInvocations as RealOmlxWebInvocation[]).find(entry =>
+        entry.cmd === "web_search" && entry.commandKey === receipt.idempotencyKey && entry.status !== "pending");
+      if (receipt && call) { searched = observed; return true; }
+      if (aggregate.terminalOutcome) throw new Error("MARKET_SEARCH_DIAGNOSTIC_ENDED_WITHOUT_REAL_SEARCH_RECEIPT");
+      return false;
+    }, { timeout: Math.min(900_000, realOmlxExecutionTimeoutMs), intervals: [100] }).toBe(true);
+    const marketScope = expectGlobalReadOnlyChatReply({ before: marketBefore, settled: searched, interpretIntent: true });
+    const marketWeb = expectActualWebReadProviders(searched.readOnly.aggregate, (page as any).__realOmlxWebInvocations, false);
+    expect(marketWeb.policy).toEqual({ enabled: true, provider: "bing" });
+    expect(marketWeb.invocations.some(call => call.cmd === "web_search" && call.status !== "pending")).toBe(true);
+    expect(searched.readOnly.aggregate.terminalOutcome, "the search diagnostic must still be live when Stop is pressed").toBeNull();
+    await page.getByTestId("composer-stop-button").click();
+    await expect.poll(async () => {
+      const observed = await telemetry.capture("market-search-stop-poll");
+      return observed.readOnly.aggregate?.terminalOutcome?.resultKind === "canceled" &&
+        !observed.readOnly.isGenerating && observed.readOnly.agentStatus === "idle";
+    }, { timeout: 60_000, intervals: [250] }).toBe(true);
+    const stoppedMarket = await telemetry.capture("market-search-canceled", undefined, true);
+    expectGlobalReadOnlyChatReply({ before: marketBefore, settled: stoppedMarket, interpretIntent: true });
+    expect(stoppedMarket.readOnly.aggregate.run.identity).toEqual(searched.readOnly.aggregate.run.identity);
+    expect(stoppedMarket.readOnly.finals).toHaveLength(1);
+    expect(stoppedMarket.snapshot.runtimeV2.terminal.exactlyOnce).toBe(true);
+    expect(stoppedMarket.readOnly.aggregate.events.filter((event: any) => event.type === "run.completed" || event.type === "turn.completed" ||
+      (event.type === "projection.published" && event.projection.kind === "final")).map((event: any) => event.type))
+      .toEqual(["run.completed", "projection.published", "turn.completed"]);
+    await fs.writeFile(path.join(telemetry.directory, "market-search-capability-diagnostic.json"), JSON.stringify({
+      purpose: "Original financial query: actual selected-provider search and user Stop; not financial task success",
+      scope: marketScope, web: marketWeb, beforeStop: searched, canceled: stoppedMarket,
+    }, null, 2));
+    const web = await send("请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。", true);
     // The exact source URL is supplied. A direct authorized fetch is a valid
     // evidence path; do not require a redundant discovery tool ceremony.
-    expect(searches.every((event: any) => event.command.payload.arguments.provider === "bing")).toBe(true);
     expect(web.aggregate.events.some((event: any) => event.type === "tool.completed" && event.presentation?.toolName === "web_fetch" && event.status === "succeeded")).toBe(true);
     expect(web.finals[0]).toMatch(/developer\.mozilla\.org/);
     expect(web.finals[0]).toMatch(/detach|分离|byteLength|无法.{0,12}(?:访问|使用)|不可.{0,8}(?:访问|使用)/i);
+    // The short natural continuation now refers to the completed stable MDN
+    // task, independently of the canceled financial diagnostic.
+    await send("继续", true);
     const followUp = await send("继续依据同一份 MDN 文档回答：如果没有传 transfer，只做普通 structuredClone，原 ArrayBuffer 是否仍然可用？请给来源链接。");
     expect(followUp.finals[0]).toMatch(/developer\.mozilla\.org/);
     expect(followUp.finals[0]).toMatch(/仍|依然|不会|可以|可用|remains|still|not detached/i);
     await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    expectWebReads = false;
     await send("本轮我们讨论一个虚构项目，代号是青岚 742。请记住这个代号并简短回复。无需联网。");
     const ordinary = await send("刚才提到的虚构项目代号是什么？只回答代号。无需联网。");
     expect(ordinary.finals[0]).toMatch(/青岚\s*742/);
-    expect(ordinary.aggregate.networkRead.enabled).toBe(false);
+    expect(canonicalChatNetworkRead(ordinary.aggregate).enabled).toBe(false);
     expect(ordinary.aggregate.events.some((event: any) => event.type === "command.scheduled" && ["web_search", "web_fetch"].includes(event.command.payload.toolName))).toBe(false);
 
     await expectRealReadOnlyCancellation(page, testInfo);
+    } catch (error) {
+      await telemetry.recordFailure(error).catch(diagnosticError => {
+        console.warn(`[real-omlx-chat-telemetry-error] ${String(diagnosticError)}`);
+      });
+      throw error;
+    } finally {
+      await fs.writeFile(path.join(telemetry.directory, "web-native-invocations.json"),
+        JSON.stringify((page as any).__realOmlxWebInvocations || [], null, 2)).catch(diagnosticError => {
+          console.warn(`[real-omlx-chat-telemetry-error] ${String(diagnosticError)}`);
+        });
+      await telemetry.finish().catch(diagnosticError => {
+        console.warn(`[real-omlx-chat-telemetry-error] ${String(diagnosticError)}`);
+      });
+    }
   });
 
   test(`real OMLX Chat cancellation preserves its terminal with ${model}`, async ({ page }, testInfo) => {
@@ -5300,5 +5351,831 @@ for (const model of models) {
     await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.prepareReadOnlyChat)).toBe(true);
     await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
     await expectRealReadOnlyCancellation(page, testInfo);
+  });
+
+  test(`real OMLX Small-model file mentions and attachments preserve read-only scope with ${model}`, async ({ page }, testInfo) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const attachment = path.join(workspace, "brief.txt");
+    await fs.writeFile(attachment, "Project code: CEDAR-731.\nConfirmed decision: offline storage.\n");
+    const before = await fingerprintPlanOnlyWorkspace(workspace);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(({ mention, attachment }) => {
+      const bridge = (window as any).__CODELY_E2E__;
+      bridge.setRealInputContext([mention], [attachment]);
+      void bridge.sendDirectEditMessage("请只读检查我提及的代码和附件。回答附件中的项目代号、已确认的存储选择，以及代码导出的函数名称。禁止修改文件或运行命令。");
+    }, { mention: path.join(workspace, "src/hooks/useCsvParser.ts"), attachment });
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "small-model-source-context");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    const answer = snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown || "";
+    expect(answer).toMatch(/CEDAR-731/);
+    expect(answer).toMatch(/offline|离线/i);
+    expect(answer).toContain("normalizeCsvOrder");
+    expect(snapshot.runtimeV2.commands.some((command: any) => ["write_file", "replace_in_file", "apply_patch", "run_command"].includes(command.toolName))).toBe(false);
+    expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+  });
+
+  test(`real OMLX Small-model XML fallback reads actual workspace source with ${model}`, async ({ page }, testInfo) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const before = await fingerprintPlanOnlyWorkspace(workspace);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      const bridge = (window as any).__CODELY_E2E__;
+      bridge.setRealToolProtocol("xml");
+      void bridge.sendDirectEditMessage("请只读检查 src/hooks/useCsvParser.ts，回答它导出的函数名。必须读取实际文件，不要修改文件或运行命令。");
+    });
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "small-model-xml");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    expect(realWorkspaceToolSucceeded(snapshot, "read_file")).toBe(true);
+    expect(snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown).toContain("normalizeCsvOrder");
+    expect(snapshot.runtimeV2.commands.some((command: any) => isWorkspaceMutationToolName(command.toolName) || command.toolName === "run_command")).toBe(false);
+    const wire = (page as any).__realOmlxProviderWire as any[];
+    expect(wire.length).toBeGreaterThan(0);
+    expect(wire.every((request) => request.tools.length === 0)).toBe(true);
+    await fs.writeFile(testInfo.outputPath("xml-provider-wire.json"), JSON.stringify(wire, null, 2));
+    expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+  });
+
+  test(`real OMLX Small-model image input reaches the vision model with ${model}`, async ({ page }, testInfo) => {
+    test.skip(!realOmlxImagePath, "Supply the deterministic red-square/blue-circle image through REAL_OMLX_IMAGE_PATH.");
+    const images = await loadRealOmlxReplayImages();
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const before = await fingerprintPlanOnlyWorkspace(workspace);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(({ images }) => {
+      void (window as any).__CODELY_E2E__.sendDirectEditMessage("请只描述附图中左边与右边图形的形状和颜色。不要读取工作区、修改文件或运行命令。", images);
+    }, { images });
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "small-model-image");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    const answer = snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown || "";
+    expect(answer).toMatch(/红|red/i);
+    expect(answer).toMatch(/蓝|blue/i);
+    expect(answer).toMatch(/方|square/i);
+    expect(answer).toMatch(/圆|circle/i);
+    expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+  });
+
+  test(`real OMLX Small-model loads instruction Skills on demand with ${model}`, async ({ page }, testInfo) => {
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      const bridge = (window as any).__CODELY_E2E__;
+      bridge.setRealInstructionSkills([{ id: "fixture-review", name: "fixture-review", desc: "Review the CSV creator field contract using the fixture review process.", content: "Read src/hooks/useCsvParser.ts. Report whether creatorName is returned. Include the exact completion marker REVIEW-PINE-864 in your final answer. Do not modify files or run commands.", type: "instruction", active: true }]);
+      void bridge.sendDirectEditMessage("请使用 fixture-review 技能检查当前 CSV creator 映射，按技能要求回复。不要修改文件或运行命令。");
+    });
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "small-model-skill");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    expect(realWorkspaceToolSucceeded(snapshot, "load_skill")).toBe(true);
+    expect(snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown).toContain("REVIEW-PINE-864");
+  });
+
+  test(`real OMLX Small-model discovers and calls a local MCP tool with ${model}`, async ({ page }, testInfo) => {
+    const requests: any[] = [];
+    const server = createServer(async (request, response) => {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      const rpc = JSON.parse(body || "{}");
+      requests.push(rpc);
+      response.setHeader("content-type", "application/json");
+      response.setHeader("mcp-session-id", "fixture-session");
+      if (rpc.id == null) { response.writeHead(202); response.end(); return; }
+      const result = rpc.method === "initialize"
+        ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" } }
+        : rpc.method === "tools/list"
+        ? { tools: [{ name: "read_fixture_fact", description: "Read the test fixture token from the MCP service.", inputSchema: { type: "object", properties: {} } }] }
+        : { content: [{ type: "text", text: "MCP_FIXTURE_TOKEN: PINE-864" }], isError: false };
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address() as { port: number };
+      await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+      await page.evaluate(async (url) => {
+        const bridge = (window as any).__CODELY_E2E__;
+        await bridge.setRealMcpFixture(url);
+        void bridge.sendDirectEditMessage("请通过 fixture MCP 服务的 read_fixture_fact 工具读取并返回测试 token。如果工具未显示，先用 tool_search 查找。只返回服务实际给出的 token。");
+      }, `http://127.0.0.1:${address.port}/mcp`);
+      const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "small-model-mcp", true);
+      expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+      expect(requests.some(rpc => rpc.method === "initialize")).toBe(true);
+      expect(requests.some(rpc => rpc.method === "tools/list")).toBe(true);
+      expect(requests.some(rpc => rpc.method === "tools/call" && rpc.params?.name === "read_fixture_fact")).toBe(true);
+      expect(realWorkspaceToolSucceeded(snapshot, "tool_search")).toBe(true);
+      expect(snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown).toContain("PINE-864");
+      await fs.writeFile(testInfo.outputPath("small-model-mcp-wire.json"), JSON.stringify(requests, null, 2));
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  for (const exactDiscovery of [false, true]) {
+  test(`real OMLX Small-model Plan discovers authorized web tools before review${exactDiscovery ? " using an exact discovery query" : ""} with ${model}`, async ({ page }, testInfo) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await fs.writeFile(path.join(workspace, "README.md"), "# Fixture\n\nThis document will be updated only after plan approval.\n");
+    const before = await fingerprintPlanOnlyWorkspace(workspace);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await page.getByTestId("composer-web-search-toggle").click();
+    await expect(page.getByTestId("composer-web-search-toggle")).toHaveAttribute("aria-pressed", "true");
+    const prompt = (exactDiscovery ? "请先调用 tool_search，query 使用 web_fetch，展开后再调用网页抓取工具。计划中的验证可描述批准后执行的有限命令，本轮不要实际执行。" : "") + "请先读取 README.md，再使用 web_fetch 打开 https://example.com/ 获取实际页面标题；如果工具未显示，先用 tool_search 查找。根据这两项证据生成更新 README.md 的可审批计划，正文注明来源 URL 和实际标题。不要修改文件、运行命令或批准计划。";
+    await page.evaluate((text) => void (window as any).__CODELY_E2E__.sendCloudMessage(text), prompt);
+    await settleVisiblePlanInterview(page, testInfo, "executable", {
+      label: exactDiscovery ? "plan-web-exact-executable-interview" : "plan-web-executable-interview",
+      timeoutMs: 180_000,
+    });
+    await expect.poll(async () => {
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      return snapshot.runtimeV2?.phase === "reviewing" || !!snapshot.runtimeV2?.terminalOutcome;
+    }, { timeout: 180_000, intervals: [500] }).toBe(true);
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+    await fs.writeFile(testInfo.outputPath("small-model-plan-web.json"), JSON.stringify(snapshot, null, 2));
+    expect(snapshot.runtimeV2.phase).toBe("reviewing");
+    expect(snapshot.runtimeV2.sealedWorkPlan).not.toBeNull();
+    const aggregate = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+    expect(aggregate.turn.turnId).toBe(snapshot.currentTurnId);
+    const admittedAt = aggregate.events.find((event: any) => event.type === "turn.admitted")?.at;
+    expect(Number.isFinite(admittedAt)).toBe(true);
+    const wire = (page as any).__realOmlxProviderWire as any[];
+    const firstRuntimeRequest = wire.find(entry => Date.parse(entry.at) >= admittedAt);
+    expect(firstRuntimeRequest, "the first request after the exact Turn admission must be recorded").toBeTruthy();
+    expect(Array.isArray(firstRuntimeRequest.tools)).toBe(true);
+    // The conditional prompt permits direct use when the first real Runtime
+    // request already offers web_fetch. The exact-discovery prompt requires
+    // tool_search independently of that visibility.
+    const requiresDiscovery = exactDiscovery || !firstRuntimeRequest.tools.includes("web_fetch");
+    const toolSearchSucceeded = realWorkspaceToolSucceeded(snapshot, "tool_search");
+    await fs.writeFile(testInfo.outputPath("plan-web-tool-visibility.json"), JSON.stringify({
+      turnId: aggregate.turn.turnId, admittedAt, firstRuntimeRequest, exactDiscovery, requiresDiscovery, toolSearchSucceeded,
+    }, null, 2));
+    if (requiresDiscovery) expect(toolSearchSucceeded).toBe(true);
+    expect(realWorkspaceToolSucceeded(snapshot, "web_fetch")).toBe(true);
+    expect(JSON.stringify(snapshot.runtimeV2.sealedWorkPlan)).toMatch(/Example Domain/i);
+    expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+    const canceled = await expectRealWorkspaceTerminal(page, testInfo, "small-model-plan-web-canceled");
+    expect(canceled.runtimeV2.terminalOutcome.resultKind).toBe("canceled");
+  });
+  }
+
+  for (const decision of ["approve", "deny"] as const) {
+    test(`real OMLX Small-model preserves per-call review ${decision} with ${model}`, async ({ page }, testInfo) => {
+      await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+      await page.evaluate(() => void (window as any).__CODELY_E2E__.sendDirectEditMessage("请运行 node -e \"console.log('REVIEW-864')\"。每次命令执行前必须等待我单独审批，即使自动批准已开启也一样。不要修改文件。"));
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+        return snapshot.activeActionRequest?.kind === "tool_permission";
+      }, { timeout: 90_000 }).toBe(true);
+      const pending = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
+      expect(pending.runtimeV2.terminalOutcome).toBeNull();
+      expect(realWorkspaceToolSucceeded(pending, "run_command")).toBe(false);
+      await page.evaluate((decision) => {
+        const bridge = (window as any).__CODELY_E2E__;
+        if (decision === "approve") bridge.approvePendingTool(); else bridge.rejectPendingTool();
+      }, decision);
+      const snapshot = await expectRealWorkspaceTerminal(page, testInfo, `small-model-review-${decision}`);
+      expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe(decision === "approve" ? "success" : "blocked");
+      expect(realWorkspaceToolSucceeded(snapshot, "run_command")).toBe(decision === "approve");
+    });
+  }
+}
+
+async function settleVisiblePlanInterview(
+  page: Page,
+  testInfo: TestInfo,
+  resultKind: "document" | "executable" = "document",
+  options: { label?: string; timeoutMs?: number; ready?: (snapshot: any) => boolean; textAnswer?: string;
+    selectChoice?: (question: { id: string; prompt: string; options: Array<{ id: string; label: string }> }) => number;
+    answerText?: (question: { id: string; prompt: string }) => string | null } = {},
+) {
+  const answered = new Map<string, { requestId: string; revision: number }>();
+  let owner: { sessionKey: string; turnId: string; runId: string } | undefined;
+  let final: any;
+  let canonicalEvents: any[] = [];
+  try {
+    await expect.poll(async () => {
+      const observed = await page.evaluate(() => {
+        const bridge = (window as any).__CODELY_E2E__;
+        return {
+          request: bridge.structuredChoiceSnapshot(),
+          snapshot: bridge.getSnapshot(),
+          aggregate: bridge.readOnlySnapshot().aggregate,
+        };
+      });
+      const request = observed.request;
+      final = { ...observed.snapshot, activeActionRequest: observed.request };
+      canonicalEvents = observed.aggregate?.events || [];
+      await fs.writeFile(testInfo.outputPath(`${options.label || "product-plan-runtime"}-latest.json`),
+        JSON.stringify({ snapshot: final, aggregate: observed.aggregate }, null, 2));
+      if (request?.kind === "user_choice" && request.status === "pending" && !request.questionnaire) {
+        const blocker = observed.aggregate?.run?.blocker;
+        throw new Error(`UNEXPECTED_PLAN_BLOCKER: ${JSON.stringify({
+          requestId: request.requestId, blockerKind: blocker?.reasonCode || request.kind,
+          clarificationKind: blocker?.clarification?.kind || null, title: request.title,
+        })}`);
+      }
+      // The public snapshot intentionally projects event fields. Read the same
+      // canonical ledger for typed answers/modelContent without changing it.
+      if (final.runtimeV2 && observed.aggregate) {
+        expect(observed.aggregate.turn.turnId).toBe(final.runtimeV2.turnId);
+        const raw = new Map(canonicalEvents.map((event: any) => [event.eventId, event]));
+        final = { ...final, runtimeV2: { ...final.runtimeV2,
+          events: (final.runtimeV2.events || []).map((event: any) => ({ ...raw.get(event.eventId), ...event })),
+        } };
+      }
+      if (final.dispatchError) throw new Error(final.dispatchError);
+      if (owner) {
+        expect(final.currentTurnId).toBe(owner.turnId);
+        expect(final.runtimeV2?.runId).toBe(owner.runId);
+      }
+      const key = `${request?.requestId}:${request?.questionnaire?.revision}`;
+      if (request?.kind === "user_choice" && request.questionnaire && !answered.has(key)) {
+        expect(["plan_confirmation", "plan_interview", "rules_interview"]).toContain(request.questionnaire.purpose);
+        owner ||= { sessionKey: request.sessionKey, turnId: request.turnId, runId: request.runId };
+        expect(request.sessionKey).toBe(owner.sessionKey);
+        expect(request.turnId).toBe(owner.turnId);
+        expect(request.runId).toBe(owner.runId);
+        const form = page.getByTestId("structured-user-questionnaire").last();
+        await expect(form).toBeVisible();
+        for (let index = 0; index < request.questionnaire.questions.length; index++) {
+          const question = request.questionnaire.questions[index];
+          const field = form.locator("fieldset").nth(index);
+          const choices = question.options || [];
+          if (question.selectionMode === "text" && options.answerText) {
+            const answer = options.answerText(question);
+            if (answer !== null) {
+              await field.locator("textarea").fill(answer);
+              continue;
+            }
+          }
+          if (options.selectChoice) {
+            const selected = options.selectChoice(question);
+            if (question.selectionMode !== "single" || selected < 0) {
+              throw new Error(`UNRECORDED_BREAKOUT_DECISION: ${JSON.stringify({ id: question.id, prompt: question.prompt, choices })}`);
+            }
+            await field.getByRole("radio").nth(selected).check();
+            continue;
+          }
+          if (question.selectionMode === "text") {
+            await field.locator("textarea").fill(options.textAnswer || "目标、边界和验收采用原请求中已明确的内容；没有额外限制，请采用题目中提供的推荐方案。");
+          } else if (choices.length) {
+            if (question.selectionMode === "single") {
+              const selected = question.id === "result_kind" ? choices.findIndex((choice: any) => choice.id === resultKind) : 0;
+              expect(selected, `required result_kind ${resultKind} must be offered by the actual questionnaire`).toBeGreaterThanOrEqual(0);
+              await field.getByRole("radio").nth(selected).check();
+            } else {
+              const minimum = Math.max(Number(question.minSelections) || 0, question.required ? 1 : 0);
+              const maximum = question.maxSelections ?? choices.length;
+              const count = Math.min(maximum, Math.max(minimum, 1));
+              expect(count).toBeGreaterThanOrEqual(minimum);
+              for (let optionIndex = 0; optionIndex < count; optionIndex++) await field.getByRole("checkbox").nth(optionIndex).check();
+              if (!count && question.required && question.allowText) await field.locator("textarea").fill("保留原请求约束，采用推荐方案。");
+            }
+          } else if (question.allowText) await field.locator("textarea").fill("保留原请求约束，采用推荐方案。");
+        }
+        answered.set(key, { requestId: request.requestId, revision: request.questionnaire.revision });
+        await form.getByRole("button", { name: "确认并继续", exact: true }).click();
+        return false;
+      }
+      const decisions = canonicalEvents.filter((event: any) => event.type === "run.decision_recorded" && event.answer);
+      const executableConfirmed = decisions.some((event: any) => event.answer.answers.some((answer: any) =>
+        answer.questionId === "result_kind" && answer.selectedValues.includes("executable")
+      ));
+      if (options.ready && answered.size > 0 && executableConfirmed && options.ready(final)) return true;
+      if (resultKind === "executable") {
+        if (final.runtimeV2?.terminalOutcome && !final.isGenerating) throw new Error(`Executable Plan ended before review: ${JSON.stringify(final.runtimeV2.terminalOutcome)}`);
+        return answered.size > 0 && executableConfirmed && request?.kind === "plan_review" &&
+          final.runtimeV2?.phase === "reviewing" && final.runtimeV2?.workPlan?.status === "pending_review" &&
+          !!final.runtimeV2?.planReviewCommit && !final.isGenerating && final.agentStatus === "pending_review";
+      }
+      return !!final.runtimeV2?.terminalOutcome && !final.isGenerating;
+    }, { timeout: options.timeoutMs ?? 360_000, intervals: [500] }).toBe(true);
+    expect(answered.size, "every new Plan must obtain at least one real user decision").toBeGreaterThan(0);
+    for (const answer of answered.values()) {
+      const accepted = canonicalEvents.find((event: any) => event.type === "run.decision_recorded" &&
+        event.requestId === answer.requestId && event.answer?.revision === answer.revision);
+      expect(accepted, "the actual UI answer must be durably accepted by its exact owner").toBeTruthy();
+      expect(accepted.run.runId).toBe(owner?.runId);
+      expect(canonicalEvents.some((event: any) => event.type === "run.resumed" && event.requestId === answer.requestId && event.run.runId === owner?.runId)).toBe(true);
+    }
+    expect(canonicalEvents.some((event: any) => event.type === "work_plan.approved"), "interview answers do not approve execution").toBe(false);
+    return final;
+  } finally {
+    await fs.writeFile(testInfo.outputPath(`${options.label || "product-plan-runtime"}.json`), JSON.stringify({ answeredRequests: [...answered.values()], owner, snapshot: final, canonicalEvents }, null, 2));
+  }
+}
+
+for (const model of models) {
+  test(`real OMLX Breakout incident Plan reaches exact review with ${model}`, async ({ page }, testInfo) => {
+    test.skip(realOmlxFixture !== "unity" || !process.env.REAL_OMLX_WORKSPACE,
+      "Requires a caller-prepared copy of the original Unity project");
+    test.setTimeout(realOmlxPlanTimeoutMs + 120_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const before = await fingerprintPlanOnlyWorkspace(workspace);
+    const replayedDecisionIds = new Set<string>();
+    let restatedLegacyRequirement = false;
+    const choices = [
+      { id: "unity_pipeline", label: /Unity Editor.*(?:自动|验证)|Unity.*(?:自动化|测试运行器)|(?:自动化|编译).*Play\s*Mode/i },
+      { id: "reuse_existing", label: /(?:现有|复用|沿用|使用).*CollectorTest|CollectorTest.*(?:搭建|改造|复用)/i },
+      { id: "angle_control", label: /角度控制|反弹角度|接触位置|命中位置/ },
+      { id: "executable", label: /可审[核阅].*实施计划/ },
+    ];
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    if (breakoutResumeSessionId > 0) {
+      expect(breakoutReplayConfirmation).toBe(true);
+      const loaded = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: breakoutResumeSessionId });
+      const runtime = loaded.runtimeSnapshot;
+      const stored = normalizeRuntimeV2Checkpoint(runtime.runtimeV2Checkpoints[runtime.currentTurnId]);
+      expect(stored?.aggregate.run?.blocker?.reasonCode).toBe("user_questionnaire");
+      const priorOwner = stored!.aggregate.run!.identity;
+      const priorRequestId = stored!.aggregate.run!.blocker!.requestId;
+      await page.getByTestId("sidebar-add-workspace").click();
+      await expect.poll(() => page.evaluate(() => {
+        const bridge = (window as any).__CODELY_E2E__;
+        const aggregate = bridge?.readOnlySnapshot?.().aggregate;
+        return {
+          owner: aggregate?.run?.identity,
+          blocker: aggregate?.run?.blocker?.reasonCode,
+          sessionId: bridge?.getSnapshot?.().currentSessionId,
+          visibleRequestId: bridge?.structuredChoiceSnapshot?.()?.requestId,
+        };
+      }), { timeout: 30_000 }).toEqual({
+        owner: priorOwner, blocker: "user_questionnaire", sessionId: breakoutResumeSessionId,
+        visibleRequestId: priorRequestId,
+      });
+      expect((page as any).__realOmlxProviderWire).toHaveLength(0);
+      await fs.writeFile(testInfo.outputPath("breakout-restored-owner.json"), JSON.stringify({
+        sessionId: breakoutResumeSessionId, owner: priorOwner, requestId: priorRequestId, revision: loaded.storageRevision,
+      }, null, 2));
+    } else {
+      const composer = page.getByTestId("composer-textarea");
+      await composer.fill(`/计划 ${breakoutTask}`);
+      await composer.press("Enter");
+    }
+    let snapshot;
+    try {
+      snapshot = await settleVisiblePlanInterview(page, testInfo, "executable", {
+        label: "breakout-incident", timeoutMs: realOmlxPlanTimeoutMs,
+        answerText: question => {
+          if (!breakoutReplayConfirmation || restatedLegacyRequirement || question.prompt !== breakoutLegacyClarifier) return null;
+          restatedLegacyRequirement = true;
+          return breakoutLegacyRestatement;
+        },
+        selectChoice: question => {
+          if (breakoutReplayConfirmation) {
+            if (replayedDecisionIds.has(question.id)) return -1;
+            const original = breakoutConfirmation.arguments.questions.find(item => item.id === question.id);
+            if (question.id !== "result_kind" && original?.prompt !== question.prompt) return -1;
+            const index = question.options.findIndex(option => option.id === breakoutConfirmation.answers[question.id]);
+            if (index >= 0) replayedDecisionIds.add(question.id);
+            return index;
+          }
+          const exact = question.options.findIndex(option => choices.some(choice => option.id === choice.id));
+          return exact >= 0 ? exact : question.options.findIndex(option => choices.some(choice => choice.label.test(option.label)));
+        },
+      });
+    } finally {
+      const wire = (page as any).__realOmlxProviderWire || [];
+      await fs.writeFile(testInfo.outputPath("breakout-wire.json"), JSON.stringify(wire.map(({ selectedKnowledgeAnchors, ...entry }: any) => entry), null, 2));
+    }
+    if (breakoutReplayConfirmation) {
+      const wire = (page as any).__realOmlxProviderWire;
+      if (breakoutResumeSessionId > 0) {
+        expect(restatedLegacyRequirement).toBe(true);
+        expect(wire.length).toBeGreaterThan(0);
+        expect(wire.every((request: any) => request.responseOrigin === "real_omlx")).toBe(true);
+      } else {
+        expect([...replayedDecisionIds].sort()).toEqual(Object.keys(breakoutConfirmation.answers).sort());
+        const recorded = wire.findIndex((request: any) => request.responseOrigin === "recorded_breakout_confirmation");
+        expect(recorded).toBeGreaterThanOrEqual(0);
+        expect(wire.filter((request: any) => request.responseOrigin === "recorded_breakout_confirmation")).toHaveLength(1);
+        expect(wire.slice(recorded + 1).length).toBeGreaterThan(0);
+        expect(wire.slice(recorded + 1).every((request: any) => request.responseOrigin === "real_omlx")).toBe(true);
+      }
+    }
+    const observed = await page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/index.ts");
+      const { resolvePlanDocumentFromAggregate } = await import("/src/lib/planDocumentRecords.ts");
+      const state = useAppStore.getState();
+      const aggregate = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[state.currentTurnId!])!.aggregate;
+      return { aggregate, sessionId: state.currentSessionId, document: resolvePlanDocumentFromAggregate(aggregate) };
+    });
+    expect(observed.document).toBeTruthy();
+    const content = await page.evaluate(reference => (window as any).__MAIN_E2E_NATIVE_TOOL("read_plan_document", { reference }), observed.document!.documentRef);
+    expect(await fs.readFile(content.path, "utf8")).toBe(content.markdown);
+    expect(content.contentHash).toBe(createHash("sha256").update(content.markdown).digest("hex"));
+    expect(content.markdown).toMatch(/CollectorTest/);
+    expect(content.markdown).toMatch(/(?:砖块|brick).{0,36}(?:分数|计分|得分|score)|(?:分数|计分|得分|score).{0,36}(?:砖块|brick)/i);
+    expect(content.markdown).toMatch(/(?:挡板|paddle).{0,60}(?:角度|angle)|(?:角度|angle).{0,60}(?:挡板|paddle)/i);
+    const events = observed.aggregate.events;
+    if (breakoutReplayConfirmation) {
+      const answers = events.flatMap(event => event.type === "run.decision_recorded" && event.answer ? event.answer.answers : []);
+      const decisions = answers.filter(answer => !answer.text).map(answer => [answer.questionId, answer.selectedValues]);
+      expect(Object.fromEntries(decisions)).toEqual(Object.fromEntries(
+        Object.entries(breakoutConfirmation.answers).map(([questionId, selection]) => [questionId, [selection]])));
+      expect(answers.flatMap(answer => answer.text ? [answer.text] : [])).toEqual(restatedLegacyRequirement ? [breakoutLegacyRestatement] : []);
+    }
+    expect(events.filter(event => event.type === "run.started")).toHaveLength(1);
+    expect(events.filter(event => event.type === "work_plan.sealed")).toHaveLength(1);
+    expect(events.some(event => event.type === "work_plan.approved" || event.type === "turn.completed")).toBe(false);
+    expect(events.some(event => event.type === "command.scheduled" && event.command.kind === "execute_tool" &&
+      /^(?:run_command|write_file|replace_in_file)$/.test(String(event.command.payload.toolName)))).toBe(false);
+    const requiredBehavior = observed.aggregate.sealedWorkPlan!.draft.validations.filter(check =>
+      check.required && (check.kind === "desktop" || check.kind === "browser" || (
+        check.kind === "finite_command" && analyzeValidationCommand(check.command || "", { cwd: check.cwd }).spec?.segments.some(segment =>
+          segment.capability === "test" || segment.capability === "inline_assertion"))));
+    expect(requiredBehavior.length).toBeGreaterThan(0);
+    expect(requiredBehavior.flatMap(check => check.criterionIds)).toEqual(
+      expect.arrayContaining(observed.aggregate.objective.acceptanceCriterionIds || []));
+    expect(snapshot.activeActionRequest.kind).toBe("plan_review");
+    expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+    await expect(page.getByRole("button", { name: "审阅并批准", exact: true }).first()).toBeVisible();
+    await expect.poll(async () => {
+      const saved = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: observed.sessionId });
+      return normalizeRuntimeV2Checkpoint(saved?.runtimeSnapshot?.runtimeV2Checkpoints?.[observed.aggregate.turn.turnId],
+        observed.aggregate.turn)?.aggregate.planReviewCommit?.artifact.documentRef.contentHash;
+    }, { timeout: 15_000 }).toBe(observed.document!.documentRef.contentHash);
+    await page.screenshot({ path: testInfo.outputPath("breakout-review.png"), fullPage: true });
+  });
+
+  test(`real OMLX Collector Plan completes validation and reaches exact review with ${model}`, async ({ page }, testInfo) => {
+    test.skip(realOmlxFixture !== "unity");
+    test.setTimeout(realOmlxPlanTimeoutMs + 120_000);
+    const useUnitySkill = (process.env.MAIN_TEST_SKILL_PACKAGE_IDS || "").split(",").some(id => id.trim());
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const fingerprint = async () => {
+      const hash = createHash("sha256");
+      for (const directory of ["Assets", "Packages", "ProjectSettings"]) {
+        const visit = async (root: string): Promise<void> => {
+          for (const entry of (await fs.readdir(root, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+            const target = path.join(root, entry.name);
+            if (entry.isDirectory()) await visit(target);
+            else if (entry.isFile()) { hash.update(path.relative(workspace, target)); hash.update(await fs.readFile(target)); }
+          }
+        };
+        await visit(path.join(workspace, directory));
+      }
+      return hash.digest("hex");
+    };
+    const before = await fingerprint();
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    const input = page.getByTestId("composer-textarea");
+    const collectorTask = "构建测试游戏方案：玩家对象命名 Player；三枚金币分别为 Coin_1、Coin_2、Coin_3；控制器类型和根对象名为 CollectorGame，并公开只读 Score/Won 供验证。WASD/方向键移动，碰到金币后金币消失、分数增加；集齐三枚显示胜利；R 键或重开按钮重置玩家、金币、分数和胜利状态。使用项目已启用的新 Input System，基础图形即可，HUD 清楚显示操作和分数。";
+    const skillAcceptance = "用 load_skill 阅读所选技能中与 Play Mode 或测试相关的一处说明。计划阶段只读，把技能说明中的验证方法安排为实施步骤。项目尚未实现，可以将新增小型 Play Mode 测试列入计划，覆盖移动、拾取计分、胜利和两种重置。";
+    await input.fill(useUnitySkill
+      ? `/计划 $unity-cli ${collectorTask}\n${skillAcceptance}`
+      : `/计划 ${collectorTask}`);
+    await input.press("Enter");
+    const snapshot = await settleVisiblePlanInterview(page, testInfo, "executable", {
+      label: "collector-plan-validation",
+      timeoutMs: realOmlxPlanTimeoutMs,
+      textAnswer: "同意把自动验收加入实施范围。请核实项目里已有的测试框架和可用入口，覆盖移动、拾取计分、胜利和两种重置，保留已确认的实现选择。",
+    });
+    const observed = await page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/index.ts");
+      const { resolvePlanDraftFromAggregate, resolvePlanDocumentFromAggregate } = await import("/src/lib/planDocumentRecords.ts");
+      const state = useAppStore.getState();
+      const aggregate = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[state.currentTurnId!])!.aggregate;
+      return { aggregate, sessionId: state.currentSessionId, draft: resolvePlanDraftFromAggregate(aggregate), document: resolvePlanDocumentFromAggregate(aggregate) };
+    });
+    expect(observed.document).toBeTruthy();
+    const content = await page.evaluate(reference => (window as any).__MAIN_E2E_NATIVE_TOOL("read_plan_document", { reference }), observed.document!.documentRef);
+    expect(await fs.readFile(content.path, "utf8")).toBe(content.markdown);
+    expect(content.contentHash).toBe(createHash("sha256").update(content.markdown).digest("hex"));
+    expect(content.markdown).toMatch(/Player/);
+    expect(content.markdown).toMatch(/CollectorGame/);
+    const events = observed.aggregate.events;
+    if (useUnitySkill) {
+      const skillCommandKeys = new Set(events.flatMap(event =>
+        event.type === "command.scheduled" && event.command.kind === "execute_tool" &&
+        event.command.payload.toolName === "load_skill" ? [event.command.idempotencyKey] : []
+      ));
+      const readUnitySkill = events.some(event => {
+        if (event.type !== "tool.completed" || event.status !== "succeeded" ||
+            event.receiptOrigin !== "executed" || !skillCommandKeys.has(event.idempotencyKey) || !event.modelContent) return false;
+        try {
+          const body = JSON.parse(event.modelContent.replace(/^\[E\d+\] [^\n]*\n/, ""));
+          return (body.type === "skill.loaded" || body.type === "skill.resource") &&
+            body.name === "unity-cli" && body.source === "package" && typeof body.content === "string" && !!body.content.trim();
+        } catch {
+          return false;
+        }
+      });
+      expect(readUnitySkill, "the Plan ledger must contain an executed Unity CLI Skill document read").toBe(true);
+    }
+    expect(events.some(event => event.type === "work_plan.approved")).toBe(false);
+    expect(observed.aggregate.evidence.some(item => item.kind === "mutation")).toBe(false);
+    expect(observed.draft).toBeNull();
+    expect(observed.aggregate.phase).toBe("reviewing");
+    const behavioralChecks = observed.aggregate.sealedWorkPlan?.draft.validations.filter(check => {
+      if (!check.required) return false;
+      if (check.kind === "browser" || check.kind === "desktop") return true;
+      if (check.kind !== "finite_command" || !check.command) return false;
+      const spec = analyzeValidationCommand(check.command, { cwd: check.cwd }).spec;
+      return spec?.kind === "finite_command" && spec.segments.some(segment =>
+        segment.capability === "test" || segment.capability === "inline_assertion"
+      );
+    }) || [];
+    expect(behavioralChecks, "the Collector plan needs a required behavioral test or interaction").not.toHaveLength(0);
+    const coveredCriteria = new Set(behavioralChecks.flatMap(check => check.criterionIds || []));
+    expect([...coveredCriteria]).toEqual(expect.arrayContaining(observed.aggregate.objective.acceptanceCriterionIds || []));
+    expect(snapshot.activeActionRequest.kind).toBe("plan_review");
+    expect(events.filter(event => event.type === "run.started")).toHaveLength(1);
+    expect(events.filter(event => event.type === "turn.completed")).toHaveLength(0);
+    await expect(page.getByRole("button", { name: "审阅并批准", exact: true }).first()).toBeVisible();
+    expect(await fingerprint()).toBe(before);
+    let persisted: unknown;
+    await expect.poll(async () => {
+      const saved = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: observed.sessionId });
+      persisted = saved?.runtimeSnapshot?.runtimeV2Checkpoints?.[observed.aggregate.turn.turnId];
+      const restored = normalizeRuntimeV2Checkpoint(persisted, observed.aggregate.turn);
+      return restored?.aggregate.phase === observed.aggregate.phase && restored.events.length >= observed.aggregate.events.length;
+    }, { timeout: 15_000, message: "the actual Session ledger must replay after native JSON persistence" }).toBe(true);
+    await fs.writeFile(testInfo.outputPath("collector-plan-persisted.json"), JSON.stringify(persisted, null, 2));
+    await fs.writeFile(testInfo.outputPath("collector-plan-acceptance.json"), JSON.stringify({ model, workspace, observed }, null, 2));
+    await page.screenshot({ path: testInfo.outputPath("collector-plan-workbench.png"), fullPage: true });
+  });
+
+  test(`real OMLX product global Plan interviews and saves an actual document with ${model}`, async ({ page }, testInfo) => {
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    const input = page.getByTestId("composer-textarea");
+    await input.fill("/计划 为初学者制定三天的本地 Markdown 学习计划，每天30分钟，完全离线，不安装软件。计划代号 LOCAL_LEARNING_842。请确认有价值的取舍后保存文档。");
+    await input.press("Enter");
+    const snapshot = await settleVisiblePlanInterview(page, testInfo);
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    const events = snapshot.runtimeV2.events;
+    expect(events.some((event: any) => event.type === "run.decision_recorded" && event.answer)).toBe(true);
+    expect(events.some((event: any) => event.type === "work_plan.approved")).toBe(false);
+    const saved = events.filter((event: any) => event.type === "tool.completed" && event.status === "succeeded" && event.modelContent)
+      .map((event: any) => { try { return JSON.parse(event.modelContent); } catch { return null; } }).find((value: any) => value?.planDocument);
+    expect(saved?.planDocument.owner.workspace).toBeNull();
+    const content = await page.evaluate(reference => (window as any).__MAIN_E2E_NATIVE_TOOL("read_plan_document", { reference }), saved.planDocument);
+    expect(content.markdown).toContain("LOCAL_LEARNING_842");
+    expect(content.markdown).toMatch(/30|三十/);
+    expect(content.contentHash).toBe(createHash("sha256").update(content.markdown).digest("hex"));
+    expect(await fs.readFile(content.path, "utf8")).toBe(content.markdown);
+    await expect(page.getByTestId("plan-document-card")).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("product-global-plan-workbench.png"), fullPage: true });
+    await page.getByRole("button", { name: "查看文档", exact: true }).click();
+    await expect(page.getByRole("dialog").last()).toContainText("LOCAL_LEARNING_842");
+  });
+
+  test(`real OMLX product Rules interviews and saves reviewed AGENTS with ${model}`, async ({ page }, testInfo) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await fs.writeFile(path.join(workspace, "AGENTS.md"), "# Project rules\n\nHUMAN_RULE_913: Preserve this existing user rule.\n");
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    const input = page.getByTestId("composer-textarea");
+    await input.fill("/规则 保留已有人工规则。为当前项目编写简短开发约束：修改后运行 npm test；不新增第三方运行时依赖；保留原有 CSV 中文字段兼容。先问清必要取舍再起草，审阅后才写AGENTS.md。");
+    await input.press("Enter");
+    const snapshot = await settleVisiblePlanInterview(page, testInfo, "document", { textAnswer:
+      "项目使用现有技术栈和文件组织。开发目标是保持 CSV creator 与中文创建者字段到 creatorName 的映射兼容；每次修改后运行 npm test 验证。禁止新增第三方运行时依赖，修改范围限当前项目，保留现有人工规则 HUMAN_RULE_913。团队采用小范围修改与差异审阅；规则覆盖目标、开发约定、测试命令和上述边界。没有其他新增约束。" });
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    expect(await fs.readFile(path.join(workspace, "AGENTS.md"), "utf8")).toBe("# Project rules\n\nHUMAN_RULE_913: Preserve this existing user rule.\n");
+    const dialog = page.getByRole("dialog").last();
+    await expect(dialog).toBeVisible();
+    const editor = dialog.getByRole("textbox");
+    await expect(editor).toHaveValue(/HUMAN_RULE_913/);
+    const candidate = await editor.inputValue();
+    expect(candidate).toContain("npm test");
+    await editor.fill(candidate + "\nEDITOR_RULE_527: Keep changes scoped.\n");
+    const save = dialog.getByRole("button", { name: /保存|写入|确认/ }).last();
+    await save.click();
+    await expect.poll(async () => await fs.readFile(path.join(workspace, "AGENTS.md"), "utf8")).toContain("EDITOR_RULE_527");
+    const actual = await fs.readFile(path.join(workspace, "AGENTS.md"), "utf8");
+    expect(actual).toContain("HUMAN_RULE_913");
+    expect(actual).toContain("npm test");
+    await fs.writeFile(testInfo.outputPath("reviewed-AGENTS.md"), actual);
+  });
+
+  test(`real OMLX product selected knowledge reaches the first runtime model request with ${model}`, async ({ page }, testInfo) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await fs.writeFile(path.join(workspace, "reference-manual.txt"), "青岚项目的发布暗号为 RAG_CEDAR_864。网络访问由用户在本轮开启；离线模式不会查询网页。\n");
+    const base = await invokeRuntimeToolBridge(workspace, "knowledge_create_base", { name: "项目发布资料", description: "Real local text index" });
+    const imported = await invokeRuntimeToolBridge(workspace, "knowledge_import_source", { kbId: base.id, path: "reference-manual.txt" });
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    const input = page.getByTestId("composer-textarea");
+    await input.fill("#");
+    const picker = page.getByTestId("knowledge-picker");
+    await expect(picker).toBeVisible();
+    await picker.getByRole("checkbox", { name: imported.source.title, exact: true }).check();
+    await picker.getByRole("button", { name: /添加所选/ }).click();
+    await input.fill("青岚项目的发布暗号是什么？请引用所选资料，不要联网。");
+    await input.press("Enter");
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "product-rag");
+    const aggregate = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+    const packet = aggregate.events.find((event: any) => event.type === "turn.admitted")?.knowledgeContext;
+    expect(packet?.references).toHaveLength(1);
+    expect(packet.references[0].sourceId).toBe(imported.source.id);
+    expect(packet.hits[0].text).toContain("RAG_CEDAR_864");
+    const answer = snapshot.runtimeV2.projections.find((projection: any) => projection.audience === "final")?.markdown || "";
+    expect(answer).toContain("RAG_CEDAR_864");
+    const wire = (page as any).__realOmlxProviderWire as any[];
+    const admittedAt = aggregate.events.find((event: any) => event.type === "turn.admitted").at;
+    // The semantic admission classifier precedes the Turn and receives no
+    // reference data. The first task-model request must already contain RAG.
+    const firstRuntimeRequest = wire.find(entry => Date.parse(entry.at) >= admittedAt);
+    expect(JSON.stringify(firstRuntimeRequest?.selectedKnowledgeAnchors)).toContain("RAG_CEDAR_864");
+    await expect(page.getByTestId("knowledge-selection-chips")).toHaveCount(0);
+    await input.fill("不用资料，只回复：下一轮正常聊天。");
+    await input.press("Enter");
+    await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate?.turn?.turnId))
+      .not.toBe(aggregate.turn.turnId);
+    const next = await expectRealWorkspaceTerminal(page, testInfo, "product-rag-next-message");
+    const nextAggregate = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+    expect(nextAggregate.events.find((event: any) => event.type === "turn.admitted")?.knowledgeContext).toBeUndefined();
+    const nextAdmittedAt = nextAggregate.events.find((event: any) => event.type === "turn.admitted").at;
+    const nextRuntimeRequest = wire.find(entry => Date.parse(entry.at) >= nextAdmittedAt);
+    expect(nextRuntimeRequest.selectedKnowledgeAnchors).toEqual([]);
+    expect(nextRuntimeRequest.tools).not.toContain("knowledge_search");
+  });
+}
+
+
+for (const model of models) {
+  test(`real OMLX workspace FIFO concludes two admitted Turns and roundtrips their actual Rust snapshot with ${model}`, async ({ page }, testInfo) => {
+    test.skip(realOmlxFixture !== "csv");
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+    const prompts = [
+      "这是普通聊天，不需要计划、文件操作或联网。请用三句话说明 Markdown 标题和列表的区别，并在最后写 FIFO_FIRST_731。",
+      "这是第二条普通聊天，不需要计划、文件操作或联网。只回复 FIFO_SECOND_942。",
+    ];
+    const clientIds = [`fifo-first-${Date.now()}`, `fifo-second-${Date.now()}`];
+    const admission = await page.evaluate(async ({ prompts, clientIds }) => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+      const observations: any[] = [];
+      const observe = () => {
+        const state = useAppStore.getState();
+        const turns = state.conversationTurns.filter(turn => clientIds.includes(turn.clientSubmissionId || ""));
+        const aggregates = turns.map(turn => normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[turn.id])?.aggregate).filter(Boolean);
+        const observation = {
+          activeTurnIds: aggregates.filter(aggregate => aggregate!.run && !aggregate!.terminalOutcome).map(aggregate => aggregate!.turn.turnId),
+          completedTurnIds: aggregates.filter(aggregate => aggregate!.terminalOutcome).map(aggregate => aggregate!.turn.turnId),
+          queue: (state.workspaceTurnQueue?.entries || []).filter(entry => clientIds.includes(entry.instruction.clientSubmissionId))
+            .map(entry => ({ clientSubmissionId: entry.instruction.clientSubmissionId, turnId: entry.receipt.turnId, status: entry.status })),
+        };
+        if (JSON.stringify(observations.at(-1)) !== JSON.stringify(observation)) observations.push(observation);
+      };
+      (window as any).__REAL_FIFO_TRACE__ = observations;
+      (window as any).__REAL_FIFO_UNSUBSCRIBE__ = useAppStore.subscribe(observe);
+      observe();
+      // Use the production receipt/FIFO ingress; no resolved intent, fake
+      // completion, queued-message replay helper or seeded Run is supplied.
+      const first = await useAppStore.getState().acceptWorkspaceInstruction({ text: prompts[0], source: "composer", clientSubmissionId: clientIds[0] });
+      const second = await useAppStore.getState().acceptWorkspaceInstruction({ text: prompts[1], source: "composer", clientSubmissionId: clientIds[1] });
+      observe();
+      return { first, second };
+    }, { prompts, clientIds });
+    let final: any;
+    let roundtrip: any;
+    let restoration: any;
+    const snapshot = () => page.evaluate(async clientIds => {
+      const { useAppStore, buildSessionRuntimeSnapshotFromStoreState } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/checkpoint.ts");
+      const { prepareProjectSessionSnapshotForSave } = await import("/src/lib/ipc.ts");
+      const state = useAppStore.getState();
+      const turns = state.conversationTurns.filter(turn => clientIds.includes(turn.clientSubmissionId || ""));
+      const aggregates = turns.map(turn => normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[turn.id])?.aggregate || null);
+      const session = state.sessionsByWorkspace[state.currentWorkspace]?.find(session => session.id === state.currentSessionId);
+      const runtimeSnapshot = buildSessionRuntimeSnapshotFromStoreState(state);
+      return {
+        turns, aggregates, trace: (window as any).__REAL_FIFO_TRACE__,
+        currentSessionId: state.currentSessionId, planLifecycle: state.planLifecycle,
+        isGenerating: state.isGenerating, agentStatus: state.agentStatus,
+        actionRequest: state.activeActionRequest, pendingRunDecision: state.pendingRunDecision,
+        queue: state.workspaceTurnQueue, ledger: state.workspaceInstructionLedger,
+        // This is the same live snapshot builder and persisted checkpoint
+        // codec used by normal session saves. Persistence below is explicit;
+        // this case does not claim automatic page reload or crash restore.
+        session: session ? prepareProjectSessionSnapshotForSave({ ...session, messages: runtimeSnapshot.taskFlow,
+          runtimeSnapshot, updatedAtMs: Date.now() }, null) : null,
+      };
+    }, clientIds);
+    try {
+      expect(admission.first).toMatchObject({ accepted: true, disposition: "admitted" });
+      expect(admission.second).toMatchObject({ accepted: true, disposition: "admitted" });
+      if (!admission.first.accepted || !admission.second.accepted) throw new Error("Both FIFO instructions must be admitted.");
+      expect(admission.second.receipt.turnId).not.toBe(admission.first.receipt.turnId);
+      expect(admission.second.receipt.sessionKey).toBe(admission.first.receipt.sessionKey);
+      expect(admission.second.receipt.sessionEpoch).toBe(admission.first.receipt.sessionEpoch);
+      await expect.poll(async () => {
+        final = await snapshot();
+        if (final.actionRequest || final.pendingRunDecision) return "unexpected_action_required";
+        return final.aggregates.length === 2 && final.aggregates.every((aggregate: any) => aggregate?.terminalOutcome) && !final.isGenerating && final.agentStatus === "idle" ? "completed" : "running";
+      }, { timeout: Math.min(realOmlxExecutionTimeoutMs, 240_000), intervals: [500] }).toBe("completed");
+      expect(final.turns.map((turn: any) => turn.clientSubmissionId)).toEqual(clientIds);
+      expect(final.queue?.entries || []).toHaveLength(0);
+      expect(final.trace.some((entry: any) => entry.queue.some((queued: any) => queued.clientSubmissionId === clientIds[1]) &&
+        !entry.completedTurnIds.includes(admission.first.receipt.turnId)), "the second real instruction must wait in the production FIFO before the first concludes").toBe(true);
+      expect(final.trace.every((entry: any) => entry.activeTurnIds.length <= 1), "parent Runs must not overlap").toBe(true);
+      const runtimeTimes: Array<{ startedAt: number; completedAt: number }> = [];
+      for (let index = 0; index < 2; index++) {
+        const aggregate = final.aggregates[index];
+        expect(aggregate.turn.turnId).toBe(index === 0 ? admission.first.receipt.turnId : admission.second.receipt.turnId);
+        expect(["chat", "analyze", "report", "summarize"]).toContain(aggregate.strategy);
+        expect(aggregate.terminalOutcome.resultKind).toBe("success");
+        const starts = aggregate.events.filter((event: any) => event.type === "run.started");
+        const completions = aggregate.events.filter((event: any) => event.type === "run.completed");
+        const turnCompletions = aggregate.events.filter((event: any) => event.type === "turn.completed");
+        const finals = aggregate.events.filter((event: any) => event.type === "projection.published" && event.projection.kind === "final" && event.projection.audience === "final");
+        expect(starts).toHaveLength(1);
+        expect(completions).toHaveLength(1);
+        expect(turnCompletions).toHaveLength(1);
+        expect(finals).toHaveLength(1);
+        expect(finals[0].projection.markdown).toContain(index === 0 ? "FIFO_FIRST_731" : "FIFO_SECOND_942");
+        expect(final.ledger.filter((entry: any) => entry.clientSubmissionId === clientIds[index] && entry.receipt.turnId === aggregate.turn.turnId)).toHaveLength(1);
+        runtimeTimes.push({ startedAt: starts[0].at, completedAt: turnCompletions[0].at });
+      }
+      expect(runtimeTimes[1].startedAt).toBeGreaterThanOrEqual(runtimeTimes[0].completedAt);
+      expect(final.session).toBeTruthy();
+      const previous = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: final.session.id });
+      const saveInput = { ...final.session, storageRevision: previous?.storageRevision || 0,
+        storageStatus: "ok", recordingDisabled: false };
+      const saved = await invokeRuntimeToolBridge(workspace, "save_project_session", { session: saveInput });
+      const loaded = await invokeRuntimeToolBridge(workspace, "load_project_session", { sessionId: final.session.id });
+      expect(saved.storageRevision).toBe(saveInput.storageRevision + 1);
+      expect(loaded.storageRevision).toBe(saved.storageRevision);
+      expect(loaded.runtimeSnapshot).toEqual(saveInput.runtimeSnapshot);
+      expect(loaded.messages).toEqual(saveInput.messages);
+      expect(loaded.runtimeSnapshot.conversationTurns.filter((turn: any) => clientIds.includes(turn.clientSubmissionId)).map((turn: any) => turn.id))
+        .toEqual([admission.first.receipt.turnId, admission.second.receipt.turnId]);
+      for (const aggregate of final.aggregates) {
+        const checkpoint = loaded.runtimeSnapshot.runtimeV2Checkpoints[aggregate.turn.turnId];
+        expect(checkpoint.owner).toEqual(aggregate.turn);
+        expect(checkpoint.aggregate).toBeUndefined();
+        expect(checkpoint.events).toEqual(aggregate.events);
+      }
+      roundtrip = { scope: "explicit Rust SessionStore save/load", saveInputRevision: saveInput.storageRevision,
+        savedRevision: saved.storageRevision, loaded };
+      const wire = (page as any).__realOmlxProviderWire as any[];
+      const requestsBeforeRestore = wire.length;
+      const cleared = await page.evaluate(async ({ loaded, workspace }) => {
+        const { useAppStore, buildEmptySessionRuntimeSnapshot } = await import("/src/store/useAppStore.ts");
+        const { messages: _messages, runtimeSnapshot: _runtimeSnapshot, ...metadata } = loaded;
+        const state = useAppStore.getState();
+        (window as any).__MAIN_E2E_NATIVE_SESSION_RESTORE__ = true;
+        (window as any).__MAIN_E2E_SESSION_RESTORE_CALLS__ = [];
+        // This is a test-only cold-memory boundary, not a reconstructed
+        // transcript. Only disk metadata survives; App owns all hydration.
+        useAppStore.setState({
+          ...buildEmptySessionRuntimeSnapshot(state, "main_mode", { sessionKey: null, sessionEpoch: null, createdAt: Date.now() }),
+          currentSessionId: null, runtimeBySessionKey: {}, isGenerating: false, agentStatus: "idle", abortController: null,
+          sessionsByWorkspace: { [workspace]: [{ ...metadata, active: false }] },
+          activeSessionByWorkspace: { [workspace]: null },
+        });
+        const empty = useAppStore.getState();
+        return { currentSessionId: empty.currentSessionId, taskFlow: empty.taskFlow, conversationTurns: empty.conversationTurns,
+          checkpoints: empty.runtimeV2Checkpoints, runtimeBySessionKey: empty.runtimeBySessionKey,
+          metadata: empty.sessionsByWorkspace[workspace] };
+      }, { loaded, workspace });
+      restoration = { scope: "App sidebar selection after clearing live memory; Rust full-snapshot fallback hydration, not a browser reload or native paged restore", cleared, requestsBeforeRestore };
+      expect(cleared.taskFlow).toEqual([]);
+      expect(cleared.conversationTurns).toEqual([]);
+      expect(cleared.checkpoints).toEqual({});
+      expect(cleared.runtimeBySessionKey).toEqual({});
+      expect(cleared.metadata[0].messages).toBeUndefined();
+      expect(cleared.metadata[0].runtimeSnapshot).toBeUndefined();
+      await page.getByTestId(`session-item-${loaded.id}`).click();
+      await expect.poll(async () => {
+        const restored = await snapshot();
+        const calls = await page.evaluate(() => (window as any).__MAIN_E2E_SESSION_RESTORE_CALLS__ || []);
+        return calls.some((call: any) => call.cmd === "load_project_session" && call.status === "fulfilled") &&
+          restored.currentSessionId === loaded.id && restored.aggregates.length === 2 && restored.aggregates.every((aggregate: any) => aggregate?.terminalOutcome?.resultKind === "success");
+      }, { timeout: 30_000 }).toBe(true);
+      const restored = await snapshot();
+      restoration.restored = restored;
+      restoration.nativeCalls = await page.evaluate(() => (window as any).__MAIN_E2E_SESSION_RESTORE_CALLS__ || []);
+      expect(restored.planLifecycle.sessionEpoch).toBe(admission.first.receipt.sessionEpoch);
+      expect(restored.turns.map((turn: any) => turn.id)).toEqual([admission.first.receipt.turnId, admission.second.receipt.turnId]);
+      for (let index = 0; index < 2; index++) {
+        expect(restored.aggregates[index].turn).toEqual(final.aggregates[index].turn);
+        expect(restored.aggregates[index].events).toEqual(final.aggregates[index].events);
+      }
+      expect(wire.length, "restoring terminal Turns must not automatically ask the model to continue").toBe(requestsBeforeRestore);
+      const priorTurnId = restored.aggregates[1].turn.turnId;
+      const input = page.getByTestId("composer-textarea");
+      await input.fill("这是恢复会话后的普通聊天：第一条聊天末尾的标记是什么？只回答那个标记，不要联网或读文件。");
+      await input.press("Enter");
+      await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate?.turn?.turnId))
+        .not.toBe(priorTurnId);
+      await expectRealWorkspaceTerminal(page, testInfo, "workspace-restored-followup");
+      const followup = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+      restoration.followup = followup;
+      expect(followup.turn.sessionKey).toBe(admission.first.receipt.sessionKey);
+      expect(followup.turn.sessionEpoch).toBe(admission.first.receipt.sessionEpoch);
+      expect(followup.turn.turnId).not.toBe(priorTurnId);
+      expect(followup.terminalOutcome.resultKind).toBe("success");
+      const followupFinals = followup.events.filter((event: any) => event.type === "projection.published" && event.projection.kind === "final" && event.projection.audience === "final");
+      expect(followupFinals).toHaveLength(1);
+      expect(followupFinals[0].projection.markdown).toContain("FIFO_FIRST_731");
+    } finally {
+      final = await snapshot();
+      await page.evaluate(() => { (window as any).__REAL_FIFO_UNSUBSCRIBE__?.(); });
+      await fs.writeFile(testInfo.outputPath("workspace-fifo-sidebar-restore.json"), JSON.stringify(restoration || null, null, 2));
+      await fs.writeFile(testInfo.outputPath("workspace-fifo-rust-snapshot.json"), JSON.stringify({ admission, final, roundtrip, restoration }, null, 2));
+    }
   });
 }

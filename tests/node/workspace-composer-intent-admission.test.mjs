@@ -120,6 +120,7 @@ test("production Composer ingress passes immutable snapshots to the durable work
       displayName: "README.md",
       kind: "text",
     }],
+    knowledgeReferences: [],
     source: "composer",
     dispatchHints: {
       subagentPreference: "preferred",
@@ -182,25 +183,9 @@ test("Chinese and English Plan shortcuts converge on the same structured intent"
   assert.doesNotMatch(chinese.turnTitle, /^\/计划/);
 });
 
-test("the Image Studio shortcut is preserved as a typed intent instead of an unknown string", () => {
-  const hints = build({ text: "/image draw a runtime architecture diagram" });
 
-  assert.equal(hints.resolvedIntent, "image_studio");
-  assert.equal(hints.runtimeIntentOverride, "image_studio");
-  assert.equal(hints.skipIntentResolution, true);
-});
 
-test("ordinary Image Studio input retains its exact workspace mode while waiting in FIFO", () => {
-  const image = build({
-    text: "draw a runtime architecture diagram",
-    snapshot: {
-      mainModeKey: "image_studio",
-      lockedComposerIntent: null,
-    },
-  });
-  assert.equal(image.resolvedIntent, "image_studio");
-  assert.equal(image.runtimeIntentOverride, "image_studio");
-});
+
 
 test("MDEBUG is durably classified as Plan with its canonical metadata", () => {
   const hints = build({

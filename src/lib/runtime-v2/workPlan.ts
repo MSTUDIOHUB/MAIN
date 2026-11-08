@@ -1,6 +1,9 @@
+import { resolveSessionWorkspaceKey } from "../sessionTypes";
+import { appendPlanDecisionJournal } from "../planDecisionJournal";
 import { sha256Hex } from "../sha256";
 import type { PlanCandidateV5 } from "../planContract";
 import { analyzeValidationCommand } from "../validationContract";
+import { normalizePlanDocumentRef, type PlanDocumentRef } from "../planDocuments";
 
 export const WORK_PLAN_V1_SCHEMA_VERSION = "work-plan.v1" as const;
 
@@ -66,6 +69,7 @@ export interface SealedWorkPlanV1 {
   readonly createdAt: number;
   readonly draft: WorkPlanDraftV1;
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
+  readonly decisionJournal?: string;
   readonly digest: string;
   readonly projectionHash: string;
   readonly markdown: string;
@@ -111,9 +115,19 @@ export interface RuntimeV2PlanChatProjection {
 }
 
 export interface RuntimeV2PlanArtifactProjection {
-  readonly path: typeof RUNTIME_V2_PLAN_ARTIFACT_PATH;
+  readonly path: string;
   readonly content: string;
   readonly projectionHash: string;
+  readonly documentRef?: PlanDocumentRef;
+}
+
+export function isWorkPlanArtifactProjectionBound(artifact: RuntimeV2PlanArtifactProjection, plan: SealedWorkPlanV1,
+  owner: { readonly workspaceKey: string; readonly sessionKey: string; readonly sessionEpoch: string; readonly turnId: string }): boolean {
+  if (artifact.content !== plan.markdown || artifact.projectionHash !== plan.projectionHash) return false;
+  if (!artifact.documentRef) return artifact.path === RUNTIME_V2_PLAN_ARTIFACT_PATH;
+  const ref = normalizePlanDocumentRef(artifact.documentRef);
+  return !!ref && ref.kind === "plan" && resolveSessionWorkspaceKey(ref.owner.workspace) === owner.workspaceKey && ref.owner.sessionKey === owner.sessionKey && ref.owner.sessionEpoch === owner.sessionEpoch &&
+    ref.owner.turnId === owner.turnId && ref.path === artifact.path && ref.contentHash === sha256Hex(plan.markdown);
 }
 
 export interface RuntimeV2PlanReviewBinding {
@@ -333,7 +347,7 @@ export function validateWorkPlanDraftV1(
   return issues;
 }
 
-export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "id" | "revision" | "digest">): string {
+export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "id" | "revision" | "digest" | "decisionJournal">): string {
   const draft = plan.draft;
   const narrative = normalizeText(draft.summary, 8_000);
   const lines: string[] = /^\s*#\s+\S/.test(narrative)
@@ -376,7 +390,7 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
   if (draft.assumptions.length > 0) lines.push("## 假设", "", markdownList(draft.assumptions), "");
   if (draft.blockingQuestions.length > 0) lines.push("## 需要用户决定", "", markdownList(draft.blockingQuestions), "");
   lines.push("---", `计划 ID：${plan.id} · 修订：${plan.revision} · 摘要：${plan.digest}`);
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return appendPlanDecisionJournal(lines.join("\n").replace(/\n{3,}/g, "\n\n").trim(), plan.decisionJournal);
 }
 
 export function sealWorkPlanV1(input: {
@@ -386,7 +400,9 @@ export function sealWorkPlanV1(input: {
   readonly id?: string;
   readonly createdAt: number;
   readonly legacy?: SealedWorkPlanV1["legacy"];
+  readonly decisionJournal?: string;
 }): SealedWorkPlanV1 {
+  if (input.decisionJournal !== undefined && (typeof input.decisionJournal !== "string" || !input.decisionJournal.trim())) throw new Error("Invalid runtime decision journal");
   const evidence = input.evidence.map((item) => ({
     id: normalizeText(item.id, 128),
     target: normalizeText(item.target, 1_024),
@@ -402,7 +418,8 @@ export function sealWorkPlanV1(input: {
     throw new Error(`WorkPlanDraftV1 rejected: ${issues.map((issue) => `${issue.path}: ${issue.message}`).join(" ")}`);
   }
   const revision = Math.max(1, Math.floor(Number(input.revision) || 1));
-  const digest = hash("work-plan-sha256", { draft: input.draft, evidence });
+  const journal = input.decisionJournal === undefined ? {} : { decisionJournal: input.decisionJournal };
+  const digest = hash("work-plan-sha256", { draft: input.draft, evidence, ...journal });
   const id = normalizeText(input.id, 128) || `WP-${digest.slice(-12)}`;
   const provisional = {
     schemaVersion: WORK_PLAN_V1_SCHEMA_VERSION,
@@ -412,6 +429,7 @@ export function sealWorkPlanV1(input: {
     createdAt: Math.max(0, Math.floor(input.createdAt)),
     draft: input.draft,
     evidence,
+    ...journal,
     digest,
   };
   const markdown = projectWorkPlanMarkdown(provisional);

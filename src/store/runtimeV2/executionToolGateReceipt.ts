@@ -32,19 +32,20 @@ export function runtimeV2ToolPreExecutionReceipt(input: {
     : receipt;
 }
 
-/** Automatic preparation cannot exercise a capability requiring an explicit
- * proposal. Settle preparation without claiming an observation; subsequent
- * model-proposed reads still pass the ordinary exact deny/review gate. */
+/** Automatic preparation requires a real project scope and cannot exercise a
+ * capability requiring an explicit proposal. Settle preparation without claiming
+ * an observation; model-proposed reads keep the ordinary deny/review gate. */
 export function runtimeV2AutomaticObservationDeferredReceipt(
   ports: RuntimeV2ExecutionPortsInput,
   command: RuntimeV2Command,
 ): RuntimeV2EventDraft | null {
+  const hasWorkspace = !!String(ports.context.runWorkspace || "").trim();
   const restriction = runtimeV2ToolCapabilityRestriction(ports, "get_project_skeleton");
   const requiredReview = runtimeV2ToolApprovalCapability(ports, "get_project_skeleton");
-  if (!restriction && !requiredReview) return null;
+  if (hasWorkspace && !restriction && !requiredReview) return null;
   ports.logStoreEvent("runtime_v2_automatic_observation_deferred", {
     turnId: command.run.turnId, runId: command.run.runId,
-    reason: restriction ? "turn_capability_restricted" : "turn_requires_human_review",
+    reason: !hasWorkspace ? "no_workspace" : restriction ? "turn_capability_restricted" : "turn_requires_human_review",
     capability: restriction || requiredReview,
   });
   return { type: "command.completed", run: command.run, idempotencyKey: command.idempotencyKey, status: "succeeded" };

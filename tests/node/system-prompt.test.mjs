@@ -225,7 +225,7 @@ test("no-tool turns contain no executable XML example or fake capability", () =>
   assert.match(prompt, /Do not edit source files or write plan artifacts before approval/);
 });
 
-test("plan, web, tabular, game-engine MCP, and goal modules are conditional", () => {
+test("plan, web, tabular and game-engine MCP modules are conditional", () => {
   const base = buildPrompt({ intent: "respond", available: ["read_file"], toolDefinitions: [tools[0]] });
   assert.doesNotMatch(base, /\[PLAN\]|\[WEB RESEARCH\]|\[TABULAR\]|\[GAME ENGINE MCP\]|\[GOAL RUNTIME CONTRACT\]/);
 
@@ -258,9 +258,7 @@ test("plan, web, tabular, game-engine MCP, and goal modules are conditional", ()
   assert.match(game, /connectedMcpServers: Godot MCP/);
   assert.doesNotMatch(game, /Game Studio|activeStudioAgent|protocolEntry|studio_auto/i);
 
-  const goal = buildPrompt({ intent: "goal", goal: { context: "GOAL_CONTRACT_SENTINEL" } });
-  assert.match(goal, /\[GOAL \(AUTONOMOUS EXECUTION\)\]/);
-  assert.match(goal, /GOAL_CONTRACT_SENTINEL/);
+  assert.doesNotMatch(base, /GOAL RUNTIME CONTRACT|AUTONOMOUS EXECUTION/);
 });
 
 test("game-engine MCP production modules contain no removed Studio lifecycle terminology", () => {

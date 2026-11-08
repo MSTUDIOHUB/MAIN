@@ -1,4 +1,5 @@
 import type { ProjectBaselineContext, ProjectBaselineFact } from "./projectBaseline";
+import type { PlanDocumentRef } from "./planDocuments";
 
 export const PROJECT_INIT_TARGET_PATH = "AGENTS.md";
 export const PROJECT_INIT_BLOCK_START = "<!-- MAIN:PROJECT_INIT:START v1 -->";
@@ -15,6 +16,13 @@ export type ProjectInitLocale = "zh" | "en";
 export interface ProjectInitCommand {
   readonly kind: "project_init";
   readonly refresh: boolean;
+  readonly request?: string;
+}
+
+export interface RulesDraftReview {
+  readonly documentRef: PlanDocumentRef;
+  readonly inspection: ProjectInitInspection;
+  readonly markdown: string;
 }
 
 export interface ProjectInitInspection {
@@ -63,6 +71,7 @@ export type ProjectInitPreviewStatus =
   | "invalid_managed_block";
 
 export interface ProjectInitPreview {
+  readonly editableDraft?: boolean;
   readonly command: ProjectInitCommand;
   readonly refresh: boolean;
   readonly locale: ProjectInitLocale;
@@ -145,11 +154,13 @@ function safeBaselineFingerprint(value: string): string {
 }
 
 export function parseProjectInitCommand(input: string): ProjectInitCommand | null {
-  if (typeof input !== "string" || /[\r\n]/.test(input)) return null;
-  const tokens = input.trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 1 && tokens[0] === "/init") return { kind: "project_init", refresh: false };
-  if (tokens.length === 2 && tokens[0] === "/init" && tokens[1] === "--refresh") return { kind: "project_init", refresh: true };
-  return null;
+  if (typeof input !== "string") return null;
+  const match = input.trim().match(/^\/(?:规则|rules|init)(?:\s+([\s\S]*))?$/i);
+  if (!match) return null;
+  const rest = (match[1] || "").trim();
+  const refresh = /^--refresh(?:\s|$)/.test(rest);
+  const request = (refresh ? rest.replace(/^--refresh\s*/, "") : rest).trim();
+  return { kind: "project_init", refresh, ...(request ? { request } : {}) };
 }
 
 export function renderProjectInitManagedBlock(
@@ -278,6 +289,23 @@ function previewWithoutChange(
   return deepFreeze({ command, refresh: command.refresh, locale, canonicalWorkspace: inspection.canonicalWorkspace, workspaceIdentity: inspection.workspaceIdentity, targetPath: inspection.targetPath, baseVersion: inspection.baseVersion, existing: inspection.content, proposed: inspection.content, unifiedDiff: "", status, baselineFingerprint: null });
 }
 
+/** AI drafts and user edits share the existing inspected-file CAS boundary. */
+export function buildProjectRulesPreview(inspection: ProjectInitInspection, candidate: string, locale: ProjectInitLocale = "zh"): ProjectInitPreview {
+  validateInspection(inspection);
+  if (typeof candidate !== "string") throw new Error("PROJECT_RULES_DRAFT_INVALID");
+  if (new TextEncoder().encode(candidate).byteLength > PROJECT_INIT_MAX_CONTENT_BYTES) throw new Error("PROJECT_INIT_CONTENT_TOO_LARGE");
+  return deepFreeze({ editableDraft: true, command: { kind: "project_init", refresh: false }, refresh: false, locale,
+    canonicalWorkspace: inspection.canonicalWorkspace, workspaceIdentity: inspection.workspaceIdentity, targetPath: inspection.targetPath,
+    baseVersion: inspection.baseVersion, existing: inspection.content, proposed: candidate,
+    unifiedDiff: createProjectInitUnifiedDiff(inspection.content, candidate, inspection.targetPath),
+    status: candidate === inspection.content ? "no_changes" : inspection.exists ? "ready_update" : "ready_create", baselineFingerprint: null });
+}
+
+export function updateProjectRulesPreview(preview: ProjectInitPreview, candidate: string): ProjectInitPreview {
+  return buildProjectRulesPreview({ canonicalWorkspace: preview.canonicalWorkspace, workspaceIdentity: preview.workspaceIdentity, targetPath: preview.targetPath,
+    exists: preview.baseVersion !== null, content: preview.existing, baseVersion: preview.baseVersion }, candidate, preview.locale);
+}
+
 export async function prepareProjectInitPreview(input: {
   readonly command: string;
   readonly workspace: string;
@@ -327,6 +355,7 @@ export async function commitProjectInitPreview(input: {
   readonly currentWorkspaceIdentity: string;
   readonly io: Pick<ProjectInitIo, "commit">;
 }): Promise<ProjectInitCommitResult> {
+  if (input.preview.editableDraft && !input.preview.proposed.trim()) throw new Error("PROJECT_RULES_DRAFT_EMPTY");
   if (input.currentWorkspaceIdentity !== input.preview.workspaceIdentity) return { status: "stale", reason: "workspace_identity" };
   if (input.preview.status === "already_initialized" || input.preview.status === "no_changes" || input.preview.status === "invalid_managed_block") {
     return { status: "no_op", reason: input.preview.status };

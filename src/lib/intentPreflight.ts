@@ -99,8 +99,10 @@ function normalizeSemanticIntent(raw: unknown, onInvalid?: (field: DiagnosticFie
 }
 
 function deriveSemanticIntent(semantic: SemanticTaskIntent): ResolvedUserIntent {
-  if (semantic.workType === "plan") return "plan";
-  if (semantic.workType === "implement" || semantic.workType === "operate" ||
+  // A capability-free natural plan is discussion; explicit Plan is resolved
+  // separately by the user-selected mode boundary below.
+  if (semantic.workType === "plan" && semantic.requiredCapabilities.length > 0) return "plan";
+  if (semantic.workType === "implement" ||
     semantic.requiredCapabilities.some((capability) =>
       capability === "workspace_write" || capability === "command" || capability === "external_interaction"
     )) return "execute";
@@ -120,16 +122,20 @@ function normalizePreflightResult(
   const candidate = raw as Record<string, unknown>;
   const semantic = normalizeSemanticIntent(candidate.semantic, onInvalid);
   if (!semantic) return null;
-  if (typeof candidate.confidence !== "number" || !Number.isFinite(candidate.confidence) ||
-    candidate.confidence < 0 || candidate.confidence > 1) return invalid("confidence");
-  if (typeof candidate.needsUserChoice !== "boolean") return invalid("needsUserChoice");
+  // Confidence and the choice hint carry no capability or approval authority.
+  // A complete semantic result remains valid when these optional hints are
+  // absent; grounded clarification below still determines whether input is missing.
+  const confidence = candidate.confidence === undefined ? 0 : candidate.confidence;
+  if (typeof confidence !== "number" || !Number.isFinite(confidence) ||
+    confidence < 0 || confidence > 1) return invalid("confidence");
+  if (candidate.needsUserChoice !== undefined && typeof candidate.needsUserChoice !== "boolean") return invalid("needsUserChoice");
   const question = typeof candidate.question === "string" ? candidate.question.trim() : undefined;
   if (candidate.needsUserChoice && !question) return invalid("question");
   const required = semantic.requiredCapabilities;
   const implementation = semantic.workType === "implement" || required.includes("workspace_write");
   const forbidden = semantic.forbiddenCapabilities;
   const explicitPolicy = explicitIntent ? getIntentPolicy(explicitIntent).toolPolicy : undefined;
-  const operationRequired = implementation || semantic.workType === "operate" ||
+  const operationRequired = implementation ||
     required.includes("command") || required.includes("external_interaction");
   const conflicts = required.some((capability) => forbidden.includes(capability)) ||
     (semantic.workType === "implement" && forbidden.includes("workspace_write")) ||
@@ -153,7 +159,7 @@ function normalizePreflightResult(
   return {
     semantic: { ...semantic, ...(clarification ? { clarification } : {}) },
     intent,
-    confidence: candidate.confidence,
+    confidence,
     title: normalizeConversationDisplayTitle(
       typeof candidate.title === "string" && candidate.title.trim() ? candidate.title : semantic.objective,
       language === "en" ? 48 : 32,
@@ -171,7 +177,7 @@ function normalizePreflightResult(
       source: "preflight",
       requiresWorkspace: required.includes("workspace_read") || implementation,
       requiresApproval,
-      confidence: candidate.confidence,
+      confidence,
     },
   };
 }
@@ -209,12 +215,13 @@ export async function runIntentPreflight(params: {
     "Interpret MAIN's current user request. Return one complete JSON object only; no prose, markdown or tools.",
     "Separate the work from its answer format. Analysis/report/summary can accompany implementation or live inspection. Explaining a command does not request running it.",
     "Identify only capabilities needed for the current work, not hypothetical examples or future plan execution. requiredCapabilities describe needs, never approval.",
+    "Capability meanings: network = public web_search and web_fetch reads; external_interaction = browser, app or MCP automation. Public web research alone requires network, without external_interaction, command or workspace_write.",
     "forbiddenCapabilities contain only explicit CURRENT operational restrictions. Read-only forbids workspace_write; no commands forbids command separately. Historical baselines, quotations and examples are reference context, not current restrictions.",
     "approvalRequiredCapabilities contain only capabilities for which the CURRENT request explicitly requires separate human approval before each invocation; otherwise use []. This adds a review requirement, never approval. Historical approvals, quotations and examples do not create this requirement.",
     "An explicit mode is a capability upper bound; still interpret restrictions in its natural-language body. Never approve tools, widen paths, invent exact commands or claim completion.",
     "Use previousRequest only for an actual continuation; the current request controls. Never ask permission to start requested work; session scopes and per-action policy own approval. Task length, commands and interaction checks are not input gaps.",
     "For a necessary missing input, provide clarification:{kind:'missing_input',field:'missing fact',evidence:'exact current-request excerpt',question:'specific question'}. For an unresolved target choice use kind:'target_ambiguity' and choices:[...] copied from that excerpt. needsUserChoice alone has no authority. Do not invent a gap for execution consent.",
-    "Required shape: {\"semantic\":{\"objective\":\"short task goal\",\"workType\":\"answer|investigate|implement|operate|plan\",\"answerFormat\":\"answer|analysis|summary|report|plan\",\"requiredCapabilities\":[],\"forbiddenCapabilities\":[],\"approvalRequiredCapabilities\":[]},\"confidence\":0.0,\"needsUserChoice\":false}. Optional title and question are short strings; question is required when needsUserChoice is true.",
+    "Required shape: {\"semantic\":{\"objective\":\"short task goal\",\"workType\":\"answer|investigate|implement|operate|plan\",\"answerFormat\":\"answer|analysis|summary|report|plan\",\"requiredCapabilities\":[],\"forbiddenCapabilities\":[],\"approvalRequiredCapabilities\":[]}}. Optional confidence is a number from 0 to 1; needsUserChoice is a boolean hint. Optional title and question are short strings; question is required when needsUserChoice is true.",
     `Capability values: ${TURN_CAPABILITIES.join(", ")}.`,
     `Mode: ${params.mainModeKey}; explicit intent: ${params.explicitIntent ?? "none"}; workspace: ${params.hasWorkspace === true}; language: ${params.language}.`,
   ].join("\n");

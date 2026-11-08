@@ -106,6 +106,26 @@ test("finite command analysis proves every fail-fast shell segment", () => {
   }
 });
 
+test("Unity batch acceptance uses the Editor test runner and lets tests finish", () => {
+  const options = '-batchmode -projectPath "." -runTests -testPlatform PlayMode -testResults "playmode.xml"';
+  for (const executable of ['Unity', '"/Applications/Unity Editor/Unity.app/Contents/MacOS/Unity"', '"C:\\Program Files\\Unity\\Editor\\Unity.exe"']) {
+    const spec = analyzeValidationCommand(`${executable} ${options}`).spec;
+    assert.equal(spec?.kind, "finite_command", executable);
+    assert.equal(spec?.capability, "test");
+  }
+  for (const command of [
+    "unity test --help",
+    'unity test . --mode PlayMode --timeout 120 --allow-install',
+    'unity test . --mode PlayMode -- -quit',
+    `Unity ${options} -quit`,
+    `Unity ${options} -executeMethod Project.Run`,
+    "Unity -runTests -projectPath .",
+    "Unity -batchmode -runTests",
+    "echo 'Unity -batchmode -runTests -projectPath .'",
+  ]) assert.equal(analyzeValidationCommand(command).spec, null, command);
+  assert.equal(analyzeValidationCommand("unity test . --mode PlayMode --timeout 120 --format json").spec?.capability, "test");
+});
+
 test("inline commands require decidable failure semantics and reject resident runtimes", () => {
   for (const command of [
     "node -e \"const value = 1; if (value !== 1) process.exit(1)\"",

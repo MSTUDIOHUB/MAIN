@@ -230,7 +230,7 @@ test("clearChatHistory revokes workspace owners before durable clear and only th
   assert.match(body, /pendingRunDecisionResolver: null/);
   assert.match(body, /pendingReviewResolve: null/);
   assert.match(body, /activeActionRequest: null/);
-  assert.match(body, /activeGoal: null/);
+  assert.doesNotMatch(body, /startGoal|resumeGoal|goalContinuationAuthorization/);
   assert.match(body, /harnessRunMarker: null/);
   assert.match(body, /abortController: null/);
   const clearedOutcomeIndex = body.indexOf('workspaceClearBarrierOutcome = "cleared"');
@@ -1323,7 +1323,7 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   await new Promise((resolve) => setImmediate(resolve));
   const realSendMessage = useAppStore.getState().sendMessage;
   const oldSessionKey = `${workspace}:${sessionId}`;
-  const firstText = "/分析 第一条用户输入必须保留";
+  const firstText = "第一条用户输入必须保留";
   assert.equal(realSendMessage(firstText), true);
   const secondText = "/分析 第二条用户输入必须按序重放";
   const staleVisibleGoalEnvelope = {
@@ -1483,7 +1483,7 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   const clearRejected = assert.rejects(clear, /preserve workspace clear failed/);
   await new Promise((resolve) => setImmediate(resolve));
   const realSendMessage = useAppStore.getState().sendMessage;
-  const latestText = "/分析 清理失败后作为全新回合重放";
+  const latestText = "清理失败后作为全新回合重放";
   assert.equal(realSendMessage(latestText, undefined, {
     submissionOriginSessionKey: oldSessionKey,
   }), true);
@@ -1589,93 +1589,7 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("failed clear preserves exact Goal continuation authority for fresh Turn admission", async (t) => {
-  // Harness ownership fails closed when durable WebView storage is unavailable.
-  // This integration test supplies the persistence surface present in desktop.
-  t.after(installFakeLocalStorageWindow());
-  const { useAppStore } = loadTranspiledModuleSync(
-    path.join(process.cwd(), "src/store/useAppStore.ts"),
-  );
-  const workspace = "/workspace-clear-submit-goal-continuation";
-  const sessionId = 708;
-  const oldTurnId = "turn-clear-submit-goal-old";
-  const oldSessionKey = `${workspace}:${sessionId}`;
-  seedWorkspaceSession(useAppStore, workspace, sessionId, oldTurnId);
-  useAppStore.setState((state) => ({
-    selectedMainModeKey: "main_mode",
-    config: {
-      ...state.config,
-      local: { ...state.config.local, model: "" },
-    },
-  }));
-  useAppStore.getState().startGoal("完成清理前的目标", {
-    sessionKey: oldSessionKey,
-    ownerTurnId: oldTurnId,
-  });
-  const goalBeforeClear = useAppStore.getState().activeGoal;
-  assert.ok(goalBeforeClear);
-  const text = "继续这个精确目标，但必须创建新回合";
-  const exactEnvelope = useAppStore.getState().captureGoalContinuationEnvelope(text, {
-    source: "goal_manual_resume",
-  });
-  assert.ok(exactEnvelope);
 
-  const durableClear = deferred();
-  let clearInvocations = 0;
-  tauriInvoke = (command, payload) => {
-    if (command === "clear_project_sessions") {
-      clearInvocations += 1;
-      return clearInvocations === 1 ? durableClear.promise : Promise.resolve();
-    }
-    if (command === "save_project_session") return Promise.resolve(payload.session);
-    return Promise.resolve("");
-  };
-
-  const clear = useAppStore.getState().clearChatHistory();
-  const clearRejected = assert.rejects(clear, /goal continuation clear failed/);
-  await new Promise((resolve) => setImmediate(resolve));
-  const realSendMessage = useAppStore.getState().sendMessage;
-  assert.equal(realSendMessage(text, undefined, {
-    submissionOriginSessionKey: oldSessionKey,
-    goalContinuationEnvelope: exactEnvelope,
-    goalContinuationGuidance: text,
-  }), true);
-
-  const admissionCalls = [];
-  const realAcceptWorkspaceInstruction = useAppStore.getState().acceptWorkspaceInstruction;
-  const realDispatchNextWorkspaceInstruction =
-    useAppStore.getState().dispatchNextWorkspaceInstruction;
-  useAppStore.setState({
-    acceptWorkspaceInstruction: async (input) => {
-      admissionCalls.push(input);
-      return realAcceptWorkspaceInstruction(input);
-    },
-    dispatchNextWorkspaceInstruction: () => true,
-  });
-  durableClear.reject(new Error("goal continuation clear failed"));
-  await clearRejected;
-  await waitFor(() => admissionCalls.length > 0, "Goal continuation admission replay");
-  assert.equal(admissionCalls[0].goalContinuationEnvelope.kind, "goal_continuation_envelope");
-  assert.notEqual(admissionCalls[0].goalContinuationEnvelope.id, exactEnvelope.id);
-  assert.equal(useAppStore.getState().conversationTurns.length, 2);
-  const freshTurnId = useAppStore.getState().conversationTurns.find(
-    (turn) => turn.id !== oldTurnId,
-  ).id;
-  assert.notEqual(freshTurnId, oldTurnId);
-  const continuationAuthorization = useAppStore.getState()
-    .workspaceTurnQueue.entries[0].instruction.payload.dispatchHints.goalContinuationAuthorization;
-  assert.equal(continuationAuthorization.goalId, goalBeforeClear.id);
-  assert.equal(continuationAuthorization.goalRevision, goalBeforeClear.revision);
-  assert.equal(continuationAuthorization.ownerTurnId, oldTurnId);
-  assert.equal(continuationAuthorization.sessionKey, oldSessionKey);
-
-  useAppStore.setState({
-    acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
-    dispatchNextWorkspaceInstruction: realDispatchNextWorkspaceInstruction,
-  });
-  await useAppStore.getState().clearChatHistory();
-  await new Promise((resolve) => setImmediate(resolve));
-});
 
 test("failed real clear preserves a usable Session with a fresh safe runtime generation", async () => {
   const { useAppStore } = loadTranspiledModuleSync(

@@ -3,6 +3,10 @@ import { expect, test } from "@playwright/test";
 for (const theme of ["light", "dark", "black"]) {
   test(`canonical tool outcomes restore readable steps and disclosed diagnostics in ${theme}`, async ({ page }, testInfo) => {
     await page.goto("/?e2eScenario=awaiting-choice");
+    await expect.poll(() => page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      return useAppStore.getState().harnessRunMarker?.runId;
+    })).toBe("run-e2e-awaiting-choice");
     await page.evaluate(async appearance => {
       const store = await import("/src/store/useAppStore.ts");
       const runtime = await import("/src/lib/runtime-v2/index.ts");
@@ -45,8 +49,8 @@ for (const theme of ["light", "dark", "black"]) {
         blocks.push({ id: 900 + index, type: "tool", turnId: turn.turnId, runId: run.runId,
           toolCallId: idempotencyKey, toolName: item.toolName, target: item.target, toolStatus: "failed", status: "error", message: raw } as any);
       });
-      append("run.paused", { run, blocker: { requestId: "outcome-pause", reasonCode: "recovery_stalled", evidenceSequence: sequence - 1,
-        message: "执行已暂停，可检查结果。", options: ["recheck", "stop"] } });
+      append("run.paused", { run, blocker: { requestId: "outcome-pause", reasonCode: "external_state_required", evidenceSequence: sequence - 1,
+        message: "外部验收设备尚未就绪，可检查已记录结果。", options: ["recheck", "stop"] } });
       const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt });
       const paused = { ...state, config: { ...state.config, workflowMode: "edit", themeMode: appearance },
         taskFlow: blocks, activeActionRequest: null, planArtifacts: [], planTasks: [], planStage: "idle", isPlanApproved: false,

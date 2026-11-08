@@ -26,6 +26,7 @@ import {
 } from "./executionProviderSourceCoverage";
 import { runtimeV2ProviderActionWindowFor } from "./executionProviderActionWindow";
 import { runtimeV2ToolDefinitions } from "./executionToolDefinitions";
+import { builtInToolRequiresWorkspace } from "../../lib/workspaceToolScope";
 import {
   buildRuntimeV2TextEnvelopeCatalog,
   selectRuntimeV2ProviderToolDefinitions,
@@ -208,8 +209,10 @@ export function runtimeV2ProviderToolDefinitionsForPrompt(
 export function createRuntimeV2ExecutionAuthorization(
   state: any,
   skillCatalog?: import("../../lib/agentSkills").SkillCatalogSnapshot | null,
+  knowledgeContext?: import("../../lib/knowledgeReferences").KnowledgeContextPacket,
+  runWorkspace?: string,
 ): RuntimeV2ExecutionAuthorization {
-  const builtInDefinitions = runtimeV2ToolDefinitions(state, skillCatalog);
+  const builtInDefinitions = runtimeV2ToolDefinitions(state, skillCatalog, knowledgeContext);
   const policy = normalizeToolPermissionPolicy(
     state?.config?.toolPermissionPolicy,
   );
@@ -223,12 +226,30 @@ export function createRuntimeV2ExecutionAuthorization(
       typeof state.mcpToolServerMap === "object"
     ? { ...state.mcpToolServerMap }
     : {};
-  const toolCatalog = buildToolCatalog({
+  const completeCatalog = buildToolCatalog({
     builtInDefinitions,
     mcpTools,
     mcpServers,
     mcpToolServerMap,
   });
+  // Assign MCP identities before filtering built-ins, so a remote tool cannot
+  // acquire a removed built-in's bare name. The frozen Run scope owns this
+  // availability view; mutable workspace selection does not supply a root.
+  const unavailable = new Set(runWorkspace !== undefined && !runWorkspace.trim()
+    ? completeCatalog.entries.filter(entry => entry.source === "built_in" &&
+      builtInToolRequiresWorkspace(entry.executionName)).map(entry => entry.exposedName)
+    : []);
+  const toolCatalog = unavailable.size === 0 ? completeCatalog : {
+    ...completeCatalog,
+    entries: completeCatalog.entries.filter(entry => !unavailable.has(entry.exposedName)),
+    toolDefinitions: completeCatalog.toolDefinitions.filter(tool => !unavailable.has(tool.function.name)),
+    lookup: (name: string): ReturnType<typeof completeCatalog.lookup> => {
+      const result = completeCatalog.lookup(name);
+      return result.status === "resolved" && result.entry.source === "built_in" &&
+          unavailable.has(result.entry.exposedName)
+        ? { status: "unknown", requestedName: name } : result;
+    },
+  };
   const toolDefinitions = toolCatalog.toolDefinitions;
   const mcpRouting = normalizeMcpRoutingConfig(state?.config?.mcpRouting);
   const discoveredCapabilityRegistry = buildToolCapabilityRegistry({
@@ -270,10 +291,10 @@ export function authorizationFor(
   if (!input.live.authorization) {
     const state = { ...input.get(), ...(input.context.workspaceMcpSnapshot || {}) };
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
-      isReadOnlyContext(input)
-        ? { ...state, webSearchEnabled: readOnlyNetworkPolicy(input).enabled }
-        : state,
+      { ...state, webSearchEnabled: readOnlyNetworkPolicy(input).enabled },
       input.context.skillCatalog,
+      input.context.knowledgeContext,
+      String(input.context.runWorkspace || ""),
     );
   }
   return input.live.authorization;

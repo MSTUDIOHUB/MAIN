@@ -124,6 +124,7 @@ export function buildSubagentDelegationGuidance(input: {
   readonly preference: SubagentDelegationPreference;
   readonly requirement?: SubagentRequirement;
   readonly language: "zh" | "en";
+  readonly scope?: "read_only";
 }): string {
   if (input.preference === "forbidden") {
     return input.language === "en"
@@ -147,6 +148,12 @@ export function buildSubagentDelegationGuidance(input: {
     : input.language === "en"
       ? "Collaboration is available for this turn."
       : "本轮允许按需协作。";
+  if (input.scope === "read_only") {
+    const method = input.language === "en"
+      ? "When spawn_subagent is available, delegate a bounded read-only investigation, design review, or validation question if an independent result can overlap useful parent work. Give the child a specific objective, success criteria, relevant evidence, and exact read scope. Continue unrelated discovery and join the result before submitting the plan."
+      : "当 spawn_subagent 可用且独立结果可与父线程的工作并行时，委派范围明确的只读调查、设计评审或验证设计。为子智能体明确目标、成功标准、相关证据及读取范围。父线程继续推进其他调查，提交计划前汇合结果。";
+    return `${availability} ${method}`;
+  }
   const preferenceMethod = input.requirement === "required"
     ? input.language === "en"
       ? "Delegate the requested bounded outcome within the user's requested deliverable and depth, dependencies, and exact ownership. Keep the child objective and success criteria within that scope; the parent owns integration and completion."

@@ -1,4 +1,4 @@
-import { isChatContext, isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { isChatContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import {
   getLocalFileReadPathForToolCall,
   isLocalFileReadApproved,
@@ -113,8 +113,12 @@ export function validateToolAgainstPhaseAndPlan(input: {
     },
   );
   if (
+    ["knowledge_search", "knowledge_get_excerpt"].includes(input.toolName) &&
+    (!input.ports.context.knowledgeContext?.references.length || ["stale", "error"].includes(input.ports.context.knowledgeContext.state))
+  ) return { allowed: false, reason: "本条消息没有可用的已选择资料范围。", failureKind: "not_authorized", reasonCode: "knowledge_scope_required" };
+  if (
     (aggregate?.strategy === "chat" || isChatContext(input.ports)) &&
-    (catalogSource !== "built_in" || !["load_skill", "tool_search", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
+    (catalogSource !== "built_in" || !["load_skill", "tool_search", "web_search", "web_fetch", "knowledge_search", "knowledge_get_excerpt"].includes(input.toolName) || input.command.kind === "execute_validation")
   ) {
     return { allowed: false, reason: "Chat 仅允许已接纳的 Skill 与网络读取。", failureKind: "not_authorized", reasonCode: "chat_read_only_authority" };
   }
@@ -387,7 +391,7 @@ export async function authorizeToolForCurrentTurn(
   } : null;
   if (risk === "external_read") {
     const networkTool = catalogResolution.entry.source === "built_in" && (exposedName === "web_search" || exposedName === "web_fetch");
-    if (networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)) {
+    if (networkTool && !readOnlyNetworkPolicy(input).enabled) {
       return { allowed: false, reason: "当前会话未启用网络访问。", allowExternalLocalRead: false };
     }
   }

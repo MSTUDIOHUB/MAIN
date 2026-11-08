@@ -166,6 +166,20 @@ test("a continuation supplies its exact prior objective as context without inher
   assert.equal(harness.calls.planResumes.length, 0);
 });
 
+for (const text of ["继续", "Continue", "What about its latest announcement?"]) {
+  test(`semantic admission sees the preceding read-only question without lexical continuation authority: ${text}`, () => {
+    const prior = { id: "prior-chat", userPrompt: "查询该基金今天上午的行情", intent: "analyze", status: "done" };
+    const harness = createHarness({ text, currentTurn: prior, currentTurnIntent: "analyze" });
+    assert.equal(harness.resolve().handled, true);
+    const request = harness.calls.preflights[0].request;
+    assert.equal(request.input, text);
+    assert.equal(request.previousRequest, prior.userPrompt);
+    assert.equal(request.explicitIntent, undefined);
+    assert.equal(harness.calls.planResumes.length, 0);
+    assert.equal(harness.calls.approvedPlans, 0);
+  });
+}
+
 test("an explicit capsule is passed as a mode boundary while its natural restrictions are interpreted", () => {
   const harness = createHarness({ text: "Only inspect; do not write or run commands.", hasWorkspace: true,
     lockedComposerIntent: "execute" });
@@ -237,20 +251,4 @@ test("hidden skip-intent control prompts do not infer shell directives from embe
   assert.equal(result.effectiveRunIntent, "execute");
   assert.equal(result.effectiveCommandDirective, null);
   assert.deepEqual(harness.calls.preflights, []);
-});
-
-test("intent routing does not promote internal resolved Goal intent into creation authority", () => {
-  const harness = createHarness({
-    text: "continue internally",
-    isHidden: true,
-    options: {
-      resolvedIntent: "goal",
-      skipIntentResolution: true,
-    },
-  });
-  const result = harness.resolve();
-
-  assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "execute");
-  assert.equal(result.goalCreationAuthorization, null);
 });

@@ -106,13 +106,15 @@ test("plan panel open path hydrates artifacts without auto-approving execution",
 
 test("ChatArea omits the duplicated effective progress ledger", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
+  const popover = fsSync.readFileSync(path.join(workspaceRoot, "src/components/CapsuleActivityPopover.tsx"), "utf8");
 
   assert.match(source, /\{isTurnExpanded && shouldShowTurnActivityNotice && \(/);
   assert.doesNotMatch(source, /getActiveTurnActivity|turn-activity-text|activityText=\{/);
   assert.match(source, /shouldShowTurnActivityNotice =[\s\S]*Boolean\(bottomThoughtSummary\)/);
-  assert.doesNotMatch(source, /data-testid="effective-progress-ledger"/);
+  assert.doesNotMatch(source + popover, /data-testid="effective-progress-ledger"/);
   assert.doesNotMatch(source, /progressItems=\{effectiveProgressLedger\}/);
-  assert.match(source, /data-testid="effective-progress-popover"/);
+  assert.match(source, /<CapsuleActivityPopover/);
+  assert.match(popover, /data-testid="effective-progress-popover"/);
   assert.match(source, /archived-phase-analysis[\s\S]*archivedAfterChoice: false/);
 });
 
@@ -185,22 +187,7 @@ test("plan UI distinguishes a candidate from an executable artifact without gues
   assert.match(chatAreaSource, /hasReviewablePlanArtifact && turn\.id === planArtifactOwnerTurnId/);
 });
 
-test("early Plan hydration busy gate retains validated Goal authority and refreshes its source context", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
 
-  assert.match(
-    source,
-    /const hasEarlyGoalAuthority = !!earlyGoalCreationAuthorization \|\|[\s\S]*?!!goalContinuationAuthorization[\s\S]*?const earlyGoalQueuedRunContext =?[\s\S]*?shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority[\s\S]*?runtimeIntentOverride:\s*"goal"[\s\S]*?goalCreationAuthorization:\s*earlyGoalCreationAuthorization[\s\S]*?goalContinuationAuthorization/,
-  );
-  assert.match(
-    source,
-    /const shouldUseEarlyPlanSendGate =[\s\S]{0,150}?autoHydrationReason \|\| shouldRouteContinuationToPlanResume[\s\S]*?if \(shouldUseEarlyPlanSendGate\)[\s\S]{0,500}?applyCurrentSendGate\(\s*state,\s*earlyGoalQueuedRunContext,?\s*\)/,
-  );
-  assert.match(
-    source,
-    /resumeSubmission:[\s\S]*?refreshedGoalSourceContextSnapshot[\s\S]*?goalSourceContextSnapshot:\s*refreshedGoalSourceContextSnapshot/,
-  );
-});
 
 test("new empty workspace sessions discover persisted plans without manufacturing approval", async () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");

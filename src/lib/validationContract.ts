@@ -352,6 +352,34 @@ function looksLikeServiceSegment(raw: string): boolean {
     /\b(?:deno\s+(?:run\s+)?[^\n]*\bserve\b|cargo\s+run\b|electron\s+\.)/i.test(command);
 }
 
+function unityCommandArguments(command: string): string[] | null {
+  const tokens = command.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+  const [program, ...args] = tokens.map(token => token.replace(/^["']|["']$/g, "").toLowerCase());
+  const executable = program?.split(/[/\\]/).pop();
+  return executable === "unity" || executable === "unity.exe" ? args : null;
+}
+
+/** An editor probe is useful during implementation but cannot stand in for a
+ * finite test. Suggest the existing recognized runner without broadening admission. */
+export function finiteValidationRepairHint(analysis: ValidationCommandAnalysis): string | undefined {
+  if (analysis.rejectionReason !== "unbounded_command_segment" || !analysis.segments.some(segment =>
+    segment.role === "unknown" && unityCommandArguments(stripShellDecorators(segment.command))?.[0] === "command")) return;
+  return "Unity Editor probes do not supply a verdict. If Unity Test Framework is available, plan PlayMode tests with assertions and use the verified runner for pass/fail, e.g. `unity test . --mode PlayMode` when Unity CLI is installed. Bind the check to the steps that create the tests.";
+}
+
+function isUnityBatchTest(command: string): boolean {
+  const args = unityCommandArguments(command);
+  if (!args) return false;
+  if (args.some(arg => /^(?:--?help|-h|--version)(?:=|$)/.test(arg))) return false;
+  // The Unity CLI drives the project's Test Framework and returns its status.
+  if (args[0] === "test") return !args.some(arg => /^--allow-install(?:=|$)|^--?quit(?:=|$)/.test(arg));
+  const projectPath = args.indexOf("-projectpath");
+  // Unity's -quit can exit before asynchronous tests finish.
+  return args.includes("-batchmode") && args.includes("-runtests") &&
+    projectPath !== -1 && !!args[projectPath + 1] && !args[projectPath + 1]!.startsWith("-") &&
+    !args.includes("-quit") && !args.includes("-executemethod");
+}
+
 function classifyFiniteSegment(
   raw: string,
 ): { capability: FiniteValidationCommandCapability | null; inlineMissingAssertion: boolean } {
@@ -371,7 +399,7 @@ function classifyFiniteSegment(
   }
   if (packageScript.startsWith("check")) return { capability: "check", inlineMissingAssertion: false };
 
-  if (/\b(?:node\s+--test|npx\s+playwright\s+test|npx\s+cypress\s+run|npx\s+vitest(?:\s+run|[^\n;&|]*\s--run(?:\s|$))|npx\s+jest\b|pytest\b|python3?\s+-m\s+(?:pytest|unittest)\b|cargo\s+test\b|go\s+test\b|swift\s+test\b|dotnet\s+test\b|(?:\.\/)?mvnw?\s+(?:test|verify)\b|(?:\.\/)?gradlew?\s+(?:test|check)\b|xcodebuild\b[^\n;&|]*\btest\b|bundle\s+exec\s+rspec\b|rspec\b|phpunit\b|composer\s+(?:run-script\s+)?test\b|make\s+(?:test|check)\b|ctest\b)/i.test(command)) {
+  if (isUnityBatchTest(command) || /\b(?:node\s+--test|npx\s+playwright\s+test|npx\s+cypress\s+run|npx\s+vitest(?:\s+run|[^\n;&|]*\s--run(?:\s|$))|npx\s+jest\b|pytest\b|python3?\s+-m\s+(?:pytest|unittest)\b|cargo\s+test\b|go\s+test\b|swift\s+test\b|dotnet\s+test\b|(?:\.\/)?mvnw?\s+(?:test|verify)\b|(?:\.\/)?gradlew?\s+(?:test|check)\b|xcodebuild\b[^\n;&|]*\btest\b|bundle\s+exec\s+rspec\b|rspec\b|phpunit\b|composer\s+(?:run-script\s+)?test\b|make\s+(?:test|check)\b|ctest\b)/i.test(command)) {
     return { capability: "test", inlineMissingAssertion: false };
   }
   if (/\b(?:cargo\s+build\b|go\s+build\b|swift\s+build\b|dotnet\s+build\b|(?:\.\/)?mvnw?\s+(?:package|compile)\b|(?:\.\/)?gradlew?\s+build\b|xcodebuild\b[^\n;&|]*\bbuild\b|cmake\s+--build\b|make\s+build\b|(?:(?:npx|bunx|pnpm\s+(?:dlx|exec)|yarn\s+dlx)\s+)?vite\s+build\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?tauri\s+build\b|(?:cargo\s+)?tauri\s+build\b)/i.test(command)) {

@@ -251,48 +251,49 @@ function runtimeV2ToolSchemaMismatch(
   schema: ToolParameterSchema,
   value: unknown,
   path: string,
-): string | null {
+): { readonly fieldPath: string; readonly reason: string } | null {
+  const issue = (description: string, fieldPath = path) => ({ fieldPath, reason: `${fieldPath} ${description}` });
   if (schema.anyOf?.length) {
     const accepted = schema.anyOf.some((candidate) =>
       runtimeV2ToolSchemaMismatch(candidate, value, path) === null
     );
-    if (!accepted) return `${path} does not match any advertised shape`;
+    if (!accepted) return issue("does not match any advertised shape");
   }
   if (
     schema.not &&
     runtimeV2ToolSchemaMismatch(schema.not, value, path) === null
   ) {
-    return `${path} matches a forbidden advertised shape`;
+    return issue("matches a forbidden advertised shape");
   }
   if (schema.enum?.length) {
     if (typeof value !== "string" || !schema.enum.includes(value)) {
-      return `${path} must be one of ${JSON.stringify(schema.enum)}`;
+      return issue(`must be one of ${JSON.stringify(schema.enum)}`);
     }
   }
   if (!schema.type) return null;
   if (schema.type === "null") {
-    return value === null ? null : `${path} must be null`;
+    return value === null ? null : issue("must be null");
   }
   if (schema.type === "string") {
-    return typeof value === "string" ? null : `${path} must be a string`;
+    return typeof value === "string" ? null : issue("must be a string");
   }
   if (schema.type === "number") {
     return typeof value === "number" && Number.isFinite(value)
       ? null
-      : `${path} must be a finite number`;
+      : issue("must be a finite number");
   }
   if (schema.type === "integer") {
     return typeof value === "number" && Number.isInteger(value)
       ? null
-      : `${path} must be an integer`;
+      : issue("must be an integer");
   }
   if (schema.type === "boolean") {
-    return typeof value === "boolean" ? null : `${path} must be a boolean`;
+    return typeof value === "boolean" ? null : issue("must be a boolean");
   }
   if (schema.type === "array") {
-    if (!Array.isArray(value)) return `${path} must be an array`;
+    if (!Array.isArray(value)) return issue("must be an array");
     if (value.length < Math.max(0, Number(schema.minItems) || 0)) {
-      return `${path} must contain at least ${schema.minItems} item(s)`;
+      return issue(`must contain at least ${schema.minItems} item(s)`);
     }
     if (schema.items) {
       for (let index = 0; index < value.length; index += 1) {
@@ -306,15 +307,15 @@ function runtimeV2ToolSchemaMismatch(
     }
     return null;
   }
-  if (schema.type !== "object") return `${path} has an unsupported type`;
+  if (schema.type !== "object") return issue("has an unsupported type");
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return `${path} must be an object`;
+    return issue("must be an object");
   }
   const record = value as Record<string, unknown>;
   const properties = schema.properties || {};
   for (const required of schema.required || []) {
     if (!Object.prototype.hasOwnProperty.call(record, required)) {
-      return `${path}.${required} is required`;
+      return issue("is required", `${path}.${required}`);
     }
   }
   for (const [key, item] of Object.entries(record)) {
@@ -341,7 +342,7 @@ function runtimeV2ToolSchemaMismatch(
       if (mismatch) return mismatch;
       continue;
     }
-    return `${path}.${key} is not advertised`;
+    return issue("is not advertised", `${path}.${key}`);
   }
   return null;
 }
@@ -355,6 +356,7 @@ export function runtimeV2ProviderToolArgumentViolation(
   tools: readonly ToolDefinition[],
 ): {
   readonly call: RuntimeV2NormalizedToolCall;
+  readonly fieldPath: string;
   readonly reason: string;
 } | null {
   const definitions = new Map(
@@ -363,12 +365,12 @@ export function runtimeV2ProviderToolArgumentViolation(
   for (const call of calls) {
     const definition = definitions.get(call.name);
     if (!definition) continue;
-    const reason = runtimeV2ToolSchemaMismatch(
+    const issue = runtimeV2ToolSchemaMismatch(
       definition.function.parameters,
       call.arguments,
       "arguments",
     );
-    if (reason) return { call, reason };
+    if (issue) return { call, ...issue };
   }
   return null;
 }

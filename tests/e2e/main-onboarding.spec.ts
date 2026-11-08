@@ -57,6 +57,7 @@ test("composer help opens the MAIN guide without submitting a turn", async ({ pa
 
 test("composer help explains Skill search and selection keys in English", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
+  await expect.poll(() => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().seedCount || 0)).toBeGreaterThan(0);
   await page.evaluate(async () => {
     const { useAppStore } = await import("/src/store/useAppStore.ts");
     useAppStore.getState().setConfig((config) => ({ ...config, language: "en" }));

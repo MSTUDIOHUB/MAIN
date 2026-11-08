@@ -21,6 +21,7 @@ import {
   type RuntimeV2ProviderRecoveryStallLease,
 } from "../../lib/runtime-v2";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import { normalizeNetworkRead } from "../../lib/networkRead";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import { awaitCanceledTurnTerminalProjection } from "../sessionCancellationBarrier";
@@ -52,7 +53,7 @@ import { restoreRuntimeV2SkillHistory } from "./executionSkillHistory";
 import { restoreRuntimeV2ExecutionHistory } from "./executionProviderHistory";
 import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import { pausedAgentLoopOutcome } from "../../lib/runOutcome";
-import { deriveRuntimeV2ExecutionBlocker, projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
+import { projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
 import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import {
   resolveRuntimeV2ObjectiveAdmission,
@@ -117,6 +118,10 @@ export async function runSubmitRuntimeV2Execute(
     logStoreEvent: input.logStoreEvent,
   });
   const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
+  input = { ...input, context: { ...input.context,
+    networkRead: normalizeNetworkRead(existing ? existing.aggregate.networkRead : turn.networkRead),
+    ...(existing ? { knowledgeContext: existing.aggregate.knowledgeContext,
+      workspaceInstructionContext: existing.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext } : {}) } };
   if (existing && !existing.aggregate.terminalOutcome) restoreRuntimeV2ExecutionHistory(live, existing.aggregate);
   const emergencyTerminal =
     getRuntimeV2EmergencyTerminalEnvelope(
@@ -206,6 +211,9 @@ export async function runSubmitRuntimeV2Execute(
         run: identity.run,
         strategy: "execute",
         objective: admission.objective,
+        networkRead: input.context.networkRead,
+        knowledgeContext: input.context.knowledgeContext,
+        workspaceInstructionContext: input.context.workspaceInstructionContext,
         capabilityRestrictions: admission.capabilityRestrictions,
         approvalRequiredCapabilities: admission.approvalRequiredCapabilities,
         constraints: admission.constraints,
@@ -279,8 +287,6 @@ export async function runSubmitRuntimeV2Execute(
         projectRuntimeV2ExecutionBlocker({ aggregate: before, get: input.get, set: input.set, language: input.context.phaseLanguage });
         return createRuntimeV2RunnerSettlement(input.context, pausedAgentLoopOutcome(before.run.blocker?.reasonCode || "action_required", "action_required"));
       }
-      const blocker = deriveRuntimeV2ExecutionBlocker(before, nextId("execution-choice"), input.context.phaseLanguage);
-      if (blocker) { await controller.pauseRun(blocker); continue; }
       const providerRecoveryWindow =
         deriveRuntimeV2ProviderRecoveryWindow(before);
       const providerRecoveryPressure =

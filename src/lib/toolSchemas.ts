@@ -6,6 +6,7 @@
 import type { Skill } from "./appTypes";
 import type { MCPTool } from "./mcpClient";
 import { TOOL_SEARCH_DEFINITION } from "./toolSearch";
+import { DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_PROVIDERS } from "./networkRead";
 import {
   SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS,
   SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS,
@@ -629,7 +630,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         type: "object",
         properties: {
           query: { type: "string", description: "搜索关键词或问题" },
-          provider: { type: "string", description: "可选搜索源：duckduckgo、bing、baidu。默认 duckduckgo" },
+          provider: { type: "string", description: `可选搜索源：${WEB_SEARCH_PROVIDERS.join("、")}。默认 ${DEFAULT_WEB_SEARCH_PROVIDER}` },
           max_results: { type: "number", description: "最多返回多少条结果，默认 5，最多 8" },
         },
         required: ["query"],
@@ -862,12 +863,11 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "knowledge_search",
-      description: "在 MAIN 全局知识库中检索已启用的资料库，返回与问题最相关的片段和 citation（知识库、文件名、页码/块号、chunk id、分数）。涉及 Unity/API 手册等已导入资料时，先用它获取证据，不要把整份文档读入上下文。",
+      description: "在用户本条消息用 # 选定的资料范围内检索，返回正文片段和来源引用。不能访问未选择的资料。",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "用户问题或要检索的关键词/概念" },
-          kb_ids: { type: "string", description: "可选，逗号分隔的知识库 ID；默认搜索当前界面启用的知识库" },
           limit: { type: "number", description: "最多返回多少个片段，默认 8，最多 16" },
         },
         required: ["query"],
@@ -878,12 +878,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "knowledge_get_excerpt",
-      description: "根据 knowledge_search 返回的 source_id 与 chunk_id 读取某个知识库片段的完整摘录。只在需要展开已命中的 citation 时使用。",
+      description: "读取当前消息已选资料范围内的片段摘录。可展开检索引用，或按 sourceOverview.nextChunkId 继续阅读同一资料；不能访问未选择的资料。",
       parameters: {
         type: "object",
         properties: {
-          source_id: { type: "string", description: "knowledge_search citation.sourceId" },
-          chunk_id: { type: "string", description: "knowledge_search citation.chunkId" },
+          source_id: { type: "string", description: "当前消息检索结果的 citation.sourceId" },
+          chunk_id: { type: "string", description: "当前消息检索结果的 citation.chunkId，或同一资料的 sourceOverview.nextChunkId" },
         },
         required: ["source_id", "chunk_id"],
       },

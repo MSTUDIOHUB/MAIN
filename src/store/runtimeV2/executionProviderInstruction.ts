@@ -153,7 +153,7 @@ export function providerModeInstruction(
     toolSurface.hasSpawnSubagent
       ? [
           command.payload.collaborationPreferred === true
-            ? `The user explicitly prefers collaboration and ${remainingSubagentCapacity} new child slot(s) are available. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
+            ? `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, and independent tasks may queue. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
             : "Delegation is optional.",
           "Use read-only children for parallel investigation. Use implement/write only after the parent has an evidence-backed solution: provide an explicit operation, implementation_plan, success criteria, and every exact non-overlapping file target; never grant a directory and let the child choose writes. The child stages one transaction and Runtime commits it at join; the parent still owns cross-file integration and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
         ].join(" ")
@@ -174,7 +174,9 @@ export function providerModeInstruction(
   const recoveryGuidance = recoveryPressure
     ? recoveringCompleteReply
       ? `Previous response had no tool call (${String(recoveryPressure.reason)}). Use the actual prior result: take the next authorized action if work remains, give a complete final report when successful receipts cover the full request, or ask a focused question if user input is required.`
-      : `Previous action made no progress (${String(recoveryPressure.reason || "non_actionable_response")}, attempt ${recoveryOccurrence}, stage ${recoveryStage || "retry"}). Check the latest tool error or file snippet and try a different approach or smaller edit.`
+      : mode === "validate" && !toolSurface.validationCorrectionActive
+        ? ""
+        : `Previous action made no progress (${String(recoveryPressure.reason || "non_actionable_response")}, attempt ${recoveryOccurrence}, stage ${recoveryStage || "retry"}). Check the latest tool error or file snippet and try a different approach or smaller edit.`
     : "";
   if (mode === "chat" || mode === "analyze" || (mode === "conclude" && command.payload.conclusionKind === "read_only")) {
     if (mode === "conclude") {
@@ -212,7 +214,7 @@ export function providerModeInstruction(
   const objectiveGuidance = [
     "Choose the next authorized action to advance the user's complete objective. Make a workspace change only when the user's current request authorizes that effect.",
     toolSurface.sourceOnlyFrontier
-      ? "There is no recorded file mutation. Source evidence alone does not make its files mandatory edit targets. Safe reads remain available for a specific missing fact that blocks the next authorized action."
+      ? "Source evidence alone does not make its files mandatory edit targets. Safe reads remain available for a specific missing fact that blocks the next authorized action."
       : "",
     "Commands and external operations use their own authorization and result evidence, without an unrelated file-source lease or write obligation. For a command or external-operation task, a complete final report is appropriate when actual successful receipts cover the user's full request. A successful intermediate action does not require you to stop; file mutations still require subsequent matching validation.",
   ].filter(Boolean).join(" ");

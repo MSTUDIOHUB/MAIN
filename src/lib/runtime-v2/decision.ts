@@ -108,11 +108,11 @@ export function runtimeV2CollaborationPayload(
     0,
     Math.floor(Number(input.subagentCapacity) || 0),
   );
-  // Adaptive lane probing may discover more concurrency during a Run. Grow the
-  // durable child budget only to the currently observed bounded lane capacity;
-  // the provider-neutral ceiling still prevents an unbounded spawn loop.
+  // Keep the legacy capacity observation for persisted-command compatibility.
+  // It is not an admitted total task budget: queued jobs acquire the existing
+  // model lane before any provider request can start.
   const maxChildRuns = admittedMaxChildRuns(state, currentCapacity);
-  const maxActiveSubagents = Math.min(currentCapacity, maxChildRuns);
+  const maxActiveSubagents = currentCapacity;
   const runSubagents = currentRunSubagents(state);
   const activeSubagents = runSubagents
     .filter((job) => job.status === "queued" || job.status === "running")
@@ -148,13 +148,7 @@ export function runtimeV2CollaborationPayload(
     failedSubagents,
     maxActiveSubagents,
     maxChildRuns,
-    remainingSubagentCapacity: Math.max(
-      0,
-      Math.min(
-        maxActiveSubagents - activeSubagents.length,
-        maxChildRuns - runSubagents.length,
-      ),
-    ),
+    remainingSubagentCapacity: maxActiveSubagents,
   };
 }
 

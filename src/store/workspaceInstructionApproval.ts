@@ -7,6 +7,7 @@ import {
 import type { TaskBlock } from "../lib/taskTypes";
 import type { ReplyOption } from "../lib/workflowModels";
 import type { WorkspaceJsonObject } from "../lib/workspaceInstruction";
+import { normalizeUserQuestionnaire } from "../lib/userQuestions";
 
 export interface WorkspaceInstructionChoiceResolutionInput {
   sessionKey: string;
@@ -86,6 +87,8 @@ function normalizeChoiceIdentity(value: unknown): UserChoiceResolutionIdentity |
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
   const optionValues = normalizeStringArray(candidate.optionValues);
+  const questionnaire = candidate.questionnaire === undefined ? undefined : normalizeUserQuestionnaire(candidate.questionnaire);
+  if (candidate.questionnaire !== undefined && !questionnaire) return null;
   if (
     typeof candidate.sessionKey !== "string" || !candidate.sessionKey.trim() ||
     typeof candidate.turnId !== "string" || !candidate.turnId.trim() ||
@@ -106,6 +109,9 @@ function normalizeChoiceIdentity(value: unknown): UserChoiceResolutionIdentity |
     optionValues,
     allowCustomReply: candidate.allowCustomReply,
     status: "pending",
+    ...(questionnaire ? { questionnaire } : {}),
+    ...(candidate.executionBlocker && typeof candidate.executionBlocker === "object" && typeof (candidate.executionBlocker as any).sessionEpoch === "string"
+      ? { executionBlocker: { sessionEpoch: (candidate.executionBlocker as any).sessionEpoch } } : {}),
   };
 }
 

@@ -9,15 +9,17 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("read/search progress stays accessible in the continuous process timeline without a ChatArea ledger", async ({ page }) => {
+test("completed read/search progress stays accessible in its archive without a ChatArea ledger", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-interleaved");
 
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
-  const processDisclosure = page.getByTestId("turn-process-disclosure");
-  await expect(processDisclosure).toContainText("5 个工具");
+  const processDisclosure = page.getByTestId("turn-process-archive-toggle");
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
+  await processDisclosure.click();
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByTestId("turn-archive-step")).toHaveCount(5);
   await expect(page.getByTestId("progress-block")).toHaveCount(0);
-  const processDetails = page.getByTestId("live-turn-process-details");
+  const processDetails = page.getByTestId("turn-process-archive-details");
   await expect(processDetails).toContainText("package.json");
   await expect(processDetails).toContainText("useAppStore.ts");
   await expect(processDetails).toContainText("release*.md");

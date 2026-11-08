@@ -17,7 +17,7 @@
 ```text
 submitAsyncWorkflowRun.ts
   -> submitRuntimeRunner.ts
-  -> runtimeV2/{chat,workspaceRead,plan,execute,goal}Runner
+  -> runtimeV2/{chat,workspaceRead,plan,execute}Runner
   -> RuntimeV2Controller + provider/tool/checkpoint/projection ports
   -> streaming.ts / toolExecutor.ts
   -> Rust IPC 受信任执行与 Session 存储
@@ -35,7 +35,7 @@ submitAsyncWorkflowRun.ts
 
 预检恢复与普通提交共用交接语义：同步提交确认接纳且精确 Turn 已采用该 claim 后，消费原 FIFO claim，再由异步 bootstrap 获取 Run。不能在二者之间重新排空同一 claim，也不能以预检耗时或一次界面重绘把有效交接判为失主；拒绝接纳、取消及身份不符均不能获得该确认。
 
-Session epoch 来自 accepted instruction receipt 与 canonical Session metadata，不能由每个 Turn 临时生成。async admission 在首次异步操作前冻结 `runSessionEpoch`，readOnly、Execute、Plan、Goal 与 Goal slice 共用身份投影；receipt 与当前 Session 冲突时拒绝。空会话即使没有 runtimeSnapshot，也必须从保留的 Session metadata 取得同一代次；checkpoint 恢复归属校验不为此放宽。
+Session epoch 来自 accepted instruction receipt 与 canonical Session metadata，不能由每个 Turn 临时生成。async admission 在首次异步操作前冻结 `runSessionEpoch`，readOnly、Execute、Plan 共用身份投影；receipt 与当前 Session 冲突时拒绝。空会话即使没有 runtimeSnapshot，也必须从保留的 Session metadata 取得同一代次；checkpoint 恢复归属校验不为此放宽。
 
 连续对话由 `executionProviderHistory.ts` 的共享生产提示消费同一份 canonical user/assistant 历史，不另建决策记忆。用户明确选择、接受或委托选择才可记录为已确认；模型建议和推断、用户明确待定项应保持独立状态，沉默不构成同意。后续修改替代旧决定，汇总与文档依据用户原文校正模型先前擅自确认的内容。该规则是模型行为契约，不增加 Runtime 审批或终态门控；真实语义质量必须单独核验，不能由 mock 或结构性 success 推定。
 
@@ -180,7 +180,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 
 - `read_file` 对大文件返回显式窗口元数据；`max_chars` 会约束实际返回字节。
 - Runtime v2 主线程只有一份 canonical transcript：标准 assistant/tool 对与 workspace、WorkPlan、child handoff system anchor 共存；不得恢复 `modelContext`、evidence digest 或另一份按条数/字符截断的内容副本。
-- `submitRuntimeRunner` 在 admission 后只解析一次 `RuntimeContextBudget`；Execute、Plan、Goal slice、Chat 和 child 共享同一个不可变对象。
+- `submitRuntimeRunner` 在 admission 后只解析一次 `RuntimeContextBudget`；Execute、Plan、Chat 和 child 共享同一个不可变对象。
 - 本地 Run 只有在 provider 同时报告所选模型的 context 上限且确认模型已加载时，才可在显式配置之上扩展；当前可用内存可以在该硬上限内降低容量。探测失败回退配置，不阻断 Turn。
 - 云 Run 保持 provider-managed context，不套用本机 KV 内存估算。
 - 完整请求（消息、工具 schema 和尾部指令）未达到本轮输入 token 预算时，保留 canonical 消息原文；达到压力后才选择语义 workset，并按完整 assistant/tool 组回收旧上下文。保留当前目标、最新证据包和尾部 phase authority，不能裁短工具或源码正文后仍沿用原版本的完整读取授权。实际源码可见性和尾部授权说明必须依据最终发出的内容；同请求恢复也遵守此预算与保真边界。工具输出追加到后续请求、按上下文压力管理历史的参考见 [Codex agent loop](https://openai.com/index/unrolling-the-codex-agent-loop/)。
@@ -224,7 +224,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 
 - 每个 Workspace Turn admission 做快速、确定性的 anchor 与浅层拓扑扫描，不用模型阅读全文，也不等待全仓库索引。
 - instructions 与 baseline 共享同一次 read-through；baseline 以 schema/parser version、canonical workspace/VCS identity、anchor、topology 和 facts fingerprint 标识，不依赖 mtime。
-- 本 Run 内 parent、Plan、Execute、Goal 和 child 接收同一份冻结基线；它不进入 Session/checkpoint 持久化。下一 Turn 从当前工作区重新构建，再按任务用 repo map/AST/文件工具读取具体源码。
+- 本 Run 内 parent、Plan、Execute 和 child 接收同一份冻结基线；它不进入 Session/checkpoint 持久化。下一 Turn 从当前工作区重新构建，再按任务用 repo map/AST/文件工具读取具体源码。
 - 用户维护的 `.MAIN/steering`、`AGENTS.md` 或等价项目规则保持独立权威；自动 baseline 只能作为非权威事实引用，不能静默重写人工规则。
 - 失败历史、模型推断、临时路径和“上次这样修成功了”不能成为无条件全局记忆。只有带 workspace、目标、版本和验证 provenance 的事实才能跨 Turn 复用，并在来源变化时失效。
 
@@ -269,7 +269,7 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - child 失败原因必须按事实投影：只有继承到有限 `lifecycleDeadlineAt` 且确实到点（或收到专用 deadline abort）才能写“显式生命周期截止”；普通 provider/协议失败不得用 deadline 文案掩盖。未提供父 deadline 时其值为无穷大。
 - 子智能体 `degraded/failed` 后父线程继续当前目标。首次有效调度与交接是编排进展，合法 join 等待不得计入父线程无进展租约；即使交接没有新证据，父线程仍须获得接管机会，重复交接不能续租。这些边界不创造来源或验收事实；只有 `completed` 且报告引用真实 evidence 时才是成功的协作结果。同一 provider 决策中的 spawn 与独立安全读取保留原顺序，并分别经过 durable command fence；join、写入和验证等可能提交效果的动作仍隔离。
 - 协作容量、派生总量和 active/failed 投影必须按同一 parent Run 隔离。child 活动时，如果父线程的最新决策只重复已经关闭的动作，调度器必须直接 join 现有 child，而不是继续占用共享 provider lane 重试父请求；child 结果到达后父线程再从新的证据边界继续。
-- 每个父 Run 的 child 总数也受 admission 时 lane 容量约束；terminal child 不重新补充本轮派生预算。这样既允许容量范围内的真实并行，又阻止小模型连续重启 child、把主任务变成无界委派循环。
+- lane 容量只限制实际 active provider 请求，不是父 Run 的 child 任务总配额。合法独立任务可进入既有 dispatcher 队列，queued/running 或历史 terminal job 数量不得与当前并发容量比较后拒收；兼容字段 `maxChildRuns` 的生产值仅由并发观察派生，不能作为独立 total budget。实际 HTTP 开始仍须经过同一个 lane acquire 的 first-token、内存和并发门；scope 去重、互斥写范围、父权限、取消和共享生命周期保持原权威。
 - 子智能体面板显示当前真实 lane 状态：本地能力未知时显示“模型请求串行／当前不开放子智能体并行”，不能把串行委派误报成多智能体并发；显式并发配置标为“已配置”，受控云探针确认首 token 重叠后才显示已实测数量。不得写死“最多两个子流”，也不得把主体槽位混入子流计数。
 
 ## 7. 验收与 UI
@@ -288,9 +288,10 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 
 - 同一个 Runtime authority resolver 生成 Execute 工具面并执行授权；本 Turn consent 可允许 `browser_evaluate`，桌面控制仍保留逐次授权。
 - browser validation 只有在存在因果关联的 passed assertion，且没有 page/console error 时才算通过；静态 build 不能单独覆盖行为 criterion。
-- Goal/WorkPlan 明确声明的 `behavioral`、`interaction`、`static` 证据类型必须严格保持。普通 Execute 没有该类型事实时，Runtime 不从自然语言猜分类，也不把所有目标硬编码为 behavioral；模型选择的真实有限 validator 可以覆盖未分类条件，最终报告必须如实说明实际验证内容。
+- WorkPlan 明确声明的 `behavioral`、`interaction`、`static` 证据类型必须严格保持。普通 Execute 没有该类型事实时，Runtime 不从自然语言猜分类，也不把所有目标硬编码为 behavioral；模型选择的真实有限 validator 可以覆盖未分类条件，最终报告必须如实说明实际验证内容。
 - Plan discovery 同时保留安全读取和 WorkPlan 提交工具，不按读取次数、动作次数或独立 discovery 时钟撤掉读取面。普通 Plan 没有默认八分钟硬限，流式请求的 inactivity watchdog 不限制活跃生成总时长；child 不继承凭父线程年龄计算的隐式截止。
-- Plan 的十分钟无进展恢复窗口从 canonical provider/tool/child 回执重建；新版本、同版本新增源码覆盖和新交付证据清零，重复结果、拒绝、回放或进程重启不续期。只在请求之间检查，先接收有效提交或新证据；活跃 child 先 join。只有调用方明确指定的 deadline 写入 run.started 后可成为父子共享硬边界，compiler 拒绝也不能延长它。没有 sealed WorkPlan 时的恢复耗尽或传输失败是 error，不得仅凭工具证据标记 partial。
+- Plan 的无进展压力从 canonical provider/tool/child 回执重建，只指导改变策略，不因十分钟停滞直接结束为 error；活跃 child 仍先 join。只有调用方明确指定的 deadline 写入 run.started 后可成为父子共享硬边界，compiler 拒绝也不能延长它。已解析且正文非空、但执行结构或验收规范有缺口的候选保存为独立 PlanDocument 草稿，以真实文档回执和结构化缺口结论完成为 partial；它不形成 sealed WorkPlan、子任务采纳或执行审批。无可保存正文时继续协议恢复，工具证据本身仍不能证明计划交付。
+- 草稿正文、来源调用哈希、诊断和 derivedFrom 只保存在同一 ledger 的 runtime-owned 保存命令及回执中。保存前后崩溃复用精确输入，已保存草稿不能在冷恢复时提升为 success；“补全验证”创建绑定原稿精确版本的新 Turn，重新取得当前源码证据并通过完整 WorkPlan 校验后才可进入审批。
 - Plan discovery/synthesis 在预算内保留同一完整 assistant/tool transcript；只在真实预算压力下删除完整组，保护用户目标和最新反馈。工具实际有界内容随 ledger 持久化，冷恢复不重读概览、不重新编号证据，也不能把旧 checkpoint 缺失正文的元数据冒充源码内容。终态意图先持久化，恢复补齐唯一的 run.completed → final projection → turn.completed。
 - Plan 对 child evidence 的 durable adoption 只能从已经持久化成功的 `work_plan.sealed` 中按 `findings[].basis`／`steps[].basis` 精确派生，事件顺序为 `handoff_delivered < work_plan.sealed < subagent.handoff_applied(source=work_plan)`。provider 正文、被拒或被截断的提交即使提到 exact evidence ID，也不是采纳权威；reviewing 冷恢复只可幂等补齐 seal 后遗漏的 receipt。
 - 普通副作用按规范化后的 tool+arguments 在同一 mutation boundary 精确拒绝，工具本身和其他参数仍然可用。`read_file` 是 coverage-aware 例外：首次缓存重放后，同一路径、同版本的其他范围只有在该请求范围仍物化于**当前实际发给模型的 decision view** 时才属于“无新信息”；canonical transcript 曾经覆盖过不等于模型现在仍看得到。若有界 workset 已淘汰该源码，允许再次从缓存重放而不访问磁盘。首次 replay 可以返回精确缓存源码；源码仍可见时再次重分片只能返回有界结构化指引，不能附加源码奖励无效读取。durable replay receipt、标准工具对、路径/版本和 mutation receipt 负责恢复关闭事实，但执行拒绝前必须再与当前 decision view 求交，不能只相信 process-local Map 或历史 ledger；成功 mutation 会重新开放新的边界。
@@ -302,7 +303,7 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - 主 Run 的同一 provider 决策中的安全观察与 `run_command` 可显式启用串行批次；每个调用按原顺序保留独立规范化身份、durable command fence、审批和实际回执。前驱失败或缺少实际回执时，剩余调用只能返回 `not_executed`，不能进入缓存回放、授权或 IPC，也不能计为已尝试的动作。命令之后的读取必须重新观察，不能使用命令之前的源码缓存或已关闭读取事实。共享 selector 默认不扩大 child 的混合批次能力。该批次不包括文件编辑、child 调度或 join，也不允许同一响应中新读取的源码提前授予编辑租约；这些混合效果仍沿用原有隔离选择边界。
 - provider 没有产生合法工具调用时，下一次请求保留完整可见的 assistant 响应和结构化 runtime 反馈。在 `execute`／`validate` 尚有未清偿 effect debt 时，完整无工具答复形成 `non_actionable_response` 恢复事实，不能误记为 `empty_response`，也不能用说明文字把执行循环伪装成进展。该答复与准确反馈在同一 canonical transcript 中成对保留到实际出站视图，保持普通工具选择，不能仅因有正文无动作就强制 required、删成 evidence-only 或关闭读取面；真实空响应、协议诊断和已失败工具仍按各自事实恢复。源码读取提供修改依据，不建立用户必须修改的义务；真正 Execute 的完成仍由效果与验收证据决定。动作被精确拒绝时，必须用标准 `assistant.tool_calls -> tool(ACTION_NOT_EXECUTED)` 对关闭模型刚提交的原生工具状态，再附加恢复事实；同一 action identity 只保留一对，修改正文必须脱敏。只写一条 system 提示而省略工具结果会让部分本地模型从未观察到决策状态变化，并确定性重放同一动作。重试不能遗忘刚刚失败的尝试，也不能靠固定轮数收口。
 - 连续 provider 拒绝使用 ledger 派生的渐进恢复指引：核对失败事实、重构完成路径，并选择真正不同的动作或诚实报告缺口。精确动作去重、source lease、显式执行契约、权限与验证债务继续独立校验；恢复不撤下安全读取，也不强制单一编辑器或按模型名分支。source/parser 拒绝后的新补丁仍需当前源码凭据，失败补丁不会自动获得授权。纠错、读取或验证的重复次数只是软信号，不能单凭次数形成 partial/error 边界。未广告工具必须成为有 assistant/tool 因果对的无效果拒绝结果，不能作为无状态 transport failure 原样重试。最终 mutation 后缺少真实验收时不得 success；持续 10 分钟没有可执行进展才触发共享恢复停滞边界，普通 Execute 总耗时不参与该计时。
-- 已拒绝的标准 assistant/tool 动作对继续存在于 canonical ledger，但从下一次 provider 的决策副本中整体移除，并由有界的结构化拒绝事实替代；真实源码读取回执仍按路径、版本和范围保留。不得删除持久化真值，也不得让失败动作反复占用模型决策上下文。
+- 已拒绝的标准 assistant/tool 动作对保留到下一次 provider 的决策副本，以真实 `ACTION_NOT_EXECUTED` 工具结果关闭刚提交的动作；同一 identity 的旧拒绝对由最新回执合并，mutation 正文保持脱敏。不得再删除这对消息后另造一份 system 拒绝事实；真实源码读取回执仍按路径、版本和范围保留，canonical ledger 不变。
 - provider 工具参数在生成 action identity 之前按工具 JSON schema 做递归标量规范化；例如数值字段的 `"260"` 与 `260` 必须是同一个动作。工具契约可以用只在 runtime 内可见、发送 provider 前会剥离的 identity-default 注解声明“显式默认值等价于省略”，不得针对模型名或事故参数编写临时修正规则。
 - 原生工具仍由 provider 配置/能力决定。某一次请求使用文本信封 fallback 只挽救该请求，不能写成 Turn 级“已证明能力”并永久撤掉后续原生工具。
 - 本地工具协议的默认值已经统一为 `auto`；LM Studio、Ollama、OMLX 不再因产品名默认进入 XML。真实 wire format 和兼容 fallback 由 adapter 能力与本次请求结果决定。

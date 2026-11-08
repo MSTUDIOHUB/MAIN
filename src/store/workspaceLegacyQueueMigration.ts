@@ -48,18 +48,8 @@ export function migrateLegacyQueuedMessageToWorkspaceTurn(input: {
       ...(input.legacy.runtimeIntentOverride
         ? { resolvedIntent: input.legacy.runtimeIntentOverride }
         : {}),
-      ...(input.legacy.goalSourceContextSnapshot
-        ? { goalSourceContextSnapshot: input.legacy.goalSourceContextSnapshot }
-        : {}),
-      ...(input.legacy.goalCreationAuthorization
-        ? { goalCreationAuthorization: input.legacy.goalCreationAuthorization }
-        : {}),
-      ...(input.legacy.goalContinuationAuthorization
-        ? { goalContinuationAuthorization: input.legacy.goalContinuationAuthorization }
-        : {}),
-      ...(input.legacy.goalContinuationGuidance
-        ? { goalContinuationGuidance: input.legacy.goalContinuationGuidance }
-        : {}),
+
+
       legacyQueuedMessageId: input.legacy.id,
     })) as WorkspaceJsonObject;
   } catch {

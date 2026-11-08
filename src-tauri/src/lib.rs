@@ -45,6 +45,9 @@ pub mod executor;
 pub mod harness;
 pub mod indexer;
 pub mod knowledge;
+pub mod plan_documents;
+mod legacy_assets;
+mod legacy_session_migration;
 pub mod mcp;
 pub mod memory;
 pub mod network_guard;
@@ -1862,48 +1865,6 @@ struct ProxyDetailedResponse {
     body: String,
     content_type: Option<String>,
     headers: std::collections::HashMap<String, String>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageStudioEngineCapabilities {
-    text_to_image: bool,
-    image_to_image: bool,
-    progress_preview: bool,
-    cuda_required: bool,
-    cloud_hosted: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageStudioEngineCheckResult {
-    ready: bool,
-    message: String,
-    capabilities: ImageStudioEngineCapabilities,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageStudioProxyResponse {
-    status: u16,
-    ok: bool,
-    body: String,
-    content_type: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageStudioStreamChunkPayload {
-    stream_id: String,
-    chunk: String,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ImageStudioStreamDonePayload {
-    stream_id: String,
-    status: String,
-    error: Option<String>,
 }
 
 // region: grep 辅助
@@ -4002,7 +3963,7 @@ const PROJECT_INIT_MAX_CONTENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectInitTargetSnapshot {
+pub struct ProjectInitTargetSnapshot {
     canonical_workspace: String,
     target_path: String,
     exists: bool,
@@ -4012,7 +3973,7 @@ struct ProjectInitTargetSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectInitCommitResult {
+pub struct ProjectInitCommitResult {
     canonical_workspace: String,
     target_path: String,
     created: bool,
@@ -4024,7 +3985,7 @@ fn project_init_content_version(content: &str) -> String {
     format!("sha256-{:x}", Sha256::digest(content.as_bytes()))
 }
 
-fn inspect_project_init_target_in_workspace(
+pub fn inspect_project_init_target_in_workspace(
     workspace: &Path,
 ) -> Result<ProjectInitTargetSnapshot, String> {
     let raw_target = workspace.join(PROJECT_INIT_TARGET_NAME);
@@ -4415,7 +4376,7 @@ fn create_file_atomic_resolved(
     publish_result
 }
 
-fn commit_project_init_in_workspace(
+pub fn commit_project_init_in_workspace(
     workspace: &Path,
     expected_target_path: &str,
     expected_base_version: Option<&str>,
@@ -5047,6 +5008,325 @@ fn missing_project_session(workspace: &str, session_id: &str) -> Value {
         "storageRevision": 0,
         "storageStatus": "missing",
     })
+}
+
+#[tauri::command]
+fn save_plan_document(
+    app: AppHandle,
+    input: plan_documents::SavePlanDocumentInput,
+) -> Result<plan_documents::PlanDocumentRef, String> {
+    let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    plan_documents::save(&root, input)
+}
+#[tauri::command]
+fn read_plan_document(
+    app: AppHandle,
+    reference: plan_documents::PlanDocumentRef,
+) -> Result<plan_documents::PlanDocumentContent, String> {
+    let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    plan_documents::read(&root, reference)
+}
+#[tauri::command]
+fn list_plan_documents(
+    app: AppHandle,
+    scope: plan_documents::PlanDocumentScope,
+) -> Result<Vec<plan_documents::PlanDocumentRef>, String> {
+    let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    plan_documents::list(&root, scope)
+}
+#[tauri::command]
+fn cleanup_legacy_image_studio_outputs() -> Result<legacy_assets::CleanupResult, String> {
+    legacy_assets::cleanup_at(&std::env::temp_dir())
+}
+
+fn discover_legacy_session_owners(
+    projects: &Path,
+    workspaces: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mut legacy_project_ids = Vec::new();
+    if projects.is_dir() {
+        for project in fs::read_dir(&projects).map_err(|e| e.to_string())? {
+            let project = project.map_err(|e| e.to_string())?;
+            if !project.file_type().map_err(|e| e.to_string())?.is_dir() {
+                continue;
+            }
+            let sessions = project.path().join("sessions");
+            if !sessions.is_dir() {
+                continue;
+            }
+            let mut has_payload = false;
+            for session in fs::read_dir(&sessions).map_err(|e| e.to_string())? {
+                let session = session.map_err(|e| e.to_string())?;
+                if !session.file_type().map_err(|e| e.to_string())?.is_dir() {
+                    continue;
+                }
+                let meta = session.path().join("session.json");
+                if meta.is_file() {
+                    has_payload = true;
+                    let value = read_json_file(&meta)?;
+                    if let Some(workspace) = value.get("workspaceRoot").and_then(Value::as_str) {
+                        workspaces.insert(normalize_workspace_for_sessions(workspace));
+                    }
+                } else if ["messages.jsonl", "runtime.json", "turns.jsonl"]
+                    .iter()
+                    .any(|name| session.path().join(name).is_file())
+                {
+                    has_payload = true;
+                }
+            }
+            if has_payload {
+                legacy_project_ids.push(project.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    for project_id in legacy_project_ids {
+        if !workspaces
+            .iter()
+            .any(|workspace| session_project_id(workspace) == project_id)
+        {
+            return Err(project_session_error(
+                "legacy_session_owner_unresolved",
+                "旧会话缺少工作区归属，请提供已知工作区后重试迁移。",
+                Some("legacy_session"),
+                Some(json!({"projectId":project_id})),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate known legacy owners before returning opaque full SQLite snapshots.
+/// A missing legacy owner fails maintenance closed instead of guessing a project.
+#[tauri::command]
+fn list_all_session_snapshots(
+    app: AppHandle,
+    known_workspaces: Option<Vec<String>>,
+) -> Result<Vec<SessionSnapshotRecord>, String> {
+    let store = open_project_session_store(&app)?;
+    let mut workspaces: HashSet<String> = store
+        .list_all_session_snapshots()
+        .map_err(project_session_store_error)?
+        .into_iter()
+        .map(|record| record.workspace)
+        .collect();
+    workspaces.insert("__MAIN_GLOBAL_CHAT__".into());
+    workspaces.extend(
+        known_workspaces
+            .unwrap_or_default()
+            .into_iter()
+            .map(|root| normalize_workspace_for_sessions(&root)),
+    );
+    let projects = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("sessions/projects");
+    discover_legacy_session_owners(&projects, &mut workspaces)?;
+    for workspace in workspaces {
+        import_legacy_project_sessions_if_needed(&app, &store, &workspace)?;
+    }
+    store
+        .list_all_session_snapshots()
+        .map_err(project_session_store_error)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompareAndSwapOpaqueSnapshotInput {
+    workspace: String,
+    session_id: String,
+    expected_revision: u64,
+    snapshot: Value,
+    mutation_deadline_ms: Option<i64>,
+}
+#[tauri::command]
+fn compare_and_swap_session_snapshot(
+    app: AppHandle,
+    input: CompareAndSwapOpaqueSnapshotInput,
+) -> Result<SessionSnapshotRecord, String> {
+    if !input.snapshot.is_object() {
+        return Err(project_session_error(
+            "invalid_input",
+            "Session snapshot must be an object.",
+            Some("snapshot"),
+            None,
+        ));
+    }
+    if input
+        .snapshot
+        .get("id")
+        .map(|id| session_id_from_value(id))
+        .transpose()?
+        .as_deref()
+        != Some(input.session_id.as_str())
+    {
+        return Err(project_session_error(
+            "invalid_input",
+            "Session snapshot id does not match its captured owner.",
+            Some("sessionId"),
+            None,
+        ));
+    }
+    let key = project_session_key(&input.workspace, input.session_id);
+    let store = open_project_session_store(&app)?;
+    let updated_at_ms = project_session_updated_at_ms(&input.snapshot, project_session_now_ms());
+    let mut snapshot = input.snapshot;
+    let object = snapshot.as_object_mut().expect("validated snapshot");
+    object.insert("workspaceRoot".into(), json!(key.workspace));
+    object.insert(
+        "projectId".into(),
+        json!(session_project_id(&key.workspace)),
+    );
+    object.insert(
+        "storageRevision".into(),
+        json!(input
+            .expected_revision
+            .checked_add(1)
+            .ok_or("revision overflow")?),
+    );
+    object.insert(
+        "storageVersion".into(),
+        json!(PROJECT_SESSION_STORAGE_VERSION),
+    );
+    object.insert("storageStatus".into(), json!("ok"));
+    object.insert("updatedAtMs".into(), json!(updated_at_ms));
+    store
+        .compare_and_swap_session_snapshot_before(
+            CompareAndSwapSessionSnapshotRequest {
+                key,
+                expected_revision: input.expected_revision,
+                snapshot,
+                updated_at_ms,
+            },
+            input.mutation_deadline_ms,
+        )
+        .map(|result| result.snapshot)
+        .map_err(project_session_store_error)
+}
+
+#[tauri::command]
+fn list_legacy_session_files(app: AppHandle, known_workspaces: Option<Vec<String>>) -> Result<Vec<legacy_session_migration::LegacySessionFile>, String> {
+    let app_data = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let mut workspaces = known_workspaces.unwrap_or_default().into_iter().map(|workspace| normalize_workspace_for_sessions(&workspace)).collect::<HashSet<_>>();
+    workspaces.insert("__MAIN_GLOBAL_CHAT__".into());
+    for record in open_project_session_store(&app)?.list_all_session_snapshots().map_err(project_session_store_error)? { workspaces.insert(record.workspace); }
+    discover_legacy_session_owners(&app_data.join("sessions/projects"), &mut workspaces)?;
+    legacy_session_migration::list_at(&app_data, &workspaces.into_iter().map(|workspace| (session_project_id(&workspace), workspace)).collect())
+}
+#[tauri::command]
+fn compare_and_swap_legacy_session_file(app: AppHandle, input: legacy_session_migration::LegacySessionFileMutation) -> Result<String, String> {
+    let app_data = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    legacy_session_migration::compare_and_swap_at(&app_data, &input)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizeLegacySessionImportInput {
+    workspace: String,
+    session_id: String,
+    expected_revision: u64,
+    expected_snapshot: Value,
+}
+
+fn legacy_copy_matches_native_snapshot(dir: &Path, snapshot: &Value) -> Result<bool, String> {
+    for name in ["session.json", "messages.jsonl", "turns.jsonl", "runtime.json"] {
+        let path = dir.join(name);
+        if !path.exists() { continue; }
+        let value = legacy_session_migration::parse(name, &fs::read(path).map_err(|error| error.to_string())?)?;
+        let expected = match name {
+            "messages.jsonl" => snapshot.get("messages"),
+            "turns.jsonl" => snapshot.get("runtimeSnapshot").and_then(|runtime| runtime.get("conversationTurns")),
+            "runtime.json" => snapshot.get("runtimeSnapshot"),
+            _ => Some(snapshot),
+        };
+        if let Some(object) = value.as_object() {
+            for (field, item) in object {
+                // Native storage owns these derived metadata fields, not transcript content.
+                if name == "session.json" && ["storageVersion", "storageRevision", "storageStatus", "updatedAtMs", "messageCount", "turnCount"].contains(&field.as_str()) { continue; }
+                if expected.and_then(|record| record.get(field)) != Some(item) { return Ok(false); }
+            }
+        } else if expected != Some(&value) { return Ok(false); }
+    }
+    Ok(true)
+}
+
+// No arbitrary path is accepted. Legacy details are obsolete only after the
+// exact complete replacement is durable; metadata is removed last for retries.
+fn finalize_legacy_session_copy(
+    store: &SessionStore,
+    app_data_root: &Path,
+    key: &SessionKey,
+    expected_revision: u64,
+    expected_snapshot: &Value,
+) -> Result<usize, String> {
+    let _copy_lock = legacy_session_migration::COPY_MUTATION_LOCK.lock().map_err(|_| "LEGACY_SESSION_LOCK_POISONED")?;
+    if session_id_from_object(expected_snapshot)? != key.session_id {
+        return Err("LEGACY_SESSION_OWNER_MISMATCH".into());
+    }
+    let trusted_root = app_data_root.canonicalize().map_err(|error| error.to_string())?;
+    let mut dir = trusted_root.clone();
+    for part in ["sessions", "projects", &session_project_id(&key.workspace), "sessions", &key.session_id] {
+        dir.push(part);
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Even an absent legacy copy still needs the exact revision fence.
+                return store.with_verified_snapshot_revision(key, expected_revision, expected_snapshot, || Ok(0))
+                    .map_err(project_session_store_error);
+            }
+            Err(error) => return Err(error.to_string()),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => return Err("LEGACY_SESSION_UNTRUSTED_PATH".into()),
+            Ok(_) => (),
+        }
+    }
+    let names = ["messages.jsonl", "turns.jsonl", "runtime.json", "session.json"];
+    // Check all owned files before deleting any. Unknown files are preserved.
+    for name in names {
+        match fs::symlink_metadata(dir.join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.to_string()),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => return Err("LEGACY_SESSION_UNTRUSTED_FILE".into()),
+            Ok(_) => (),
+        }
+    }
+    let metadata_path = dir.join("session.json");
+    if metadata_path.is_file() {
+        let metadata = read_json_file(&metadata_path)?;
+        if session_id_from_object(&metadata)? != key.session_id ||
+            metadata.get("workspaceRoot").and_then(Value::as_str)
+                .is_some_and(|owner| normalize_workspace_for_sessions(owner) != key.workspace) {
+            return Err("LEGACY_SESSION_OWNER_MISMATCH".into());
+        }
+    }
+    store.with_verified_snapshot_revision(key, expected_revision, expected_snapshot, || {
+        // Divergent ordinary legacy content remains as a cleaned inert copy.
+        // Absence of a component match is never permission to erase that copy.
+        if !legacy_copy_matches_native_snapshot(&dir, expected_snapshot)? { return Ok(0); }
+        let mut removed = 0;
+        for name in names {
+            let path = dir.join(name);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => return Err("LEGACY_SESSION_UNTRUSTED_FILE".into()),
+                Ok(_) => (),
+            }
+            if dir.canonicalize().map_err(|error| error.to_string())? != dir || !dir.starts_with(&trusted_root) {
+                return Err("LEGACY_SESSION_UNTRUSTED_PATH".into());
+            }
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+            removed += 1;
+        }
+        Ok(removed)
+    }).map_err(project_session_store_error)
+}
+
+#[tauri::command]
+fn finalize_legacy_session_import(app: AppHandle, input: FinalizeLegacySessionImportInput) -> Result<usize, String> {
+    let key = project_session_key(&input.workspace, input.session_id);
+    let app_data = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let store = open_project_session_store(&app)?;
+    finalize_legacy_session_copy(&store, &app_data, &key, input.expected_revision, &input.expected_snapshot)
 }
 
 #[tauri::command]
@@ -8378,7 +8658,6 @@ enum ProxyPhaseError<E> {
 enum GuardedRequestLease<'a> {
     Proxy(&'a ProxyRequestLease),
     Stream(&'a ChatStreamLease),
-    ImageStudio,
 }
 
 impl GuardedRequestLease<'_> {
@@ -8386,9 +8665,6 @@ impl GuardedRequestLease<'_> {
         match self {
             Self::Proxy(lease) => lease.is_cancelled(),
             Self::Stream(lease) => lease.is_cancelled(),
-            Self::ImageStudio => {
-                IMAGE_STUDIO_STREAM_CANCEL.load(std::sync::atomic::Ordering::Acquire)
-            }
         }
     }
 
@@ -8396,7 +8672,6 @@ impl GuardedRequestLease<'_> {
         match self {
             Self::Proxy(lease) => lease.set_abort_handle(handle),
             Self::Stream(lease) => lease.set_abort_handle(handle),
-            Self::ImageStudio => set_image_studio_abort_handle(handle),
         }
     }
 }
@@ -9388,622 +9663,6 @@ fn cancel_proxy_request(request_id: Option<String>) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-// endregion
-
-// region: 图像工作室 HTTP 代理
-
-static IMAGE_STUDIO_STREAM_CANCEL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static IMAGE_STUDIO_STREAM_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
-    std::sync::Mutex::new(None);
-
-fn normalize_image_studio_engine(engine: &str) -> Result<&'static str, String> {
-    match engine.trim() {
-        "local_image_service" | "hidream_http" => Ok("local_image_service"),
-        "web_fallback" | "huggingface_space" => Ok("web_fallback"),
-        _ => Err("Unsupported Image Studio provider.".to_string()),
-    }
-}
-
-fn image_studio_default_capabilities(engine: &str) -> ImageStudioEngineCapabilities {
-    let hosted = engine == "web_fallback";
-    ImageStudioEngineCapabilities {
-        text_to_image: true,
-        image_to_image: !hosted,
-        progress_preview: !hosted,
-        cuda_required: !hosted,
-        cloud_hosted: hosted,
-    }
-}
-
-fn set_image_studio_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
-    if let Ok(mut slot) = IMAGE_STUDIO_STREAM_ABORT.lock() {
-        *slot = handle;
-    }
-}
-
-fn abort_active_image_studio_request() {
-    if let Ok(mut slot) = IMAGE_STUDIO_STREAM_ABORT.lock() {
-        if let Some(handle) = slot.take() {
-            handle.abort();
-        }
-    }
-}
-
-fn emit_image_studio_stream_done(
-    app: &AppHandle,
-    stream_id: &str,
-    status: &str,
-    error: Option<String>,
-) {
-    let _ = app.emit(
-        "image-studio-stream-done",
-        ImageStudioStreamDonePayload {
-            stream_id: stream_id.to_string(),
-            status: status.to_string(),
-            error,
-        },
-    );
-}
-
-fn is_allowed_image_studio_host(host: &str) -> bool {
-    let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-    if normalized == "localhost" {
-        return true;
-    }
-    match normalized.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) => addr.is_loopback() || addr.is_private(),
-        Ok(IpAddr::V6(addr)) => addr.is_loopback() || addr.is_unique_local(),
-        Err(_) => false,
-    }
-}
-
-fn is_allowed_hugging_face_space_host(host: &str) -> bool {
-    host.trim()
-        .trim_matches(['[', ']'])
-        .eq_ignore_ascii_case("hidream-ai-hidream-o1-image-dev.hf.space")
-}
-
-fn validate_image_studio_endpoint_for_engine(
-    engine: &str,
-    endpoint: &str,
-) -> Result<url::Url, String> {
-    let trimmed = endpoint.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("图像工作室 endpoint 不能为空".to_string());
-    }
-    let parsed = url::Url::parse(trimmed).map_err(|e| format!("图像工作室 endpoint 无效: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        _ => return Err("图像工作室 endpoint 仅支持 http/https".to_string()),
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("图像工作室 endpoint 不允许包含用户名或密码".to_string());
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "图像工作室 endpoint 缺少主机名".to_string())?;
-    if engine == "web_fallback" {
-        if parsed.scheme() != "https" {
-            return Err("HiDream Web fallback endpoint 必须使用 https".to_string());
-        }
-        if !is_allowed_hugging_face_space_host(host) {
-            return Err("HiDream Web fallback endpoint 仅允许官方托管 Space".to_string());
-        }
-        NetworkGrant::from_urls([parsed.as_str()], false)
-            .map_err(|error| format!("图像工作室 endpoint 被网络安全策略拒绝: {error}"))?;
-    } else if !is_allowed_image_studio_host(host) {
-        return Err(
-            "图像工作室 endpoint 只允许 localhost、127.0.0.1、::1 或私有局域网 IP".to_string(),
-        );
-    } else {
-        NetworkGrant::for_explicit_local_origin(parsed.as_str(), false)
-            .map_err(|error| format!("图像工作室 endpoint 被网络安全策略拒绝: {error}"))?;
-    }
-    Ok(parsed)
-}
-
-fn build_image_studio_url(
-    engine: &str,
-    endpoint: &str,
-    request_path: &str,
-) -> Result<url::Url, String> {
-    let mut base = validate_image_studio_endpoint_for_engine(engine, endpoint)?;
-    let path = request_path.trim();
-    if !path.starts_with('/') {
-        return Err("图像工作室请求路径必须以 / 开头".to_string());
-    }
-    if path.contains("://") || path.contains('\\') || path.contains('\0') {
-        return Err("图像工作室请求路径非法".to_string());
-    }
-    if path.split('/').any(|part| part == "..") {
-        return Err("图像工作室请求路径不允许包含 ..".to_string());
-    }
-    base.set_path(path);
-    base.set_query(None);
-    base.set_fragment(None);
-    Ok(base)
-}
-
-#[tauri::command]
-async fn check_image_studio_engine(
-    engine: String,
-    endpoint: String,
-) -> Result<ImageStudioEngineCheckResult, String> {
-    let engine_kind = normalize_image_studio_engine(&engine)?;
-    let headers = HashMap::new();
-
-    if engine_kind == "local_image_service" {
-        let health_url = build_image_studio_url(engine_kind, &endpoint, "/health")?;
-        match send_guarded_proxy_request(
-            health_url.as_str(),
-            "GET",
-            &headers,
-            None,
-            Some(Duration::from_secs(5)),
-            Duration::from_secs(5),
-            false,
-            false,
-            false,
-            true,
-            None,
-        )
-        .await
-        {
-            Ok(response) if response.status().is_success() => {
-                return Ok(ImageStudioEngineCheckResult {
-                    ready: true,
-                    message: format!("Local image service is reachable at {}.", health_url),
-                    capabilities: image_studio_default_capabilities(engine_kind),
-                });
-            }
-            Ok(_) | Err(_) => {}
-        }
-
-        let models_url = build_image_studio_url(engine_kind, &endpoint, "/v1/models")?;
-        return match send_guarded_proxy_request(
-            models_url.as_str(),
-            "GET",
-            &headers,
-            None,
-            Some(Duration::from_secs(5)),
-            Duration::from_secs(5),
-            false,
-            false,
-            false,
-            true,
-            None,
-        )
-        .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                let ready = status.is_success();
-                Ok(ImageStudioEngineCheckResult {
-                    ready,
-                    message: if ready {
-                        format!(
-                            "Local image service model discovery succeeded at {}.",
-                            models_url
-                        )
-                    } else {
-                        format!(
-                            "Local image service returned HTTP {} from /v1/models.",
-                            status
-                        )
-                    },
-                    capabilities: image_studio_default_capabilities(engine_kind),
-                })
-            }
-            Err(error) => Ok(ImageStudioEngineCheckResult {
-                ready: false,
-                message: format!("本地图片服务健康检查失败: {error}"),
-                capabilities: image_studio_default_capabilities(engine_kind),
-            }),
-        };
-    }
-
-    let url = build_image_studio_url(engine_kind, &endpoint, "/config")?;
-    match send_guarded_proxy_request(
-        url.as_str(),
-        "GET",
-        &headers,
-        None,
-        Some(Duration::from_secs(5)),
-        Duration::from_secs(5),
-        false,
-        false,
-        false,
-        false,
-        None,
-    )
-    .await
-    {
-        Ok(response) => {
-            let status = response.status();
-            let ready = !status.is_server_error();
-            Ok(ImageStudioEngineCheckResult {
-                ready,
-                message: if ready {
-                    "HiDream Web fallback is reachable and ready for hosted generation.".to_string()
-                } else {
-                    format!("HiDream Web fallback returned HTTP {}.", status)
-                },
-                capabilities: image_studio_default_capabilities(engine_kind),
-            })
-        }
-        Err(error) => Ok(ImageStudioEngineCheckResult {
-            ready: false,
-            message: format!("HiDream Web 健康检查失败: {error}"),
-            capabilities: image_studio_default_capabilities(engine_kind),
-        }),
-    }
-}
-
-#[tauri::command]
-async fn proxy_image_studio_request(
-    app: AppHandle,
-    engine: Option<String>,
-    endpoint: String,
-    path: String,
-    method: String,
-    body: Option<String>,
-    stream_id: Option<String>,
-) -> Result<ImageStudioProxyResponse, String> {
-    let engine_kind =
-        normalize_image_studio_engine(engine.as_deref().unwrap_or("local_image_service"))?;
-    let meth = method.trim().to_ascii_uppercase();
-    let url = build_image_studio_url(engine_kind, &endpoint, &path)?;
-    if !matches!(meth.as_str(), "GET" | "POST" | "DELETE") {
-        return Err(format!("Unsupported Image Studio HTTP method: {meth}"));
-    }
-    let stream_id = (meth == "GET")
-        .then_some(stream_id)
-        .flatten()
-        .filter(|value| !value.trim().is_empty());
-    let mut headers = HashMap::new();
-    if stream_id.is_some() {
-        headers.insert("Accept".to_string(), "text/event-stream".to_string());
-        IMAGE_STUDIO_STREAM_CANCEL.store(false, std::sync::atomic::Ordering::Release);
-        set_image_studio_abort_handle(None);
-    }
-    let response = match send_guarded_proxy_request(
-        url.as_str(),
-        &meth,
-        &headers,
-        body.as_deref(),
-        Some(Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS)),
-        Duration::from_secs(MODEL_REQUEST_TIMEOUT_SECS),
-        false,
-        meth == "POST",
-        false,
-        true,
-        stream_id.as_ref().map(|_| GuardedRequestLease::ImageStudio),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error)
-            if stream_id.is_some()
-                && (error == "Aborted"
-                    || IMAGE_STUDIO_STREAM_CANCEL.load(std::sync::atomic::Ordering::Acquire)) =>
-        {
-            let stream_id = stream_id.as_deref().unwrap_or_default();
-            emit_image_studio_stream_done(&app, stream_id, "cancelled", None);
-            return Ok(ImageStudioProxyResponse {
-                status: 499,
-                ok: false,
-                body: String::new(),
-                content_type: None,
-            });
-        }
-        Err(error) => return Err(format!("图像工作室请求失败: {error}")),
-    };
-    if let Some(stream_id) = stream_id {
-        return stream_image_studio_response(app, stream_id, response).await;
-    }
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("读取图像工作室响应失败: {e}"))?;
-
-    Ok(ImageStudioProxyResponse {
-        status: status.as_u16(),
-        ok: status.is_success(),
-        body,
-        content_type,
-    })
-}
-
-async fn stream_image_studio_response(
-    app: AppHandle,
-    stream_id: String,
-    response: reqwest::Response,
-) -> Result<ImageStudioProxyResponse, String> {
-    use futures_util::StreamExt;
-
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            error_body.chars().take(500).collect::<String>()
-        ));
-    }
-
-    let status_code = status.as_u16();
-    let mut stream = response.bytes_stream();
-    let mut utf8_tail: Vec<u8> = Vec::new();
-
-    loop {
-        let (chunk_abort_handle, chunk_abort_registration) =
-            futures_util::future::AbortHandle::new_pair();
-        set_image_studio_abort_handle(Some(chunk_abort_handle));
-        let next_chunk =
-            futures_util::future::Abortable::new(stream.next(), chunk_abort_registration).await;
-        set_image_studio_abort_handle(None);
-
-        let item = match next_chunk {
-            Err(_) => {
-                emit_image_studio_stream_done(&app, &stream_id, "cancelled", None);
-                return Ok(ImageStudioProxyResponse {
-                    status: 499,
-                    ok: false,
-                    body: String::new(),
-                    content_type,
-                });
-            }
-            Ok(item) => item,
-        };
-
-        let Some(chunk_result) = item else {
-            break;
-        };
-
-        if IMAGE_STUDIO_STREAM_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
-            emit_image_studio_stream_done(&app, &stream_id, "cancelled", None);
-            return Ok(ImageStudioProxyResponse {
-                status: 499,
-                ok: false,
-                body: String::new(),
-                content_type,
-            });
-        }
-
-        match chunk_result {
-            Ok(bytes) => {
-                let mut combined = Vec::with_capacity(utf8_tail.len() + bytes.len());
-                combined.extend_from_slice(&utf8_tail);
-                utf8_tail.clear();
-                combined.extend_from_slice(&bytes);
-                let text = match std::str::from_utf8(&combined) {
-                    Ok(value) => value.to_string(),
-                    Err(error) => {
-                        let valid_up_to = error.valid_up_to();
-                        if valid_up_to == 0 {
-                            utf8_tail = combined;
-                            continue;
-                        }
-                        utf8_tail = combined[valid_up_to..].to_vec();
-                        std::str::from_utf8(&combined[..valid_up_to])
-                            .unwrap_or("")
-                            .to_string()
-                    }
-                };
-                if !text.is_empty() {
-                    let _ = app.emit(
-                        "image-studio-stream-chunk",
-                        ImageStudioStreamChunkPayload {
-                            stream_id: stream_id.clone(),
-                            chunk: text,
-                        },
-                    );
-                }
-            }
-            Err(error) => {
-                emit_image_studio_stream_done(
-                    &app,
-                    &stream_id,
-                    "error",
-                    Some(format!("图像流读取失败: {error}")),
-                );
-                return Ok(ImageStudioProxyResponse {
-                    status: status_code,
-                    ok: false,
-                    body: String::new(),
-                    content_type,
-                });
-            }
-        }
-    }
-
-    set_image_studio_abort_handle(None);
-    emit_image_studio_stream_done(&app, &stream_id, "ok", None);
-    Ok(ImageStudioProxyResponse {
-        status: status_code,
-        ok: true,
-        body: String::new(),
-        content_type,
-    })
-}
-
-#[tauri::command]
-fn cancel_image_studio_job() -> Result<(), String> {
-    IMAGE_STUDIO_STREAM_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-    abort_active_image_studio_request();
-    Ok(())
-}
-
-fn decode_image_studio_data_url(data_url: &str) -> Result<Vec<u8>, String> {
-    let trimmed = data_url.trim();
-    let comma_index = trimmed
-        .find(',')
-        .ok_or_else(|| "图像输出必须是 data URL".to_string())?;
-    let header = trimmed[..comma_index].to_ascii_lowercase();
-    if !header.starts_with("data:image/") || !header.contains(";base64") {
-        return Err("图像输出必须是 base64 图片 data URL".to_string());
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(trimmed[comma_index + 1..].trim())
-        .map_err(|e| format!("解析图像输出失败: {e}"))
-}
-
-fn normalize_image_studio_output_file_name(file_name: &str) -> String {
-    let safe_name = sanitize_attachment_filename(file_name);
-    let lower = safe_name.to_ascii_lowercase();
-    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        safe_name
-    } else {
-        format!("{safe_name}.png")
-    }
-}
-
-fn save_image_studio_output_bytes(
-    session_key: &str,
-    file_name: &str,
-    bytes: &[u8],
-) -> Result<String, String> {
-    let workspace = ensure_chat_temp_root(session_key)?;
-    let safe_name = normalize_image_studio_output_file_name(file_name);
-    let relative_path = format!("image-studio/{safe_name}");
-    let real_path = resolve_write_path(&relative_path, &workspace)?;
-    if let Some(parent) = real_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建图像输出目录失败: {e}"))?;
-    }
-    let real_path = revalidate_write_path(&real_path, &workspace)?;
-    fs::write(&real_path, bytes).map_err(|e| format!("保存图像输出失败: {e}"))?;
-    Ok(real_path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn save_image_studio_output(
-    session_key: String,
-    file_name: String,
-    data_url: String,
-) -> Result<String, String> {
-    let bytes = decode_image_studio_data_url(&data_url)?;
-    save_image_studio_output_bytes(&session_key, &file_name, &bytes)
-}
-
-fn validate_image_studio_remote_image_url(image_url: &str) -> Result<url::Url, String> {
-    let parsed =
-        url::Url::parse(image_url.trim()).map_err(|e| format!("图像输出 URL 无效: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        _ => return Err("远程图像输出只允许 http/https URL".to_string()),
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("远程图像输出 URL 不允许包含用户名或密码".to_string());
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "远程图像输出 URL 缺少主机名".to_string())?;
-    if is_allowed_hugging_face_space_host(host) {
-        if parsed.scheme() != "https" {
-            return Err("HiDream Web 文件 URL 必须使用 https".to_string());
-        }
-        if !parsed.path().starts_with("/gradio_api/file=") {
-            return Err("HiDream Web 文件 URL 不是受支持的 Gradio 文件地址".to_string());
-        }
-        return Ok(parsed);
-    }
-    if !is_allowed_image_studio_host(host) {
-        return Err("远程图像输出仅允许 HiDream Web 或回环/私网本地图片服务 URL".to_string());
-    }
-    Ok(parsed)
-}
-
-#[tauri::command]
-async fn save_image_studio_remote_output(
-    session_key: String,
-    file_name: String,
-    image_url: String,
-) -> Result<String, String> {
-    let url = validate_image_studio_remote_image_url(&image_url)?;
-    let response = send_guarded_proxy_request(
-        url.as_str(),
-        "GET",
-        &HashMap::new(),
-        None,
-        Some(Duration::from_secs(120)),
-        Duration::from_secs(120),
-        false,
-        false,
-        false,
-        true,
-        None,
-    )
-    .await
-    .map_err(|error| format!("下载远程图像失败: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("下载远程图像失败: HTTP {status}"));
-    }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if !content_type.to_ascii_lowercase().starts_with("image/") {
-        return Err("远程输出不是图片内容".to_string());
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("读取远程图像失败: {e}"))?;
-    if bytes.len() > 64 * 1024 * 1024 {
-        return Err("远程图像超过 64MB，未保存。".to_string());
-    }
-    save_image_studio_output_bytes(&session_key, &file_name, &bytes)
-}
-
-fn image_studio_temp_sessions_root() -> PathBuf {
-    std::env::temp_dir()
-        .join("MAIN")
-        .join(".tmp")
-        .join("chat-sessions")
-}
-
-#[tauri::command]
-fn open_image_studio_output(
-    app: AppHandle,
-    path: String,
-) -> Result<OpenFileExternalResult, String> {
-    let raw = PathBuf::from(path.trim());
-    let real_path = raw
-        .canonicalize()
-        .map_err(|e| format!("图像输出路径不存在或无法访问: {e}"))?;
-    if !real_path.is_file() {
-        return Err("图像输出目标不是文件".to_string());
-    }
-    let temp_root = image_studio_temp_sessions_root()
-        .canonicalize()
-        .map_err(|e| format!("无法解析图像输出根目录: {e}"))?;
-    if !real_path.starts_with(&temp_root) {
-        return Err("只能打开 MAIN 图像工作室保存的输出文件".to_string());
-    }
-    let open_path = real_path.to_string_lossy().to_string();
-    app.opener()
-        .open_path(open_path.clone(), None::<&str>)
-        .map_err(|e| format!("无法使用系统默认应用打开图像：{e}"))?;
-    Ok(OpenFileExternalResult {
-        path: open_path,
-        opened: true,
-    })
 }
 
 // endregion
@@ -11953,11 +11612,28 @@ fn index_workspace_documents(
     run_document_reader(&workspace, &payload)
 }
 
-fn knowledge_app_data_dir(state: &State<'_, WorkspaceState>) -> Result<PathBuf, String> {
-    let workspace = state.get_root()?;
-    let dir = workspace.join(".MAIN");
-    fs::create_dir_all(&dir).map_err(|error| format!("创建知识库数据目录失败: {error}"))?;
-    Ok(dir)
+fn knowledge_app_data_dir(
+    app: &AppHandle,
+    state: &State<'_, WorkspaceState>,
+) -> Result<PathBuf, String> {
+    let directory = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let mut roots = HashSet::new();
+    roots.insert(state.get_root()?);
+    if let Ok(store) = open_project_session_store(app) {
+        for record in store
+            .list_all_session_snapshots()
+            .map_err(project_session_store_error)?
+        {
+            if record.workspace != "__MAIN_GLOBAL_CHAT__" {
+                roots.insert(PathBuf::from(record.workspace));
+            }
+        }
+    }
+    for root in roots {
+        knowledge::migration::migrate_legacy_root(&directory, &root.join(".MAIN"))?;
+    }
+    Ok(directory)
 }
 
 fn resolve_knowledge_import_path(
@@ -11992,6 +11668,7 @@ fn copy_knowledge_source_to_store(
     kb_id: &str,
     source_path: &Path,
 ) -> Result<PathBuf, String> {
+    knowledge::get_knowledge_base(app_data_dir, kb_id)?;
     if !source_path.is_file() {
         return Err("知识库导入目标不是文件".to_string());
     }
@@ -12020,19 +11697,21 @@ fn copy_knowledge_source_to_store(
 
 #[tauri::command]
 fn knowledge_list_bases(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
 ) -> Result<Vec<knowledge::KnowledgeBase>, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     knowledge::list_knowledge_bases(&app_data_dir)
 }
 
 #[tauri::command]
 fn knowledge_create_base(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     name: String,
     description: Option<String>,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     let name = name.trim();
     if name.is_empty() {
         return Err("知识库名称不能为空".to_string());
@@ -12042,41 +11721,65 @@ fn knowledge_create_base(
 
 #[tauri::command]
 fn knowledge_set_base_enabled(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     kb_id: String,
     enabled: bool,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     knowledge::set_knowledge_base_enabled(&app_data_dir, &kb_id, enabled)
 }
 
 #[tauri::command]
-fn knowledge_delete_base(state: State<'_, WorkspaceState>, kb_id: String) -> Result<(), String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+fn knowledge_delete_base(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    kb_id: String,
+) -> Result<(), String> {
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     knowledge::delete_knowledge_base(&app_data_dir, &kb_id)
 }
 
 #[tauri::command]
 fn knowledge_list_sources(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     kb_id: String,
 ) -> Result<Vec<knowledge::KnowledgeSource>, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     knowledge::list_sources(&app_data_dir, &kb_id)
 }
 
 #[tauri::command]
 fn knowledge_import_source(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<WorkspaceState>,
     kb_id: String,
     path: String,
     workspace: Option<String>,
 ) -> Result<knowledge::KnowledgeImportResult, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
+    if let Some(ref workspace) = workspace {
+        knowledge::migration::migrate_legacy_root(
+            &app_data_dir,
+            &PathBuf::from(workspace).join(".MAIN"),
+        )?;
+    }
     let source_path = resolve_knowledge_import_path(&state, &path, workspace)?;
     let storage_path = copy_knowledge_source_to_store(&app_data_dir, &kb_id, &source_path)?;
-    let extracted = extract_document_for_knowledge(&storage_path)?;
+    let extracted = match extract_document_for_knowledge(&storage_path) {
+        Ok(extracted) => extracted,
+        Err(error) => {
+            knowledge::record_source_failure(
+                &app_data_dir,
+                &kb_id,
+                &source_path,
+                &storage_path,
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
     knowledge::index_extracted_source(
         &app_data_dir,
         &kb_id,
@@ -12127,8 +11830,9 @@ async fn knowledge_import_url(
     max_depth: Option<usize>,
     max_pages: Option<usize>,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
 
+    knowledge::get_knowledge_base(&app_data_dir, &kb_id)?;
     // Clear cancel flag
     set_import_cancelled(&kb_id, false);
 
@@ -12169,6 +11873,7 @@ async fn knowledge_import_url(
     queue.push_back((entry_url.clone(), 1));
 
     let mut visited = HashSet::new();
+    let mut import_errors: Vec<String> = Vec::new();
     let mut queued = HashSet::new();
     queued.insert(url.clone());
 
@@ -12255,11 +11960,13 @@ async fn knowledge_import_url(
 
                 let target_dir = knowledge::source_storage_dir(&app_data_dir, &kb_id);
                 if let Err(e) = fs::create_dir_all(&target_dir) {
+                    import_errors.push(format!("创建目录失败: {e}"));
                     record_debug_log(&app, "error", "knowledge", format!("创建目录失败: {e}"));
                     continue;
                 }
                 let storage_path = target_dir.join(&file_name);
                 if let Err(e) = fs::write(&storage_path, content_bytes) {
+                    import_errors.push(format!("写入文件失败: {e}"));
                     record_debug_log(&app, "error", "knowledge", format!("写入文件失败: {e}"));
                     continue;
                 }
@@ -12277,7 +11984,7 @@ async fn knowledge_import_url(
                 });
 
                 let original_path = PathBuf::from(&url_str);
-                let _ = knowledge::index_extracted_source(
+                let indexed = knowledge::index_extracted_source(
                     &app_data_dir,
                     &kb_id,
                     &original_path,
@@ -12285,6 +11992,16 @@ async fn knowledge_import_url(
                     &extracted,
                     true, // force reindex
                 );
+                if let Err(error) = indexed {
+                    import_errors.push(error.clone());
+                    knowledge::record_source_failure(
+                        &app_data_dir,
+                        &kb_id,
+                        &original_path,
+                        &storage_path,
+                        &error,
+                    )?;
+                }
 
                 // If recursive, extract links and queue them
                 if recursive && depth < depth_limit && visited.len() + queue.len() < page_limit {
@@ -12302,6 +12019,7 @@ async fn knowledge_import_url(
                 }
             }
             Err(err) => {
+                import_errors.push(err.clone());
                 record_debug_log(
                     &app,
                     "warn",
@@ -12323,17 +12041,34 @@ async fn knowledge_import_url(
         }
     }
 
-    // Emit finished event
+    // Completion is truthful: canceled/error imports cannot emit a successful done.
+    let import_status = if is_import_cancelled(&kb_id) {
+        "cancelled"
+    } else if import_errors.is_empty() {
+        "done"
+    } else {
+        "error"
+    };
     let _ = app.emit(
         "knowledge-import-progress",
         json!({
             "kbId": kb_id,
-            "status": "done",
+            "status": import_status,
+            "error": import_errors.first(),
             "current": visited.len(),
             "total": visited.len(),
         }),
     );
 
+    if import_status == "cancelled" {
+        return Err("知识库导入已取消".into());
+    }
+    if !import_errors.is_empty() {
+        return Err(format!(
+            "知识库导入部分或全部失败：{}",
+            import_errors.join("; ")
+        ));
+    }
     // Return the updated knowledge base
     knowledge::list_knowledge_bases(&app_data_dir)?
         .into_iter()
@@ -12343,16 +12078,25 @@ async fn knowledge_import_url(
 
 #[tauri::command]
 fn knowledge_rebuild_base(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     kb_id: String,
 ) -> Result<knowledge::KnowledgeBase, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     let sources = knowledge::stored_sources(&app_data_dir, &kb_id)?;
     for stored in sources {
         if !stored.storage_path.exists() {
-            continue;
+            let error="知识库来源副本不存在，未能重建索引";
+            knowledge::mark_source_failure(&app_data_dir,&kb_id,&stored.source.id,error)?;
+            return Err(error.into());
         }
-        let extracted = extract_document_for_knowledge(&stored.storage_path)?;
+        let expected_root=knowledge::source_storage_dir(&app_data_dir,&kb_id).canonicalize().map_err(|e|e.to_string())?;
+        let actual=stored.storage_path.canonicalize().map_err(|e|e.to_string())?;
+        if !actual.starts_with(&expected_root) { return Err("KNOWLEDGE_UNTRUSTED_SOURCE_PATH".into()); }
+        let extracted = match extract_document_for_knowledge(&actual) {
+            Ok(extracted)=>extracted,
+            Err(error)=>{knowledge::mark_source_failure(&app_data_dir,&kb_id,&stored.source.id,&error)?;return Err(error);}
+        };
         let original_path = PathBuf::from(&stored.source.original_path);
         let _ = knowledge::index_extracted_source(
             &app_data_dir,
@@ -12371,28 +12115,32 @@ fn knowledge_rebuild_base(
 
 #[tauri::command]
 fn knowledge_search(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     query: String,
-    kb_ids: Option<Vec<String>>,
+    references: Vec<knowledge::KnowledgeReference>,
     limit: Option<usize>,
 ) -> Result<knowledge::KnowledgeSearchResult, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
-    knowledge::search(
-        &app_data_dir,
-        &query,
-        &kb_ids.unwrap_or_default(),
-        limit.unwrap_or(8),
-    )
+    if references.is_empty() {
+        return knowledge::search(Path::new(""), &query, &references, limit.unwrap_or(8));
+    }
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
+    knowledge::search(&app_data_dir, &query, &references, limit.unwrap_or(8))
 }
 
 #[tauri::command]
 fn knowledge_get_excerpt(
+    app: AppHandle,
     state: State<'_, WorkspaceState>,
     source_id: String,
     chunk_id: String,
+    references: Vec<knowledge::KnowledgeReference>,
 ) -> Result<Option<knowledge::KnowledgeSearchHit>, String> {
-    let app_data_dir = knowledge_app_data_dir(&state)?;
-    knowledge::get_excerpt(&app_data_dir, &source_id, &chunk_id)
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
+    knowledge::get_excerpt(&app_data_dir, &source_id, &chunk_id, &references)
 }
 
 /// Delete a protocol package folder without trusting persisted relative paths.
@@ -12473,37 +12221,45 @@ fn delete_chat_temp_path(session_key: String, path: String) -> Result<(), String
     Ok(())
 }
 
-const PLAN_FILE_NAMES: [&str; 5] = [
-    "plan.md",
-    "requirements.md",
-    "design.md",
-    "tasks.md",
-    "bugfix.md",
-];
-
-fn delete_plan_files_in_dir(plans_dir: &Path) -> Result<(), String> {
-    if !plans_dir.exists() {
-        return Ok(());
-    }
-
-    for name in &PLAN_FILE_NAMES {
-        let file_path = plans_dir.join(name);
-        if file_path.exists() && file_path.is_file() {
-            fs::remove_file(&file_path)
-                .map_err(|e| format!("删除计划文件 {:?} 失败: {e}", file_path))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Delete all plan files (plan.md, requirements.md, design.md, tasks.md, bugfix.md)
-/// from the `.MAIN/plans/` directory when the user explicitly requests cleanup.
+/// Clear the explicitly selected workspace or global session's saved plan files.
 #[tauri::command]
-fn delete_plan_files(state: State<WorkspaceState>) -> Result<(), String> {
-    let workspace = state.get_root()?;
-    let plans_dir = workspace.join(".MAIN").join("plans");
-    delete_plan_files_in_dir(&plans_dir)
+fn delete_plan_files(
+    app: AppHandle,
+    state: State<WorkspaceState>,
+    workspace: Option<String>,
+    chat_temp_session_key: Option<String>,
+    protected_turn_ids: Option<Vec<String>>,
+) -> Result<plan_documents::PlanFileCleanup, String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let protected = protected_turn_ids.as_deref().unwrap_or_default();
+    if let Some(session_key) = chat_temp_session_key {
+        if workspace.is_some()
+            || !session_key
+                .strip_prefix("__MAIN_GLOBAL_CHAT__:")
+                .is_some_and(|session_id| {
+                    !session_id.is_empty() && session_id.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        {
+            return Err("PLAN_DOCUMENT_OWNER_MISMATCH".into());
+        }
+        let legacy_plans = std::env::temp_dir()
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .join("MAIN")
+            .join(".tmp")
+            .join("chat-sessions")
+            .join(sanitize_session_key(&session_key))
+            .join(".MAIN")
+            .join("plans");
+        let app_data = app.path().app_data_dir().map_err(|error| error.to_string())?;
+        return plan_documents::cleanup_global_session(
+            &app_data,
+            &session_key,
+            &legacy_plans,
+            protected,
+        );
+    }
+    plan_documents::cleanup_workspace(&resolve_workspace_root(&state, workspace)?, protected)
 }
 
 // endregion
@@ -13299,18 +13055,21 @@ pub fn run() {
             proxy_request,
             proxy_request_detailed,
             cancel_proxy_request,
-            check_image_studio_engine,
-            proxy_image_studio_request,
-            cancel_image_studio_job,
-            save_image_studio_output,
-            save_image_studio_remote_output,
-            open_image_studio_output,
             start_chat_stream,
             cancel_chat_stream,
             read_document,
             analyze_tabular_document,
             query_tabular_document,
             index_workspace_documents,
+            save_plan_document,
+            read_plan_document,
+            list_plan_documents,
+            list_all_session_snapshots,
+            compare_and_swap_session_snapshot,
+            finalize_legacy_session_import,
+            list_legacy_session_files,
+            compare_and_swap_legacy_session_file,
+            cleanup_legacy_image_studio_outputs,
             knowledge_list_bases,
             knowledge_create_base,
             knowledge_set_base_enabled,
@@ -13373,7 +13132,7 @@ mod tests {
         authorize_proxy_redirect_hop, await_proxy_abortable_phase,
         browser_evaluate_supervisor_timeout, cancel_chat_stream, cancel_proxy_request,
         commit_project_init_in_workspace, compare_file_nodes, delete_path_within_workspace,
-        delete_plan_files_in_dir, delete_protocol_package_at, discover_agent_skills_in_root,
+        delete_protocol_package_at, discover_agent_skills_in_root,
         dispatch_chat_stream_worker,
         extract_protocol_package_in_workspace, find_entry_points, get_proxy_request_registry,
         get_stream_registry, glob_search_in_workspace, inspect_project_init_target_in_workspace,
@@ -13389,7 +13148,6 @@ mod tests {
         revalidate_write_path, run_cancellable_bounded_process, run_file_read_io,
         run_workspace_shell_command, should_emit_chat_stream_done,
         should_hide_list_directory_entry, should_skip_recursive_search_dir,
-        validate_image_studio_endpoint_for_engine, validate_image_studio_remote_image_url,
         validate_proxy_request_headers, validate_pty_input, ChatStreamLease, FileNode,
         ProxyPhaseError, ProxyRequestLease, EARLY_CANCELLED_PROXY_REQUEST_LIMIT,
         EARLY_CANCELLED_STREAM_LIMIT, PTY_TAIL_DEFAULT_CHARS,
@@ -13766,32 +13524,42 @@ mod tests {
         }
     }
 
+#[test]
+fn legacy_snapshot_enumeration_discovers_unlisted_owners_and_fails_closed_on_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let projects = temp.path().join("projects");
+    let owner = "/unlisted/project";
+    let project = projects.join(super::session_project_id(owner));
+    let session = project.join("sessions/s1");
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        session.join("session.json"),
+        serde_json::json!({"id":"s1","workspaceRoot":owner}).to_string(),
+    )
+    .unwrap();
+    let mut owners = std::collections::HashSet::new();
+    super::discover_legacy_session_owners(&projects, &mut owners).unwrap();
+    assert!(owners.contains(owner));
+    let unknown = projects
+        .join(super::session_project_id("/missing/meta"))
+        .join("sessions/s2");
+    fs::create_dir_all(&unknown).unwrap();
+    fs::write(unknown.join("messages.jsonl"), "{}\n").unwrap();
+    assert!(
+        super::discover_legacy_session_owners(&projects, &mut owners)
+            .unwrap_err()
+            .contains("legacy_session_owner_unresolved")
+    );
+    owners.insert("/missing/meta".into());
+    super::discover_legacy_session_owners(&projects, &mut owners).unwrap();
+}
+
     #[test]
     fn curl_fallback_treats_redirects_as_explicit_errors() {
         let output = "redirect body\n__HTTP_STATUS__:302".to_string();
         let error = parse_curl_status_output(output, "https://api.example.com/start")
             .expect_err("curl fallback must never silently accept a redirect");
         assert!(error.starts_with("HTTP 302:"));
-    }
-
-    #[test]
-    fn image_studio_local_exceptions_never_include_metadata_or_link_local_hosts() {
-        for endpoint in [
-            "http://169.254.169.254",
-            "http://[fe80::1]",
-            "http://224.0.0.1",
-        ] {
-            validate_image_studio_endpoint_for_engine("local_image_service", endpoint)
-                .expect_err(endpoint);
-            validate_image_studio_remote_image_url(&format!("{endpoint}/output.png"))
-                .expect_err(endpoint);
-        }
-
-        validate_image_studio_endpoint_for_engine(
-            "local_image_service",
-            "http://192.168.1.10:8188",
-        )
-        .expect("an explicit RFC1918 image service remains supported");
     }
 
     fn write_json_atomic(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
@@ -14294,7 +14062,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_plan_files_in_dir_removes_plan_md_and_legacy_artifacts() {
+    fn delete_plan_files_removes_plan_md_and_legacy_artifacts() {
         let workspace = make_temp_workspace("plan-cleanup");
         let plans_dir = workspace.join(".MAIN").join("plans");
         fs::create_dir_all(&plans_dir).unwrap();
@@ -14309,7 +14077,8 @@ mod tests {
         }
         fs::write(plans_dir.join("notes.md"), "# keep").unwrap();
 
-        delete_plan_files_in_dir(&plans_dir).unwrap();
+        let removed = super::plan_documents::cleanup_workspace(&workspace, &[]).unwrap();
+        assert_eq!(removed.removed_legacy_files, 5);
 
         for name in [
             "plan.md",
@@ -15643,4 +15412,70 @@ def global_function(x):
         assert!(listed.get("messages").is_none());
         assert!(listed.get("runtimeSnapshot").is_none());
     }
+    fn legacy_copy_fixture() -> (tempfile::TempDir, crate::session_store::SessionStore, crate::session_store::SessionKey, serde_json::Value, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(temp.path().join("sessions/session-store.sqlite3")).unwrap();
+        let key = crate::session_store::SessionKey { workspace: "/legacy-owner".into(), session_id: "s1".into() };
+        let snapshot = json!({"id":"s1","workspaceRoot":"/legacy-owner","messages":[{"type":"user","content":"ordinary retained"}],"runtimeSnapshot":{"conversationTurns":[]}});
+        store.compare_and_swap_session_snapshot(crate::session_store::CompareAndSwapSessionSnapshotRequest { key:key.clone(), expected_revision:0, snapshot:snapshot.clone(), updated_at_ms:1 }).unwrap();
+        let dir = temp.path().join("sessions/projects").join(super::session_project_id(&key.workspace)).join("sessions/s1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("messages.jsonl"), snapshot["messages"][0].to_string()+"\n").unwrap();
+        fs::write(dir.join("turns.jsonl"), "").unwrap();
+        fs::write(dir.join("runtime.json"), snapshot["runtimeSnapshot"].to_string()).unwrap();
+        fs::write(dir.join("session.json"), json!({"id":"s1","workspaceRoot":key.workspace}).to_string()).unwrap();
+        (temp, store, key, snapshot, dir)
+    }
+
+    #[test]
+    fn finalized_legacy_copy_is_removed_only_after_exact_native_snapshot_commit() {
+        let (temp, store, key, snapshot, dir) = legacy_copy_fixture();
+        fs::write(dir.join("user-export.txt"), "preserve unknown file").unwrap();
+        assert_eq!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&snapshot).unwrap(),4);
+        for name in ["session.json","messages.jsonl","turns.jsonl","runtime.json"] { assert!(!dir.join(name).exists()); }
+        assert_eq!(fs::read_to_string(dir.join("user-export.txt")).unwrap(),"preserve unknown file");
+        assert_eq!(store.get_session_snapshot(&key).unwrap().unwrap().snapshot,snapshot);
+        assert_eq!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&snapshot).unwrap(),0);
+    }
+
+    #[test]
+    fn finalized_legacy_copy_conflicts_and_missing_native_owners_preserve_original_bytes() {
+        let (temp, store, key, snapshot, dir) = legacy_copy_fixture();
+        assert!(super::finalize_legacy_session_copy(&store,temp.path(),&key,2,&snapshot).is_err());
+        let wrong_snapshot=json!({"id":"s1","messages":[]});
+        assert!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&wrong_snapshot).is_err());
+        let missing = crate::session_store::SessionKey { workspace:"/other-owner".into(),session_id:"s1".into() };
+        assert!(super::finalize_legacy_session_copy(&store,temp.path(),&missing,1,&snapshot).is_err());
+        fs::write(dir.join("session.json"),json!({"id":"s1","workspaceRoot":"/wrong-owner"}).to_string()).unwrap();
+        assert!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&snapshot).unwrap_err().contains("OWNER_MISMATCH"));
+        assert!(fs::read_to_string(dir.join("messages.jsonl")).unwrap().contains("ordinary retained"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalized_legacy_copy_never_follows_file_or_directory_symlinks() {
+        let (temp, store, key, snapshot, dir) = legacy_copy_fixture();
+        let outside=tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"),"ordinary export").unwrap();
+        fs::remove_file(dir.join("runtime.json")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("keep"),dir.join("runtime.json")).unwrap();
+        assert!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&snapshot).is_err());
+        assert!(dir.join("messages.jsonl").exists());
+        assert_eq!(fs::read_to_string(outside.path().join("keep")).unwrap(),"ordinary export");
+        fs::remove_file(dir.join("runtime.json")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(outside.path(),&dir).unwrap();
+        assert!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&snapshot).is_err());
+        assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
+    fn finalized_legacy_copy_keeps_divergent_ordinary_content_in_place() {
+        let (temp, store, key, snapshot, dir) = legacy_copy_fixture();
+        fs::write(dir.join("messages.jsonl"), "{\"type\":\"user\",\"content\":\"different ordinary history\"}\n").unwrap();
+        assert_eq!(super::finalize_legacy_session_copy(&store,temp.path(),&key,1,&snapshot).unwrap(),0);
+        assert!(fs::read_to_string(dir.join("messages.jsonl")).unwrap().contains("different ordinary history"));
+        assert!(dir.join("session.json").exists());
+    }
+
 }

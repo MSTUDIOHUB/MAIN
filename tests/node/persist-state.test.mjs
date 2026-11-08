@@ -68,7 +68,7 @@ const {
 );
 
 test("persist schema version is bumped for runtime payload slimming", () => {
-  assert.equal(LOCAL_PERSIST_SCHEMA_VERSION, 2);
+  assert.equal(LOCAL_PERSIST_SCHEMA_VERSION, 3);
 });
 
 test("retired Gemini ZIP extension metadata cannot restore or persist a hidden capability", () => {
@@ -107,12 +107,7 @@ test("external Skill source switches persist separately without removing individ
     { codex: true, claude: true, gemini: true, custom: true });
 });
 
-test("hydration drops stale Goal composer intent without changing other intents", () => {
-  assert.equal(sanitizeHydratedLockedComposerIntent("goal"), null);
-  assert.equal(sanitizeHydratedLockedComposerIntent("plan"), "plan");
-  assert.equal(sanitizeHydratedLockedComposerIntent("analyze"), "analyze");
-  assert.equal(sanitizeHydratedLockedComposerIntent(null), null);
-});
+
 
 test("buildPersistedAppState keeps lightweight config/session metadata only", () => {
   const persisted = buildPersistedAppState({
@@ -199,10 +194,10 @@ test("buildPersistedAppState keeps lightweight config/session metadata only", ()
     Object.prototype.hasOwnProperty.call(persisted.sessionsByWorkspace["/repo"][0], "messages"),
     false,
   );
-  assert.equal(persisted.imageStudio?.config?.endpoint, "https://hidream-ai-hidream-o1-image-dev.hf.space");
+  assert.equal(Object.hasOwn(persisted, "imageStudio"), false);
 });
 
-test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and stale session payloads", () => {
+test("stripLegacyRuntimeFieldsFromPersistedState removes live runtime keys while retaining legacy transcripts until native commit", () => {
   const stripped = stripLegacyRuntimeFieldsFromPersistedState({
     taskFlow: [{ id: 1 }],
     agentMessages: [{ role: "assistant", content: "x" }],
@@ -243,24 +238,17 @@ test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and 
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "gameStudioInitialized"), false);
   assert.equal(stripped.lockedComposerIntent, null);
   assert.deepEqual(stripped.sessionsByWorkspace, {
-    "/repo": [
-      {
-        id: 1,
-        title: "Persisted",
-        storageStatus: "ok",
-        recordingDisabled: false,
-      },
-    ],
+    "/repo": [{ id: 1, title: "Persisted", storageStatus: "ok", recordingDisabled: false,
+      messages: [{ id: 5 }], runtimeSnapshot: { taskFlow: [{ id: 5 }] }, _retirementMigrationPending: true }],
   });
+  const pendingWrite = buildPersistedAppState(stripped);
+  assert.deepEqual(pendingWrite.sessionsByWorkspace["/repo"][0].messages, [{ id: 5 }], "a crash before native commit must retain the original local transcript");
+  const { _retirementMigrationPending: _pending, ...committed } = stripped.sessionsByWorkspace["/repo"][0];
+  const afterCommit = buildPersistedAppState({ sessionsByWorkspace: { "/repo": [committed] } });
+  assert.equal(Object.hasOwn(afterCommit.sessionsByWorkspace["/repo"][0], "messages"), false);
 });
 
-test("legacy hydration preserves non-Goal composer intent", () => {
-  const stripped = stripLegacyRuntimeFieldsFromPersistedState({
-    lockedComposerIntent: "plan",
-  });
 
-  assert.equal(stripped.lockedComposerIntent, "plan");
-});
 
 test("stripSessionsByWorkspaceForLocalPersist keeps temporary recording-disabled sessions", () => {
   const sessions = stripSessionsByWorkspaceForLocalPersist({
@@ -339,4 +327,21 @@ test("invalid GitHub sources and sources attached to rules or legacy paths canno
     assert.equal(normalized.at(-2).type, "instruction");
     assert.equal(normalized.at(-1).packagePath, ".protocols/legacy");
   }
+});
+
+
+test("hydration drops stale Goal composer intent without changing other intents", () => {
+  assert.equal(sanitizeHydratedLockedComposerIntent("goal"), null);
+  assert.equal(sanitizeHydratedLockedComposerIntent("plan"), "plan");
+  assert.equal(sanitizeHydratedLockedComposerIntent("analyze"), "analyze");
+  assert.equal(sanitizeHydratedLockedComposerIntent(null), null);
+});
+
+
+test("legacy hydration preserves non-Goal composer intent", () => {
+  const stripped = stripLegacyRuntimeFieldsFromPersistedState({
+    lockedComposerIntent: "plan",
+  });
+
+  assert.equal(stripped.lockedComposerIntent, "plan");
 });

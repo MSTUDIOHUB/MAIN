@@ -31,6 +31,7 @@ export interface ApplySubmitVisibleTurnInput {
   admittedUserBlockId?: number;
   uiParentTurnId?: string | null;
   parentPlanTurnId?: string | null;
+  sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
   isInternalTurn: boolean;
   shouldExplicitlyReuseCurrentTurn: boolean;
   shouldAutoResumeChoiceTurn: boolean;
@@ -140,7 +141,9 @@ export function applySubmitVisibleTurn(
   }
   input.sessionSet({
     taskFlow: visibleTurnPatch.taskFlow,
-    conversationTurns: visibleTurnPatch.conversationTurns,
+    conversationTurns: input.sourcePlanDraft
+      ? visibleTurnPatch.conversationTurns.map(turn => turn.id === input.turnId ? { ...turn, sourcePlanDraft: input.sourcePlanDraft } : turn)
+      : visibleTurnPatch.conversationTurns,
   });
 
   const userBlock = visibleTurnPatch?.userBlock ?? null;

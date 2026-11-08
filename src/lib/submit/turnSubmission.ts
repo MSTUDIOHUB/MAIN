@@ -14,7 +14,6 @@ import {
 import {
   isExactUserChoiceResolutionIdentity,
   isMatchingUserChoiceResolution,
-  type ActionRequest,
   type UserChoiceResolutionIdentity,
 } from "../actionRequest";
 import {
@@ -76,6 +75,7 @@ import type {
   ReplyOption,
 } from "../workflowModels";
 import { selectRuntimeEngineVersionForNewTurn } from "../runtimeEngineSelection";
+import { createPlanLifecycleSessionEpoch } from "../planLifecycle";
 
 const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> = {
   respond: { zh: "回复", en: "Respond" },
@@ -85,8 +85,6 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   analyze: { zh: "分析", en: "Analyze" },
   summarize: { zh: "总结", en: "Summarize" },
   report: { zh: "报告", en: "Report" },
-  image_studio: { zh: "生成图片", en: "Generate Image" },
-  goal: { zh: "目标", en: "Goal" },
 };
 
 const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
@@ -97,8 +95,8 @@ const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
   "analyze",
   "summarize",
   "report",
-  "image_studio",
-  "goal",
+
+
 ]);
 
 export function isResolvedUserIntentChoice(choice: PendingRunDecisionChoice): choice is ResolvedUserIntent {
@@ -127,6 +125,7 @@ export function buildSubmitInputEnvelope(params: {
     : null;
   const mentionSnapshot = options.contextMentionsSnapshot ?? state.contextMentions;
   const attachedFilesSnapshot = options.attachedFilesSnapshot ?? state.attachedFiles;
+  const knowledgeReferencesSnapshot = options.knowledgeReferencesSnapshot || [];
   const remoteFeishu = options.remoteFeishu || (
     state.feishuLinkedSessionId === state.currentSessionId && state.feishuLinkedContext
       ? state.feishuLinkedContext
@@ -152,8 +151,9 @@ export function buildSubmitInputEnvelope(params: {
     uiParentTurnId,
     mentionSnapshot,
     attachedFilesSnapshot,
+    knowledgeReferencesSnapshot,
     remoteFeishu,
-    hasSupplementalInput: mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0,
+    hasSupplementalInput: mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0 || knowledgeReferencesSnapshot.length > 0,
     currentMainModeKey,
     languageResolutionInput,
     preferredLanguage,
@@ -276,9 +276,8 @@ export interface SubmitPipelineOptions {
    */
   submissionOriginSessionKey?: string;
   /** @deprecated Untrusted compatibility field. Store requires a one-shot continuation envelope. */
-  continueExistingGoal?: boolean;
-  /** One-shot user choice injected into the next Goal continuation contract. */
-  goalContinuationGuidance?: string;
+
+
 }
 
 export interface SubmitPipelineSnapshot {
@@ -305,9 +304,9 @@ export interface SubmitPipelineInput {
   images?: string[];
   options?: SubmitPipelineOptions;
   /** One-shot authorization consumed from the exact visible UI submission envelope. */
-  validatedVisibleGoalCreationAuthorization?: GoalCreationAuthorization | null;
+
   /** Authorization restored only after matching the current queued message id. */
-  validatedQueuedGoalCreationAuthorization?: GoalCreationAuthorization | null;
+
   snapshot: SubmitPipelineSnapshot;
   preferredLanguage?: "zh" | "en";
 }
@@ -319,6 +318,7 @@ export interface SubmitInputEnvelopeOptions {
   uiParentTurnId?: string;
   contextMentionsSnapshot?: string[];
   attachedFilesSnapshot?: Array<AttachedFile | string>;
+  knowledgeReferencesSnapshot?: readonly import("../knowledgeReferences").KnowledgeReference[];
   remoteFeishu?: FeishuRemoteContext;
 }
 
@@ -349,6 +349,7 @@ export interface SubmitInputEnvelope {
   uiParentTurnId: string | null;
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
+  knowledgeReferencesSnapshot: readonly import("../knowledgeReferences").KnowledgeReference[];
   remoteFeishu?: FeishuRemoteContext;
   hasSupplementalInput: boolean;
   currentMainModeKey: MainModeKey;
@@ -397,481 +398,9 @@ export interface SubmitShortcutDecision {
   mainDebugShortcut: ReturnType<typeof parseMainDebugShortcut> | null;
   mainIntentShortcut: ReturnType<typeof parseMainIntentShortcutForMode> | null;
   lockedComposerIntent: MainIntentShortcut | null;
-  /** One-shot authority minted only from this visible submission's explicit Goal UI. */
-  goalCreationAuthorization: GoalCreationAuthorization | null;
+
+
   textAfterIntentShortcut: string;
-}
-
-export interface GoalCreationAuthorization {
-  kind: "goal_creation_authorization";
-  intent: "goal";
-  source: "visible_goal_shortcut" | "visible_goal_composer_capsule";
-}
-
-export interface VisibleGoalSubmissionEnvelope {
-  kind: "visible_goal_submission_envelope";
-  id: string;
-}
-
-export interface GoalContinuationAuthorization {
-  kind: "goal_continuation_authorization";
-  source: "goal_user_choice" | "goal_manual_resume" | "goal_e2e_resume";
-  workspaceKey: string;
-  sessionKey: string;
-  goalId: string;
-  goalRevision: number;
-  ownerTurnId: string;
-  requestId?: string;
-}
-
-export interface GoalContinuationEnvelope {
-  kind: "goal_continuation_envelope";
-  id: string;
-}
-
-export function createGoalCreationAuthorization(
-  source: GoalCreationAuthorization["source"],
-): GoalCreationAuthorization {
-  return {
-    kind: "goal_creation_authorization",
-    intent: "goal",
-    source,
-  };
-}
-
-export function createGoalContinuationAuthorization(input: Omit<
-  GoalContinuationAuthorization,
-  "kind"
->): GoalContinuationAuthorization {
-  return {
-    kind: "goal_continuation_authorization",
-    ...input,
-    goalRevision: Math.max(1, Math.floor(Number(input.goalRevision) || 1)),
-    ...(String(input.requestId || "").trim()
-      ? { requestId: String(input.requestId).trim() }
-      : {}),
-  };
-}
-
-export function resolveVisibleGoalSubmissionSessionKey(input: {
-  currentWorkspace?: string | null;
-  currentSessionId?: number | null;
-}): string {
-  const workspaceKey = resolveSessionWorkspaceKey(input.currentWorkspace);
-  return resolveSessionRuntimeKey(workspaceKey, input.currentSessionId) ||
-    `workspace-only:${workspaceKey}`;
-}
-
-export function isGoalCreationAuthorization(value: unknown): value is GoalCreationAuthorization {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<GoalCreationAuthorization>;
-  return candidate.kind === "goal_creation_authorization" &&
-    candidate.intent === "goal" &&
-    (
-      candidate.source === "visible_goal_shortcut" ||
-      candidate.source === "visible_goal_composer_capsule"
-    );
-}
-
-export function isGoalContinuationAuthorization(
-  value: unknown,
-): value is GoalContinuationAuthorization {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<GoalContinuationAuthorization>;
-  const sourceValid = candidate.source === "goal_user_choice" ||
-    candidate.source === "goal_manual_resume" ||
-    candidate.source === "goal_e2e_resume";
-  const requestId = String(candidate.requestId || "").trim();
-  return candidate.kind === "goal_continuation_authorization" &&
-    sourceValid &&
-    !!String(candidate.workspaceKey || "").trim() &&
-    !!String(candidate.sessionKey || "").trim() &&
-    !!String(candidate.goalId || "").trim() &&
-    Number.isFinite(Number(candidate.goalRevision)) &&
-    Number(candidate.goalRevision) >= 1 &&
-    !!String(candidate.ownerTurnId || "").trim() &&
-    (candidate.source === "goal_user_choice" ? !!requestId : true);
-}
-
-export function validateGoalContinuationAuthorization(input: {
-  authorization?: unknown;
-  currentWorkspace?: string | null;
-  currentSessionId?: number | null;
-  activeGoal?: {
-    id: string;
-    revision?: number;
-    sessionKey?: string;
-    ownerTurnId?: string;
-    status?: string;
-  } | null;
-  activeActionRequest?: ActionRequest | null;
-}): GoalContinuationAuthorization | null {
-  if (!isGoalContinuationAuthorization(input.authorization) || !input.activeGoal) {
-    return null;
-  }
-  const authorization = input.authorization;
-  const workspaceKey = resolveSessionWorkspaceKey(input.currentWorkspace);
-  const sessionKey = resolveVisibleGoalSubmissionSessionKey(input);
-  const goal = input.activeGoal;
-  const goalSessionKey = String(goal.sessionKey || "").trim();
-  const continuationStatusMatches = authorization.source === "goal_user_choice"
-    ? goal.status === "awaiting_input" || goal.status === "paused"
-    : goal.status === "active" ||
-      goal.status === "paused" ||
-      goal.status === "awaiting_input" ||
-      goal.status === "blocked";
-  if (
-    !continuationStatusMatches ||
-    authorization.workspaceKey !== workspaceKey ||
-    authorization.sessionKey !== sessionKey ||
-    authorization.goalId !== goal.id ||
-    authorization.goalRevision !== Math.max(1, Number(goal.revision) || 1) ||
-    authorization.ownerTurnId !== String(goal.ownerTurnId || "").trim() ||
-    (
-      goalSessionKey &&
-      goalSessionKey !== sessionKey &&
-      goalSessionKey !== workspaceKey
-    )
-  ) {
-    return null;
-  }
-
-  const request = input.activeActionRequest;
-  if (authorization.source === "goal_user_choice") {
-    return request?.kind === "user_choice" &&
-      request.status === "pending" &&
-      request.requestId === authorization.requestId &&
-      request.sessionKey === authorization.sessionKey &&
-      request.turnId === authorization.ownerTurnId
-        ? authorization
-        : null;
-  }
-  if (authorization.source === "goal_manual_resume" && authorization.requestId) {
-    return request?.kind === "goal_confirmation" &&
-      request.status === "pending" &&
-      request.requestId === authorization.requestId &&
-      request.sessionKey === authorization.sessionKey &&
-      request.turnId === authorization.ownerTurnId &&
-      request.goalId === authorization.goalId &&
-      request.goalRevision === authorization.goalRevision
-        ? authorization
-        : null;
-  }
-  // A manual resume without a request identity cannot bypass a newer Goal
-  // confirmation that appeared after the envelope was captured.
-  if (
-    authorization.source === "goal_manual_resume" &&
-    request?.kind === "goal_confirmation" &&
-    request.status === "pending"
-  ) {
-    return null;
-  }
-  return authorization;
-}
-
-/**
- * Resolve Goal authority from the explicit controls visible at submit time.
- * A locked capsule wins over slash text just as it does in the submit pipeline;
- * hidden/internal submissions can never mint this authority.
- */
-export function resolveVisibleGoalCreationAuthorization(input: {
-  text: string;
-  isHidden?: boolean;
-  currentMainModeKey: MainModeKey;
-  lockedComposerIntent?: MainIntentShortcut | null;
-}): GoalCreationAuthorization | null {
-  if (input.isHidden) return null;
-  const mainDebugShortcut = input.currentMainModeKey === "main_mode"
-    ? parseMainDebugShortcut(input.text)
-    : null;
-  if (mainDebugShortcut) return null;
-
-  const modeScopedLockedComposerIntent =
-    input.lockedComposerIntent &&
-    isMainIntentShortcutAllowedInMainMode(
-      input.lockedComposerIntent,
-      input.currentMainModeKey,
-    )
-      ? input.lockedComposerIntent
-      : null;
-  if (modeScopedLockedComposerIntent) {
-    return modeScopedLockedComposerIntent === "goal"
-      ? createGoalCreationAuthorization("visible_goal_composer_capsule")
-      : null;
-  }
-
-  const mainIntentShortcut = parseMainIntentShortcutForMode(
-    input.text,
-    input.currentMainModeKey,
-  );
-  return mainIntentShortcut?.intent === "goal"
-    ? createGoalCreationAuthorization("visible_goal_shortcut")
-    : null;
-}
-
-export interface VisibleGoalSubmissionAuthorizationBroker {
-  capture(input: {
-    text: string;
-    sessionKey: string;
-    currentMainModeKey: MainModeKey;
-    lockedComposerIntent?: MainIntentShortcut | null;
-  }): VisibleGoalSubmissionEnvelope | null;
-  carryValidated(input: {
-    text: string;
-    sessionKey: string;
-    authorization: GoalCreationAuthorization;
-  }): VisibleGoalSubmissionEnvelope;
-  consume(input: {
-    envelope?: VisibleGoalSubmissionEnvelope | null;
-    text: string;
-    sessionKey: string;
-    isHidden?: boolean;
-  }): GoalCreationAuthorization | null;
-  /** Restore the exact consumed envelope when its enclosing admission rolls back. */
-  restoreConsumed(input: {
-    envelope?: VisibleGoalSubmissionEnvelope | null;
-    text: string;
-    sessionKey: string;
-    authorization: GoalCreationAuthorization;
-  }): boolean;
-}
-
-/**
- * Keeps the visible Goal decision alive across UI cleanup / next-paint
- * scheduling without making the authorization replayable. The opaque envelope
- * is bound to the exact text and session and is deleted on the first consume
- * attempt, including mismatches.
- */
-export function createVisibleGoalSubmissionAuthorizationBroker(options?: {
-  now?: () => number;
-  createId?: () => string;
-  ttlMs?: number;
-}): VisibleGoalSubmissionAuthorizationBroker {
-  const now = options?.now || (() => Date.now());
-  const createId = options?.createId || (() =>
-    `visible-goal-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
-  const ttlMs = Math.max(1, options?.ttlMs ?? 30_000);
-  const pending = new Map<string, {
-    text: string;
-    sessionKey: string;
-    authorization: GoalCreationAuthorization;
-    expiresAt: number;
-  }>();
-
-  const pruneExpired = (at: number) => {
-    for (const [id, entry] of pending) {
-      if (entry.expiresAt <= at) pending.delete(id);
-    }
-  };
-
-  const storeAuthorization = (input: {
-    text: string;
-    sessionKey: string;
-    authorization: GoalCreationAuthorization;
-    capturedAt: number;
-  }): VisibleGoalSubmissionEnvelope => {
-    const id = createId();
-    pending.set(id, {
-      text: input.text,
-      sessionKey: input.sessionKey,
-      authorization: input.authorization,
-      expiresAt: input.capturedAt + ttlMs,
-    });
-    return { kind: "visible_goal_submission_envelope", id };
-  };
-
-  return {
-    capture(input) {
-      const capturedAt = now();
-      pruneExpired(capturedAt);
-      const authorization = resolveVisibleGoalCreationAuthorization({
-        text: input.text,
-        currentMainModeKey: input.currentMainModeKey,
-        lockedComposerIntent: input.lockedComposerIntent,
-      });
-      if (!authorization) return null;
-      return storeAuthorization({
-        text: input.text,
-        sessionKey: input.sessionKey,
-        authorization,
-        capturedAt,
-      });
-    },
-    carryValidated(input) {
-      const capturedAt = now();
-      pruneExpired(capturedAt);
-      if (!isGoalCreationAuthorization(input.authorization)) {
-        throw new Error("Invalid Goal creation authorization carry");
-      }
-      return storeAuthorization({
-        ...input,
-        capturedAt,
-      });
-    },
-    consume(input) {
-      const consumedAt = now();
-      pruneExpired(consumedAt);
-      const envelope = input.envelope;
-      if (
-        !envelope ||
-        envelope.kind !== "visible_goal_submission_envelope" ||
-        !String(envelope.id || "").trim()
-      ) {
-        return null;
-      }
-
-      const entry = pending.get(envelope.id);
-      pending.delete(envelope.id);
-      if (
-        !entry ||
-        input.isHidden ||
-        entry.text !== input.text ||
-        entry.sessionKey !== input.sessionKey
-      ) {
-        return null;
-      }
-      return entry.authorization;
-    },
-    restoreConsumed(input) {
-      const restoredAt = now();
-      pruneExpired(restoredAt);
-      const envelope = input.envelope;
-      if (
-        !envelope ||
-        envelope.kind !== "visible_goal_submission_envelope" ||
-        !String(envelope.id || "").trim() ||
-        pending.has(envelope.id) ||
-        !isGoalCreationAuthorization(input.authorization)
-      ) {
-        return false;
-      }
-      pending.set(envelope.id, {
-        text: input.text,
-        sessionKey: input.sessionKey,
-        authorization: input.authorization,
-        expiresAt: restoredAt + ttlMs,
-      });
-      return true;
-    },
-  };
-}
-
-export interface GoalContinuationAuthorizationBroker {
-  issueValidated(input: {
-    text: string;
-    authorization: GoalContinuationAuthorization;
-  }): GoalContinuationEnvelope;
-  consume(input: {
-    envelope?: GoalContinuationEnvelope | null;
-    text: string;
-  }): GoalContinuationAuthorization | null;
-  /** Restore the exact consumed envelope when its enclosing admission rolls back. */
-  restoreConsumed(input: {
-    envelope?: GoalContinuationEnvelope | null;
-    text: string;
-    authorization: GoalContinuationAuthorization;
-  }): boolean;
-}
-
-export function createGoalContinuationAuthorizationBroker(options?: {
-  now?: () => number;
-  createId?: () => string;
-  ttlMs?: number;
-}): GoalContinuationAuthorizationBroker {
-  const now = options?.now || (() => Date.now());
-  const createId = options?.createId || (() =>
-    `goal-continuation-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
-  const ttlMs = Math.max(1, options?.ttlMs ?? 5 * 60_000);
-  const pending = new Map<string, {
-    text: string;
-    authorization: GoalContinuationAuthorization;
-    expiresAt: number;
-  }>();
-  const pruneExpired = (at: number) => {
-    for (const [id, entry] of pending) {
-      if (entry.expiresAt <= at) pending.delete(id);
-    }
-  };
-
-  return {
-    issueValidated(input) {
-      if (!isGoalContinuationAuthorization(input.authorization)) {
-        throw new Error("Invalid Goal continuation authorization");
-      }
-      const issuedAt = now();
-      pruneExpired(issuedAt);
-      const id = createId();
-      pending.set(id, {
-        text: input.text,
-        authorization: input.authorization,
-        expiresAt: issuedAt + ttlMs,
-      });
-      return { kind: "goal_continuation_envelope", id };
-    },
-    consume(input) {
-      const consumedAt = now();
-      pruneExpired(consumedAt);
-      const envelope = input.envelope;
-      if (
-        !envelope ||
-        envelope.kind !== "goal_continuation_envelope" ||
-        !String(envelope.id || "").trim()
-      ) {
-        return null;
-      }
-      const entry = pending.get(envelope.id);
-      pending.delete(envelope.id);
-      return entry && entry.text === input.text ? entry.authorization : null;
-    },
-    restoreConsumed(input) {
-      const restoredAt = now();
-      pruneExpired(restoredAt);
-      const envelope = input.envelope;
-      if (
-        !envelope ||
-        envelope.kind !== "goal_continuation_envelope" ||
-        !String(envelope.id || "").trim() ||
-        pending.has(envelope.id) ||
-        !isGoalContinuationAuthorization(input.authorization)
-      ) {
-        return false;
-      }
-      pending.set(envelope.id, {
-        text: input.text,
-        authorization: input.authorization,
-        expiresAt: restoredAt + ttlMs,
-      });
-      return true;
-    },
-  };
-}
-
-export function resolveQueuedGoalCreationAuthorization(input: {
-  queuedMessageId?: string | null;
-  replayMessageId?: string | null;
-  queuedText?: string | null;
-  replayText?: string | null;
-  queuedSessionKey?: string | null;
-  replaySessionKey?: string | null;
-  authorization?: unknown;
-}): GoalCreationAuthorization | null {
-  if (!isExactQueuedMessageReplay(input)) return null;
-  return isGoalCreationAuthorization(input.authorization) ? input.authorization : null;
-}
-
-export function resolveQueuedGoalContinuationAuthorization(input: {
-  queuedMessageId?: string | null;
-  replayMessageId?: string | null;
-  queuedText?: string | null;
-  replayText?: string | null;
-  queuedSessionKey?: string | null;
-  replaySessionKey?: string | null;
-  authorization?: unknown;
-}): GoalContinuationAuthorization | null {
-  if (!isExactQueuedMessageReplay(input)) return null;
-  return isGoalContinuationAuthorization(input.authorization)
-    ? input.authorization
-    : null;
 }
 
 export function isExactQueuedMessageReplay(input: {
@@ -930,8 +459,8 @@ export interface SubmitEffectiveIntentInput {
   mainDebugShortcut: ReturnType<typeof parseMainDebugShortcut> | null;
   mainIntentShortcut: ReturnType<typeof parseMainIntentShortcutForMode> | null;
   lockedComposerIntent: MainIntentShortcut | null;
-  goalCreationAuthorization?: GoalCreationAuthorization | null;
-  goalContinuationAuthorization?: GoalContinuationAuthorization | null;
+
+
   currentTurn: Pick<ConversationTurn, "userPrompt"> | null;
   currentTurnIntent: ResolvedRunIntent;
   shouldContinuePlanIntent: boolean;
@@ -1130,6 +659,7 @@ export interface SubmitSendGateDecision {
 
 export interface SubmitSessionBootstrapSession {
   id: number;
+  planLifecycleEpoch: string;
   title: string;
   titleSource: "default";
   date: string;
@@ -1452,22 +982,12 @@ export function resolveSubmitEffectiveIntentDecision(
     (shouldContinuePlanIntent ? "plan" : null) ||
     (shouldContinuePreviousTurnIntent && previousTurnContinuationIntent ? previousTurnContinuationIntent : null) ||
     (shouldReuseExistingTurnIntent ? currentTurnIntent : fallbackRunIntent);
-  // Goal is the only intent that creates a durable autonomous runtime. An
-  // inferred/inherited intent or an internal resolvedIntent must not mint that
-  // runtime. Existing Goal continuations carry their own explicit contract.
-  if (
-    effectiveRunIntent === "goal" &&
-    !isGoalContinuationAuthorization(input.goalContinuationAuthorization) &&
-    !isGoalCreationAuthorization(input.goalCreationAuthorization)
-  ) {
-    effectiveRunIntent = "execute";
-  }
+
   let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
   let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
 
   if (
     shouldExecuteOnceFromReplyOption &&
-    !isGoalContinuationAuthorization(input.goalContinuationAuthorization) &&
     effectiveRunIntent !== "execute"
   ) {
     effectiveRunIntent = "execute";
@@ -1603,27 +1123,16 @@ export function resolveSubmitRuntimeDecision(params: {
   executionConsentGranted?: boolean;
   shouldExecuteOnceFromReplyOption: boolean;
   preservePlanState: boolean;
-  goalCreationAuthorization?: GoalCreationAuthorization | null;
-  goalContinuationAuthorization?: GoalContinuationAuthorization | null;
+
+
   /** A reserved Plan attempt must not inherit generic auto-approval. */
   requiresPlanExecutionAdmission?: boolean;
 }): SubmitRuntimeDecision {
-  // The exact, one-shot Goal continuation capability is itself runtime
-  // authority. Replays (for example after a failed history clear) must not
-  // silently fall back to a chat/respond runtime merely because the caller did
-  // not duplicate that authority as a runtimeIntentOverride.
-  const requestedRuntimeRunIntent =
-    isGoalContinuationAuthorization(params.goalContinuationAuthorization)
-      ? "goal"
-      : params.runtimeIntentOverride ||
+  const requestedRuntimeRunIntent = params.runtimeIntentOverride ||
     (params.shouldExecuteOnceFromReplyOption && params.effectiveRunIntent !== "plan"
       ? "execute"
       : params.effectiveRunIntent);
-  const runtimeRunIntent = requestedRuntimeRunIntent === "goal" &&
-    !isGoalCreationAuthorization(params.goalCreationAuthorization) &&
-    !isGoalContinuationAuthorization(params.goalContinuationAuthorization)
-      ? "execute"
-      : requestedRuntimeRunIntent;
+  const runtimeRunIntent = requestedRuntimeRunIntent;
   const effectiveDisplayIntent: ResolvedRunIntent =
     params.effectiveRunIntent === "plan" && runtimeRunIntent === "execute"
       ? "execute"
@@ -1686,6 +1195,7 @@ export function buildSubmitSessionBootstrapDecision(params: {
       ? null
       : {
           id: ensuredSessionId,
+          planLifecycleEpoch: createPlanLifecycleSessionEpoch(params.autoSessionNowMs),
           title: autoSessionTitle,
           titleSource: "default",
           date: autoSessionDate,
@@ -2012,8 +1522,8 @@ export function resolveSubmitPreflightResultDecision(params: {
   const preflightSuggestsOperation = preflight?.intent === "execute";
   if (!preflight) {
     const reason = preferredLanguage === "en"
-      ? "MAIN could not interpret this request. Retry or select a mode; no tools have run."
-      : "MAIN 未能解析这条请求。请重试或选择模式；尚未执行工具。";
+      ? "MAIN could not interpret this request. Retry or choose how to handle it below; no tools have run."
+      : "MAIN 未能解析这条请求。请重试或在下方选择处理方式；尚未执行工具。";
     return {
       kind: "ask_user_choice",
       pendingRunDecision: buildSubmitIntentConfirmationPendingDecision({
@@ -3144,8 +2654,8 @@ export function resolveSubmitShortcutDecision(input: {
   currentMainModeKey: MainModeKey;
   hasWorkspace?: boolean;
   lockedComposerIntent?: MainIntentShortcut | null;
-  validatedVisibleGoalCreationAuthorization?: GoalCreationAuthorization | null;
-  validatedQueuedGoalCreationAuthorization?: GoalCreationAuthorization | null;
+
+
   isQueuedReplay?: boolean;
 }): SubmitShortcutDecision {
   const mainDebugShortcut = !input.isHidden && input.currentMainModeKey === "main_mode"
@@ -3165,41 +2675,12 @@ export function resolveSubmitShortcutDecision(input: {
   const directLockedComposerIntent = !input.isHidden && !mainDebugShortcut
     ? modeScopedLockedComposerIntent || mainIntentShortcut?.intent || null
     : null;
-  // Raw /goal text is self-authenticating at the submit boundary. A capsule is
-  // not: Store callers unrelated to the composer can observe the same global
-  // lock, so capsule authority must arrive through the one-shot visible
-  // envelope captured by the UI event.
-  const directGoalCreationAuthorization =
-    input.hasWorkspace !== false &&
-    !input.isHidden &&
-    !input.isQueuedReplay &&
-    !mainDebugShortcut &&
-    mainIntentShortcut?.intent === "goal" &&
-    (!modeScopedLockedComposerIntent || modeScopedLockedComposerIntent === "goal")
-      ? createGoalCreationAuthorization("visible_goal_shortcut")
-      : null;
-  const capturedVisibleGoalCreationAuthorization = input.hasWorkspace !== false &&
-    !input.isHidden &&
-    !input.isQueuedReplay &&
-    isGoalCreationAuthorization(input.validatedVisibleGoalCreationAuthorization)
-      ? input.validatedVisibleGoalCreationAuthorization
-      : null;
-  const replayedGoalCreationAuthorization = input.hasWorkspace !== false &&
-    !input.isHidden &&
-    isGoalCreationAuthorization(input.validatedQueuedGoalCreationAuthorization)
-      ? input.validatedQueuedGoalCreationAuthorization
-      : null;
-  const carriedGoalCreationAuthorization =
-    capturedVisibleGoalCreationAuthorization || replayedGoalCreationAuthorization;
-  const lockedComposerIntent = directLockedComposerIntent ||
-    (carriedGoalCreationAuthorization ? "goal" : null);
-  const goalCreationAuthorization: GoalCreationAuthorization | null =
-    directGoalCreationAuthorization || carriedGoalCreationAuthorization;
+  const lockedComposerIntent = directLockedComposerIntent;
   return {
     mainDebugShortcut,
     mainIntentShortcut,
     lockedComposerIntent,
-    goalCreationAuthorization,
+
     textAfterIntentShortcut,
   };
 }
@@ -3253,8 +2734,8 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     hasWorkspace:
       resolveSessionWorkspaceKey(snapshot.currentWorkspace) !== GLOBAL_CHAT_KEY,
     lockedComposerIntent: snapshot.lockedComposerIntent,
-    validatedVisibleGoalCreationAuthorization: input.validatedVisibleGoalCreationAuthorization,
-    validatedQueuedGoalCreationAuthorization: input.validatedQueuedGoalCreationAuthorization,
+
+
     isQueuedReplay: !!options.queuedUserMessageId,
   });
   const hasSupplementalInput =

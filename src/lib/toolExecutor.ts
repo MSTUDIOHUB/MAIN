@@ -54,6 +54,7 @@ import {
 } from "./toolCapabilities";
 import { getShellToolCwd } from "./toolExecutionContract";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
+import { builtInToolRequiresWorkspace } from "./workspaceToolScope";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
@@ -109,16 +110,6 @@ function parseOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-function parseOptionalStringList(value: unknown): string[] | undefined {
-  if (Array.isArray(value)) {
-    const items = value.map((item) => String(item || "").trim()).filter(Boolean);
-    return items.length > 0 ? items : undefined;
-  }
-  if (typeof value !== "string") return undefined;
-  const items = value.split(",").map((item) => item.trim()).filter(Boolean);
-  return items.length > 0 ? items : undefined;
-}
-
 const LOCAL_FILE_READ_TOOLS = new Set([
   "read_file",
   "read_document",
@@ -131,37 +122,6 @@ const GLOBAL_CHAT_CONTEXT_READ_TOOLS = new Set([
   "read_document",
   "analyze_tabular_document",
   "query_tabular_document",
-]);
-
-const WORKSPACE_REQUIRED_TOOL_NAMES = new Set([
-  "list_directory",
-  "glob_search",
-  "grep_search",
-  "repo_map_status",
-  "repo_map_search",
-  "repo_map_context",
-  "repo_map_files",
-  "repo_map_impact",
-  "code_ast_query",
-  "find_symbol_references",
-  "get_project_skeleton",
-  "get_file_outline",
-  "index_workspace_documents",
-  "replace_in_file",
-  "write_file",
-  "apply_patch",
-  "git_status",
-  "git_diff",
-  "delete_workspace_path",
-  "run_command",
-  "browser_evaluate",
-  "computer_use",
-  "execute_command",
-  "send_pty_input",
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
 ]);
 
 function isMissingPtySessionError(error: unknown): boolean {
@@ -232,7 +192,7 @@ function assertWorkspaceAvailableForTool(
 ): void {
   if (workspace.trim()) return;
   if (isGlobalChatContextReadToolCall(name, args, sessionKey)) return;
-  if (!WORKSPACE_REQUIRED_TOOL_NAMES.has(name) && !GLOBAL_CHAT_CONTEXT_READ_TOOLS.has(name)) return;
+  if (!builtInToolRequiresWorkspace(name) && !GLOBAL_CHAT_CONTEXT_READ_TOOLS.has(name)) return;
   throw new Error(
     `WORKSPACE_REQUIRED_FOR_TOOL: ${name} requires an active workspace. Global Chat can only read explicitly attached chat files; open a project conversation or attach/@ a specific file first.`,
   );
@@ -275,6 +235,8 @@ export interface ToolExecutionOptions {
   shellPermissionApproval?: ShellPermissionApproval;
   toolCatalog?: ToolCatalog;
   skillCatalog?: SkillCatalogSnapshot | null;
+  /** Captured message scope; model-supplied kb/source ids cannot widen it. */
+  knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
 }
 
 async function prepareExternalLocalReadArgs(
@@ -914,7 +876,7 @@ export async function executeTool(
       if (!query) throw new Error("Missing required parameter 'query'.");
       return await knowledgeSearch(
         query,
-        parseOptionalStringList(args.kb_ids ?? args.kbIds),
+        [...(options.knowledgeReferences || [])],
         parseOptionalNumber(args.limit),
       );
     }
@@ -924,7 +886,7 @@ export async function executeTool(
       const chunkId = parseOptionalString(args.chunk_id ?? args.chunkId);
       if (!sourceId) throw new Error("Missing required parameter 'source_id'.");
       if (!chunkId) throw new Error("Missing required parameter 'chunk_id'.");
-      return await knowledgeGetExcerpt(sourceId, chunkId);
+      return await knowledgeGetExcerpt(sourceId, chunkId, [...(options.knowledgeReferences || [])]);
     }
 
     case "replace_in_file": {

@@ -1,5 +1,4 @@
 import type { GitDiffEntry, ShellPermissionDecision } from "./ipc";
-import type { ImageGenerationBlockPayload } from "./imageStudio";
 import type { ProgressNarration } from "./progressNarration";
 import type { TurnRuntimePhase } from "./turnPhase";
 import type { UserContextItem } from "./userContextItems";
@@ -156,7 +155,6 @@ export type TaskBlock =
       escalationReason?: string;
       failedAttempts?: Array<{ content: string; reasoning?: string; reason: string; timestamp: number }>;
     })
-  | (TaskBlockBase & ImageGenerationBlockPayload)
   | ProgressTaskBlock
   | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number; originalChars?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })

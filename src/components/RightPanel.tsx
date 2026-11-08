@@ -15,6 +15,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
+import PlanDocumentCard from "./PlanDocumentCard";
+import { continuePlanDraft } from "../store/planDraftContinuation";
+import { resolvePlanDocumentFromAggregate, resolvePlanDraftFromAggregate, resolveSessionPlanDocument } from "../lib/planDocumentRecords";
+import { samePlanDocumentRef } from "../lib/planDocuments";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EQuickReplyHandler, getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
@@ -1059,6 +1063,25 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     resolveSessionWorkspaceKey(currentWorkspace),
     currentSessionId,
   );
+  const activeSessionEpoch = useAppStore((state) => {
+    const workspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
+    const session = (state.sessionsByWorkspace[workspaceKey] || []).find(candidate => candidate.id === currentSessionId);
+    return session?.planLifecycleEpoch || (state.planLifecycle.sessionKey === activeSessionKey ? state.planLifecycle.sessionEpoch : null);
+  });
+  const versionedPlanTurn = useMemo(() => resolveSessionPlanDocument(conversationTurns, {
+    sessionKey: activeSessionKey, sessionEpoch: activeSessionEpoch,
+  }), [activeSessionKey, activeSessionEpoch, conversationTurns]);
+  const versionedPlanRef = versionedPlanTurn?.planDocument;
+  const versionedPlanAggregate = useMemo(() => versionedPlanTurn ? normalizeRuntimeV2Checkpoint(
+    runtimeV2Checkpoints[versionedPlanTurn.id], {
+      turnId: versionedPlanTurn.id, sessionKey: activeSessionKey ?? undefined, sessionEpoch: activeSessionEpoch ?? undefined,
+    },
+  )?.aggregate : null, [activeSessionEpoch, activeSessionKey, runtimeV2Checkpoints, versionedPlanTurn]);
+  const versionedPlanDocument = useMemo(() => resolvePlanDocumentFromAggregate(versionedPlanAggregate), [versionedPlanAggregate]);
+  const versionedDraft = useMemo(() => {
+    const draft = resolvePlanDraftFromAggregate(versionedPlanAggregate);
+    return draft && samePlanDocumentRef(draft.documentRef, versionedPlanRef) ? draft : null;
+  }, [versionedPlanAggregate, versionedPlanRef]);
   const latestPlanEntry = useMemo(() => {
     const entries = conversationTurns.map((turn) => ({
       turn,
@@ -1108,9 +1131,11 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         runtimeV2Checkpoints[latestPlanTurn.id],
         { turnId: latestPlanTurn.id },
       );
-      return resolveRuntimeV2PlanReviewFromAggregate(checkpoint?.aggregate);
+      const review = resolveRuntimeV2PlanReviewFromAggregate(checkpoint?.aggregate);
+      return review && (review.pending || !versionedPlanRef || samePlanDocumentRef(review.commit.artifact.documentRef, versionedPlanRef))
+        ? review : null;
     },
-    [latestPlanTurn, runtimeV2Checkpoints],
+    [latestPlanTurn, runtimeV2Checkpoints, versionedPlanRef],
   );
   const legacyPlanApprovalIdentity = buildTypedPlanApprovalIdentity(planArtifacts);
   const planApprovalIdentity = runtimeV2PlanReview
@@ -1145,7 +1170,13 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasMatchingPlanActionOwner &&
     !!planApprovalIdentity &&
     activeActionRequest.planRevision === planApprovalIdentity.revision &&
-    activeActionRequest.artifactHash === planApprovalIdentity.artifactHash;
+    activeActionRequest.artifactHash === planApprovalIdentity.artifactHash &&
+    (!activeActionRequest.documentRef || (
+      runtimeV2PlanReview?.pending === true &&
+      activeActionRequest.requestId === runtimeV2PlanReview.commit.review.requestId &&
+      activeActionRequest.sessionEpoch === runtimeV2PlanReview.commit.review.sessionEpoch &&
+      samePlanDocumentRef(activeActionRequest.documentRef, runtimeV2PlanReview.commit.artifact.documentRef)
+    ));
   const hasMatchingPlanChoiceRequest =
     activeActionRequest?.kind === "user_choice" &&
     hasMatchingPlanActionOwner;
@@ -1316,6 +1347,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   };
   const hasPlanPanelContent =
     !!runtimeV2PlanReview ||
+    !!versionedPlanRef ||
     planArtifacts.length > 0 ||
     fallbackPlanPreview.length > 0;
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
@@ -1359,9 +1391,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     return {
       icon: IconFileText,
       title: language === "zh" ? "计划工作区" : "Plan Workspace",
-      description: latestPlanTurn?.title || (language === "zh" ? "在这里查看计划预览、审批状态和执行进度。" : "Review plan previews, approval state, and execution progress here."),
+      description: (!runtimeV2PlanReview ? versionedPlanRef?.title : null) || latestPlanTurn?.title || (language === "zh" ? "在这里查看计划预览、审批状态和执行进度。" : "Review plan previews, approval state, and execution progress here."),
     };
-  }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, subagentRuns.length, viewedDiffTask?.target]);
+  }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, runtimeV2PlanReview, subagentRuns.length, versionedPlanRef?.title, viewedDiffTask?.target]);
 
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
   const isBlackTheme = config.themeMode === "black";
@@ -1468,6 +1500,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                       ? language === "zh" ? "失败" : "Failed"
                       : planPresentationBehavior.mode === "no_action"
                       ? language === "zh" ? "未执行" : "No Action"
+                      : versionedDraft
+                      ? language === "zh" ? "草稿" : "Draft"
+                      : versionedPlanRef
+                      ? language === "zh" ? "已保存" : "Saved"
                       : planArtifacts.length > 0
                       ? language === "zh" ? "已同步" : "Synced"
                       : fallbackPlanPreview
@@ -1507,6 +1543,14 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
 
         <div className="min-h-0 flex-1 overflow-hidden">
           {rightPanelTab === "plan" && hasPlanPanelContent && (
+            !runtimeV2PlanReview && versionedPlanRef ? (
+              <div data-testid="versioned-plan-panel" className="h-full overflow-y-auto px-4 pb-5">
+                <PlanDocumentCard reference={versionedPlanRef} draft={versionedDraft} language={language}
+                  inlineMarkdown={versionedPlanDocument && samePlanDocumentRef(versionedPlanDocument.documentRef, versionedPlanRef) ? versionedPlanDocument.markdown : undefined}
+                  continuationDisabled={agentStatus !== "idle" || isGenerating || activeActionRequest?.status === "pending"}
+                  onCompleteValidation={versionedDraft ? async (supplement) => (await continuePlanDraft({ get: useAppStore.getState, record: versionedDraft, supplement })).accepted : undefined} />
+              </div>
+            ) : (
             <PlanPanel
               presentation={planPresentation}
               runtimeV2Review={runtimeV2PlanReview?.commit.panel || null}
@@ -1547,7 +1591,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                   void rejectPlanAndDeleteFiles(planReviewResolutionIdentity);
                 }
               }}
-            />
+            />)
           )}
 
           {rightPanelTab === "diff" && (

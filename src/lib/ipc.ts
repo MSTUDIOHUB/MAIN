@@ -2,7 +2,12 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { KnowledgeReference } from "./knowledgeReferences";
+export type { KnowledgeReference } from "./knowledgeReferences";
+import type { PlanDocumentRef, PlanDocumentScope, SavePlanDocumentInput } from "./planDocuments";
+export type { PlanDocumentOwner, PlanDocumentRef, PlanDocumentScope, SavePlanDocumentInput } from "./planDocuments";
 import type { GithubSkillSource } from "./githubSkillSource";
+import type { WebSearchProvider } from "./networkRead";
 import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
 import {
   createProjectSessionMutationCoordinator,
@@ -458,6 +463,7 @@ export interface KnowledgeBase {
   sourceCount: number;
   indexStatus: string;
   embeddingProfile: string;
+  indexRevision: string;
   createdAtMs: number;
   updatedAtMs: number;
 }
@@ -474,6 +480,7 @@ export interface KnowledgeSource {
   status: string;
   metadata: Record<string, unknown> | null;
   lastIndexedAtMs: number;
+  sourceRevision: string;
 }
 
 export interface KnowledgeCitation {
@@ -485,12 +492,20 @@ export interface KnowledgeCitation {
   page?: number | null;
   block?: string | null;
   score: number;
+  indexRevision: string;
+  sourceRevision: string;
+  sourceUrl?: string | null;
 }
 
 export interface KnowledgeSearchHit {
   text: string;
   excerpt: string;
   citation: KnowledgeCitation;
+  returnedCharRange: { start: number; end: number };
+  totalChars: number;
+  complete: boolean;
+  retrievalKind: "lexical_match" | "source_overview" | "source_excerpt";
+  sourceOverview?: { totalChunks: number; totalChars: number; nextChunkId?: string | null } | null;
 }
 
 export interface KnowledgeSearchResult {
@@ -930,40 +945,7 @@ export interface AttachmentIngestResult {
   sizeBytes: number;
 }
 
-export interface ImageStudioEngineCheckResult {
-  ready: boolean;
-  message: string;
-  capabilities?: Record<string, unknown>;
-}
-
-export interface ImageStudioProxyRequestInput {
-  engine?: string;
-  endpoint: string;
-  path: string;
-  method: "GET" | "POST" | "DELETE";
-  body?: string;
-  streamId?: string;
-}
-
-export interface ImageStudioProxyResponse {
-  status: number;
-  ok: boolean;
-  body: string;
-  contentType?: string | null;
-}
-
-export interface ImageStudioStreamChunkPayload {
-  streamId: string;
-  chunk: string;
-}
-
-export interface ImageStudioStreamDonePayload {
-  streamId: string;
-  status: "ok" | "error" | "cancelled";
-  error?: string | null;
-}
-
-export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
+export type { WebSearchProvider } from "./networkRead";
 
 export interface WebSearchResultItem {
   title: string;
@@ -1202,43 +1184,69 @@ export function readAttachmentImageDataUrl(sourcePath: string): Promise<string> 
   return invoke<string>("read_attachment_image_data_url", { sourcePath });
 }
 
-export function checkImageStudioEngine(config: { engine: string; endpoint: string }): Promise<ImageStudioEngineCheckResult> {
-  return invoke<ImageStudioEngineCheckResult>("check_image_studio_engine", {
-    engine: config.engine,
-    endpoint: config.endpoint,
-  });
+export interface ProjectSessionSnapshotRecord {
+  workspace: string;
+  sessionId: string;
+  revision: number;
+  snapshot: Record<string, unknown>;
+  updatedAtMs: number;
 }
 
-export function proxyImageStudioRequest(input: ImageStudioProxyRequestInput): Promise<ImageStudioProxyResponse> {
-  return invoke<ImageStudioProxyResponse>("proxy_image_studio_request", input as unknown as Record<string, unknown>);
+/** Full maintenance enumeration, including known legacy project owners. */
+export function listAllSessionSnapshots(knownWorkspaces?: readonly string[]): Promise<ProjectSessionSnapshotRecord[]> {
+  return invoke<ProjectSessionSnapshotRecord[]>("list_all_session_snapshots", { knownWorkspaces });
 }
 
-export function cancelImageStudioJob(): Promise<void> {
-  return invoke<void>("cancel_image_studio_job");
+/** Exact CAS; deliberately bypasses autosave revision reconciliation. */
+export function compareAndSwapSessionSnapshot(input: {
+  workspace: string;
+  sessionId: string;
+  expectedRevision: number;
+  snapshot: Record<string, unknown>;
+  mutationDeadlineMs?: number;
+}): Promise<ProjectSessionSnapshotRecord> {
+  return invoke<ProjectSessionSnapshotRecord>("compare_and_swap_session_snapshot", { input });
 }
 
-export function saveImageStudioOutput(sessionKey: string, fileName: string, dataUrl: string): Promise<string> {
-  return invoke<string>("save_image_studio_output", { sessionKey, fileName, dataUrl });
+export interface LegacySessionFile {
+  workspace: string;
+  sessionId: string;
+  fileName: "session.json" | "messages.jsonl" | "turns.jsonl" | "runtime.json";
+  contentHash: string;
+  value: unknown;
+}
+export function listLegacySessionFiles(knownWorkspaces?: readonly string[]): Promise<LegacySessionFile[]> {
+  return invoke("list_legacy_session_files", { knownWorkspaces });
+}
+export function compareAndSwapLegacySessionFile(input: Omit<LegacySessionFile, "contentHash"> & { expectedHash: string }): Promise<string> {
+  return invoke("compare_and_swap_legacy_session_file", { input });
 }
 
-export function saveImageStudioRemoteOutput(sessionKey: string, fileName: string, imageUrl: string): Promise<string> {
-  return invoke<string>("save_image_studio_remote_output", { sessionKey, fileName, imageUrl });
+/** Reclaim only exact imported app-owned legacy copies after their SQLite CAS. */
+export function finalizeLegacySessionImport(input: {
+  workspace: string;
+  sessionId: string;
+  expectedRevision: number;
+  expectedSnapshot: Record<string, unknown>;
+}): Promise<number> {
+  return invoke<number>("finalize_legacy_session_import", { input });
 }
 
-export function openImageStudioOutput(path: string): Promise<OpenFileExternalResult> {
-  return invoke<OpenFileExternalResult>("open_image_studio_output", { path });
+/** Only the retired feature's trusted temp folders; accepts no filesystem path. */
+export function cleanupLegacyImageStudioOutputs(): Promise<{ removedDirectories: number }> {
+  return invoke("cleanup_legacy_image_studio_outputs");
 }
 
-export function listenImageStudioStreamChunk(
-  handler: (payload: ImageStudioStreamChunkPayload) => void,
-): Promise<UnlistenFn> {
-  return listen<ImageStudioStreamChunkPayload>("image-studio-stream-chunk", (event) => handler(event.payload));
+export function savePlanDocument(input: SavePlanDocumentInput): Promise<PlanDocumentRef> {
+  return invoke<PlanDocumentRef>("save_plan_document", { input });
 }
 
-export function listenImageStudioStreamDone(
-  handler: (payload: ImageStudioStreamDonePayload) => void,
-): Promise<UnlistenFn> {
-  return listen<ImageStudioStreamDonePayload>("image-studio-stream-done", (event) => handler(event.payload));
+export function readPlanDocument(reference: PlanDocumentRef): Promise<PlanDocumentRef & { markdown: string }> {
+  return invoke("read_plan_document", { reference });
+}
+
+export function listPlanDocuments(scope: PlanDocumentScope): Promise<PlanDocumentRef[]> {
+  return invoke<PlanDocumentRef[]>("list_plan_documents", { scope });
 }
 
 export function deleteWorkspacePath(path: string, workspace?: string): Promise<void> {
@@ -1549,19 +1557,21 @@ export function knowledgeRebuildBase(kbId: string): Promise<KnowledgeBase> {
   return invoke<KnowledgeBase>("knowledge_rebuild_base", { kbId });
 }
 
+/** Only frozen selections from this message may authorize a search. */
 export function knowledgeSearch(
   query: string,
-  kbIds?: string[],
+  references: readonly KnowledgeReference[],
   limit?: number,
 ): Promise<KnowledgeSearchResult> {
-  return invoke<KnowledgeSearchResult>("knowledge_search", { query, kbIds, limit });
+  return invoke<KnowledgeSearchResult>("knowledge_search", { query, references, limit });
 }
 
 export function knowledgeGetExcerpt(
   sourceId: string,
   chunkId: string,
+  references: readonly KnowledgeReference[],
 ): Promise<KnowledgeSearchHit | null> {
-  return invoke<KnowledgeSearchHit | null>("knowledge_get_excerpt", { sourceId, chunkId });
+  return invoke<KnowledgeSearchHit | null>("knowledge_get_excerpt", { sourceId, chunkId, references });
 }
 
 export function knowledgeImportUrl(
@@ -1584,8 +1594,12 @@ export function knowledgeCancelImportUrl(kbId: string): Promise<void> {
   return invoke<void>("knowledge_cancel_import_url", { kbId });
 }
 
-export function deletePlanFiles(): Promise<void> {
-  return invoke<void>("delete_plan_files");
+export function deletePlanFiles(scope: {
+  workspace?: string;
+  chatTempSessionKey?: string;
+  protectedTurnIds?: string[];
+}): Promise<{ removedDocumentIds: string[]; removedLegacyFiles: number }> {
+  return invoke("delete_plan_files", scope);
 }
 
 export function runHookCommand(

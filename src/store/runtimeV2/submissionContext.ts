@@ -5,8 +5,6 @@ import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { ProjectBaselineContext } from "../../lib/projectBaseline";
 import type { TurnInputContextSignals } from "../../lib/turnIntake";
 import type {
-  GoalContinuationAuthorization,
-  GoalCreationAuthorization,
 } from "../../lib/submit/turnSubmission";
 
 /**
@@ -19,6 +17,9 @@ import type {
  */
 export interface RuntimeV2SubmissionContext {
   readonly networkRead?: import("../../lib/networkRead").NetworkReadPolicy;
+  readonly knowledgeContext?: import("../../lib/knowledgeReferences").KnowledgeContextPacket;
+  readonly planPurpose?: "plan" | "rules";
+  readonly sourcePlanDraft?: import("../../lib/planDrafts").PlanDraftRecord;
   readonly turnId: string;
   readonly uiDisplayTurnId: string;
   readonly runWorkspace: string | undefined;
@@ -39,13 +40,13 @@ export interface RuntimeV2SubmissionContext {
   /** Frozen, deterministic workspace facts. This is not an instruction,
    * capability, validation receipt, or persisted Session truth. */
   readonly projectBaselineContext?: ProjectBaselineContext | null;
-  /** Immutable catalog revision shared by parent, Plan, Goal slices and safe
+  /** Immutable catalog revision shared by parent, Plan and safe
    * tool execution for this Run. */
   readonly skillCatalog?: SkillCatalogSnapshot | null;
   /** Connector view resolved for this Run's workspace before execution. */
   readonly workspaceMcpSnapshot?: import("../../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
-  readonly goalCreationAuthorization?: GoalCreationAuthorization | null;
-  readonly goalContinuationAuthorization?: GoalContinuationAuthorization | null;
+
+
   readonly abortCtrl: AbortController;
   readonly timerInterval: unknown;
   readonly harnessRunId: string;
@@ -55,9 +56,8 @@ export interface RuntimeV2SubmissionContext {
    * history compactor, and bounded read in this Run consumes this same value.
    */
   readonly runtimeContextBudget?: RuntimeContextBudget | null;
-  /** Optional parent-owned objective slice. Goal execution must preserve the
-   * original criterion ids instead of re-admitting a synthesized prompt as
-   * an anonymous Execute request. */
+  /** Optional parent-owned objective slice. Preserve its original criterion
+   * ids instead of re-admitting a synthesized prompt as a new objective. */
   readonly executeAdmission?: {
     readonly objective: string;
     readonly constraints?: readonly string[];
@@ -85,7 +85,7 @@ export interface RuntimeV2ObjectiveAdmission {
 }
 
 /**
- * Preserve an upstream Goal admission when present. Task routing does not
+ * Preserve an upstream structured admission when present. Task routing does not
  * classify acceptance evidence, so an ordinary Turn binds the exact user
  * request as one opaque criterion instead of guessing requirements from prose.
  */

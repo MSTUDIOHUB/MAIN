@@ -1,4 +1,5 @@
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { renderKnowledgeContextAnchor } from "../../lib/knowledgeReferences";
 import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 import type {
   AgentMessage,
@@ -466,12 +467,16 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     "Continue useful discussion and advice without requiring a question or approval every turn. Pending choices alone do not prevent a complete reply.",
   ].join("\n");
 
+  const networkInstruction = readOnlyNetworkPolicy(input).enabled
+    ? `Web search is enabled. Search provider: ${readOnlyNetworkPolicy(input).provider}. For explicit web requests or current/time-sensitive external facts, use web_search or web_fetch before answering. Anchor queries to the Current Date (${currentDate}). Check actual results before claiming information is unavailable; cite source URLs and dates, and state any gaps in freshness or precision. Ordinary conversation does not require a search.`
+    : "Network access is disabled for this Turn.";
   const chat = readOnlyTurn && !input.context.runWorkspace && !input.context.turnInputContextSignals?.attachedFilePaths?.length;
   if (chat) return [
     "[MAIN RUNTIME V2]", `Current Date: ${currentDate}`, `Respond in: ${language}`,
     conversationContinuity,
     "This is Chat. Answer from the supplied conversation and admitted context. Never claim a tool was used unless its receipt is present. No workspace, shell, browser control, validation, MCP or child-agent capabilities are available.",
-    readOnlyNetworkPolicy(input).enabled ? `Optional web_search and web_fetch are enabled. Search provider: ${readOnlyNetworkPolicy(input).provider}. Use current dates for time-sensitive questions.` : "Network access is disabled for this Turn.",
+    networkInstruction,
+    renderKnowledgeContextAnchor(input.context.knowledgeContext),
     "Return a complete user-facing Markdown reply. Skill instructions do not grant additional tool permissions.", skillCatalog, explicitSkills,
   ].join("\n");
   return [
@@ -480,10 +485,12 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     `Workspace: ${workspace}`,
     `Respond in: ${language}`,
     conversationContinuity,
+    readOnlyTurn ? networkInstruction : "",
     "Use structured tools for every read, modification, command, and verification. With a native tool call, you may include one brief public progress sentence in normal response content; MAIN routes it only to Capsule and never uses it as control state. Do not expose private reasoning or repeat that sentence in the final answer.",
+    "Tool calls are proposed actions. MAIN checks permissions and obtains any required human review before executing them. When an operation requires approval, submit its concrete tool call so MAIN can show the review card; a prose approval question cannot create that card or authorize execution.",
     readOnlyTurn
       ? (readOnlyNetworkPolicy(input).enabled
-        ? `This is a bounded task with read-only authority and enabled web search. Inspect relevant admitted context or use exposed web tools (web_search, web_fetch) for external/real-time information. When querying time-sensitive or real-time information (e.g. weather, news, schedules, dates), use the Current Date (${currentDate}) as the reference point and anchor search queries to the current time context. Never request or claim a file mutation, shell command, browser action, or validation effect.`
+        ? "This is a bounded task with read-only authority and enabled web search. Inspect relevant admitted context or use exposed web tools for external information. Never request or claim a file mutation, shell command, browser action, or validation effect."
         : "This is a bounded task with read-only authority. Inspect only the minimum relevant admitted file context. Never request or claim a file mutation, shell command, browser action, or validation effect.")
       : "Before a final answer, use evidence from actual tool results. Carry out the user's authorized task and verify its observable result. When an existing implementation needs repair, make the smallest justified change and validate after modification.",
     readOnlyTurn
@@ -500,6 +507,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
         ].join("\n")
       : "",
     projectBaseline,
+    renderKnowledgeContextAnchor(input.context.knowledgeContext),
     skillCatalog,
     explicitSkills,
   ].join("\n");

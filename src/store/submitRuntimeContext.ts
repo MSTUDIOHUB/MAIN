@@ -5,10 +5,6 @@ import type { CommandDirective, ResolvedRunIntent } from "../lib/runIntent";
 import type { SubmissionRuntimeContext } from "../lib/submissionRuntimeContracts";
 import type { PlanExecutionRunProvenance } from "../lib/planExecutionProvenance";
 import type { ProjectBaselineContext } from "../lib/projectBaseline";
-import type {
-  GoalContinuationAuthorization,
-  GoalCreationAuthorization,
-} from "../lib/submit/turnSubmission";
 import {
   normalizeTurnInputContextSignals,
   type TurnInputContextSignals,
@@ -29,8 +25,8 @@ export interface CreateSubmitRuntimeContextInput {
   approvalRequiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
   intentClarification?: import("../lib/turnClarification").TurnClarification;
-  goalCreationAuthorization: GoalCreationAuthorization | null;
-  goalContinuationAuthorization: GoalContinuationAuthorization | null;
+
+
   effectiveCommandDirective: CommandDirective | null;
   options: unknown;
   attachedFilesSnapshot: Array<AttachedFile | string>;
@@ -38,6 +34,8 @@ export interface CreateSubmitRuntimeContextInput {
   remoteFeishu: FeishuRemoteContext | undefined;
   workspaceTree: string | null;
   workspaceInstructionContext?: string;
+  planPurpose?: "rules";
+  sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
   projectBaselineContext?: ProjectBaselineContext | null;
   skillCatalog?: SkillCatalogSnapshot | null;
   workspaceMcpSnapshot?: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
@@ -74,8 +72,8 @@ export function createSubmitRuntimeContext(
     approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     requiredCapabilities: input.requiredCapabilities,
     intentClarification: input.intentClarification,
-    goalCreationAuthorization: input.goalCreationAuthorization,
-    goalContinuationAuthorization: input.goalContinuationAuthorization,
+
+
     effectiveCommandDirective: input.effectiveCommandDirective,
     options: input.options,
     attachedFilesSnapshot: input.attachedFilesSnapshot,
@@ -85,6 +83,8 @@ export function createSubmitRuntimeContext(
     workspaceInstructionContext: String(
       input.workspaceInstructionContext || "",
     ),
+    planPurpose: input.planPurpose,
+    sourcePlanDraft: input.sourcePlanDraft,
     projectBaselineContext: input.projectBaselineContext || null,
     skillCatalog: input.skillCatalog || null,
     workspaceMcpSnapshot: input.workspaceMcpSnapshot || null,

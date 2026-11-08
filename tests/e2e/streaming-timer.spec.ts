@@ -23,7 +23,8 @@ test.beforeEach(async ({ page }) => {
         capture.savedSessions.push(JSON.parse(JSON.stringify(args?.session ?? null)));
         return args?.session ?? null;
       }
-      if (cmd === "list_project_sessions") return [];
+      if (["list_project_sessions", "list_all_session_snapshots", "list_legacy_session_files"].includes(cmd)) return [];
+      if (cmd === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
       return null;
     };
   });
