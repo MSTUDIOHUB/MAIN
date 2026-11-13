@@ -1,6 +1,6 @@
 import type { RuntimeV2NormalizedToolCall } from "../../lib/runtime-v2";
 import type { ToolDefinition } from "../../lib/toolSchemas";
-import { isRuntimeV2ReadOnlyToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { isRuntimeV2ReadOnlyToolCall } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerReadReceipts";
@@ -120,7 +120,7 @@ export function boundRuntimeV2ProviderToolCalls(
     (options.allowMixedObservationShellBatch === true &&
       calls.some((call) => call.name === "run_command") &&
       calls.every((call) =>
-        call.name === "run_command" || isRuntimeV2ReadOnlyToolName(call.name)
+        call.name === "run_command" || isRuntimeV2ReadOnlyToolCall(call)
       ))
   ) {
     const seenShells = new Set<string>();
@@ -167,7 +167,7 @@ export function boundRuntimeV2ProviderToolCalls(
             : "first_novel_after_attempt",
     };
   }
-  if (calls.every((call) => isRuntimeV2ReadOnlyToolName(call.name))) {
+  if (calls.every(isRuntimeV2ReadOnlyToolCall)) {
     const novelEligibleIndices = eligibleIndices.filter((index) =>
       !attemptedIdentities.has(
         runtimeV2ProviderToolCallIdentity(calls[index]!),
@@ -206,7 +206,7 @@ export function boundRuntimeV2ProviderToolCalls(
     };
   }
   if (calls.every((call) =>
-    call.name === "spawn_subagent" || isRuntimeV2ReadOnlyToolName(call.name)
+    call.name === "spawn_subagent" || isRuntimeV2ReadOnlyToolCall(call)
   )) {
     const maxSpawnSubagents = Math.max(
       0,
@@ -232,7 +232,7 @@ export function boundRuntimeV2ProviderToolCalls(
       (index) => calls[index]!.name === "spawn_subagent",
     ).slice(0, maxSpawnSubagents));
     if (selectedSpawns.size === 0 && !novelEligibleIndices.some(
-      (index) => isRuntimeV2ReadOnlyToolName(calls[index]!.name),
+      (index) => isRuntimeV2ReadOnlyToolCall(calls[index]!),
     )) {
       return { accepted: [], discarded: [...calls], selection: "all_rejected" };
     }
@@ -240,7 +240,7 @@ export function boundRuntimeV2ProviderToolCalls(
     // provider selected a novel observation or delegation. The child limit
     // constrains scheduling only; it must never discard independent reads.
     const acceptedIndices = eligibleIndices.filter((index) =>
-      isRuntimeV2ReadOnlyToolName(calls[index]!.name) || selectedSpawns.has(index)
+      isRuntimeV2ReadOnlyToolCall(calls[index]!) || selectedSpawns.has(index)
     );
     if (acceptedIndices.length === 0) {
       return {

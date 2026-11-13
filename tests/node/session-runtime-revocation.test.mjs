@@ -126,77 +126,7 @@ test("revocation isolates failures so Session deletion can continue", () => {
   });
 });
 
-test("workspace history clear revokes Execute, Goal, approval, and Harness owners exactly once", () => {
-  const order = [];
-  const executeRuntime = {
-    currentTurnId: "turn-execute",
-    agentStatus: "running",
-    abortController: { abort: () => order.push("execute:abort") },
-  };
-  const goalRuntime = {
-    currentTurnId: "turn-goal",
-    agentStatus: "running",
-    abortController: { abort: () => order.push("goal:abort") },
-  };
-  const approvalRuntime = {
-    currentTurnId: "turn-approval",
-    agentStatus: "pending_review",
-    pendingRunDecisionResolver: (choice) => order.push(`approval:run:${choice}`),
-    pendingReviewResolve: (decision) => order.push(`approval:tool:${decision.action}`),
-  };
-  const harnessRuntime = {
-    currentTurnId: "turn-harness",
-    agentStatus: "running",
-    harnessRunMarker: marker({
-      sessionKey: "workspace-a:4",
-      turnId: "turn-harness",
-      runId: "run-harness",
-    }),
-  };
-  const foreignRuntime = {
-    abortController: { abort: () => order.push("foreign:abort") },
-    harnessRunMarker: marker({ sessionKey: "workspace-ab:5" }),
-  };
 
-  const results = revokeWorkspaceSessionRuntimesBeforeClear({
-    workspaceKey: "workspace-a",
-    activeSessionKey: "workspace-a:1",
-    // The active runtime must override a stale cached snapshot for this owner.
-    activeRuntime: executeRuntime,
-    runtimeBySessionKey: {
-      "workspace-a:1": { abortController: { abort: () => order.push("stale-active:abort") } },
-      "workspace-a:2": goalRuntime,
-      "workspace-a:3": approvalRuntime,
-      "workspace-a:4": harnessRuntime,
-      "workspace-ab:5": foreignRuntime,
-    },
-    closeHarness: (ownedMarker) => {
-      order.push(`harness:${ownedMarker.sessionKey}:${ownedMarker.runId}`);
-      return true;
-    },
-  });
-
-  assert.deepEqual(order, [
-    "execute:abort",
-    "goal:abort",
-    "approval:run:cancel",
-    "approval:tool:reject",
-    "harness:workspace-a:4:run-harness",
-  ]);
-  assert.deepEqual(results.map((result) => result.sessionKey), [
-    "workspace-a:1",
-    "workspace-a:2",
-    "workspace-a:3",
-    "workspace-a:4",
-  ]);
-  assert.deepEqual(results[2], {
-    sessionKey: "workspace-a:3",
-    aborted: false,
-    runDecisionSettled: true,
-    reviewSettled: true,
-    harnessClosed: false,
-  });
-});
 
 test("settings reset revokes the active projection and every cached Session owner", () => {
   const order = [];
@@ -402,4 +332,77 @@ test("settings reset reports the exact owner identity when one revocation phase 
     phase: "abort",
     message: "cannot abort",
   }]);
+});
+
+
+test("workspace history clear revokes Execute, Goal, approval, and Harness owners exactly once", () => {
+  const order = [];
+  const executeRuntime = {
+    currentTurnId: "turn-execute",
+    agentStatus: "running",
+    abortController: { abort: () => order.push("execute:abort") },
+  };
+  const goalRuntime = {
+    currentTurnId: "turn-goal",
+    agentStatus: "running",
+    abortController: { abort: () => order.push("goal:abort") },
+  };
+  const approvalRuntime = {
+    currentTurnId: "turn-approval",
+    agentStatus: "pending_review",
+    pendingRunDecisionResolver: (choice) => order.push(`approval:run:${choice}`),
+    pendingReviewResolve: (decision) => order.push(`approval:tool:${decision.action}`),
+  };
+  const harnessRuntime = {
+    currentTurnId: "turn-harness",
+    agentStatus: "running",
+    harnessRunMarker: marker({
+      sessionKey: "workspace-a:4",
+      turnId: "turn-harness",
+      runId: "run-harness",
+    }),
+  };
+  const foreignRuntime = {
+    abortController: { abort: () => order.push("foreign:abort") },
+    harnessRunMarker: marker({ sessionKey: "workspace-ab:5" }),
+  };
+
+  const results = revokeWorkspaceSessionRuntimesBeforeClear({
+    workspaceKey: "workspace-a",
+    activeSessionKey: "workspace-a:1",
+    // The active runtime must override a stale cached snapshot for this owner.
+    activeRuntime: executeRuntime,
+    runtimeBySessionKey: {
+      "workspace-a:1": { abortController: { abort: () => order.push("stale-active:abort") } },
+      "workspace-a:2": goalRuntime,
+      "workspace-a:3": approvalRuntime,
+      "workspace-a:4": harnessRuntime,
+      "workspace-ab:5": foreignRuntime,
+    },
+    closeHarness: (ownedMarker) => {
+      order.push(`harness:${ownedMarker.sessionKey}:${ownedMarker.runId}`);
+      return true;
+    },
+  });
+
+  assert.deepEqual(order, [
+    "execute:abort",
+    "goal:abort",
+    "approval:run:cancel",
+    "approval:tool:reject",
+    "harness:workspace-a:4:run-harness",
+  ]);
+  assert.deepEqual(results.map((result) => result.sessionKey), [
+    "workspace-a:1",
+    "workspace-a:2",
+    "workspace-a:3",
+    "workspace-a:4",
+  ]);
+  assert.deepEqual(results[2], {
+    sessionKey: "workspace-a:3",
+    aborted: false,
+    runDecisionSettled: true,
+    reviewSettled: true,
+    harnessClosed: false,
+  });
 });

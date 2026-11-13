@@ -21,6 +21,7 @@ const provider = loadTs(path.join(root, 'src/store/runtimeV2/executionProviderPo
 const tool = loadTs(path.join(root, 'src/store/runtimeV2/executionToolPort.ts'));
 const outcome = loadTs(path.join(root, 'src/store/runtimeV2/executionOutcome.ts'));
 const instruction = loadTs(path.join(root, 'src/store/runtimeV2/executionProviderInstruction.ts'));
+const { resolveRuntimeV2ObjectiveAdmission } = loadTs(path.join(root, 'src/store/runtimeV2/submissionContext.ts'));
 const streaming = loadTs(path.join(root, 'src/lib/streaming.ts'));
 const ipc = loadTs(path.join(root, 'src/lib/ipc.ts'));
 
@@ -38,7 +39,8 @@ function fixture({ strategy = 'execute', objective = 'Create src/new-controller.
     aggregate = runtime.transition(aggregate, { ...draft, schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: aggregate?.nextSequence || 0, eventId: `event-${++ordinal}`, at: ordinal });
     state.runtimeV2Checkpoints.turn = runtime.createRuntimeV2Checkpoint({ aggregate, revision: ordinal, updatedAt: aggregate.updatedAt });
   };
-  append({ type: 'turn.admitted', turn: { workspaceKey: '/fixture', sessionKey: '/fixture:1', sessionEpoch: 'epoch', turnId: 'turn', clientSubmissionId: 'submission' }, strategy, objective, constraints: [], acceptanceCriteria: [] });
+  const admission = resolveRuntimeV2ObjectiveAdmission({ runtimeRunIntent: strategy }, objective);
+  append({ type: 'turn.admitted', turn: { workspaceKey: '/fixture', sessionKey: '/fixture:1', sessionEpoch: 'epoch', turnId: 'turn', clientSubmissionId: 'submission' }, strategy, objective, completionRequirement: admission.completionRequirement, constraints: [], acceptanceCriteria: [] });
   append({ type: 'run.started', run, phase: strategy === 'plan' ? 'planning' : 'observing' });
   const ports = { get: () => state, set: patch => Object.assign(state, typeof patch === 'function' ? patch(state) : patch), live,
     context: { turnId: 'turn', runWorkspace: '/fixture', runSessionKey: '/fixture:1', runtimeRunIntent: strategy === 'plan' ? 'plan' : strategy === 'execute' ? 'execute' : 'analyze', phaseLanguage: 'en', runtimeContextBudget: { contextLimit: 64000, inputBudget: 48000, outputBudget: 4096, readWindowChars: 24000 } },

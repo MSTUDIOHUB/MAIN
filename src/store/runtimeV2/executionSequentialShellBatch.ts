@@ -1,6 +1,8 @@
 import type { RuntimeV2Command, TurnAggregateV1 } from "../../lib/runtime-v2";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
-import { isRuntimeV2ReadOnlyToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { isRuntimeV2ReadOnlyToolCall, RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+
+const independentRead = new Set(["knowledge_search", "knowledge_get_excerpt", "load_skill"]);
 
 export interface RuntimeV2ShellBatchInterruption {
   readonly predecessorToolCallId: string;
@@ -11,9 +13,8 @@ export interface RuntimeV2ShellBatchInterruption {
 
 /** Reconstruct sequencing from the canonical provider/command/receipt ledger.
  * Reads may accompany shell actions in one ordered observation batch.
- * A failed member invalidates the assumptions behind its pending siblings;
- * each sibling still receives an ordinary tool result, without running it or
- * inventing another process-local queue. */
+ * A failed predecessor fences dependent siblings. A bound Editor observation
+ * queries current state independently and still goes through its own authorization. */
 export function runtimeV2SequentialShellBatchInterruption(
   aggregate: TurnAggregateV1 | null,
   command: RuntimeV2Command,
@@ -29,10 +30,14 @@ export function runtimeV2SequentialShellBatchInterruption(
     const currentIndex = calls.findIndex((call) => call.id === callId);
     if (currentIndex < 0) continue;
     const sequentialObservation = calls.some((call) => call.name === "run_command") &&
-      calls.every((call) => call.name === "run_command" || isRuntimeV2ReadOnlyToolName(call.name));
+      calls.every((call) => call.name === "run_command" || isRuntimeV2ReadOnlyToolCall(call));
     if (currentIndex === 0 || !sequentialObservation) return null;
+    if (calls[currentIndex]!.boundEditorObservation || RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(calls[currentIndex]!.name)) return null;
     batchIndex = index;
-    predecessors = calls.slice(0, currentIndex).map((call) => call.id);
+    const currentReadIsIndependent = independentRead.has(calls[currentIndex]!.name);
+    predecessors = calls.slice(0, currentIndex)
+      .filter(call => !currentReadIsIndependent || call.name !== "run_command")
+      .map(call => call.id);
     break;
   }
   if (batchIndex < 0) return null;

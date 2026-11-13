@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import ts from "typescript";
+import { createHash } from "node:crypto";
 
 const workspaceRoot = process.cwd();
 const cache = new Map();
@@ -70,8 +71,160 @@ const engineSelection = loadTs(path.join(workspaceRoot, "src/lib/runtimeEngineSe
 const runIntent = loadTs(path.join(workspaceRoot, "src/lib/runIntent.ts"));
 const planProtocol = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planModelProtocol.ts"));
 const planSubmissionPolicy = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planSubmissionPolicy.ts"));
+const { hashPlanDraftCandidate } = loadTs(path.join(workspaceRoot, "src/lib/planDrafts.ts"));
 const EXPLICIT_PLAN_TEST_BUDGET_MS = 8 * 60_000;
 const PLAN_RECOVERY_STALL_MS = 10 * 60_000;
+
+test("Plan Skill paging sends only unseen ranges, including when a covering receipt was evicted", async () => {
+  const { boundReadOnlyHistory } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/readOnlyHistory.ts"));
+  const parts = ["a".repeat(1000), "b".repeat(1000), "c".repeat(1000)];
+  const document = parts.join("");
+  const read = (id, startChar, endChar, resource, version = "v1") => {
+    const readTarget = { skill_id: "s:fixture", expected_version: version, ...(resource ? { resource } : {}) };
+    const call = { id, type: "function", function: { name: "load_skill", arguments: JSON.stringify({ ...readTarget, start_char: startChar }) } };
+    return [
+      { role: "assistant", content: "", tool_calls: [call] },
+      { role: "tool", tool_call_id: id, content: `[E7] s:fixture\n${JSON.stringify({
+        type: resource ? "skill.resource" : "skill.loaded", id: "fixture", ref: "s:fixture", readTarget, version,
+        ...(resource ? { resource } : {}), disclosure: "window", totalChars: document.length, totalLines: 1,
+        returnedRange: { startLine: 1, endLine: 1, startChar, endChar }, content: document.slice(startChar, endChar),
+        effect: resource ? "resource_guidance_no_additional_permissions" : "instructions_partially_read_no_additional_permissions",
+      })}` },
+    ];
+  };
+  const user = { role: "user", content: "Plan with the relevant Unity guidance." };
+  const messages = [
+    user, ...read("first", 0, 2000), ...read("overlap", 1000, 3000), ...read("covered", 1900, 2100),
+    ...read("resource", 1100, 1300, "references/test.md"),
+    ...read("new-version", 1100, 1300, undefined, "v2"),
+  ];
+  const project = (input, contextLimit) => boundReadOnlyHistory(input, {
+    contextLimit, reservedOutputTokens: 0, preserveUserMessages: true, compactSkillGuidance: true,
+  });
+  const receipt = (input, id) => JSON.parse(input.find(message => message.tool_call_id === id).content.split("\n", 2)[1]);
+  const wire = project(messages, 32_768);
+  assert.deepEqual(receipt(wire, "overlap").newWindows, [{ startChar: 2000, endChar: 3000, content: parts[2] }]);
+  assert.deepEqual(receipt(wire, "covered").newWindows, []);
+  assert.deepEqual(receipt(wire, "covered").receiptReplayOf, ["first", "overlap"]);
+  assert.equal(receipt(wire, "resource").content, document.slice(1100, 1300));
+  assert.equal(receipt(wire, "new-version").content, document.slice(1100, 1300));
+  assert.equal(receipt(messages, "overlap").content, parts[1] + parts[2], "durable source body is unchanged");
+  const pressured = project([user, ...read("wide", 0, 3000), ...read("reread", 1100, 1300)], 420);
+  assert.equal(pressured.some(message => message.tool_call_id === "wide"), false, "drop the old call/result group");
+  assert.equal(receipt(pressured, "reread").content, document.slice(1100, 1300), "an evicted source cannot justify a replay pointer");
+
+  const { restorePlanHistory } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/planHistory.ts"));
+  const calls = ["first", "overlap", "covered"].map(id => {
+    const tool = messages.find(message => message.tool_calls?.[0].id === id).tool_calls[0];
+    return { id, name: tool.function.name, arguments: JSON.parse(tool.function.arguments) };
+  });
+  const skillReads = new Map(calls.map(call => [call.arguments.start_char, JSON.stringify(receipt(messages, call.id))]));
+  const { executeReadOnlyPlanTool } = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async (_name, args) => skillReads.get(args.start_char) }],
+  ]));
+  const run = { runId: "skill-plan", turnId: "skill-turn" };
+  const events = [];
+  const push = event => events.push({ ...event, run, sequence: events.length + 1 });
+  const logs = [];
+  const live = { messages: [user], evidence: [], evidenceContents: new Map() };
+  const ledger = {
+    snapshot: () => ({ objective: {} }),
+    schedule: async (run, kind, payload) => {
+      const command = { run, kind, idempotencyKey: payload.toolCallId, payload };
+      push({ type: "command.scheduled", command });
+      return command;
+    },
+    settleCommand: async event => push(event),
+  };
+  for (const call of calls) {
+    push({ type: "provider.responded", result: { toolCalls: [call], diagnostics: [] } });
+    live.messages.push(messages.find(message => message.tool_calls?.[0].id === call.id));
+    await executeReadOnlyPlanTool({ ...live, context: {}, ledger, run, call, parallelReadCount: 1,
+      logStoreEvent: (event, data) => logs.push({ event, ...data }) });
+  }
+  const completed = events.filter(event => event.type === "tool.completed");
+  assert.deepEqual(completed.map(event => event.status), ["succeeded", "succeeded", "succeeded"]);
+  assert.deepEqual(completed.map(event => event.evidence.length), [1, 1, 0]);
+  assert.deepEqual(logs.map(({ retainedChars, newSkillChars }) => [retainedChars, newSkillChars]), [[2000, 2000], [3000, 1000], [3000, 0]]);
+  assert.equal(live.evidence.length, 1);
+  assert.equal(live.evidenceContents.size, 0, "Skill bytes have one owner in the receipt transcript");
+  const restored = { messages: [user], evidence: [], evidenceContents: new Map() };
+  restorePlanHistory({ ...restored, aggregate: { events: structuredClone(events) }, run });
+  assert.equal(restored.evidenceContents.size, 0);
+  assert.deepEqual(project(restored.messages, 32_768), project(live.messages, 32_768));
+});
+
+test("Plan executes admitted web reads with frozen provider and no workspace source authority", async () => {
+  const policy = { enabled: true, provider: "bing" };
+  const output = JSON.stringify({ url: "https://example.com/source", finalUrl: "https://example.com/source", content: "fact ".repeat(3000), truncated: false });
+  const calls = [];
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async (...args) => { calls.push(args); return output; } }],
+  ]));
+  const messages = []; const evidence = []; const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: { runWorkspace: "/fixture", runSessionKey: "session", networkRead: { enabled: false, provider: "baidu" } },
+    ledger: {
+      snapshot: () => ({ networkRead: policy, objective: {} }),
+      schedule: async () => ({ idempotencyKey: "plan-web-read" }),
+      settleCommand: async (event) => settlements.push(event), recordSoftSignal: async () => undefined,
+    }, run: { runId: "web-plan", turnId: "web-turn" },
+    call: { id: "web-read", name: "web_fetch", arguments: { url: "https://example.com/source" } },
+    messages, evidence, evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(calls.length, 1, "an advertised admitted web read must reach its executor");
+  assert.deepEqual(calls[0][4].networkRead, policy);
+  assert.equal(settlements[0].status, "succeeded");
+  assert.equal(settlements[0].evidence[0].kind, "tool");
+  assert.ok(messages[0].content.endsWith(output), "keep the complete already-bounded network JSON receipt");
+  assert.equal(evidence.length, 1);
+});
+
+test("Plan tool_search discovers only admitted read-only candidates and unlocks web tools", async () => {
+  const discovery = loadTs(path.join(workspaceRoot, "src/lib/toolSearch.ts"));
+  const context = { runSessionKey: "plan-web-discovery", networkRead: { enabled: true, provider: "bing" } };
+  const messages = []; const settlements = [];
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolSearch", discovery],
+    ["../../lib/toolExecutor", { executeTool: async (name, args, _workspace, sessionKey, options) => {
+      assert.equal(name, "tool_search");
+      const candidates = options.toolCatalog?.toolDefinitions.map((tool) => tool.function.name) || [];
+      assert.ok(candidates.includes("web_search"), "discovery must receive the admitted Plan catalog");
+      assert.equal(candidates.includes("write_file"), false);
+      assert.equal(candidates.includes("submit_runtime_v2_work_plan"), false);
+      return discovery.executeToolSearch(args, { sessionKey, toolCatalog: options.toolCatalog });
+    } }],
+  ]));
+  await planEvidence.executeReadOnlyPlanTool({ context,
+    ledger: { snapshot: () => ({ networkRead: context.networkRead, objective: {} }), schedule: async () => ({ idempotencyKey: "plan-tool-discovery" }), settleCommand: async (event) => settlements.push(event), recordSoftSignal: async () => undefined },
+    run: { runId: "web-plan", turnId: "web-turn" }, call: { id: "web-discovery", name: "tool_search", arguments: { query: "web" } },
+    messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(settlements[0].status, "succeeded");
+  assert.equal(settlements[0].evidence[0].kind, "tool");
+  assert.ok(discovery.getUnlockedToolsForSession(context.runSessionKey).has("web_search"));
+});
+
+for (const [label, aggregate] of [
+  ["historical missing snapshot", { objective: {} }],
+  ["disabled snapshot", { networkRead: { enabled: false, provider: "bing" }, objective: {} }],
+  ["restricted network", { networkRead: { enabled: true, provider: "bing" }, objective: { capabilityRestrictions: ["network"] } }],
+  ["network needs review", { networkRead: { enabled: true, provider: "bing" }, objective: { approvalRequiredCapabilities: ["network"] } }],
+]) test(`Plan web reads remain blocked for ${label}`, async () => {
+  let executed = 0; const settlements = [];
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async () => { executed++; return "must not run"; } }],
+  ]));
+  await planEvidence.executeReadOnlyPlanTool({
+    context: { networkRead: { enabled: true, provider: "baidu" } },
+    ledger: { snapshot: () => aggregate, schedule: async () => ({ idempotencyKey: label }), settleCommand: async (event) => settlements.push(event), recordSoftSignal: async () => undefined },
+    run: { runId: "web-plan", turnId: "web-turn" }, call: { id: "denied-web", name: "web_search", arguments: { query: "fixture" } },
+    messages: [], evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.equal(executed, 0);
+  assert.equal(settlements[0].status, "blocked");
+  assert.deepEqual(settlements[0].evidence, []);
+});
 
 const turn = {
   workspaceKey: "/fixture",
@@ -243,12 +396,12 @@ function event(sequence, at, value) {
   };
 }
 
-function reviewCheckpoint() {
+function reviewCheckpoint(owner = turn, ownerRun = run) {
   const sealed = plan();
   const commit = adapter.createRuntimeV2PlanReviewCommit({
     plan: sealed,
-    turn,
-    run,
+    turn: owner,
+    run: ownerRun,
     requestId: "review-request-a",
     createdAt: 20,
   });
@@ -256,7 +409,7 @@ function reviewCheckpoint() {
   const append = (value) => {
     const result = runtime.appendRuntimeV2Checkpoint({
       checkpoint,
-      owner: turn,
+      owner,
       expectedRevision: checkpoint?.revision || 0,
       event: value,
     });
@@ -265,16 +418,16 @@ function reviewCheckpoint() {
   };
   append(event(0, 10, {
     type: "turn.admitted",
-    turn,
+    turn: owner,
     strategy: "plan",
     objective: sealed.draft.objective,
     constraints: [],
     acceptanceCriteria: [],
   }));
-  append(event(1, 11, { type: "run.started", run, phase: "planning" }));
+  append(event(1, 11, { type: "run.started", run: ownerRun, phase: "planning" }));
   append(event(2, 20, {
     type: "work_plan.sealed",
-    run,
+    run: ownerRun,
     workPlan: adapter.toRuntimeV2WorkPlanReference(sealed),
     sealedPlan: sealed,
     reviewCommit: commit,
@@ -547,13 +700,13 @@ function planningCheckpointWithRequiredSpawnTimeouts(timeoutCount) {
   return checkpoint;
 }
 
-function planningCheckpointWithTypedSubmissionRejection() {
+function planningCheckpointWithTypedSubmissionRejection({ emptyBody = false } = {}) {
   const runStartedAt = 1_000_000;
   const rejectionAt = runStartedAt + EXPLICIT_PLAN_TEST_BUDGET_MS - 10;
   const toolCallId = "cold-rejected-work-plan";
   const idempotencyKey = "cold-rejected-work-plan-command";
   const candidate = {
-    planMarkdown: "Create the cold-repair owner from the rejected typed candidate.",
+    planMarkdown: emptyBody ? "" : "Create the cold-repair owner from the rejected typed candidate.",
     changes: [{
       title: "Create the cold-repair owner",
       operation: "create",
@@ -596,6 +749,15 @@ function planningCheckpointWithTypedSubmissionRejection() {
     acceptanceEvidenceRequirements: ["behavioral"],
   });
   append(runStartedAt, { type: "run.started", run, phase: "planning" });
+  append(rejectionAt - 3, {
+    type: "command.scheduled", run,
+    command: { idempotencyKey: "cold-rejected-plan-provider", kind: "request_model", run, phase: "planning",
+      payload: { mode: "plan", stage: "discovery", transport: "native_tool", submissionRepairPending: false } },
+  });
+  append(rejectionAt - 2, {
+    type: "provider.responded", run, idempotencyKey: "cold-rejected-plan-provider",
+    result: { visibleText: "", toolCalls: [{ id: toolCallId, name: "submit_runtime_v2_work_plan", arguments: candidate }], diagnostics: [], usage: {} },
+  });
   append(rejectionAt - 1, {
     type: "command.scheduled",
     run,
@@ -623,8 +785,10 @@ function planningCheckpointWithTypedSubmissionRejection() {
     presentation: {
       toolName: "submit_runtime_v2_work_plan",
       target: runtime.WORK_PLAN_V1_SCHEMA_VERSION,
-      message:
-        "WORK_PLAN_REJECTED: validations[0].stepIndexes references an unknown step.",
+      // Legacy checkpoints used the same typed rejection code for protocol and semantic gaps.
+      message: emptyBody
+        ? "WORK_PLAN_REJECTED: submit one JSON object with a non-empty planMarkdown body."
+        : "WORK_PLAN_REJECTED: validations[0].stepIndexes references an unknown step.",
     },
   });
   assert.equal(checkpoint.aggregate.sealedWorkPlan, null);
@@ -633,7 +797,7 @@ function planningCheckpointWithTypedSubmissionRejection() {
 }
 
 function planningCheckpointWithRepeatedSubmitOnlyArgumentViolations() {
-  const restored = planningCheckpointWithTypedSubmissionRejection();
+  const restored = planningCheckpointWithTypedSubmissionRejection({ emptyBody: true });
   let checkpoint = restored.checkpoint;
   const append = (at, value) => {
     const result = runtime.appendRuntimeV2Checkpoint({
@@ -781,6 +945,7 @@ function actionRequest(commit, overrides = {}) {
     planRevision: commit.authority.revision,
     artifactHash: commit.authority.projectionHash,
     artifactPaths: [commit.artifact.path],
+    ...(commit.artifact.documentRef ? { documentRef: commit.artifact.documentRef } : {}),
     ...overrides,
   };
 }
@@ -792,26 +957,32 @@ async function runProductionPlanScenario(
 ) {
   let taskId = 0;
   const logs = [];
+  const savedDocuments = [];
+  const runSessionKey = options.runSessionKey || turn.sessionKey;
+  const revision = options.revision;
   let state = {
-    conversationTurns: [{
+    ...(revision ? { currentWorkspace: turn.workspaceKey, currentSessionId: 1 } : {}),
+    conversationTurns: [...(revision?.turns || []), {
       id: turn.turnId,
       clientSubmissionId: turn.clientSubmissionId,
-      userPrompt: "修复文件打开与标签显示",
+      userPrompt: options.userPrompt ?? "修复文件打开与标签显示",
       status: "running",
       blockIds: [],
+      ...(revision ? { approvedPlanContinuation: { ...revision.source, revise: true } } : {}),
     }],
     config: options.config || { language: "zh" },
     planLifecycle: {
-      sessionKey: turn.sessionKey,
+      sessionKey: runSessionKey,
       sessionEpoch: turn.sessionEpoch,
     },
-    runtimeV2Checkpoints: options.initialCheckpoint
-      ? { [turn.turnId]: options.initialCheckpoint }
-      : {},
+    runtimeV2Checkpoints: {
+      ...revision?.checkpoints,
+      ...(options.initialCheckpoint ? { [turn.turnId]: options.initialCheckpoint } : {}),
+    },
     runtimeEvents: [],
     taskFlow: [],
     harnessRunMarker: {
-      sessionKey: turn.sessionKey,
+      sessionKey: runSessionKey,
       turnId: turn.turnId,
       runId: run.runId,
       status: "running",
@@ -853,6 +1024,7 @@ async function runProductionPlanScenario(
                 [input.owner.turnId]: result.checkpoint,
               },
             };
+            options.onCheckpoint?.(result.checkpoint);
           }
           return result;
         },
@@ -901,6 +1073,13 @@ async function runProductionPlanScenario(
         },
     }],
     ["../../lib/toolExecutor", { executeTool: toolExecution }],
+    ["../../lib/ipc", { ...revision?.ipc, savePlanDocument: async input => {
+      savedDocuments.push(input);
+      if (options.saveDocument) return options.saveDocument(input, savedDocuments.length);
+      return { owner: input.owner, documentId: input.documentId, revision: 1,
+        contentHash: createHash("sha256").update(input.markdown).digest("hex"),
+        path: `${input.owner.workspace || "/session-data"}/.MAIN/plans/${input.documentId}/rev-1.md`, title: input.title, kind: input.kind };
+    } }],
     ["../../lib/toolSchemas", {
       READ_ONLY_SUBAGENT_ACCESS_MODES: ["read"],
       READ_ONLY_SUBAGENT_TASK_KINDS: ["explore", "review", "validate"],
@@ -978,16 +1157,16 @@ async function runProductionPlanScenario(
   );
   const abortCtrl = new AbortController();
   options.onAbortCtrl?.(abortCtrl);
-  const settlement = await planRunner.runSubmitRuntimeV2Plan({
+  const runnerInput = {
     lifecycleDeadlineAt: options.lifecycleDeadlineAt,
     get,
     set,
     context: {
       turnId: turn.turnId,
-      runSessionKey: turn.sessionKey,
+      runSessionKey,
       harnessRunId: run.runId,
-      runWorkspace: turn.workspaceKey,
-      runScopeKey: turn.workspaceKey,
+      runWorkspace: options.runWorkspace ?? turn.workspaceKey,
+      runScopeKey: options.runScopeKey ?? turn.workspaceKey,
       runSessionId: 1,
       phaseLanguage: "zh",
       abortCtrl,
@@ -1001,6 +1180,10 @@ async function runProductionPlanScenario(
         providerContextLimit: null,
         availableMemoryBytes: null,
       },
+      networkRead: options.networkRead,
+      projectBaselineContext: options.projectBaselineContext,
+      capabilityRestrictions: options.capabilityRestrictions,
+      approvalRequiredCapabilities: options.approvalRequiredCapabilities,
       turnInputContextSignals: options.turnInputContextSignals || {
         subagentPreference: "unspecified",
       },
@@ -1014,8 +1197,20 @@ async function runProductionPlanScenario(
     }),
     persistSessionRecord: async () => undefined,
     logStoreEvent: (eventName, data) => logs.push({ eventName, data }),
-  });
+  };
+  // These cases target the existing WorkPlan protocol/child/recovery seam.
+  // Seed its genuine pre-interview legacy checkpoint through the production
+  // bootstrap (including actual source overview), rather than bypassing the
+  // mandatory interview in runSubmitRuntimeV2Plan. New-admission interview,
+  // typed-answer, cold resume and executable-review coverage lives in
+  // plan-interview-production.test.mjs.
+  if (!options.initialCheckpoint) {
+    const bootstrap = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planBootstrap.ts"), mocks);
+    await bootstrap.bootstrapRuntimeV2Plan(runnerInput);
+  }
+  const settlement = await planRunner.runSubmitRuntimeV2Plan(runnerInput);
   return {
+    savedDocuments,
     settlement,
     state,
     checkpoint: state.runtimeV2Checkpoints[turn.turnId],
@@ -1031,6 +1226,103 @@ function testModelLaneLease() {
     setPressureHandler() {},
   };
 }
+
+test("production Plan queues three independent native spawns on an unknown lane before proving overlap", async () => {
+  const lanes = loadTs(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
+  lanes.resetModelLaneCoordinatorForTests();
+  lanes.setModelLaneMemoryReaderForTests(async () => ({
+    total_gb: 64, available_gb: 24,
+    total_bytes: 64 * 1024 ** 3, available_bytes: 24 * 1024 ** 3,
+  }));
+  const config = { activeProfile: "local", local: { provider: "OMLX", endpoint: "http://fixture.invalid/v1", model: "fixture-model" }, cloud: {}, cloudServers: [] };
+  const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
+  const threeQueued = deferred();
+  const secondStarted = deferred();
+  const allowSecondChunk = deferred();
+  const thirdStarted = deferred();
+  let controller;
+  let timeout;
+  let parentRequests = 0;
+  let childRequests = 0;
+  let queuedCheckpoint;
+  const initial = lanes.getModelLaneCapacityObservation(config);
+  assert.equal(initial.maxActiveSubagents, 1);
+  try {
+    const result = await runProductionPlanScenario(async (messages, _settings, callbacks, signal) => {
+      const transcript = messages.map((message) => String(message.content || "")).join("\n");
+      if (/read-only child of the current MAIN turn/i.test(transcript)) {
+        const ordinal = ++childRequests;
+        const aborted = new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        if (ordinal === 1) {
+          await Promise.race([threeQueued.promise, aborted]);
+          if (!signal.aborted) {
+            assert.equal(childRequests, 1, "queued jobs cannot bypass cold first-chunk admission");
+            callbacks.onLifecycle?.({ phase: "model_progress" });
+            await Promise.race([secondStarted.promise, aborted]);
+            await new Promise((resolve) => setImmediate(resolve));
+            assert.equal(childRequests, 2, "third HTTP request waits for actual overlap evidence");
+            assert.equal(lanes.getModelLaneCapacityObservation(config).maxActiveRequests, 2);
+            allowSecondChunk.resolve();
+            await Promise.race([thirdStarted.promise, aborted]);
+          }
+        } else if (ordinal === 2) {
+          secondStarted.resolve();
+          await Promise.race([allowSecondChunk.promise, aborted]);
+          callbacks.onLifecycle?.({ phase: "model_progress" });
+          await Promise.race([thirdStarted.promise, aborted]);
+        } else {
+          assert.equal(ordinal, 3);
+          assert.equal(lanes.getModelLaneCapacityObservation(config).maxActiveRequests, 3);
+          thirdStarted.resolve();
+          callbacks.onLifecycle?.({ phase: "model_progress" });
+        }
+        return { content: "No source finding is claimed by this scheduling fixture.", toolCalls: [], usage: {}, protocolViolation: null };
+      }
+      if (++parentRequests === 1) return { content: "", usage: {}, protocolViolation: null, toolCalls: ["parser", "consumer", "contract"].map((scope, index) => ({
+        id: `queued-native-${scope}`, name: "spawn_subagent", arguments: JSON.stringify({
+          task_key: scope, task_kind: "review", access_mode: "read",
+          objective: `Review the independent ${scope} boundary.`, success_criteria: "Return a source-backed observation.",
+          required_paths: `src/${scope}.js`, allowed_paths: `src/${scope}.js`,
+        }),
+      })) };
+      controller.abort("three queued requests observed through the actual lane");
+      return { content: "", toolCalls: [], usage: {}, protocolViolation: null };
+    }, async (name) => {
+      if (name === "get_project_skeleton") return "src/parser.js\nsrc/consumer.js\nsrc/contract.js";
+      throw new Error(`unexpected tool ${name}`);
+    }, {
+      config, acquireModelLane: lanes.acquireModelLane,
+      subagentCapacityPolicy: { maxActiveRequests: initial.maxActiveSubagents, modelRequestMode: "parallel" },
+      turnInputContextSignals: { subagentPreference: "preferred" },
+      capabilityRestrictions: [], approvalRequiredCapabilities: [],
+      onAbortCtrl(value) {
+        controller = value;
+        // Deferred gates prove ordering. The watchdog only bounds a stuck fixture.
+        timeout = setTimeout(() => value.abort("scheduling fixture did not admit all native tasks"), 10_000);
+      },
+      onCheckpoint(checkpoint) {
+        if (checkpoint.aggregate.subagents.length === 3 && !queuedCheckpoint) {
+          queuedCheckpoint = structuredClone(checkpoint);
+          threeQueued.resolve();
+        }
+      },
+    });
+    assert.equal(result.checkpoint.aggregate.subagents.length, 3, "lane concurrency is not a total child-task quota");
+    assert.equal(childRequests, 3);
+    assert.ok(queuedCheckpoint.aggregate.subagents.every((job) => job.status === "queued" || job.status === "running"));
+    const persisted = runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: queuedCheckpoint })[turn.turnId];
+    const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(persisted)), queuedCheckpoint.owner);
+    assert.ok(restored, "queued task ledger replays through the cold checkpoint boundary");
+    assert.equal(restored.aggregate.subagents.length, 3, "cold replay preserves every admitted queued task");
+    assert.equal(result.logs.some((entry) => entry.data?.reason === "turn_child_budget_exhausted"), false);
+    assert.ok(result.checkpoint.aggregate.subagents.every((job) => !["queued", "running"].includes(job.status)), "parent cancellation drains all admitted children");
+  } finally {
+    clearTimeout(timeout);
+    controller?.abort("scheduling fixture cleanup");
+    lanes.resetModelLaneCoordinatorForTests();
+    lanes.setModelLaneMemoryReaderForTests();
+  }
+});
 
 test("Plan accepts new evidence and a valid submission after more than ten minutes", async () => {
   const originalNow = Date.now;
@@ -1123,7 +1415,7 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     assert.equal(engineSelection.isRuntimeV2GlobalChatTurn(intent, "/workspace"), false);
     assert.equal(engineSelection.isRuntimeV2WorkspaceReadTurn(intent, "/workspace"), true);
   }
-  assert.equal(engineSelection.selectRuntimeEngineVersionForNewTurn("goal"), "v2");
+  assert.equal(engineSelection.selectRuntimeEngineVersionForNewTurn("goal"), "legacy", "retired Goal values never admit a runnable Goal route");
   assert.equal(runIntent.resolveWorkspaceAwareWorkflowMode("chat", false), "chat");
   assert.equal(runIntent.resolveWorkspaceAwareWorkflowMode("chat", true), "edit");
   assert.equal(runIntent.resolveWorkspaceAwareWorkflowMode("plan", true), "plan");
@@ -1157,7 +1449,7 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
     effectiveIntent: "execute",
     runtimeIntent: "goal",
     runWorkspace: "/workspace",
-  }), "goal");
+  }), null);
   const app = fs.readFileSync(
     path.join(workspaceRoot, "src/App.tsx"),
     "utf8",
@@ -1199,7 +1491,7 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
   assert.match(runner, /resolveRuntimeV2VisibleRunnerKind/);
   assert.doesNotMatch(runner, /canRunRuntimeV2Plan/);
   assert.match(runner, /runSubmitRuntimeV2Plan/);
-  assert.match(runner, /runSubmitRuntimeV2Goal/);
+  assert.doesNotMatch(runner, /runSubmitRuntimeV2Goal/, "retired Goal has no submission runner");
   assert.match(runner, /runSubmitRuntimeV2WorkspaceRead/);
   assert.match(runner, /runtimeV2RunnerKind === "workspace_read"/);
   assert.doesNotMatch(runner, /\bnew WorkflowEngine\b|orchestrator\/workflowEngine/);
@@ -1219,7 +1511,9 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
   const planImplementation = `${planRunner}\n${planCompletion}\n${planReviewProjection}`;
   assert.doesNotMatch(planImplementation, /\bPlanArtifact\b|planMaterialization|extractPlan|parsePlan/);
   assert.match(planCompletion, /createRuntimeV2PlanReviewCommit/);
-  assert.match(planReviewProjection, /content: input\.plan\.markdown/);
+  assert.match(planReviewProjection, /markdown: input\.plan\.markdown/);
+  assert.match(planReviewProjection, /savePlanDocument/);
+  assert.doesNotMatch(planReviewProjection, /executeTool/);
   assert.match(planCompletion, /reviewCommit: commit/);
   assert.match(planReviewProjection, /markdown: input\.commit\.chat\.markdown/);
   assert.doesNotMatch(planRunner, /plan:soft-round-limit|PLAN_MODEL_ROUND_LIMIT/);
@@ -1436,7 +1730,7 @@ test("production Plan hard-admits one required child before restoring discovery"
   });
   assert.deepEqual(
     parentRequests[1].tools.map((tool) => tool.function.name),
-    ["read_file", "wait_subagents", "submit_runtime_v2_work_plan"],
+    ["read_file", "spawn_subagent", "wait_subagents", "submit_runtime_v2_work_plan"],
   );
 
   const requestCommands = result.checkpoint.aggregate.events.filter((entry) =>
@@ -1552,7 +1846,7 @@ test("required Plan normalizes an in-workspace absolute child scope before resto
   });
   assert.deepEqual(
     parentRequests[1].tools.map((tool) => tool.function.name),
-    ["read_file", "wait_subagents", "submit_runtime_v2_work_plan"],
+    ["read_file", "spawn_subagent", "wait_subagents", "submit_runtime_v2_work_plan"],
   );
   assert.equal(parentRequests[1].requestOptions.toolChoice, "required");
 
@@ -1821,7 +2115,7 @@ test("required Plan rejects an unadvertised read batch before admitting a legal 
   }
   assert.deepEqual(
     parentRequests[2].tools.map((tool) => tool.function.name),
-    ["read_file", "wait_subagents", "submit_runtime_v2_work_plan"],
+    ["read_file", "spawn_subagent", "wait_subagents", "submit_runtime_v2_work_plan"],
   );
   assert.deepEqual(readExecutions, []);
 
@@ -2333,7 +2627,7 @@ test("cold-restored required Plan rehydrates completed child evidence before its
     firstTranscript,
     /The restored child found the existing owner in src\/main\.js/,
   );
-  assert.equal(firstToolNames.includes("spawn_subagent"), false);
+  assert.equal(firstToolNames.includes("spawn_subagent"), true, "a completed child does not consume a total task quota");
   assert.equal(firstToolNames.includes("submit_runtime_v2_work_plan"), true);
   assert.equal(firstToolChoice, "required");
   assert.equal(result.settlement.outcome.status, "paused");
@@ -2504,7 +2798,7 @@ test("Plan applies child handoff only from a sealed WorkPlan basis, not a reject
             id: "truncated-child-plan",
             name: "submit_runtime_v2_work_plan",
             arguments: JSON.stringify({
-              planMarkdown: "This incomplete submission does not adopt child evidence.",
+              planMarkdown: "", // The truncated response has no complete reviewable body.
               changes: [],
             }),
           }],
@@ -3021,9 +3315,8 @@ test("cold-restored aggregate optional Plan cannot be upgraded by required conte
   assert.equal(firstRequest.command.payload.collaborationRequirementMet, false);
 });
 
-test("production Plan rejects an incomplete typed graph before sealing", async () => {
+test("production Plan preserves a non-empty graph with a missing required change as a diagnostic draft", async () => {
   let round = 0;
-  let correctionTranscript = "";
   const validSubmission = {
     planMarkdown: "Create the implementation before its deterministic tests.",
     changes: [{
@@ -3053,35 +3346,11 @@ test("production Plan rejects an incomplete typed graph before sealing", async (
     }],
   };
   const result = await runProductionPlanScenario(
-    async (messages) => {
+    async () => {
       round += 1;
-      if (round === 1) {
-        const invalidSubmission = structuredClone(validSubmission);
-        delete invalidSubmission.changes[1].change;
-        return {
-          content: "",
-          toolCalls: [{
-            id: "submit-incomplete-graph",
-            name: "submit_runtime_v2_work_plan",
-            arguments: JSON.stringify(invalidSubmission),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      }
-      correctionTranscript = messages
-        .map((message) => String(message.content || ""))
-        .join("\n");
-      return {
-        content: "",
-        toolCalls: [{
-          id: "submit-corrected-graph",
-          name: "submit_runtime_v2_work_plan",
-          arguments: JSON.stringify(validSubmission),
-        }],
-        usage: {},
-        protocolViolation: null,
-      };
+      const invalidSubmission = structuredClone(validSubmission);
+      delete invalidSubmission.changes[1].change;
+      return planProviderReply("submit-incomplete-graph", "submit_runtime_v2_work_plan", invalidSubmission);
     },
     async (name) => {
       if (name === "get_project_skeleton") return "empty fixture";
@@ -3090,33 +3359,17 @@ test("production Plan rejects an incomplete typed graph before sealing", async (
     },
   );
 
-  assert.equal(round, 2);
-  assert.equal(result.settlement.outcome.status, "paused");
-  assert.match(
-    correctionTranscript,
-    /PLAN_TOOL_ARGUMENTS_REJECTED:.*arguments\.changes\[1\]\.change is required/,
-  );
-  const rejectedProviderResult = result.checkpoint.aggregate.events.find(
-    (event) =>
-      event.type === "provider.responded" &&
-      event.result.diagnostics.some((diagnostic) =>
-        diagnostic.code === "tool_arguments_rejected"
-      ),
-  );
-  assert.ok(rejectedProviderResult);
-  assert.deepEqual(rejectedProviderResult.result.toolCalls, []);
-  assert.equal(
-    result.checkpoint.aggregate.events.filter((event) =>
-      event.type === "work_plan.sealed"
-    ).length,
-    1,
-  );
-  assert.ok(result.logs.some((entry) =>
-    entry.eventName === "runtime_v2_plan_submission_rejected" &&
-    /arguments\.changes\[1\]\.change is required/.test(
-      String(entry.data?.detail || ""),
-    )
-  ));
+  assert.equal(round, 1, "an existing reviewable document is not regenerated for a structure gap");
+  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(result.savedDocuments.length, 1);
+  assert.match(result.savedDocuments[0].markdown, /Create the implementation before its deterministic tests/);
+  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null,
+    "a title fallback must not conceal the missing required change specification");
+  assert.equal(result.checkpoint.aggregate.events.some(event => event.type === "work_plan.sealed" || event.type === "work_plan.approved"), false);
+  const draft = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
+  assert.ok(draft);
+  assert.ok(draft.diagnostics.some(diagnostic => diagnostic.fieldPath.endsWith("changes[1].change")),
+    "the retained draft identifies the exact missing authored field");
 });
 
 test("production Plan runs, joins, and adopts one read-only child before review", async () => {
@@ -3204,7 +3457,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         await new Promise((resolve) => setTimeout(resolve, 10));
         parentReadWhileChildActive = childInFlight;
         assert.equal(names.includes("wait_subagents"), true);
-        assert.equal(names.includes("spawn_subagent"), false);
+        assert.equal(names.includes("spawn_subagent"), true, "a queued child waits at transport admission without closing independent tasks");
         return {
           content: "",
           toolCalls: [{
@@ -3236,93 +3489,12 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         .join("\n");
       const childEvidenceId = transcript.match(/child:[^\s,]+:E1/)?.[0];
       assert.ok(childEvidenceId, "joined child evidence must reach the parent");
-      if (parentRound === 4) {
-        assert.match(transcript, /SUBAGENT_RESULTS/);
-        return {
-          content: "",
-          toolCalls: [{
-            id: "submit-without-child-adoption",
-            name: "submit_runtime_v2_work_plan",
-            arguments: JSON.stringify({
-              planMarkdown: "Use only the parent source observation.",
-              changes: [{
-                title: "Update the reviewed owner",
-                operation: "modify",
-                targets: ["src/main.js"],
-                basis: ["E2"],
-                change: "Update the reviewed owner while preserving its public boundary.",
-                expectedOutcome: "The owner remains coherent.",
-                dependsOn: [],
-                criterionIds: ["criterion-user-objective"],
-              }],
-              validations: [{
-                kind: "finite_command",
-                command: "npm run build",
-                cwd: "/fixture",
-                expectedOutcome: "Build succeeds.",
-                required: true,
-                stepIndexes: [0],
-                criterionIds: ["criterion-user-objective"],
-              }],
-            }),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      }
-      assert.match(
-        transcript,
-        /Completed planning child evidence must be explicitly assessed/,
-      );
-      assert.deepEqual(
-        names,
-        ["submit_runtime_v2_work_plan"],
-        "a rejected submission must enter the submit-only repair surface",
-      );
-      assert.match(transcript, /Correct the rejected WorkPlan/);
-      assert.match(transcript, /WORK_PLAN_REJECTED/);
+      assert.match(transcript, /SUBAGENT_RESULTS/);
+      assert.ok(names.includes("read_file"), "joined child evidence does not close safe source reads");
+      assert.ok(names.includes("submit_runtime_v2_work_plan"));
+      assert.equal(names.includes("write_file"), false);
       assert.match(transcript, /Report: The reviewed owner is in src\/main\.js/);
       assert.match(transcript, /Finding: The reviewed owner is in src\/main\.js/);
-      assert.match(transcript, new RegExp(childEvidenceId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-      if (parentRound === 5) {
-        assert.match(transcript, /Use only the parent source observation/);
-        return {
-          content: "",
-          toolCalls: [{
-            id: "submit-still-without-child-adoption",
-            name: "submit_runtime_v2_work_plan",
-            arguments: JSON.stringify({
-              planMarkdown: "Second rejected submission still omits child adoption.",
-              changes: [{
-                title: "Update the reviewed owner",
-                operation: "modify",
-                targets: ["src/main.js"],
-                basis: ["E2"],
-                change: "Update the reviewed owner while preserving its public boundary.",
-                expectedOutcome: "The owner remains coherent.",
-                dependsOn: [],
-                criterionIds: ["criterion-user-objective"],
-              }],
-              validations: [{
-                kind: "finite_command",
-                command: "npm run build",
-                cwd: "/fixture",
-                expectedOutcome: "Build succeeds.",
-                required: true,
-                stepIndexes: [0],
-                criterionIds: ["criterion-user-objective"],
-              }],
-            }),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      }
-      assert.match(
-        transcript,
-        /Second rejected submission still omits child adoption/,
-        "a second rejection must remain in the narrow semantic repair window",
-      );
       return {
         content: "",
         toolCalls: [{
@@ -3402,7 +3574,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
     }),
   );
   assert.equal(parentReadWhileChildActive, true);
-  assert.equal(parentRound, 6);
+  assert.equal(parentRound, 4);
   assert.equal(childRound, 2);
   const aggregate = result.checkpoint.aggregate;
   const events = aggregate.events;
@@ -3448,20 +3620,28 @@ test("production Plan runs, joins, and adopts one read-only child before review"
     aggregate.sealedWorkPlan.draft.steps[0].basis.includes(childEvidence.id),
   );
   assert.ok(requestTools[1].includes("wait_subagents"));
-  assert.deepEqual(requestTools[4], ["submit_runtime_v2_work_plan"]);
-  assert.deepEqual(requestTools[5], ["submit_runtime_v2_work_plan"]);
-  const rejectionLogIndex = result.logs.findIndex((entry) =>
-    entry.eventName === "runtime_v2_plan_submission_rejected"
-  );
-  assert.ok(rejectionLogIndex >= 0);
-  const repairRequest = result.logs.slice(rejectionLogIndex + 1).find((entry) =>
-    entry.eventName === "runtime_v2_plan_provider_request_opened"
-  );
-  assert.equal(repairRequest?.data?.stage, "synthesis");
-  assert.equal(repairRequest?.data?.compactRecovery, false);
-  assert.deepEqual(repairRequest?.data?.offeredToolNames, [
-    "submit_runtime_v2_work_plan",
-  ]);
+  assert.deepEqual(requestTools[3], ["read_file", "spawn_subagent", "submit_runtime_v2_work_plan"]);
+  assert.equal(result.logs.some(entry => entry.eventName === "runtime_v2_plan_submission_rejected"), false,
+    "the first complete plan adopts the actual child finding instead of depending on semantic regeneration");
+  assert.equal(result.savedDocuments.length, 1);
+
+});
+
+test("a complete Plan that omits joined child adoption saves a draft without granting acceptance", async () => {
+  const inherited = planningCheckpointWithCompletedChild();
+  const candidate = simplePlanSubmission("src/child-grounded-owner.js");
+  let requests = 0;
+  const result = await runProductionPlanScenario(async () => {
+    assert.equal(++requests, 1, "missing child adoption preserves the original complete candidate");
+    return planProviderReply("unadopted-child-plan", "submit_runtime_v2_work_plan", candidate);
+  }, planFixtureTool, { initialCheckpoint: inherited.checkpoint });
+  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(result.savedDocuments.length, 1);
+  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
+  assert.equal(result.checkpoint.aggregate.events.some(event => event.type === "subagent.handoff_applied"), false);
+  const draft = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
+  assert.ok(draft.diagnostics.some(diagnostic => diagnostic.code === "plan_collaboration_incomplete"));
+  assert.equal(result.state.activeActionRequest?.kind === "plan_review", false);
 });
 
 test("production Plan quarantines implement/write spawn arguments outside the advertised discovery schema", async () => {
@@ -3571,8 +3751,9 @@ test("production Plan quarantines implement/write spawn arguments outside the ad
   );
 });
 
-test("production Plan quarantines an advertised read_file call missing its required path", async () => {
+test("production Plan quarantines the entire read batch when one call is missing its required path", async () => {
   const invalidCallId = "plan-read-without-required-path";
+  const validCallId = "plan-read-valid-sibling";
   const parentRequests = [];
   const readExecutions = [];
   let abortCtrl = null;
@@ -3584,16 +3765,12 @@ test("production Plan quarantines an advertised read_file call missing its requi
         toolNames: tools.map((tool) => tool.function.name),
       });
       if (parentRequests.length === 1) {
-        assert.ok(tools.some((tool) =>
-          tool.function.name === "read_file"
-        ));
         return {
           content: "",
-          toolCalls: [{
-            id: invalidCallId,
-            name: "read_file",
-            arguments: JSON.stringify({}),
-          }],
+          toolCalls: [
+            { id: validCallId, name: "read_file", arguments: JSON.stringify({ path: "src/main.js" }) },
+            { id: invalidCallId, name: "read_file", arguments: "{}" },
+          ],
           usage: {},
           protocolViolation: null,
         };
@@ -3628,6 +3805,7 @@ test("production Plan quarantines an advertised read_file call missing its requi
   if (diagnosticAbort) clearTimeout(diagnosticAbort);
 
   assert.equal(parentRequests.length, 2);
+  assert.ok(parentRequests[0].toolNames.includes("read_file"));
   assert.deepEqual(
     parentRequests[1].toolNames,
     parentRequests[0].toolNames,
@@ -3643,11 +3821,27 @@ test("production Plan quarantines an advertised read_file call missing its requi
   );
   assert.ok(quarantined);
   assert.deepEqual(quarantined.result.toolCalls, []);
+  assert.match(quarantined.result.diagnostics.find(item => item.code === "tool_arguments_rejected").message,
+    /arguments\.path is required.*entire provider-selected batch was rejected/i);
+  const retryMessages = parentRequests[1].messages;
+  const rejectedGroupIndex = retryMessages.findIndex(message =>
+    message.role === "assistant" && message.tool_calls?.some(call => call.id === invalidCallId));
+  assert.notEqual(rejectedGroupIndex, -1);
+  assert.deepEqual(retryMessages[rejectedGroupIndex].tool_calls.map(call => call.id), [validCallId, invalidCallId]);
+  const replies = retryMessages.slice(rejectedGroupIndex + 1, rejectedGroupIndex + 3);
+  assert.deepEqual(replies.map(message => [message.role, message.tool_call_id]),
+    [["tool", validCallId], ["tool", invalidCallId]]);
+  const feedback = replies.map(message => JSON.parse(message.content.replace(/^PLAN_TOOL_ARGUMENTS_REJECTED: /, "")));
+  assert.deepEqual(feedback.map(item => [item.code, item.effect, item.responseDisposition]), [
+    ["PLAN_TOOL_BATCH_REJECTED", "none", "rejected_before_dispatch"],
+    ["PLAN_TOOL_ARGUMENTS_REJECTED", "none", "rejected_before_dispatch"],
+  ]);
+  assert.ok(feedback.every(item => item.rejectedTool === "read_file" && item.reason === "arguments.path is required"));
   assert.equal(
     events.some((entry) =>
       entry.type === "command.scheduled" &&
       entry.command.kind === "execute_tool" &&
-      entry.command.payload.toolCallId === invalidCallId
+      [validCallId, invalidCallId].includes(entry.command.payload.toolCallId)
     ),
     false,
   );
@@ -3657,6 +3851,56 @@ test("production Plan quarantines an advertised read_file call missing its requi
     ),
     false,
   );
+});
+
+test("production Plan rejects a questionnaire missing title before a corrected call pauses", async () => {
+  const now = Date.now();
+  const admission = runtime.appendRuntimeV2Checkpoint({
+    checkpoint: null, owner: turn, expectedRevision: 0,
+    event: event(0, now, { type: "turn.admitted", turn, strategy: "plan", planPurpose: "plan",
+      objective: "修复文件打开与标签显示", constraints: [],
+      acceptanceCriteria: ["保留现有标签行为"], acceptanceCriterionIds: ["criterion-user-objective"] }),
+  });
+  assert.equal(admission.disposition, "committed");
+  const invalidCallId = "plan-question-without-title";
+  const correctedCallId = "plan-question-corrected-title";
+  const title = "确认标签处理";
+  const questions = [{ id: "label_behavior", prompt: "重新打开文件时，应复用当前标签还是新建标签？",
+    selectionMode: "single", required: true, options: [{ id: "reuse", label: "复用当前标签" }, { id: "new", label: "新建标签" }] }];
+  const requests = [];
+  const result = await runProductionPlanScenario(
+    async (messages, _settings, _callbacks, _signal, tools) => {
+      const questionTool = tools.find(tool => tool.function.name === "ask_plan_questions");
+      requests.push({ messages, required: questionTool?.function.parameters.required });
+      return requests.length === 1
+        ? planProviderReply(invalidCallId, "ask_plan_questions", { questions })
+        : planProviderReply(correctedCallId, "ask_plan_questions", { title, questions });
+    },
+    planFixtureTool,
+    { initialCheckpoint: admission.checkpoint },
+  );
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests.map(request => request.required), [["title", "questions"], ["title", "questions"]]);
+  const reply = requests[1].messages.find(message => message.role === "tool" && message.tool_call_id === invalidCallId);
+  assert.ok(reply);
+  const feedback = JSON.parse(reply.content.replace(/^PLAN_TOOL_ARGUMENTS_REJECTED: /, ""));
+  assert.deepEqual([feedback.code, feedback.effect, feedback.reason],
+    ["PLAN_TOOL_ARGUMENTS_REJECTED", "none", "arguments.title is required"]);
+  const events = result.checkpoint.aggregate.events;
+  const quarantined = events.find(entry => entry.type === "provider.responded" &&
+    entry.result.diagnostics.some(item => item.code === "tool_arguments_rejected"));
+  assert.deepEqual(quarantined?.result.toolCalls, []);
+  const executions = events.filter(entry => entry.type === "command.scheduled" &&
+    entry.command.kind === "execute_tool" && entry.command.payload.toolName === "ask_plan_questions");
+  assert.deepEqual(executions.map(entry => entry.command.payload.toolCallId), [correctedCallId]);
+  const pauses = events.filter(entry => entry.type === "run.paused");
+  assert.equal(result.settlement.outcome.status, "paused");
+  assert.equal(pauses.length, 1);
+  assert.equal(pauses[0].blocker.questionnaire.title, title);
+  assert.equal(pauses[0].blocker.questionnaire.questions[0].id, questions[0].id);
+  assert.ok(pauses[0].sequence > executions[0].sequence);
+  assert.equal(result.savedDocuments.length, 0);
+  assert.equal(events.some(entry => entry.type === "work_plan.approved"), false);
 });
 
 test("production Plan runner seals the first valid evidence-grounded plan and pauses for review", async () => {
@@ -3695,23 +3939,6 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
           protocolViolation: null,
         };
       }
-      if (providerRound === 2) {
-        return {
-          content: "",
-          toolCalls: [{
-            id: "reject-protocol-markup",
-            name: "submit_runtime_v2_work_plan",
-            arguments: JSON.stringify({
-              planMarkdown:
-                "让我用 <function=read_file> 后再计划。",
-              changes: reviewedDraft.steps,
-              validations: reviewedDraft.validations,
-            }),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      }
       acceptedSubmissionRequest = messages;
       return {
         content: "",
@@ -3742,7 +3969,7 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
       throw new Error(`unexpected tool ${name}`);
     },
   );
-  assert.equal(providerRound, 3);
+  assert.equal(providerRound, 2);
   assert.ok(observedReadArgs.some((args) =>
     args.__raw !== true &&
     args.max_chars === 18_000
@@ -3763,8 +3990,11 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
     result.checkpoint.aggregate,
   );
   assert.ok(resolved?.pending);
+  writtenPlan = result.savedDocuments[0]?.markdown;
   assert.equal(writtenPlan, resolved.plan.markdown);
   assert.equal(resolved.commit.artifact.content, writtenPlan);
+  assert.equal(resolved.commit.artifact.documentRef.contentHash, createHash("sha256").update(writtenPlan).digest("hex"));
+  assert.equal(resolved.commit.artifact.path, result.state.activeActionRequest.documentRef.path);
   assert.ok(result.checkpoint.aggregate.events.some((event) =>
     event.type === "projection.published" &&
     event.audience === "capsule_live"
@@ -3772,7 +4002,8 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
   const acceptedSubmissionText = acceptedSubmissionRequest
     .map((message) => String(message.content || ""))
     .join("\n");
-  assert.match(acceptedSubmissionText, /WORK_PLAN_REJECTED/);
+  assert.doesNotMatch(acceptedSubmissionText, /WORK_PLAN_REJECTED/);
+  assert.equal(result.logs.some(entry => entry.eventName === "runtime_v2_plan_submission_rejected"), false);
   assert.doesNotMatch(acceptedSubmissionText, /mandatory evidence audit/);
 });
 
@@ -3878,7 +4109,7 @@ test("Plan discovery keeps read and submit tools available until the model submi
   assert.ok(submitTool);
   assert.deepEqual(
     submitTool.function.parameters.required,
-    ["planMarkdown", "changes"],
+    ["planMarkdown", "changes", "validations"],
   );
   assert.equal(
     submitTool.function.parameters.properties.findingsJson,
@@ -3987,12 +4218,9 @@ test("Plan synthesis falls back once from ignored native tools to a schema-bound
   assert.equal(synthesisRequests[1].maxTokens, 4_096);
   assert.deepEqual(
     synthesisRequests[1].tools.map((tool) => tool.function.name),
-    ["submit_runtime_v2_work_plan"],
+    ["read_file", "submit_runtime_v2_work_plan"],
   );
-  assert.deepEqual(synthesisRequests[1].options.toolChoice, {
-    type: "function",
-    function: { name: "submit_runtime_v2_work_plan" },
-  });
+  assert.equal(synthesisRequests[1].options.toolChoice, "required");
   assert.equal(synthesisRequests[2].maxTokens, 4_096);
   assert.deepEqual(synthesisRequests[2].tools, []);
   assert.equal(synthesisRequests[2].options.toolChoice, undefined);
@@ -4094,11 +4322,8 @@ test("Plan synthesis preserves an admitted output budget above 4096 tokens", asy
 
   assert.equal(requests.length, 2);
   assert.equal(result.settlement.outcome.status, "paused");
-  assert.deepEqual(requests[1].toolNames, ["submit_runtime_v2_work_plan"]);
-  assert.deepEqual(requests[1].requestOptions.toolChoice, {
-    type: "function",
-    function: { name: "submit_runtime_v2_work_plan" },
-  });
+  assert.deepEqual(requests[1].toolNames, ["read_file", "submit_runtime_v2_work_plan"]);
+  assert.equal(requests[1].requestOptions.toolChoice, "required");
   assert.equal(
     requests[1].maxOutputTokens,
     admittedOutputBudget,
@@ -4309,265 +4534,79 @@ test("WorkPlan compilation downgrades non-finite commands without granting execu
       draft: withoutFallback.draft,
       criterionIds: ["criterion-user-objective"],
     }),
-    /Admitted criteria missing from required validations/,
+    /advisory.*cannot provide required validation coverage/,
   );
 });
 
-test("cold-restored typed WorkPlan rejection restores submit-only repair and never renews a semantic stall", async () => {
+test("cold-restored non-empty typed rejection saves its exact original candidate without another model request", async () => {
   const restored = planningCheckpointWithTypedSubmissionRejection();
-  const corrected = structuredClone(restored.candidate);
-  corrected.validations[0].stepIndexes = [0];
-  const originalNow = Date.now;
-  const requests = [];
-  let repaired;
-  let expired;
-  let expiredProviderCalls = 0;
-
-  try {
-    Date.now = () => restored.rejectionAt + 1_000;
-    repaired = await runProductionPlanScenario(
-      async (
-        messages,
-        _settings,
-        _callbacks,
-        _signal,
-        tools,
-        _maxOutputTokens,
-        requestOptions,
-      ) => {
-        requests.push({
-          transcript: messages
-            .map((message) => String(message.content || ""))
-            .join("\n"),
-          toolNames: tools.map((tool) => tool.function.name),
-          requestOptions,
-        });
-        return {
-          content: "",
-          toolCalls: [{
-            id: "cold-corrected-work-plan",
-            name: "submit_runtime_v2_work_plan",
-            arguments: JSON.stringify(corrected),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      },
-      async (name) => {
-        if (name === "get_project_skeleton") return "src/main.js";
-        if (name === "write_file") return "written";
-        throw new Error(`unexpected tool ${name}`);
-      },
-      { initialCheckpoint: restored.checkpoint },
-    );
-
-    Date.now = () =>
-      restored.rejectionAt +
-      PLAN_RECOVERY_STALL_MS +
-      1;
-    expired = await runProductionPlanScenario(
-      async () => {
-        expiredProviderCalls += 1;
-        throw new Error("an expired cold repair must not call the provider");
-      },
-      async (name) => {
-        if (name === "get_project_skeleton") return "src/main.js";
-        throw new Error(`unexpected tool ${name}`);
-      },
-      { initialCheckpoint: restored.checkpoint },
-    );
-  } finally {
-    Date.now = originalNow;
-  }
-
-  assert.equal(requests.length, 1);
-  assert.deepEqual(requests[0].toolNames, ["submit_runtime_v2_work_plan"]);
-  assert.deepEqual(requests[0].requestOptions.toolChoice, {
-    type: "function",
-    function: { name: "submit_runtime_v2_work_plan" },
-  });
-  assert.equal(
-    requests[0].requestOptions.timeoutMs,
-    planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS,
-  );
-  assert.match(requests[0].transcript, /WORK_PLAN_REJECTED:/);
-  assert.match(requests[0].transcript, /validations\[0\]\.stepIndexes references an unknown step/);
-  assert.match(requests[0].transcript, /WORK_PLAN_REJECTED/);
-  assert.ok(requests[0].toolNames.includes("submit_runtime_v2_work_plan"));
-  const repairOpened = repaired.logs.find((entry) =>
-    entry.eventName === "runtime_v2_plan_provider_request_opened"
-  );
-  assert.equal(repairOpened?.data?.stage, "synthesis");
-  assert.equal(repairOpened?.data?.submissionRepairPending, true);
-  assert.equal(repaired.settlement.outcome.status, "paused");
-  assert.equal(repaired.checkpoint.aggregate.phase, "reviewing");
-  assert.deepEqual(
-    repaired.checkpoint.aggregate.sealedWorkPlan.draft.validations[0].stepIndexes,
-    [0],
-  );
-  assert.equal(
-    restored.checkpoint.aggregate.events.some((entry) =>
-      entry.type === "work_plan.sealed"
-    ),
-    false,
-  );
-
-  assert.equal(expiredProviderCalls, 0);
-  assert.equal(expired.settlement.outcome.status, "completed");
-  assert.equal(expired.checkpoint.aggregate.sealedWorkPlan, null);
-  assert.equal(
-    expired.checkpoint.aggregate.events.some((entry) =>
-      entry.type === "command.scheduled" &&
-      entry.command.kind === "request_model"
-    ),
-    false,
-  );
-  const terminal = expired.logs.find((entry) =>
-    entry.eventName === "runtime_v2_plan_terminal"
-  );
-  assert.equal(terminal?.data?.detailCode, "runtime_v2_plan_recovery_stall_exhausted");
-});
-
-test("typed WorkPlan rejection cannot renew the semantic recovery window", async () => {
-  const originalNow = Date.now;
-  const startedAt = 1_000_000;
-  let now = startedAt;
-  const requests = [];
-  let abortCtrl = null;
-  let diagnosticAbort = null;
-  const rejectedSubmission = {
-    planMarkdown: "Create the bounded owner and verify it with the repository build.",
-    changes: [{
-      title: "Create the bounded owner",
-      operation: "create",
-      targets: ["src/bounded-owner.js"],
-      change: "Create the requested owner behind the existing module boundary.",
-      expectedOutcome: "The bounded owner exists without changing unrelated files.",
-      dependsOn: [],
-      criterionIds: ["criterion-user-objective"],
-    }],
-    validations: [{
-      kind: "finite_command",
-      command: "npm run build",
-      cwd: "/fixture",
-      expectedOutcome: "The repository build succeeds.",
-      required: true,
-      stepIndexes: [1],
-      criterionIds: ["criterion-user-objective"],
-    }],
-  };
-  let result;
-
-  Date.now = () => now;
-  try {
-    result = await runProductionPlanScenario(
-      async (
-        messages,
-        settings,
-        _callbacks,
-        _signal,
-        tools,
-        _maxOutputTokens,
-        requestOptions,
-      ) => {
-        requests.push({
-          transcript: messages
-            .map((message) => String(message.content || ""))
-            .join("\n"),
-          toolNames: tools.map((tool) => tool.function.name),
-          requestOptions,
-          settings,
-        });
-        if (requests.length === 1) {
-          now = startedAt + EXPLICIT_PLAN_TEST_BUDGET_MS - 10;
-        } else if (requests.length === 2) {
-          now = startedAt +
-            EXPLICIT_PLAN_TEST_BUDGET_MS +
-            PLAN_RECOVERY_STALL_MS +
-            1;
-        } else {
-          abortCtrl.abort("unexpected repeated WorkPlan repair grace");
-        }
-        return {
-          content: "",
-          toolCalls: [{
-            id: `reject-work-plan-${requests.length}`,
-            name: "submit_runtime_v2_work_plan",
-            arguments: JSON.stringify(rejectedSubmission),
-          }],
-          usage: {},
-          protocolViolation: null,
-        };
-      },
-      async (name) => {
-        if (name === "get_project_skeleton") return "src/main.js";
-        throw new Error(`unexpected tool ${name}`);
-      },
-      {
-        reasoningToggle: true,
-        onAbortCtrl: (controller) => {
-          abortCtrl = controller;
-          diagnosticAbort = setTimeout(
-            () => controller.abort("WorkPlan grace test timeout"),
-            2_000,
-          );
-        },
-      },
-    );
-  } finally {
-    Date.now = originalNow;
-    if (diagnosticAbort) clearTimeout(diagnosticAbort);
-  }
-
-  assert.equal(requests.length, 2, "a second rejection must not renew the recovery window");
-  assert.deepEqual(requests[1].toolNames, ["submit_runtime_v2_work_plan"]);
-  assert.deepEqual(requests[1].requestOptions.toolChoice, {
-    type: "function",
-    function: { name: "submit_runtime_v2_work_plan" },
-  });
-  assert.equal(
-    requests[1].requestOptions.timeoutMs,
-    planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS,
-    "typed rejection repair needs one full but bounded provider request",
-  );
-  assert.match(requests[1].transcript, /WORK_PLAN_REJECTED/);
-  assert.equal(requests[1].settings.reasoningRequest, "off");
-  assert.equal(requests[1].settings.preserveAssistantReasoning, false);
-
-  assert.equal(result.settlement.outcome.status, "completed");
+  let requests = 0;
+  const result = await withFakePlanClock(restored.rejectionAt + PLAN_RECOVERY_STALL_MS + 1, async () => runProductionPlanScenario(async () => {
+    requests++;
+    throw new Error("the complete rejected candidate is already durable and must not be regenerated");
+  }, planFixtureTool, { initialCheckpoint: restored.checkpoint }));
+  assert.equal(requests, 0);
+  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(result.savedDocuments.length, 1);
+  assert.match(result.savedDocuments[0].markdown, /Create the cold-repair owner from the rejected typed candidate/);
+  const record = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
+  assert.ok(record);
+  assert.equal(record.source.toolCallId, restored.toolCallId);
+  assert.equal(record.source.candidateHash, hashPlanDraftCandidate(restored.candidate));
+  assert.equal(result.checkpoint.aggregate.events.filter(event => event.type === "run.completed").length, 1);
+  assert.equal(result.checkpoint.aggregate.events.filter(event => event.type === "turn.completed").length, 1);
   assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
-  assert.equal(
-    result.checkpoint.aggregate.events.some((entry) =>
-      entry.type === "work_plan.sealed"
-    ),
-    false,
-  );
-  const firstRejection = result.logs.findIndex((entry) =>
-    entry.eventName === "runtime_v2_plan_submission_rejected"
-  );
-  const repairOpened = result.logs.findIndex((entry, index) =>
-    index > firstRejection &&
-    entry.eventName === "runtime_v2_plan_provider_request_opened" &&
-    entry.data?.submissionRepairPending === true
-  );
-  const secondRejection = result.logs.findIndex((entry, index) =>
-    index > repairOpened &&
-    entry.eventName === "runtime_v2_plan_submission_rejected"
-  );
-  const terminal = result.logs.findIndex((entry, index) =>
-    index > secondRejection &&
-    entry.eventName === "runtime_v2_plan_terminal" &&
-    entry.data?.detailCode === "runtime_v2_plan_recovery_stall_exhausted"
-  );
-  assert.ok(firstRejection >= 0);
-  assert.ok(repairOpened > firstRejection);
-  assert.ok(secondRejection > repairOpened);
-  assert.ok(terminal > secondRejection);
-  assert.equal(result.logs[repairOpened].data.timeoutMs,
-    planProtocol.PLAN_SYNTHESIS_RECOVERY_REQUEST_TIMEOUT_MS);
 });
 
-test("a repeated submit-only Plan argument violation pivots to one compact structured recovery", async () => {
+test("cold-restored legacy empty-body rejection retains safe reads beyond the soft stall window", async () => {
+  const restored = planningCheckpointWithTypedSubmissionRejection({ emptyBody: true });
+  const corrected = structuredClone(restored.candidate);
+  corrected.planMarkdown = "Create the bounded owner using the retained source contract, then verify the build.";
+  corrected.validations[0].stepIndexes = [0];
+  for (const elapsed of [1_000, PLAN_RECOVERY_STALL_MS + 1]) {
+    const requests = [];
+    const result = await withFakePlanClock(restored.rejectionAt + elapsed, async () => runProductionPlanScenario(
+      async (messages, _settings, _callbacks, _signal, tools, _maxTokens, requestOptions) => {
+        requests.push({ messages, toolNames: tools.map(tool => tool.function.name), requestOptions });
+        return planProviderReply("cold-corrected-work-plan", "submit_runtime_v2_work_plan", corrected);
+      }, planFixtureTool, { initialCheckpoint: restored.checkpoint }));
+    assert.equal(requests.length, 1, "elapsed soft recovery time does not close a safe legacy repair");
+    assert.deepEqual(requests[0].toolNames, ["read_file", "submit_runtime_v2_work_plan"]);
+    assert.equal(requests[0].requestOptions.toolChoice, "required");
+    assert.match(requests[0].messages.map(message => String(message.content || "")).join("\n"), /WORK_PLAN_REJECTED:/);
+    assert.match(requests[0].messages.map(message => String(message.content || "")).join("\n"), /non-empty planMarkdown body/);
+    assert.equal(result.settlement.outcome.status, "paused");
+    assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+    assert.deepEqual(result.checkpoint.aggregate.sealedWorkPlan.draft.validations[0].stepIndexes, [0]);
+    assert.equal(result.checkpoint.aggregate.events.filter(event => event.type === "run.started").length, 1);
+    assert.equal(result.checkpoint.aggregate.events.some(event => event.type === "run.completed"), false);
+    assert.equal(result.logs.some(entry => entry.data?.detailCode === "runtime_v2_plan_recovery_stall_exhausted"), false);
+  }
+});
+
+test("the first non-empty Plan with an invalid validation step saves partial without requesting semantic repair", async () => {
+  const candidate = simplePlanSubmission("src/bounded-owner.js");
+  candidate.validations[0].stepIndexes = [1];
+  let requests = 0;
+  const result = await runProductionPlanScenario(async () => {
+    assert.equal(++requests, 1, "structural readiness gaps preserve the candidate instead of regenerating it");
+    return planProviderReply("invalid-validation-step", "submit_runtime_v2_work_plan", candidate);
+  }, planFixtureTool, { reasoningToggle: true });
+  assert.equal(requests, 1);
+  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(result.savedDocuments.length, 1);
+  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
+  const draft = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
+  assert.ok(draft);
+  assert.equal(draft.source.candidateHash, hashPlanDraftCandidate(candidate));
+  assert.equal(draft.source.toolCallId, "invalid-validation-step");
+  assert.ok(draft.diagnostics.some(diagnostic => diagnostic.fieldPath.includes("validations")));
+  assert.equal(result.checkpoint.aggregate.events.filter(event => event.type === "run.completed").length, 1);
+  assert.equal(result.checkpoint.aggregate.events.filter(event => event.type === "turn.completed").length, 1);
+  assert.equal(result.checkpoint.aggregate.events.some(event => event.type === "work_plan.sealed" || event.type === "work_plan.approved"), false);
+});
+
+test("repeated Plan repair argument violations retain safe tools and accept exact JSON", async () => {
   const requests = [];
   const validSubmission = {
     planMarkdown: "Create the bounded repair owner and verify the repository build.",
@@ -4591,8 +4630,9 @@ test("a repeated submit-only Plan argument violation pivots to one compact struc
     }],
   };
   const typedRejectedSubmission = structuredClone(validSubmission);
-  typedRejectedSubmission.validations[0].stepIndexes = [1];
+  typedRejectedSubmission.planMarkdown = "";
   const argumentRejectedSubmission = structuredClone(validSubmission);
+  argumentRejectedSubmission.planMarkdown = ""; // No complete document exists: strict protocol/schema repair still applies.
   delete argumentRejectedSubmission.changes[0].change;
 
   const result = await runProductionPlanScenario(
@@ -4654,28 +4694,27 @@ test("a repeated submit-only Plan argument violation pivots to one compact struc
   );
 
   assert.deepEqual(requests[1].toolNames, [
+    "read_file",
     "submit_runtime_v2_work_plan",
   ]);
   assert.deepEqual(requests[2].toolNames, [
+    "read_file",
     "submit_runtime_v2_work_plan",
   ]);
-  assert.deepEqual(requests[1].requestOptions.toolChoice, {
-    type: "function",
-    function: { name: "submit_runtime_v2_work_plan" },
-  });
+  assert.equal(requests[1].requestOptions.toolChoice, "required");
   assert.match(requests[2].transcript, /PLAN_TOOL_ARGUMENTS_REJECTED/);
 
   const compactRecovery = requests[3];
   assert.ok(compactRecovery, "the repeated violation must open one recovery request");
   assert.deepEqual(
     compactRecovery.toolNames,
-    [],
-    "a third request must not repeat the same native submit-only surface",
+    ["read_file", "submit_runtime_v2_work_plan"],
+    "typed repair keeps reads available even after repeated argument errors",
   );
-  assert.equal(compactRecovery.requestOptions.toolChoice, undefined);
+  assert.equal(compactRecovery.requestOptions.toolChoice, "required");
   assert.equal(
-    compactRecovery.requestOptions.responseFormat?.type,
-    "json_schema",
+    compactRecovery.requestOptions.responseFormat,
+    undefined,
   );
   assert.equal(
     compactRecovery.maxOutputTokens,
@@ -4688,7 +4727,7 @@ test("a repeated submit-only Plan argument violation pivots to one compact struc
   assert.equal(
     requests.length,
     4,
-    "one compact structured recovery must seal without another native retry",
+    "exact JSON remains compatible without closing the safe tool surface",
   );
   assert.equal(result.settlement.outcome.status, "paused");
   assert.equal(result.checkpoint.aggregate.phase, "reviewing");
@@ -4707,13 +4746,14 @@ test("a repeated submit-only Plan argument violation pivots to one compact struc
   );
   assert.ok(compactOpened);
   assert.equal(compactOpened.data?.submissionRepairPending, true);
-  assert.equal(compactOpened.data?.transport, "structured_response");
+  assert.equal(compactOpened.data?.transport, "native_tool");
   assert.equal(compactOpened.data?.repairReasoningDisabled, true);
 });
 
-test("cold Plan restore preserves repeated submit-only violations and starts at compact structured recovery", async () => {
+test("cold Plan restore preserves repeated repair violations without closing safe tools", async () => {
   const restored = planningCheckpointWithRepeatedSubmitOnlyArgumentViolations();
   const correctedSubmission = structuredClone(restored.candidate);
+  correctedSubmission.planMarkdown = "Create the bounded owner using the retained source contract, then verify the build.";
   correctedSubmission.validations[0].stepIndexes = [0];
   const originalNow = Date.now;
   const requests = [];
@@ -4776,11 +4816,11 @@ test("cold Plan restore preserves repeated submit-only violations and starts at 
   assert.equal(requests.length, 1);
   assert.deepEqual(
     requests[0].toolNames,
-    [],
-    "restore must not re-grant the already exhausted native submit surface",
+    ["read_file", "submit_runtime_v2_work_plan"],
+    "old submit-only recovery state cannot revoke safe reads after restore",
   );
-  assert.equal(requests[0].requestOptions.toolChoice, undefined);
-  assert.equal(requests[0].requestOptions.responseFormat?.type, "json_schema");
+  assert.equal(requests[0].requestOptions.toolChoice, "required");
+  assert.equal(requests[0].requestOptions.responseFormat, undefined);
   assert.equal(
     requests[0].maxOutputTokens,
     planProtocol.PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
@@ -4796,11 +4836,24 @@ test("cold Plan restore preserves repeated submit-only violations and starts at 
   assert.equal(opened?.data?.stage, "synthesis");
   assert.equal(opened?.data?.submissionRepairPending, true);
   assert.equal(opened?.data?.compactRecovery, true);
-  assert.equal(opened?.data?.transport, "structured_response");
+  assert.equal(opened?.data?.transport, "native_tool");
 });
 
-test("invalid structured Plan submissions recover until semantic stall, never by count", async () => {
+function withExplicitPlanDeadline(checkpoint, deadlineAt) {
+  let replayed = null;
+  for (const value of checkpoint.events) {
+    const entry = value.type === "run.started" ? { ...value, lifecycleDeadlineAt: deadlineAt } : value;
+    const result = runtime.appendRuntimeV2Checkpoint({ checkpoint: replayed, owner: turn, expectedRevision: replayed?.revision || 0, event: entry });
+    assert.equal(result.disposition, "committed");
+    replayed = result.checkpoint;
+  }
+  return replayed;
+}
+
+test("invalid Plan repair JSON remains recoverable past soft stall and ends only at an explicit caller deadline", async () => {
   const restored = planningCheckpointWithRepeatedSubmitOnlyArgumentViolations();
+  const deadlineAt = restored.rejectionAt + PLAN_RECOVERY_STALL_MS + 5_000;
+  const boundedCheckpoint = withExplicitPlanDeadline(restored.checkpoint, deadlineAt);
   const originalNow = Date.now;
   let now = restored.restoredAt;
   const requests = [];
@@ -4827,9 +4880,9 @@ test("invalid structured Plan submissions recover until semantic stall, never by
           maxOutputTokens,
           requestOptions,
         });
-        if (requests.length > 1) {
-          now = restored.rejectionAt + PLAN_RECOVERY_STALL_MS + 1;
-        }
+        if (requests.length === 2) now = restored.rejectionAt + PLAN_RECOVERY_STALL_MS + 1;
+        if (requests.length === 3) now = deadlineAt + 1;
+        assert.ok(requests.length <= 3, "only the explicit caller deadline may close this protocol recovery");
         return {
           content: "{}",
           toolCalls: [],
@@ -4842,7 +4895,7 @@ test("invalid structured Plan submissions recover until semantic stall, never by
         throw new Error(`unexpected tool ${name}`);
       },
       {
-        initialCheckpoint: restored.checkpoint,
+        initialCheckpoint: boundedCheckpoint,
         reasoningToggle: true,
       },
     );
@@ -4852,35 +4905,36 @@ test("invalid structured Plan submissions recover until semantic stall, never by
 
   assert.deepEqual(
     requests[0]?.toolNames,
-    [],
-    "the sole post-violation recovery must use structured response",
+    ["read_file", "submit_runtime_v2_work_plan"],
+    "typed repair remains open to source evidence while malformed JSON recovers",
   );
-  assert.equal(requests[0]?.requestOptions.responseFormat?.type, "json_schema");
+  assert.equal(requests[0]?.requestOptions.responseFormat, undefined);
   assert.equal(requests[0]?.settings.reasoningRequest, "off");
   assert.equal(
     requests.length,
-    2,
-    "invalid output permits recovery until the durable stall window expires",
+    3,
+    "invalid output still permits recovery after soft stall until the explicit caller deadline",
   );
   assert.equal(result.settlement.outcome.status, "completed");
   assert.equal(result.settlement.outcome.resultKind, "error");
   assert.equal(result.checkpoint.aggregate.terminalOutcome?.resultKind, "error");
   assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
+  assert.equal(result.savedDocuments.length, 0, "malformed protocol output never creates an empty draft");
   assert.deepEqual(result.checkpoint.aggregate.scheduledCommands, []);
   assert.equal(
     result.checkpoint.aggregate.events.filter((entry) =>
       entry.type === "command.scheduled" &&
       entry.command.kind === "request_model"
     ).length,
-    4,
-    "the durable attempts are retained across recovery",
+    6,
+    "the original request, two historical repair requests and three new attempts are all retained",
   );
   const terminal = result.logs.find((entry) =>
     entry.eventName === "runtime_v2_plan_terminal"
   );
   assert.equal(
     terminal?.data?.detailCode,
-    "runtime_v2_plan_recovery_stall_exhausted",
+    "runtime_v2_plan_deadline_reached",
   );
 });
 
@@ -6159,6 +6213,128 @@ function simplePlanSubmission(target = "src/new-fixture.js") {
     validations: [{ kind: "finite_command", command: "npm run build", expectedOutcome: "Build passes.", required: true, stepIndexes: [0], criterionIds: ["criterion-user-objective"] }],
   };
 }
+
+test("production Plan actively starts a scoped child and keeps the parent moving without a spawn call", async () => {
+  let parentRound = 0;
+  let childStarted = false;
+  let releaseChild;
+  const parentContinued = new Promise(resolve => { releaseChild = resolve; });
+  const result = await runProductionPlanScenario(async (messages, _settings, callbacks) => {
+    if (messages.some(message => String(message.content).includes("You are a read-only child"))) {
+      childStarted = true;
+      callbacks.onLifecycle?.({ phase: "model_progress", chunkCount: 1, byteCount: 10 });
+      await parentContinued;
+      return { content: "The scoped project manifest identifies the verification entry point.", toolCalls: [], usage: {} };
+    }
+    parentRound++;
+    if (parentRound === 1) return {
+      content: "", toolCalls: ["src/main.js", "package.json"].map((path, index) => ({
+        id: `source-${index}`, name: "read_file", arguments: JSON.stringify({ path }),
+      })), usage: {},
+    };
+    if (parentRound === 2) {
+      assert.equal(childStarted, true);
+      releaseChild();
+      return planProviderReply("parent-continues", "read_file", { path: "src/other.js" });
+    }
+    return planProviderReply("plan", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, (name, args) => planFixtureTool(name, args), {
+    initialCheckpoint: planningCheckpointWithRequirement("optional"),
+    turnInputContextSignals: { subagentPreference: "preferred" },
+    subagentCapacityPolicy: { maxActiveRequests: 1, modelRequestMode: "parallel" },
+    projectBaselineContext: { kind: "project_baseline_context", workspace: { canonicalPath: turn.workspaceKey },
+      fingerprints: { overall: "fixture" }, anchors: [{ path: "package.json", kind: "manifest" }],
+      facts: { languages: [], packageManagers: [], runtimes: [], scripts: [] }, topology: [], truncated: {}, omissions: [], diagnostics: [] },
+  });
+  assert.equal(result.settlement.outcome.status, "paused");
+  const { events, subagents } = result.checkpoint.aggregate;
+  assert.equal(subagents.length, 1);
+  assert.ok(subagents[0].proactiveKey);
+  assert.equal(subagents[0].sourceToolCallId, undefined);
+  assert.ok(events.some(event => event.type === "subagent.telemetry" && event.telemetry.phase === "first_token"));
+  assert.ok(events.some(event => event.type === "tool.completed" && event.evidence.some(item => item.target === "src/other.js")));
+});
+
+test("approved Plan revision opens a child on the exact changed target before the parent provider", async () => {
+  const sessionKey = `${turn.workspaceKey}:1`;
+  const sourceTurn = { ...turn, sessionKey, turnId: "reviewed-plan", clientSubmissionId: "reviewed-plan-receipt" };
+  const sourceRun = { ...run, sessionKey, turnId: sourceTurn.turnId, runId: "reviewed-run", attemptId: "reviewed-run" };
+  const { checkpoint: review, commit } = reviewCheckpoint(sourceTurn, sourceRun);
+  const append = (state, fields) => runtime.transition(state, event(state?.nextSequence || 0, (state?.updatedAt || 20) + 1, fields));
+  const checkpoint = aggregate => runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt });
+  const close = (aggregate, owner, active, resultKind) => {
+    const finalProjection = runtime.buildRuntimeV2FinalProjection(aggregate, `final-${owner.turnId}`, resultKind, resultKind);
+    const outcome = { resultKind, reason: resultKind, completedAt: aggregate.updatedAt + 2, finalProjectionId: finalProjection.id };
+    if (resultKind === "canceled") aggregate = append(aggregate, { type: "run.aborted", run: active, reason: outcome.reason });
+    aggregate = append(aggregate, { type: "run.completed", run: active, outcome, finalProjection });
+    aggregate = append(aggregate, { type: "projection.published", run: active, audience: "final", projectionId: finalProjection.id, projection: finalProjection });
+    return append(aggregate, { type: "turn.completed", turn: owner, runId: active.runId, outcome });
+  };
+  const approved = append(review.aggregate, { type: "work_plan.approved", run: sourceRun,
+    workPlan: { ...review.aggregate.workPlan, status: "approved" } });
+  const source = { turn: sourceTurn, approvalEventId: approved.events.at(-1).eventId, authority: commit.authority };
+  const driftTurn = { ...turn, sessionKey, turnId: "blocked-resume", clientSubmissionId: "blocked-resume-receipt" };
+  const driftRun = { ...run, sessionKey, turnId: driftTurn.turnId, runId: "blocked-run", attemptId: "blocked-run" };
+  const target = "src/main.js";
+  let drift = append(null, { type: "turn.admitted", turn: driftTurn, strategy: "plan", objective: "Continue the approved plan",
+    constraints: [], acceptanceCriteria: [] });
+  drift = append(drift, { type: "run.started", run: driftRun, phase: "planning" });
+  drift = append(drift, { type: "observation.recorded", run: driftRun, evidence: { id: "approved-plan-drift:0", kind: "tool", target } });
+  const currentSource = "export const changed = true;\n";
+  const observed = [];
+  const dispatches = [];
+  let abort;
+  let releaseChild;
+  const parentEntered = new Promise(resolve => { releaseChild = resolve; });
+  const result = await runProductionPlanScenario(async (messages, _settings, callbacks) => {
+    const transcript = messages.map(message => String(message.content)).join("\n");
+    if (transcript.includes("You are a read-only child")) {
+      dispatches.push("child");
+      callbacks.onLifecycle?.({ phase: "model_progress", chunkCount: 1, byteCount: 10 });
+      await parentEntered;
+      return { content: "The exact source is available for review.", toolCalls: [], usage: {} };
+    }
+    dispatches.push("parent");
+    releaseChild();
+    assert.match(transcript, /CURRENT REVISION PATH CHECKS/);
+    assert.match(transcript, /export const changed = true/);
+    abort.abort("fixture verified overlapping provider requests");
+    return { content: "", toolCalls: [], usage: {} };
+  }, async name => { throw new Error(`unexpected workspace tool ${name}`); }, {
+    runSessionKey: sessionKey,
+    revision: {
+      source,
+      turns: [{ id: sourceTurn.turnId, clientSubmissionId: sourceTurn.clientSubmissionId, userPrompt: "Prepare the plan" },
+        { id: driftTurn.turnId, approvedPlanContinuation: source }],
+      checkpoints: { [sourceTurn.turnId]: checkpoint(close(approved, sourceTurn, sourceRun, "canceled")),
+        [driftTurn.turnId]: checkpoint(close(drift, driftTurn, driftRun, "blocked")) },
+      ipc: {
+        getFileMetadata: async path => ({ path }),
+        readFileWindow: async path => {
+          observed.push(path);
+          return { path, content: currentSource, contentVersion: `sha256-${createHash("sha256").update(currentSource).digest("hex")}`,
+            totalLines: 1, totalChars: currentSource.length, returnedStartLine: 1, returnedEndLine: 1,
+            returnedStartChar: 0, returnedEndChar: currentSource.length, complete: true };
+        },
+      },
+    },
+    onAbortCtrl: value => { abort = value; },
+    turnInputContextSignals: { subagentPreference: "preferred" },
+    subagentCapacityPolicy: { maxActiveRequests: 1, modelRequestMode: "parallel" },
+  });
+  assert.deepEqual(observed, [target]);
+  assert.deepEqual(dispatches, ["child", "parent"]);
+  const { events, subagents } = result.checkpoint.aggregate;
+  assert.equal(subagents.length, 1);
+  assert.deepEqual(subagents[0].allowedPaths, [target]);
+  assert.equal(subagents[0].accessMode, "read");
+  assert.equal(subagents[0].taskKind, "review");
+  const childOpened = events.findIndex(event => event.type === "subagent.telemetry" && event.telemetry.phase === "request_opened");
+  const parentScheduled = events.findIndex(event => event.type === "command.scheduled" && event.command.kind === "request_model");
+  assert.ok(childOpened >= 0 && childOpened < parentScheduled);
+  assert.ok(!events.some(event => event.type === "work_plan.approved"));
+});
+
 const planProviderReply = (id, name, args) => ({ content: "", toolCalls: [{ id, name, arguments: JSON.stringify(args) }], usage: {}, protocolViolation: null });
 const planFixtureTool = async (name, args) => {
   if (name === "get_project_skeleton") return "src/main.js";
@@ -6166,6 +6342,244 @@ const planFixtureTool = async (name, args) => {
   if (name === "write_file") return "written";
   throw new Error(`unexpected tool ${name}`);
 };
+
+function ordinarySynthesisCheckpoint(restrictions = []) {
+  let checkpoint = planningCheckpointWithRequirement("optional");
+  if (restrictions.length) {
+    let restricted = null;
+    for (const value of checkpoint.events) {
+      const entry = value.type === "turn.admitted" ? { ...value, capabilityRestrictions: restrictions } : value;
+      restricted = runtime.appendRuntimeV2Checkpoint({ checkpoint: restricted, owner: turn, expectedRevision: restricted?.revision || 0, event: entry }).checkpoint;
+    }
+    checkpoint = restricted;
+  }
+  const append = (value) => {
+    const result = runtime.appendRuntimeV2Checkpoint({ checkpoint, owner: turn, expectedRevision: checkpoint.revision,
+      event: event(checkpoint.aggregate.nextSequence, checkpoint.aggregate.updatedAt + 1, value) });
+    assert.equal(result.disposition, "committed");
+    checkpoint = result.checkpoint;
+  };
+  const idempotencyKey = "ordinary-synthesis-before-cold-restore";
+  append({ type: "command.scheduled", run, command: { idempotencyKey, kind: "request_model", run, phase: "planning",
+    payload: { mode: "plan", stage: "synthesis", transport: "native_tool", submissionRepairPending: false, compactRecovery: false } } });
+  append({ type: "provider.responded", run, idempotencyKey, result: { visibleText: "I need one specific source fact before submitting the plan.", toolCalls: [], diagnostics: [] } });
+  return checkpoint;
+}
+
+for (const scenario of ["prose", "text_envelope", "transport", "cold"]) test(`ordinary Plan synthesis keeps safe missing-fact reads after ${scenario} recovery`, async () => {
+  const requests = [];
+  const reads = [];
+  const candidate = simplePlanSubmission();
+  candidate.planMarkdown = "Use ORDINARY_SYNTHESIS_FACT_27 to create the bounded fixture, then verify the build.";
+  const result = await runProductionPlanScenario(async (messages, _settings, _callbacks, _signal, tools, _maxTokens, options) => {
+    requests.push({ messages, names: tools.map((tool) => tool.function.name), options });
+    if (scenario === "transport" && requests.length <= 2) throw new Error("ECONNRESET: ordinary synthesis transport interruption");
+    if (scenario !== "cold" && scenario !== "transport" && requests.length === 1) return { content: "I need the exact source contract before completing this plan.", toolCalls: [], usage: {}, protocolViolation: null };
+    const readRound = scenario === "transport" ? 3 : scenario === "cold" ? 1 : 2;
+    if (requests.length === readRound) return planProviderReply("ordinary-missing-fact", "read_file", { path: "src/ordinary-fact.ts" });
+    return planProviderReply("ordinary-source-grounded-plan", "submit_runtime_v2_work_plan", candidate);
+  }, async (name, args) => {
+    if (name === "read_file") { if (!args.__raw) reads.push(args.path); return "export const ORDINARY_SYNTHESIS_FACT_27 = true;"; }
+    return planFixtureTool(name, args);
+  }, { initialCheckpoint: scenario === "cold" ? ordinarySynthesisCheckpoint() : undefined, nativeToolRoundTrip: scenario !== "text_envelope" });
+  const recovered = requests[scenario === "transport" ? 2 : scenario === "cold" ? 0 : 1];
+  if (scenario === "text_envelope") {
+    assert.deepEqual(recovered.names, []);
+    assert.equal(recovered.options.toolChoice, undefined);
+    assert.match(recovered.messages.map((message) => String(message.content || "")).join("\n"), /read_file/);
+  } else {
+    assert.ok(recovered.names.includes("read_file"), "a soft no-action or transport boundary cannot withdraw authorized source reads");
+    assert.ok(recovered.names.includes("submit_runtime_v2_work_plan"));
+    assert.equal(recovered.options.toolChoice, "required", "ordinary synthesis can choose a missing-fact read or submission");
+  }
+  assert.match(recovered.messages.map((message) => String(message.content || "")).join("\n"), /Read only a specific missing fact, or call submit_runtime_v2_work_plan/);
+  assert.equal(recovered.options.responseFormat, undefined);
+  assert.deepEqual(reads, ["src/ordinary-fact.ts"]);
+  assert.match(requests.at(-1).messages.map((message) => String(message.content || "")).join("\n"), /export const ORDINARY_SYNTHESIS_FACT_27 = true/);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.equal(result.checkpoint.aggregate.run.identity.runId, run.runId);
+  assert.equal(result.checkpoint.aggregate.events.filter((entry) => entry.type === "run.started").length, 1);
+  assert.ok(result.checkpoint.aggregate.evidence.some((entry) => entry.kind === "source" && entry.target === "src/ordinary-fact.ts"));
+  assert.equal(result.checkpoint.aggregate.evidence.some((entry) => entry.kind === "mutation"), false);
+  if (scenario === "transport") {
+    assert.deepEqual(requests[1].names, [], "explicit structured-response compatibility stays schema-only on the wire");
+    assert.equal(requests[1].options.responseFormat?.type, "json_schema");
+  }
+});
+
+test("ordinary cold synthesis retains durable workspace and network restrictions", async () => {
+  const requests = [];
+  let reads = 0;
+  const result = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, _maxTokens, options) => {
+    requests.push({ names: tools.map((tool) => tool.function.name), options });
+    return requests.length === 1 ? planProviderReply("ordinary-restricted-read", "read_file", { path: "src/ordinary-fact.ts" })
+      : planProviderReply("ordinary-restricted-plan", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, async (name, args) => {
+    if (name === "read_file" || name === "web_fetch") { reads++; throw new Error("restricted tools cannot execute"); }
+    return planFixtureTool(name, args);
+  }, { initialCheckpoint: ordinarySynthesisCheckpoint(["workspace_read", "network"]) });
+  assert.equal(reads, 0);
+  assert.ok(requests.every((request) => !request.names.includes("read_file") && !request.names.includes("web_fetch") && !request.names.includes("write_file")));
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.deepEqual(result.checkpoint.aggregate.objective.capabilityRestrictions, ["workspace_read", "network"]);
+});
+
+test("advisory Plan validation reports its unsupported required coverage instead of missing mapped IDs", () => {
+  const candidate = simplePlanSubmission();
+  candidate.validations = [{ kind: "assertion", required: true, expectedOutcome: "The recovered source fact is represented in the result." }];
+  const compiled = planProtocol.workPlanDraftFromSubmission(candidate, [], "Create the fixture", ["criterion-user-objective"]);
+  assert.deepEqual(compiled.draft.validations[0].criterionIds, ["criterion-user-objective"]);
+  assert.equal(compiled.draft.validations[0].required, false);
+  assert.throws(() => planSubmissionPolicy.assertAdmittedPlanCriteriaMapped({ draft: compiled.draft, criterionIds: ["criterion-user-objective"] }), error => {
+    assert.match(error.message, /validations\[0\].*assertion/);
+    assert.match(error.message, /cannot provide required validation coverage/);
+    assert.doesNotMatch(error.message, /missing from required validations\[\]\.criterionIds/);
+    return true;
+  });
+});
+
+test("incident advisory-only Plan saves a reviewable draft once and concludes partial without regeneration", async () => {
+  const candidate = simplePlanSubmission();
+  candidate.planMarkdown = "# Collector game plan\n\nUse Player, Coin_1/Coin_2/Coin_3 and CollectorGame with read-only Score/Won.\n";
+  candidate.validations = ["Move with WASD", "Collect coins", "Show score", "Show victory", "Reset with R"].map(expectedOutcome => ({ kind: "advisory", required: true, expectedOutcome }));
+  let requests = 0;
+  const result = await runProductionPlanScenario(async () => {
+    requests++;
+    if (requests > 1) throw new Error("semantic validation gaps must preserve the draft instead of requesting another whole plan");
+    return planProviderReply("incident-advisory-plan", "submit_runtime_v2_work_plan", candidate);
+  }, planFixtureTool);
+  assert.equal(requests, 1);
+  assert.equal(result.settlement.outcome.resultKind, "partial");
+  assert.equal(result.savedDocuments.length, 1);
+  assert.match(result.savedDocuments[0].markdown, /Collector game plan/);
+  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
+  assert.equal(result.state.activeActionRequest?.kind === "plan_review", false);
+  const record = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
+  assert.ok(record);
+  assert.ok(record.diagnostics.some(item => item.criterionIds.includes("criterion-user-objective")));
+  assert.equal(record.source.toolCallId, "incident-advisory-plan");
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "run.completed").length, 1);
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "turn.completed").length, 1);
+});
+
+for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan responds to first pre-action ${firstStop} with bounded recovery and safe reads`, async () => {
+  const candidate = simplePlanSubmission();
+  candidate.validations = [{ kind: "advisory", expectedOutcome: "Inspect the result in the editor." }];
+  const requests = [];
+  const options = { reasoningToggle: true, runtimeContextBudget: { contextLimit: 32768, inputBudget: 24576, outputBudget: 8192, readWindowChars: 16000 } };
+  const completed = await runProductionPlanScenario(async (_messages, settings, _callbacks, _signal, tools, maxTokens, options) => {
+    requests.push({ settings, names: tools.map(tool => tool.function.name), maxTokens, options });
+    return requests.length === 1 ? {
+      content: firstStop === "length" ? "" : "Hidden reasoning mirrored into the raw body.",
+      semanticContent: "",
+      reasoningContent: "No action before the output limit.",
+      finishReason: firstStop === "length" ? "length" : null,
+      ...(firstStop === "reasoning_only_timeout" ? { clientStopReason: firstStop } : {}),
+      toolCalls: [], usage: {},
+    }
+      : planProviderReply("bounded-recovery-draft", "submit_runtime_v2_work_plan", candidate);
+  }, planFixtureTool, options);
+  assert.equal(completed.settlement.outcome.resultKind, "partial");
+  assert.equal(requests[0].maxTokens, 8192);
+  assert.equal(requests[0].options.reasoningOnlyTimeoutMs, 60_000);
+  assert.equal(requests[1].maxTokens, 4096);
+  assert.equal(requests[1].settings.reasoningRequest, "off");
+  assert.ok(requests[1].names.includes("read_file"));
+  assert.ok(requests[1].names.includes("submit_runtime_v2_work_plan"));
+  const truncated = completed.checkpoint.aggregate.events.find(event => event.type === "provider.responded" && event.result.diagnostics.some(item => item.code === "output_truncated"));
+  const restored = await runProductionPlanScenario(async (_messages, settings, _callbacks, _signal, tools, maxTokens) => {
+    assert.equal(maxTokens, 4096);
+    assert.equal(settings.reasoningRequest, "off");
+    assert.ok(tools.some(tool => tool.function.name === "read_file"));
+    return planProviderReply("bounded-recovery-restored-draft", "submit_runtime_v2_work_plan", candidate);
+  }, planFixtureTool, { ...options, initialCheckpoint: checkpointThrough(completed.checkpoint, truncated.sequence) });
+  assert.equal(restored.settlement.outcome.resultKind, "partial");
+});
+
+test("a sealed Plan with a downgraded advisory check survives the Session JSON boundary", async () => {
+  const candidate = simplePlanSubmission();
+  candidate.validations.push({ kind: "finite_command", command: "npm run dev", expectedOutcome: "Observe the local service." });
+  const result = await runProductionPlanScenario(async () => planProviderReply("review-with-advisory-downgrade", "submit_runtime_v2_work_plan", candidate), planFixtureTool);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  const advisory = result.checkpoint.aggregate.sealedWorkPlan.draft.validations[1];
+  assert.equal(advisory.kind, "advisory");
+  assert.equal(Object.hasOwn(advisory, "command"), false, "a downgraded check has no command property to lose on disk");
+  const raw = runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: result.checkpoint })[turn.turnId];
+  const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(raw)), turn);
+  assert.equal(restored?.aggregate.phase, "reviewing");
+  assert.equal(restored.aggregate.planReviewCommit.artifact.documentRef.contentHash, result.checkpoint.aggregate.planReviewCommit.artifact.documentRef.contentHash);
+});
+
+for (const cold of [false, true]) test(`Plan protocol repair can read a missing fact and resubmit within the same Run${cold ? " after legacy typed rejection restore" : ""}`, async () => {
+  const restored = planningCheckpointWithTypedSubmissionRejection({ emptyBody: true });
+  const invalid = simplePlanSubmission();
+  invalid.planMarkdown = ""; // No reviewable body exists yet; protocol recovery remains safe and necessary.
+  const corrected = simplePlanSubmission();
+  corrected.planMarkdown = "Create the fixture using the recovered RECOVERY_FACT_864 contract, then verify it.";
+  const requests = [];
+  const reads = [];
+  const result = await withFakePlanClock(restored.rejectionAt + 1_000, async () => runProductionPlanScenario(async (messages, _settings, _callbacks, _signal, tools, _maxTokens, requestOptions) => {
+    requests.push({ messages, names: tools.map(tool => tool.function.name), requestOptions });
+    const index = requests.length - (cold ? 0 : 1);
+    if (index === 0) return planProviderReply("invalid-validation", "submit_runtime_v2_work_plan", invalid);
+    if (index === 1) return planProviderReply("missing-repair-fact", "read_file", { path: "src/recovery-fact.ts" });
+    return cold ? { content: JSON.stringify(corrected), toolCalls: [], usage: {}, protocolViolation: null }
+      : planProviderReply("repaired-plan", "submit_runtime_v2_work_plan", corrected);
+  }, async (name, args) => {
+    if (name === "read_file") { reads.push(args.path); return "export const RECOVERY_FACT_864 = true;"; }
+    return planFixtureTool(name, args);
+  }, { initialCheckpoint: cold ? restored.checkpoint : undefined }));
+  const repairRequest = requests[cold ? 0 : 1];
+  assert.ok(repairRequest.names.includes("read_file"), "a rejected WorkPlan does not close authorized safe reads");
+  assert.ok(repairRequest.names.includes("submit_runtime_v2_work_plan"));
+  assert.equal(repairRequest.requestOptions.toolChoice, "required", "Plan may choose a safe read or submission");
+  assert.doesNotMatch(repairRequest.messages.map(message => String(message.content || "")).join("\n"), /only the effect-free submission ingress|do not investigate again/);
+  assert.ok(reads.includes("src/recovery-fact.ts"));
+  assert.match(requests.at(-1).messages.map(message => String(message.content || "")).join("\n"), /export const RECOVERY_FACT_864 = true/);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.equal(result.checkpoint.aggregate.run.identity.runId, run.runId);
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "run.started").length, 1);
+  assert.ok(result.checkpoint.aggregate.evidence.some(entry => entry.kind === "source" && entry.target === "src/recovery-fact.ts"));
+  assert.equal(result.checkpoint.aggregate.evidence.some(entry => entry.kind === "mutation"), false);
+});
+
+test("cold Plan repair preserves durable workspace and network restrictions", async () => {
+  const restored = planningCheckpointWithTypedSubmissionRejection({ emptyBody: true });
+  let restricted = null;
+  for (const value of restored.checkpoint.aggregate.events) {
+    const entry = value.type === "turn.admitted" ? { ...value, capabilityRestrictions: ["workspace_read", "network"], networkRead: { enabled: true, provider: "bing" } } : value;
+    restricted = runtime.appendRuntimeV2Checkpoint({ checkpoint: restricted, owner: turn, expectedRevision: restricted?.revision || 0, event: entry }).checkpoint;
+  }
+  const requests = [];
+  let reads = 0;
+  const corrected = structuredClone(restored.candidate);
+  corrected.planMarkdown = "Create the bounded owner using the retained source contract, then verify the build.";
+  corrected.validations[0].stepIndexes = [0];
+  const result = await withFakePlanClock(restored.rejectionAt + 1_000, async () => runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools) => {
+    requests.push(tools.map(tool => tool.function.name));
+    return requests.length === 1 ? planProviderReply("restricted-repair-read", "read_file", { path: "src/recovery-fact.ts" })
+      : planProviderReply("restricted-corrected-plan", "submit_runtime_v2_work_plan", corrected);
+  }, async (name, args) => {
+    if (name === "read_file" || name === "web_fetch") { reads++; throw new Error("restricted tools must not execute"); }
+    return planFixtureTool(name, args);
+  }, { initialCheckpoint: restricted }));
+  assert.equal(reads, 0);
+  assert.ok(requests.every(names => !names.includes("read_file") && !names.includes("web_fetch") && !names.includes("write_file")));
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.deepEqual(result.checkpoint.aggregate.objective.capabilityRestrictions, ["workspace_read", "network"]);
+});
+
+test("global Plan checkpoints retain the canonical admitted Session scope", async () => {
+  const { GLOBAL_CHAT_KEY } = loadTs(path.join(workspaceRoot, "src/lib/sessionTypes.ts"));
+  const result = await runProductionPlanScenario(async () =>
+    planProviderReply("global-plan-submit", "submit_runtime_v2_work_plan", simplePlanSubmission()),
+  planFixtureTool, { runWorkspace: "", runScopeKey: GLOBAL_CHAT_KEY, runSessionKey: `${GLOBAL_CHAT_KEY}:1` });
+  assert.equal(result.checkpoint.owner.workspaceKey, GLOBAL_CHAT_KEY);
+  assert.equal(result.checkpoint.owner.sessionKey, `${GLOBAL_CHAT_KEY}:1`);
+  assert.equal(result.checkpoint.aggregate.turn.workspaceKey, GLOBAL_CHAT_KEY);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+});
+
 function checkpointThrough(checkpoint, sequence) {
   let result = null;
   for (const event of checkpoint.aggregate.events.filter((event) => event.sequence <= sequence)) {
@@ -6174,26 +6588,76 @@ function checkpointThrough(checkpoint, sequence) {
   return result;
 }
 
-test("Plan repeated receipts and reused provider call IDs cannot renew semantic progress", async () => {
+test("Plan persists its captured network policy and keeps it through cold restore", async () => {
+  const policy = { enabled: true, provider: "bing" };
+  const first = await runProductionPlanScenario(async () =>
+    planProviderReply("network-policy-submit", "submit_runtime_v2_work_plan", simplePlanSubmission()),
+  planFixtureTool, { networkRead: policy });
+  assert.equal(first.checkpoint.aggregate.phase, "reviewing");
+  assert.deepEqual(first.checkpoint.aggregate.networkRead, policy);
+  const start = first.checkpoint.aggregate.events.find((entry) => entry.type === "run.started");
+  const prefix = checkpointThrough(first.checkpoint, start.sequence);
+  const restored = await runProductionPlanScenario(async () =>
+    planProviderReply("restored-network-submit", "submit_runtime_v2_work_plan", simplePlanSubmission()),
+  planFixtureTool, { initialCheckpoint: prefix, networkRead: { enabled: false, provider: "baidu" } });
+  assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
+  assert.deepEqual(restored.checkpoint.aggregate.networkRead, policy);
+});
+
+test("Plan unverified reader output stays visible without creating source evidence", async () => {
+  const output = JSON.stringify({ url: "https://example.com/source", content: "Proxy error content", retrieval: { usable: false } });
+  const planEvidence = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async () => output }],
+  ]));
+  const messages = []; const evidence = []; const settlements = [];
+  await planEvidence.executeReadOnlyPlanTool({
+    context: {}, ledger: {
+      snapshot: () => ({ networkRead: { enabled: true, provider: "bing" }, objective: {} }),
+      schedule: async () => ({ idempotencyKey: "unverified-reader" }), settleCommand: async (event) => settlements.push(event), recordSoftSignal: async () => undefined,
+    }, run, call: { id: "reader", name: "web_fetch", arguments: { url: "https://example.com/source" } },
+    messages, evidence, evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
+  });
+  assert.deepEqual(settlements[0].evidence, []);
+  assert.deepEqual(evidence, []);
+  assert.equal(messages[0].content, output);
+});
+
+test("Plan repeated receipts retain soft pressure while a live or cold correction can still submit", async () => {
   const originalNow = Date.now;
   let now = 9_000_000;
   let requests = 0;
   Date.now = () => now;
   try {
-    const result = await runProductionPlanScenario(async () => {
+    const result = await runProductionPlanScenario(async (messages, _settings, _callbacks, _signal, tools) => {
       requests += 1;
-      now += requests === 3 ? PLAN_RECOVERY_STALL_MS + 1 : 1000;
-      return planProviderReply("provider-reuses-this-id", "read_file", { path: "src/main.js" });
+      if (requests <= 3) {
+        now += requests === 3 ? PLAN_RECOVERY_STALL_MS + 1 : 1000;
+        return planProviderReply("provider-reuses-this-id", "read_file", { path: "src/main.js" });
+      }
+      assert.equal(requests, 4);
+      assert.ok(tools.some(tool => tool.function.name === "read_file"));
+      assert.match(messages.map(message => String(message.content || "")).join("\n"), /Cached or unchanged results are not progress/);
+      return planProviderReply("live-correction-after-soft-stall", "submit_runtime_v2_work_plan", simplePlanSubmission());
     }, planFixtureTool);
-    assert.equal(requests, 3);
-    assert.equal(result.settlement.outcome.resultKind, "error");
-    assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
-    assert.ok(result.logs.some((entry) => entry.data?.detailCode === "runtime_v2_plan_recovery_stall_exhausted"));
-    const lastRead = result.checkpoint.aggregate.events.filter((event) => event.type === "tool.completed").at(-1);
+    assert.equal(requests, 4);
+    assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+    assert.equal(result.checkpoint.aggregate.terminalOutcome, null);
+    const events = result.checkpoint.aggregate.events;
+    const readCommands = new Set(events.filter(event => event.type === "command.scheduled" && event.command.payload.toolName === "read_file").map(event => event.command.idempotencyKey));
+    const lastRead = events.filter(event => event.type === "tool.completed" && readCommands.has(event.idempotencyKey)).at(-1);
     const resume = checkpointThrough(result.checkpoint, lastRead.sequence);
-    const restored = await runProductionPlanScenario(async () => { throw new Error("expired recovery must not request a model"); }, async () => { throw new Error("restore must not recollect evidence"); }, { initialCheckpoint: resume });
-    assert.equal(restored.settlement.outcome.resultKind, "error");
-    assert.equal(restored.checkpoint.aggregate.events.filter((event) => event.type === "provider.responded").length, 3);
+    const recovery = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/readOnlyProgress.ts")).deriveReadOnlyRecoveryWindow(resume.aggregate, { finalTextIsProgress: false });
+    assert.ok(recovery?.pressure.occurrence >= 2, "same-version reads did not renew progress");
+    assert.ok(now - recovery.startedAt > PLAN_RECOVERY_STALL_MS);
+    let restoredRequests = 0;
+    const restored = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools) => {
+      restoredRequests++;
+      assert.ok(tools.some(tool => tool.function.name === "read_file"));
+      return planProviderReply("cold-correction-after-soft-stall", "submit_runtime_v2_work_plan", simplePlanSubmission());
+    }, async () => { throw new Error("retained evidence needs no disk reread"); }, { initialCheckpoint: resume });
+    assert.equal(restoredRequests, 1);
+    assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
+    assert.equal(restored.checkpoint.aggregate.events.filter(event => event.type === "provider.responded").length, 4);
   } finally { Date.now = originalNow; }
 });
 
@@ -6299,7 +6763,7 @@ test("Plan compact recovery alternates the actual wire contract and restores tha
   const result = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, _budget, options) => {
     attempts.push({ tools: tools.map((tool) => tool.function.name), responseFormat: options.responseFormat });
     if (attempts.length <= 2) throw new Error("ECONNRESET: fixture transport interrupted");
-    assert.deepEqual(attempts[2].tools, ["submit_runtime_v2_work_plan"]);
+    assert.deepEqual(attempts[2].tools, ["read_file", "submit_runtime_v2_work_plan"]);
     assert.equal(attempts[2].responseFormat, undefined);
     return planProviderReply("native-recovery", "submit_runtime_v2_work_plan", simplePlanSubmission());
   }, planFixtureTool);
@@ -6315,13 +6779,62 @@ test("Plan compact recovery alternates the actual wire contract and restores tha
   let resumedRequests = 0;
   const restored = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, budget, options) => {
     resumedRequests += 1;
-    assert.deepEqual(tools.map((tool) => tool.function.name), ["submit_runtime_v2_work_plan"]);
+    assert.deepEqual(tools.map((tool) => tool.function.name), ["read_file", "submit_runtime_v2_work_plan"]);
     assert.equal(options.responseFormat, undefined);
     assert.equal(budget, planProtocol.PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS);
     return planProviderReply("restored-native-recovery", "submit_runtime_v2_work_plan", simplePlanSubmission());
   }, planFixtureTool, { initialCheckpoint: prefix });
   assert.equal(resumedRequests, 1);
   assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
+});
+
+for (const fallback of ["valid_plan", "repetition", "no_action"]) test(`typed Plan repair sends the repetition fallback on the wire and handles ${fallback}`, async () => {
+  const initial = planningCheckpointWithTypedSubmissionRejection({ emptyBody: true });
+  const attempts = [];
+  const exhausted = fallback !== "valid_plan";
+  const repeated = () => Object.assign(new Error("STREAM_VISIBLE_TEXT_REPETITION: repeated output"), { code: "STREAM_VISIBLE_TEXT_REPETITION" });
+  const result = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, _tokens, options) => {
+    attempts.push({ tools: tools.map((tool) => tool.function.name), format: options.responseFormat });
+    if (attempts.length > 2) throw new runtime.RuntimeV2ProviderTransportsUnavailableError();
+    if (attempts.length === 1 || fallback === "repetition") throw repeated();
+    return { content: exhausted ? "No valid action." : JSON.stringify(simplePlanSubmission()), toolCalls: [], usage: {} };
+  }, planFixtureTool, { initialCheckpoint: initial.checkpoint });
+  assert.equal(attempts.length, 2);
+  assert.ok(attempts[0].tools.includes("read_file"));
+  assert.deepEqual(attempts[1].tools, []);
+  assert.equal(attempts[1].format?.type, "json_schema");
+  const events = result.checkpoint.aggregate.events;
+  const failures = events.filter((event) => event.type === "command.completed" &&
+    event.failureReasonCode === "STREAM_VISIBLE_TEXT_REPETITION");
+  assert.equal(failures.length, fallback === "repetition" ? 2 : 1);
+  assert.equal(result.checkpoint.aggregate.phase, exhausted ? "completed" : "reviewing");
+  if (exhausted) {
+    assert.equal(result.settlement.outcome.resultKind, "error");
+    assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
+    assert.equal(events.filter((event) => event.type === "turn.completed").length, 1);
+    assert.equal(events.filter((event) => event.type === "projection.published" && event.audience === "final").length, 1);
+    assert.equal(result.savedDocuments.length, 0);
+  }
+  let restoredRequests = 0;
+  const restored = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, _tokens, options) => {
+    restoredRequests++;
+    assert.deepEqual(tools, []);
+    assert.equal(options.responseFormat?.type, "json_schema");
+    return { content: JSON.stringify(simplePlanSubmission()), toolCalls: [], usage: {} };
+  }, planFixtureTool, { initialCheckpoint: checkpointThrough(result.checkpoint,
+    fallback === "no_action" ? events.findLast(event => event.type === "provider.responded").sequence : failures.at(-1).sequence) });
+  assert.equal(restoredRequests, exhausted ? 0 : 1);
+  assert.equal(restored.checkpoint.aggregate.phase, exhausted ? "completed" : "reviewing");
+  if (!exhausted) {
+    const scheduled = events.find(event => event.type === "command.scheduled" && event.command.payload.planRepetitionFallback);
+    const interrupted = await runProductionPlanScenario(async (_messages, _settings, _callbacks, _signal, tools, _tokens, options) => {
+      assert.deepEqual(tools, []);
+      assert.equal(options.responseFormat?.type, "json_schema");
+      return { content: JSON.stringify(simplePlanSubmission()), toolCalls: [], usage: {} };
+    }, planFixtureTool, { initialCheckpoint: checkpointThrough(result.checkpoint, scheduled.sequence) });
+    assert.equal(interrupted.checkpoint.aggregate.phase, "reviewing");
+    assert.equal(interrupted.checkpoint.aggregate.events.filter(event => event.type === "work_plan.sealed").length, 1);
+  }
 });
 
 test("Plan cold history never attaches a future receipt to an interrupted reused call ID", () => {
@@ -6340,6 +6853,42 @@ test("Plan cold history never attaches a future receipt to an interrupted reused
   assert.equal(tools[1].content, "The resumed file's actual source.");
 });
 
+
+test("a focused approved-Plan revision advertises exact reads and synthesis without workspace discovery", async () => {
+  const requests = [];
+  const logs = [];
+  const port = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planProviderPort.ts"), new Map([
+    ["../../lib/streaming", {
+      isStreamOutputLimited,
+      streamChatCompletion: async (...args) => {
+        requests.push(args[4].map(tool => tool.function.name));
+        return { content: "", toolCalls: [], usage: {}, finishReason: "stop" };
+      },
+    }],
+    ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ markFirstToken() {}, reportFailure() {}, release() {}, setPressureHandler() {} }) }],
+    ["../../lib/providerLaneSettings", {
+      deriveBudgetedStreamSettings: () => ({}),
+      deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+    }],
+  ]));
+  for (const focusedRevision of [true, false]) await port.requestPlanModel({
+    get: () => ({ config: {} }),
+    context: { abortCtrl: new AbortController(), phaseLanguage: "en", runWorkspace: "/fixture", runSessionKey: run.sessionKey },
+    ledger: {
+      snapshot: () => ({ objective: { text: "Revise the reviewed plan" }, evidence: [] }),
+      schedule: async () => ({ idempotencyKey: "revision-request" }),
+      settleCommand: async () => {},
+    },
+    run, messages: [{ role: "user", content: "Review the changed source." }],
+    deadlineAt: Date.now() + 30_000, stage: "synthesis", evidence: [], evidenceContents: new Map(),
+    collaboration: { collaborationAllowed: true, remainingSubagentCapacity: 1 },
+    submissionRepairPending: false, focusedRevision,
+    logStoreEvent: (name, data) => logs.push({ name, data }),
+  });
+  assert.deepEqual(requests[0], ["read_file", "spawn_subagent", "submit_runtime_v2_work_plan"]);
+  assert.ok(requests[1].includes("glob_search") && requests[1].includes("grep_search"));
+  assert.equal(logs.find(item => item.name === "runtime_v2_plan_provider_request_opened").data.reasoningOnlyTimeoutMs, 60_000);
+});
 
 test("Plan distinguishes client output guards from real provider length without accepting an incomplete response", async () => {
   for (const cause of ["reasoning_char_limit", "action_char_limit", "provider_length", "stop"]) {
@@ -6389,4 +6938,86 @@ test("Plan distinguishes client output guards from real provider length without 
     assert.equal(shape.stopSource, isClientStop ? "client_guard" : cause === "provider_length" ? "provider" : null);
     if (isClientStop) assert.match(diagnostic.message, new RegExp(cause));
   }
+});
+
+test("Plan knowledge reads use only canonical selected versions, retain bounded JSON and create no workspace source lease", async () => {
+  const reference = { kind: "source", kbId: "kb-plan", sourceId: "design", sourceRevision: "rev-original" };
+  const hit = { text: "A confirmed external design constraint.", citation: { kbId: "kb-plan", sourceId: "design", sourceRevision: "rev-original", chunkId: "constraint" } };
+  const output = JSON.stringify({ hits: [hit] });
+  const calls = [], settlements = [], messages = [];
+  const port = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planEvidencePort.ts"), new Map([
+    ["../../lib/toolExecutor", { executeTool: async (...args) => { calls.push(args); return output; } }],
+  ]));
+  const context = { runWorkspace: "/fixture", runSessionKey: "plan-knowledge", runtimeContextBudget: { readWindowChars: 2000 }, knowledgeContext: { state: "retrieved", references: [{ ...reference, sourceRevision: "live-changed" }] } };
+  const canonical = { knowledgeContext: { state: "retrieved", references: [reference] }, objective: {} };
+  const input = { context, ledger: { snapshot: () => canonical, schedule: async () => ({ idempotencyKey: "knowledge-read" }), settleCommand: async event => settlements.push(event), recordSoftSignal: async () => {} },
+    run, call: { id: "knowledge", name: "knowledge_search", arguments: { query: "constraint" } }, messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {} };
+  await port.executeReadOnlyPlanTool(input);
+  assert.deepEqual(calls[0][4].knowledgeReferences, [reference]);
+  assert.equal(settlements[0].status, "succeeded");
+  assert.ok(settlements[0].evidence.every(item => item.kind === "tool"));
+  assert.deepEqual(JSON.parse(messages[0].content.slice(messages[0].content.indexOf("\n") + 1)), { hits: [hit] });
+  for (const packet of [undefined, { state: "no_hits", references: [] }, { state: "stale", references: [reference] }]) {
+    calls.length = 0; settlements.length = 0;
+    canonical.knowledgeContext = packet;
+    await port.executeReadOnlyPlanTool(input);
+    assert.equal(calls.length, 0);
+    assert.equal(settlements[0].status, "blocked");
+  }
+});
+
+
+test("production Plan preserves a multiline objective while saving a valid single-line document title", async () => {
+  const objective = [
+    "请为 CSV creatorName 数据链路生成可审批的整改计划，保持原始目标和用户限定范围。",
+    "主体负责整合已确认的调查事实，并保留独立审批后才允许实际修改的边界。",
+    "1. 检查 CSV 字段映射，保留现有中文字段及消费契约。",
+    "2. 明确图表消费端和订单类型需要的 creatorName，不扩大写入范围。",
+    "3. 仅修复 src/main.js，所有已采用的证据必须使用真实 evidence ID。",
+    "4. 验收使用原有 npm run build，不提前执行命令或修改业务源码。",
+    "输出必须保留上述每行约束，不能为了文档标题而缩减原始 objective。",
+  ].join("\n");
+  let round = 0;
+  const toolCalls = [];
+  const result = await runProductionPlanScenario(async () => {
+    round += 1;
+    return { content: "", toolCalls: [{ id: `multiline-objective-${round}`,
+      name: round === 1 ? "read_file" : "submit_runtime_v2_work_plan",
+      arguments: JSON.stringify(round === 1 ? { path: "src/main.js" } : {
+        planMarkdown: "修复已调查的字段映射，保留中文字段和消费契约，并在独立批准后验证。",
+        changes: [{ title: "修复字段映射", operation: "modify", targets: ["src/main.js"], basis: ["E2"],
+          change: "最小修复 creatorName 映射，保留原有输入与消费契约。", expectedOutcome: "字段映射符合现有消费契约。", dependsOn: [], criterionIds: ["criterion-user-objective"] }],
+        validations: [{ kind: "finite_command", command: "npm run build", expectedOutcome: "构建通过。", required: true, stepIndexes: [0], criterionIds: ["criterion-user-objective"] }],
+      }) }], usage: {}, protocolViolation: null };
+  }, async (name) => {
+    toolCalls.push(name);
+    if (name === "get_project_skeleton") return "src/main.js";
+    if (name === "read_file") return "export const creatorName = row.creator || row['创建者'] || '';\n";
+    throw new Error(`unexpected tool ${name}`);
+  }, { userPrompt: objective });
+  assert.equal(round, 2);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.equal(result.settlement.outcome.status, "paused");
+  const resolved = adapter.resolveRuntimeV2PlanReviewFromAggregate(result.checkpoint.aggregate);
+  assert.equal(resolved?.pending, true);
+  const saved = result.savedDocuments[0];
+  const ref = resolved.commit.artifact.documentRef;
+  assert.equal(saved.title, objective.replace(/\s+/g, " ").trim());
+  assert.doesNotMatch(saved.title, /[\u0000\r\n]/);
+  assert.equal(resolved.plan.draft.objective, objective);
+  assert.ok(resolved.plan.markdown.includes("修复已调查的字段映射，保留中文字段和消费契约，并在独立批准后验证。"));
+  assert.equal(saved.markdown, resolved.plan.markdown);
+  assert.equal(ref.contentHash, createHash("sha256").update(saved.markdown).digest("hex"));
+  assert.deepEqual(ref.owner, { workspace: turn.workspaceKey, sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId });
+  assert.deepEqual(result.state.activeActionRequest.documentRef, ref);
+  assert.equal(adapter.validateSealedWorkPlanV1Integrity(resolved.plan).ok, true);
+  const { normalizePlanDocumentRef } = loadTs(path.join(workspaceRoot, "src/lib/planDocuments.ts"));
+  assert.deepEqual(normalizePlanDocumentRef(ref), ref);
+  assert.equal(normalizePlanDocumentRef({ ...ref, title: objective }), null, "the strict ref reader still rejects multiline titles");
+  assert.equal(result.checkpoint.aggregate.events.some(event => event.type === "work_plan.approved"), false);
+  assert.equal(toolCalls.some(name => ["write_file", "replace_in_file", "run_command"].includes(name)), false);
+  const persisted = runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: result.checkpoint })[turn.turnId];
+  const restored = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(persisted)), turn);
+  assert.deepEqual(restored.aggregate.sealedWorkPlan, resolved.plan);
+  assert.deepEqual(restored.aggregate.planReviewCommit.artifact.documentRef, ref);
 });

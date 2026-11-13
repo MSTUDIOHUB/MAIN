@@ -6,8 +6,7 @@ export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 /**
  * Inspired by gg-framework / ggcoder:
  * Keep the default exposed tool surface small (8 orthogonal core tools) and
- * static across turns so local models (Ollama, LM Studio, llama.cpp) preserve
- * 100% prefix KV Cache and avoid tool-choice paralysis across 28+ overlapping schemas.
+ * stable across turns to improve prefix cache reuse and limit overlapping schemas.
  */
 export const CORE_DEFAULT_TOOL_NAMES: ReadonlySet<string> = new Set([
   "read_file",
@@ -135,9 +134,15 @@ const PROMPT_CAPABILITY_UNLOCK_RULES: readonly {
     pattern: /\b(web_search|web_fetch|联网搜索|搜索网页|抓取网页)\b/i,
     tools: ["web_search", "web_fetch"],
   },
+  {
+    pattern: /\b(knowledge_search|knowledge_get_excerpt|知识库|代码手册|tuanjie|团结引擎|unity6|verse|uefn)\b/i,
+    tools: ["knowledge_search", "knowledge_get_excerpt"],
+  },
 ];
 
 const EXTENDED_TOOL_KEYWORDS: Readonly<Record<string, readonly string[]>> = {
+  knowledge_search: ["knowledge", "manual", "docs", "api", "tuanjie", "unity", "verse", "知识库", "代码手册", "团结引擎"],
+  knowledge_get_excerpt: ["knowledge", "excerpt", "chunk", "manual", "知识库", "原文", "片段"],
   list_directory: ["directory", "folder", "ls", "tree", "目录", "文件夹"],
   get_project_skeleton: ["skeleton", "architecture", "tree", "overview", "unity", "骨架", "目录树", "架构"],
   get_file_outline: ["outline", "signature", "csharp", "c#", "class", "interface", "大纲", "签名"],
@@ -215,6 +220,7 @@ export function executeToolSearch(
   options: {
     readonly sessionKey?: string;
     readonly toolCatalog?: ToolCatalog;
+    readonly availableToolNames?: ReadonlySet<string>;
   } = {},
 ): string {
   const rawQuery = String(args.query || "").trim();
@@ -224,7 +230,8 @@ export function executeToolSearch(
   );
   const catalogDefinitions = options.toolCatalog?.toolDefinitions || [];
   const candidates = catalogDefinitions.filter(
-    (def) => !CORE_DEFAULT_TOOL_NAMES.has(def.function.name),
+    (def) => !CORE_DEFAULT_TOOL_NAMES.has(def.function.name) &&
+      (!options.availableToolNames || options.availableToolNames.has(def.function.name)),
   );
 
   if (!rawQuery || rawQuery === "*" || rawQuery.toLowerCase() === "all") {

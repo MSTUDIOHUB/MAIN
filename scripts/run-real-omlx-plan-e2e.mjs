@@ -156,6 +156,7 @@ const result = spawnSync(
     env: {
       ...process.env,
       MAIN_REAL_OMLX_E2E: "1",
+      MAIN_FROZEN_RUNTIME_E2E: process.env.MAIN_FROZEN_RUNTIME_E2E || "1",
       PLAYWRIGHT_REUSE_EXISTING_SERVER: "0",
       OMLX_ENDPOINT: endpoint,
       OMLX_API_KEY: apiKey,

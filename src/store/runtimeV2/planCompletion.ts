@@ -24,6 +24,7 @@ import {
   createRuntimeV2PlanReviewCommit,
   resolveRuntimeV2PlanReviewFromAggregate,
 } from "./workPlanAdapter";
+import { recoverRuntimeV2PlanDraft } from "./planDraftRunner";
 
 type RuntimeV2PlanCompletion =
   | {
@@ -87,18 +88,18 @@ export async function completeRuntimeV2Plan(input: {
     input.sealedPlan.revision,
     input.sealedPlan.projectionHash.slice(-16),
   ].join(":");
+  input.runner.context.abortCtrl.signal.throwIfAborted();
+  const documentRef = await writeReviewArtifact({
+    context: input.runner.context, ledger: input.ledger, run: input.run, plan: input.sealedPlan,
+  });
+  input.runner.context.abortCtrl.signal.throwIfAborted();
   const commit = createRuntimeV2PlanReviewCommit({
     plan: input.sealedPlan,
     turn: input.turn,
     run: input.run,
     requestId,
     createdAt: Date.now(),
-  });
-  await writeReviewArtifact({
-    context: input.runner.context,
-    ledger: input.ledger,
-    run: input.run,
-    plan: input.sealedPlan,
+    documentRef,
   });
   await input.ledger.append({
     type: "work_plan.sealed",
@@ -160,6 +161,10 @@ export async function recoverRuntimeV2PlanFailure(input: {
         ),
       ),
     };
+  }
+  if (aggregate.events.some(event => event.type === "command.scheduled" && event.command.payload.planDraftMetadata)) {
+    const draft = await recoverRuntimeV2PlanDraft(input.runner, input.ledger, input.run);
+    if (draft) return { kind: "settled", settlement: draft };
   }
   const recoveredReview = resolveRuntimeV2PlanReviewFromAggregate(aggregate);
   if (recoveredReview?.pending) {

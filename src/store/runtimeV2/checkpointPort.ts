@@ -1,5 +1,5 @@
+import { RuntimeV2GuidancePendingError, runtimeV2PendingGuidance } from "../../lib/runtime-v2/guidance";
 import {
-  appendRuntimeV2Checkpoint,
   commitRuntimeV2EmergencyTerminalEnvelope,
   normalizeRuntimeV2Checkpoint,
   normalizeRuntimeV2EmergencyTerminalEnvelope,
@@ -12,8 +12,10 @@ import {
   type RuntimeV2TurnIdentity,
   RuntimeV2CheckpointWriteBoundaryError,
 } from "../../lib/runtime-v2";
+import { createAsyncRuntimeV2CheckpointAppender } from "../../lib/runtime-v2/checkpoint";
 import { persistSubmitRuntimeProjection } from "../persistSubmitRuntimeProjection";
 import type { ProjectSessionSaveOptions } from "../../lib/projectSessionMutationCoordinator";
+import { createKeyedAsyncQueue } from "../../lib/keyedAsyncQueue";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -34,6 +36,8 @@ export interface RuntimeV2CheckpointStoreAdapterInput {
     sessionId: number | string | null | undefined;
     expectedRevisionToken: unknown;
   }) => { published: boolean; disposition: string };
+  /** Extra projection committed in the same Session snapshot as this user's guidance event. */
+  readonly projectGuidance?: (state: any, stage: "persist" | "publish") => Record<string, unknown> | null;
   readonly logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 
@@ -75,6 +79,9 @@ function runIdForEvent(event: RuntimeV2Event): string | null {
 }
 
 const CHECKPOINT_PROJECTION_ATTEMPTS = 3;
+// User input may arrive while a controller is waiting for its provider. The
+// exact Session's append and publication form one writer boundary.
+const checkpointWriters = createKeyedAsyncQueue();
 
 /**
  * Store-side CAS port. Runtime v2 itself never sees Zustand, Session records,
@@ -84,7 +91,8 @@ const CHECKPOINT_PROJECTION_ATTEMPTS = 3;
 export function createRuntimeV2CheckpointPort(
   input: RuntimeV2CheckpointStoreAdapterInput,
 ): CheckpointPort {
-  return {
+  const appendCheckpoint = createAsyncRuntimeV2CheckpointAppender();
+  const port: CheckpointPort = {
     async load({ owner }) {
       if (emergencyEnvelopeForOwner(input.get(), owner)) {
         throw new Error(
@@ -95,6 +103,7 @@ export function createRuntimeV2CheckpointPort(
     },
 
     async append({ owner, expectedRevision, event }) {
+      const startedAt = Date.now();
       for (
         let attempt = 1;
         attempt <= CHECKPOINT_PROJECTION_ATTEMPTS;
@@ -104,23 +113,42 @@ export function createRuntimeV2CheckpointPort(
         if (emergencyEnvelopeForOwner(state, owner)) {
           return { disposition: "conflict" as const, checkpoint: null };
         }
-        const appended = appendRuntimeV2Checkpoint({
-          checkpoint: checkpointForOwner(state, owner),
-          owner,
-          expectedRevision,
-          event,
-        });
+        const current = checkpointForOwner(state, owner);
+        if (current && current.revision > expectedRevision) {
+          if (current.events.some(existing => existing.eventId === event.eventId)) {
+            return appendCheckpoint({ checkpoint: current, owner, expectedRevision, event });
+          }
+          const added = current.aggregate.events.slice(expectedRevision);
+          // Never rebase past a concurrent lifecycle decision or effect.
+          if (added.length !== current.revision - expectedRevision ||
+            (event.type !== "guidance.admitted" && !added.every(item => item.type === "guidance.admitted"))) {
+            return { disposition: "conflict" as const, checkpoint: null };
+          }
+          if (event.type === "command.scheduled" && event.command.kind === "finalize_turn" &&
+            (event.command.payload.resultKind === "success" || event.command.payload.resultKind === "partial") &&
+            runtimeV2PendingGuidance(current.aggregate)) throw new RuntimeV2GuidancePendingError();
+          expectedRevision = current.revision;
+          event = { ...event, sequence: current.aggregate.nextSequence, at: Math.max(event.at, current.aggregate.updatedAt) };
+        }
+        const appended = await appendCheckpoint({ checkpoint: current, owner, expectedRevision, event });
         if (appended.disposition !== "committed") {
           return appended.disposition === "idempotent"
             ? { disposition: "idempotent" as const, checkpoint: appended.checkpoint }
             : { disposition: "conflict" as const, checkpoint: null };
         }
 
+        const latestBeforePersist = input.get();
+        if (emergencyEnvelopeForOwner(latestBeforePersist, owner) ||
+            (checkpointForOwner(latestBeforePersist, owner)?.revision ?? 0) !== expectedRevision) continue;
+        const guidancePatch = input.projectGuidance?.(latestBeforePersist, "persist");
+        if (input.projectGuidance && !guidancePatch) return { disposition: "conflict" as const, checkpoint: null };
+        const preparationElapsedMs = Date.now() - startedAt;
         const storeRevisionBeforePersist = input.getSessionRevisionToken();
         const projectedState = {
-          ...state,
+          ...latestBeforePersist,
+          ...guidancePatch,
           runtimeV2Checkpoints: {
-            ...checkpointMapFor(state),
+            ...checkpointMapFor(latestBeforePersist),
             [owner.turnId]: appended.checkpoint,
           },
         };
@@ -140,7 +168,8 @@ export function createRuntimeV2CheckpointPort(
             isCurrent: () => {
               const latest = input.get();
               return !emergencyEnvelopeForOwner(latest, owner) &&
-                (checkpointForOwner(latest, owner)?.revision ?? 0) === expectedRevision;
+                (checkpointForOwner(latest, owner)?.revision ?? 0) === expectedRevision &&
+                (!input.projectGuidance || !!input.projectGuidance(latest, "persist"));
             },
           });
         } catch (error) {
@@ -193,8 +222,11 @@ export function createRuntimeV2CheckpointPort(
         // that latest state, then publish synchronously against its current
         // owner token. This preserves concurrent UI fields without weakening
         // the ledger's own expectedRevision fence above.
+        const rebasedGuidancePatch = input.projectGuidance?.(latestState, "publish");
+        if (input.projectGuidance && !rebasedGuidancePatch) return { disposition: "conflict" as const, checkpoint: null };
         const rebasedProjectedState = {
           ...latestState,
+          ...rebasedGuidancePatch,
           runtimeV2Checkpoints: {
             ...checkpointMapFor(latestState),
             [owner.turnId]: appended.checkpoint,
@@ -242,6 +274,10 @@ export function createRuntimeV2CheckpointPort(
           eventType: event.type,
           sequence: event.sequence,
           revision: appended.checkpoint.revision,
+          elapsedMs: Date.now() - startedAt,
+          preparationElapsedMs,
+          commandKey: event.type === "command.scheduled" ? event.command.idempotencyKey
+            : "idempotencyKey" in event ? event.idempotencyKey : undefined,
           sideEffectFence: event.type === "command.scheduled",
           ...(event.type === "soft_signal.observed"
             ? { signal: event.signal }
@@ -448,6 +484,11 @@ export function createRuntimeV2CheckpointPort(
       }
       return { disposition: "conflict" as const, envelope: null };
     },
+  };
+  return {
+    ...port,
+    append: (request) => checkpointWriters.run(request.owner.sessionKey, () => port.append(request)),
+    commitEmergencyTerminal: (request) => checkpointWriters.run(request.owner.sessionKey, () => port.commitEmergencyTerminal(request)),
   };
 }
 

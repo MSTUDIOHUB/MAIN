@@ -69,3 +69,57 @@ test("changing decision guidance leaves the canonical conversation as a stable r
   await requestRuntimeV2ProviderOnce({ ...input, textEnvelope: true });
   assert.deepEqual(requests[2].messages.slice(0, -3), prefix, "protocol instructions also belong after stable history");
 });
+
+test("queued guidance reaches only the next v2 request and is retained once during protocol retry", async () => {
+  const requests = [];
+  const runtime = loadTs("src/lib/runtime-v2/index.ts", new Map());
+  const { isStreamOutputLimited } = loadTs("src/lib/streaming.ts", new Map());
+  const mocks = new Map([
+    ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ markFirstToken() {}, release() {}, reportFailure() {} }) }],
+    ["../../lib/streaming", { isStreamOutputLimited, streamChatCompletion: async (messages) => {
+      requests.push(structuredClone(messages));
+      return { content: "Answer", semanticContent: "Answer", toolCalls: [], finishReason: "stop", protocolViolation: null };
+    } }],
+  ]);
+  const { requestRuntimeV2ProviderOnce } = loadTs("src/store/runtimeV2/executionProviderRequest.ts", mocks);
+  const { createRuntimeV2LiveExecutionState } = loadTs("src/store/runtimeV2/executionTypes.ts", mocks);
+  const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn" };
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId, runId: "run", parentRunId: null, attemptId: "attempt" };
+  let aggregate = null;
+  const add = draft => {
+    const sequence = aggregate?.nextSequence ?? 0;
+    aggregate = runtime.transition(aggregate, { ...draft, schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence, at: sequence + 1, eventId: `event-${sequence}` });
+  };
+  add({ type: "turn.admitted", turn, strategy: "execute", objective: "Build the scene", constraints: [], acceptanceCriteria: [] });
+  add({ type: "run.started", run, phase: "observing" });
+  const schedule = idempotencyKey => {
+    const command = { kind: "request_model", phase: "observing", run, idempotencyKey, payload: { mode: "execute" } };
+    add({ type: "command.scheduled", run, command });
+    return command;
+  };
+  const inFlight = schedule("in-flight");
+  const text = "Inspect the Console before continuing.";
+  add({ type: "guidance.admitted", run, text, sourceReceiptId: "receipt" });
+
+  const live = createRuntimeV2LiveExecutionState();
+  live.messages = [{ role: "system", content: "[MAIN RUNTIME V2] stable" }, { role: "user", content: "Build the scene", runtimeTurnId: turn.turnId }];
+  const ports = {
+    get: () => ({ config: { activeProfile: "local", local: { endpoint: "http://fixture.invalid/v1", model: "fixture", provider: "omlx", toolProtocol: "auto", contextLimit: 32768 } },
+      runtimeV2Checkpoints: { turn: runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt }) },
+      conversationTurns: [], agentMessages: [] }),
+    context: { turnId: "turn", runWorkspace: "/fixture", phaseLanguage: "en", runtimeRunIntent: "execute", runtimeContextBudget: { contextLimit: 32768, inputBudget: 24576, outputBudget: 8192 } },
+    live, logStoreEvent() {},
+  };
+  const tools = [{ type: "function", function: { name: "read_file", description: "Read source", parameters: { type: "object", properties: {} } } }];
+  const input = { live, ports, tools, toolChoice: null, signal: new AbortController().signal };
+  await requestRuntimeV2ProviderOnce({ ...input, command: inFlight, textEnvelope: false });
+  assert.equal(requests[0].filter(message => message.content === text).length, 0);
+
+  add({ type: "provider.responded", run, idempotencyKey: inFlight.idempotencyKey, result: { visibleText: "", toolCalls: [], diagnostics: [] } });
+  const next = schedule("next");
+  await requestRuntimeV2ProviderOnce({ ...input, command: next, textEnvelope: false });
+  await requestRuntimeV2ProviderOnce({ ...input, command: next, textEnvelope: true });
+  assert.deepEqual(requests.slice(1).map(request => request.filter(message => message.role === "user" && message.content === text).length), [1, 1]);
+  assert.equal(live.messages.filter(message => message.content === text).length, 1);
+});

@@ -1,4 +1,6 @@
-import { executeTool } from "../../lib/toolExecutor";
+import { savePlanDocument } from "../../lib/ipc";
+import { sha256Hex } from "../../lib/sha256";
+import { planDocumentDisplayTitle, type PlanDocumentRef } from "../../lib/planDocuments";
 import {
   type RuntimeV2RunIdentity,
   type RuntimeV2WorkPlanReference,
@@ -21,31 +23,36 @@ export async function writeReviewArtifact(input: {
   readonly ledger: PlanLedger;
   readonly run: RuntimeV2RunIdentity;
   readonly plan: SealedWorkPlanV1;
-}): Promise<void> {
+}): Promise<PlanDocumentRef> {
+  // Only display metadata is single-line; sealed objective/Markdown stay exact.
+  const title = planDocumentDisplayTitle(input.plan.draft.objective);
+  const documentId = `plan-${sha256Hex(`${input.run.sessionKey}:${input.run.sessionEpoch}:${input.run.turnId}:${input.plan.id}:${input.plan.revision}`).slice(0, 24)}`;
+  const admission = input.ledger.snapshot()?.events.find(event => event.type === "turn.admitted");
+  const derivedFrom = admission?.type === "turn.admitted" ? admission.sourcePlanDraft?.documentRef : undefined;
   const command = await input.ledger.schedule(input.run, "execute_tool", {
-    toolName: "write_file",
-    target: ".MAIN/plans/plan.md",
+    toolName: "save_plan_document",
+    target: documentId,
     runtimeOwnedPlanArtifact: true,
+    ...(derivedFrom ? { derivedFrom } : {}),
   });
   try {
-    await executeTool(
-      "write_file",
-      { path: ".MAIN/plans/plan.md", content: input.plan.markdown },
-      input.context.runWorkspace || "",
-      input.context.runSessionKey,
-    );
+    const documentRef = await savePlanDocument({ owner: { workspace: input.context.runWorkspace || null, sessionKey: input.run.sessionKey, sessionEpoch: input.run.sessionEpoch, turnId: input.run.turnId },
+      documentId, expectedRevision: 0, title, markdown: input.plan.markdown, kind: "plan" });
     await input.ledger.settleCommand({
       type: "tool.completed",
       run: input.run,
       idempotencyKey: command.idempotencyKey,
       status: "succeeded",
+      modelContent: JSON.stringify({ planDocument: documentRef, markdown: input.plan.markdown,
+        ...(derivedFrom ? { derivedFrom } : {}) }),
       evidence: [{
         id: `plan-artifact:${input.plan.id}:${input.plan.revision}`,
         kind: "tool",
-        target: ".MAIN/plans/plan.md",
-        version: input.plan.projectionHash,
+        target: documentRef.path,
+        version: documentRef.contentHash,
       }],
     });
+    return documentRef;
   } catch (error) {
     await input.ledger.settleCommand({
       type: "tool.completed",
@@ -74,6 +81,7 @@ function reviewRequest(commit: RuntimeV2PlanReviewCommit) {
     planRevision: commit.authority.revision,
     artifactHash: commit.authority.projectionHash,
     artifactPaths: [commit.artifact.path],
+    ...(commit.artifact.documentRef ? { documentRef: commit.artifact.documentRef } : {}),
   };
 }
 
@@ -93,6 +101,7 @@ export function applyReviewProjection(
             ...turn,
             status: "awaiting_approval" as const,
             summary: commit.panel.title,
+            ...(commit.artifact.documentRef ? { planDocument: commit.artifact.documentRef } : {}),
           }
         : turn
     ),

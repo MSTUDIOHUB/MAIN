@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { installCapsuleFixtureStartup } from "./capsuleFixtureStartup";
 
 const ACTIVE_CAPSULE_STATUSES = ["analyzing", "planning", "executing", "validating", "recovering"] as const;
 const INACTIVE_CAPSULE_STATUSES = [
@@ -52,14 +53,7 @@ async function readCapsuleBeam(page: Page) {
   });
 }
 
-test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => {
-    if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
-      window.localStorage.clear();
-      window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
-    }
-  });
-});
+test.beforeEach(({ page }) => installCapsuleFixtureStartup(page));
 
 test("Runtime v2 provider deadline settles in the browser event loop", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-execution-progress");
@@ -204,9 +198,8 @@ test("newer structured editing activity replaces settled ChatArea commentary in 
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
   const guidance = capsule.getByTestId("capsule-guidance-label");
-  await expect(guidance).toContainText(
-    "正在修改 src/components/ExecutionCapsule.tsx，落实已经确认的修复方案。",
-  );
+  await expect(capsule).toHaveAttribute("data-activity-kind", "tool");
+  await expect(guidance).toHaveText("正在修改 src/components/ExecutionCapsule.tsx");
   await expect(guidance).not.toContainText("正在更新当前运行的展示状态");
   await expect(capsule).not.toContainText("当前判断");
   await expect(page.locator('[data-testid="chat-scroll-container"]')).toContainText(
@@ -216,57 +209,23 @@ test("newer structured editing activity replaces settled ChatArea commentary in 
   await expect(capsule).not.toContainText("**");
 });
 
-test("Run Status renders a duplicated V2 title and summary only once", async ({ page }, testInfo) => {
+test("M ignores repeated planning snapshots and retains the actual tool receipt", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-execution-progress");
-  const duplicateText = "正在搜索 `src/components`，收窄需要检查的代码范围。";
+  await expect(page.getByTestId("agent-explanation-capsule")).toBeVisible();
+  const duplicateText = "正在形成计划";
 
-  await page.evaluate(async (text) => {
-    const [{ useAppStore }, { withEventSchema }] = await Promise.all([
-      import("/src/store/useAppStore.ts"),
-      import("/src/lib/turnEvents.ts"),
-    ]);
-    const state = useAppStore.getState();
-    const marker = state.harnessRunMarker;
-    if (!marker) throw new Error("Expected an active E2E run marker");
-    useAppStore.setState({
-      runtimeEvents: [
-        ...state.runtimeEvents,
-        withEventSchema({
-          type: "progress.updated",
-          threadId: marker.sessionKey,
-          turnId: marker.turnId,
-          runId: marker.runId,
-          parentRunId: marker.parentRunId,
-          timestampMs: Date.now() + 1_000,
-          progress: {
-            phase: "investigating",
-            title: text,
-            status: "running",
-            action: text,
-            summary: text,
-            tool: "grep_search",
-            target: "src/components",
-            canonicalTarget: "src/components",
-            audience: "user",
-            dedupeKey: `runtime-v2:${marker.turnId}:duplicate-popover-copy`,
-          },
-        }),
-      ],
-    });
-  }, duplicateText);
+  await page.evaluate((text) => (window as any).__CODELY_E2E__.appendCapsulePhaseSnapshots(text), duplicateText);
 
-  await page.getByTitle("查看运行状态").click();
+  await page.getByTitle("查看本轮活动").click();
   const progressPopover = page.getByTestId("effective-progress-popover");
   const currentActivity = page.getByTestId("run-status-current-activity");
   await expect(progressPopover).toBeVisible();
-  await expect(currentActivity.getByText(duplicateText, { exact: true })).toHaveCount(1);
-
-  const screenshotPath = testInfo.outputPath("run-status-v2-deduplicated.png");
-  await progressPopover.screenshot({ path: screenshotPath });
-  await testInfo.attach("run-status-v2-deduplicated", {
-    path: screenshotPath,
-    contentType: "image/png",
-  });
+  await expect(currentActivity).toContainText("正在修改");
+  await expect(progressPopover).not.toContainText(duplicateText);
+  const rows = progressPopover.getByTestId("turn-activity-row");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("ExecutionCapsule.tsx");
+  await expect(rows.first()).toHaveAttribute("data-outcome", "succeeded");
 });
 
 test("pure plan execution keeps the runtime checkpoint in the main Capsule without duplicating its task tracker", async ({ page }) => {
@@ -277,9 +236,7 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
-  await expect(capsule.getByTestId("capsule-guidance-label")).toContainText(
-    "正在修改 src/task-9.ts，落实已经确认的修复方案。",
-  );
+  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText("正在修改 src/task-9.ts");
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("apply_patch");
   await expect.poll(async () => capsule.evaluate(
@@ -288,19 +245,27 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   await expect(capsule).not.toContainText("阶段：tool_start");
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
+  const progressToggle = page.getByTestId("plan-task-progress-toggle");
+  await expect(progressToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("plan-task-row")).toHaveCount(0);
+  await progressToggle.click();
   await expect(page.getByTestId("plan-task-progress")).toContainText("T1: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T8: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
+  await progressToggle.click();
+  await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
+  await expect(page.getByTestId("plan-task-row")).toHaveCount(0);
 });
 
-test("approved child-run progress replaces its parent review pause in Run Status", async ({ page }) => {
+test("approved child-run activity excludes its parent review pause", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
 
-  await page.getByTitle("查看运行状态").click();
+  await page.getByTitle("查看本轮活动").click();
   const progressPopover = page.getByTestId("effective-progress-popover");
   await expect(progressPopover).toBeVisible();
-  await expect(progressPopover).toContainText("正在执行已批准计划");
-  await expect(progressPopover).toContainText("apply_patch · src/task-9.ts");
+  await expect(progressPopover.getByTestId("run-status-current-activity")).toContainText("正在修改 src/task-9.ts");
+  await expect(progressPopover.getByTestId("turn-activity-empty")).toBeVisible();
+  await expect(progressPopover).not.toContainText("apply_patch");
   await expect(progressPopover).not.toContainText("等待审核");
   await expect(progressPopover).not.toContainText("计划产物已物化");
   await expect(progressPopover).not.toContainText("旧审核进度");
@@ -321,8 +286,8 @@ test("preapproval Plan recovery keeps internal phases and heartbeats out of user
   await expect(page.locator("[data-plan-runtime-phase]")).toHaveCount(0);
   await expect(page.getByTestId("plan-review-capsule")).toHaveCount(0);
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
-  await page.getByTitle("查看运行状态").click();
-  await expect(page.getByTestId("effective-progress-popover")).toContainText("暂无运行状态");
+  await page.getByTitle("查看本轮活动").click();
+  await expect(page.getByTestId("turn-activity-empty")).toBeVisible();
   await expect(page.locator("body")).not.toContainText(/Needs rewrite|Drafting|草稿结构不完整|65 秒|隐藏推理正文不会展示|SECRET MODEL REASONING/);
 });
 
@@ -347,6 +312,7 @@ test("PlanPanel counts only trusted evidence, not claimed completed checkboxes",
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("1/8");
+  await page.getByTestId("plan-task-progress-toggle").click();
   await expect(page.getByTestId("plan-task-progress")).toContainText("1.1 修复 useTrendData 回退逻辑");
   await expect(page.getByTestId("plan-task-status").nth(1)).toContainText("待验证");
   await expect(page.getByTestId("plan-task-progress")).not.toContainText("缺少真实执行证据");

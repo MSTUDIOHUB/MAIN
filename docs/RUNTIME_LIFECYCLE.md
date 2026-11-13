@@ -11,7 +11,7 @@
 
 在工作区会话中，每条进入模型执行管线的用户提交都会先获得稳定的提交身份、接纳凭证和 `turnId`，然后才进入意图与执行策略。`Chat` 只是 Turn 的一种策略，不能绕过 Turn 接纳、持久化、取消或结论投影。
 
-`/init` 是明确的本地工作区命令例外：Composer 在提交接纳前截获它，只打开 `AGENTS.md` diff 审阅；预览与取消不创建 user message、Turn 或 Run，也不调用 provider。用户确认后由固定目标的专用 CAS 写入边界完成修改。Plan、Analyze 等模型型 Slash shortcut 仍走普通 Turn。
+`/规则` 和隐藏兼容别名 `/init` 都走普通 Turn 接纳，进入 Plan Run 调查项目和根 `AGENTS.md`，通过结构化问答确认约束，再保存版本化规则草稿。用户随后编辑、审阅 diff 并确认保存时，才由固定目标的专用 CAS 写入边界更新根 `AGENTS.md`。访谈确认不等于执行批准，取消草稿审阅也不会撤销已经存在的 Turn 记录。
 
 接纳同时创建用户块与非空回合标题；标题可以随后语义优化，但第一轮日志、侧栏和执行投影不能因为尚未取得模型标题而退化成无 Turn 的聊天消息。
 
@@ -23,7 +23,7 @@ active Run 存在时，Composer 输入有两条不同的 ingress，不能用一�
 
 | ingress | 是否创建 Turn | 身份与持久化 | 约束 |
 | --- | --- | --- | --- |
-| Queue | 是 | 按普通 Workspace instruction 创建 receipt、`turnId`、用户块和标题，进入 durable FIFO；当前 Run 结束或释放队头后再执行 | 可携带附件、图片和显式 Plan/Goal 等新意图；active Run 中回车默认选择 Queue |
+| Queue | 是 | 按普通 Workspace instruction 创建 receipt、`turnId`、用户块和标题，进入 durable FIFO；当前 Run 结束或释放队头后再执行 | 可携带附件、图片和显式 Plan 等新意图；active Run 中回车默认选择 Queue |
 | Guide | 否 | 创建绑定当前 `turnId` 的一次性 `activeGuidance`，在当前 Run 下一次模型迭代前消费 | 仅文本；必须有 running Run；不能承载附件、图片或需要独立生命周期的显式意图 |
 
 `src/lib/turnRuntimeContract.ts` 的 `decideTurnIngress()` 定义 canonical 决策：普通 `submit` 遇到 open Turn 时必须拒绝为 `active_run_requires_explicit_ingress`；`queue` 始终接纳新 Turn；`guidance` 只可附着于 exact running Run。UI 的两个按钮和 Store 的 FIFO/`activeGuidance` 是该语义的产品适配，不能把 Guide 伪装成历史 user Turn，也不能让 Queue 修改当前 Run 的上下文。
@@ -117,9 +117,11 @@ WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
 
 Plan authoring 没有默认总时限，也不会将父线程年龄换算成 child 剩余预算。模型流和正在执行的工具可以跨越十分钟；只有调用方明确提供的 `lifecycleDeadlineAt` 才写入 `run.started` 并成为父子共享硬边界，拒绝或恢复都不得延长它。旧 checkpoint 没有该字段时按无默认硬限恢复。
 
-无进展窗口复用只读证据比较，从 canonical provider/tool 回执推导：新版本、同版本新增源码覆盖或新交付的 child 证据清零；重复读取、回放、空响应、提交校验失败和传输失败不能续期。十分钟连续无进展只在请求之间检查，先接收有效提交和新证据，再判断是否耗尽；尚有活跃 child 时先 join，不能因父线程年龄取消它。编译失败仍进入 submit-only 纠错，恢复输出可以缩小并关闭 reasoning，但普通错误次数不直接生成终态。
+无进展窗口复用只读证据比较，从 canonical provider/tool 回执推导：新版本、同版本新增源码覆盖或新交付的 child 证据清零；重复读取、回放、空响应、提交校验失败和传输失败不能续期。连续无进展只在请求之间更新策略，尚有活跃 child 时先 join，不能因父线程年龄取消它。没有可保存正文的协议错误继续提供安全读取与提交能力；已有正文的语义缺口进入草稿保存，不再整份重生成。普通错误次数不直接生成终态。
 
-Plan discovery 与 synthesis 共用完整的 assistant/tool transcript，只在真实上下文压力下压缩完整工具组，并保护目标、末尾指令和最新回执。冷恢复从 ledger 重建实际工具内容，不重新收集概览或伪造缺失的历史正文。未产生 sealed WorkPlan 的停滞、显式预算耗尽及不可恢复传输失败均为 error，权限或必需协作条件不足为 blocked，用户停止为 canceled；已有工具证据不能证明 partial 计划交付。
+Plan discovery 与 synthesis 共用完整的 assistant/tool transcript，只在真实上下文压力下压缩完整工具组，并保护目标、末尾指令和最新回执。冷恢复从 ledger 重建实际工具内容，不重新收集概览或伪造缺失的历史正文。无进展压力只改变恢复策略，不直接构成 Plan 终态；显式预算耗尽及不可恢复传输失败为 error，权限或必需协作条件不足为 blocked，用户停止为 canceled。
+
+可解析且正文非空的候选先评估执行准备情况。通过全部校验后沿用 seal、保存正式 Markdown 和审批流程；存在结构或验收缺口时保存带诊断的草稿，并以 completed(partial) 完成本轮。该 partial 由真实文档保存回执和明确缺口支撑，普通工具证据不能替代它。草稿不形成审批或执行权威，冷恢复保持同一 partial；保存失败只重试精确正文。“补全验证”另建绑定原稿 revision/hash 的新 Turn，继承目标、已确认选择及诊断，新文档归新 Turn 所有，通过完整校验后再单独批准。
 
 Plan 的 canonical 顺序为：
 
@@ -149,10 +151,10 @@ conversationTurnStatus = awaiting_approval
 isTerminal = false
 ```
 
-`plan.artifact_accepted` 不生成 `run.completed` 或 `turn.completed`，也不能被通用 done/idle 收尾覆盖。它只有在 `.MAIN/plans/plan.md`、sealed WorkPlan/digest、ActionRequest、Plan lifecycle、Run 与 checkpoint identity 全部一致时才具有可批准权威。
+实施计划进入 `pending_review`（v2 canonical `work_plan.sealed`；旧兼容投影 `plan.artifact_accepted`）不生成 `run.completed` 或 `turn.completed`，也不能被通用 done/idle 收尾覆盖。新 WorkPlan 必须有真实版本化文档保存回执，documentRef 的 owner、revision、path、contentHash 与 sealed WorkPlan、ReviewCommit、ActionRequest 和当前 Run 一致后才可批准。旧无 documentRef 的已持久化计划保持原有 `.MAIN/plans/plan.md` 精确绑定契约。仅保存概念计划文档的 Run 可在真实保存后正常完成，不进入执行审核。
 
 - `changes_requested`：同一 Run 回到 `planning`，保留原始用户目标和已有版本化证据；新的 WorkPlan 通过同一 compiler 后替换 review artifact/revision。
-- `approved`：review Run 转为 `recoverable` 暂停，随后启动 `parentRunId = reviewedRunId` 的执行 child Run；批准不等于执行成功。
+- `approved`：精确审核请求通过校验并持久化 `work_plan.approved` 后，同一 Turn/Run 进入 `preparing`，再经普通观察、修改和验证阶段执行批准的步骤。不会为该批准另建执行 child Run；共享子智能体仍可在原有权限和调度边界内使用。批准不等于执行成功，另外要求的逐次工具审批仍然有效。
 - 取消审核：依照 canonical 取消顺序收口，不把 `pending_review` 留成 done/idle。
 
 Markdown 只负责审核显示。批准后任务和验证从 sealed typed graph 的 `C/D/V` 节点派生，禁止重新解析 Markdown 生成另一套执行真相。
@@ -169,7 +171,7 @@ provider 的下一动作目录有一个不改变授权的短暂收敛窗口。�
 
 浏览器、桌面和长驻进程生命周期保留各自的结构化启动、观察、交互和清理边界，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。它们不能被普通文件阶段用来重新引入 `read-only -> mutation-only -> validation-only` 振荡。调查 child 的 finding 只是带 provenance 的参考；实现 child 的写入权也必须由父线程当前版本读取和明确方案建立，并在 join 时重新校验，不能从 child 摘要或另造 `context_restore` lease 获得。
 
-每批工具结果先形成真实 source、mutation、validation、browser/desktop 或 Goal evidence，再考虑重复和协议软信号。软信号可以要求换动作、刷新事实或压缩上下文，但不得暂停、锁死目标或生成终态。修改目标的排他依据只有 exact path 的当前版本读取和 mutation preflight；不存在从模糊诊断猜出的 transaction lock。
+每批工具结果先形成真实 source、mutation、validation、browser/desktop evidence，再考虑重复和协议软信号。软信号可以要求换动作、刷新事实或压缩上下文，但不得暂停、锁死目标或生成终态。修改目标的排他依据只有 exact path 的当前版本读取和 mutation preflight；不存在从模糊诊断猜出的 transaction lock。
 
 当 mutation 因源码不匹配或 preflight 拒绝而没有落盘时，恢复读取只刷新可见源码，不消费这条失败事实。durable ledger 保留最新可纠正 tool-call identity，关闭更早失败目标的恢复所有权，decision view 脱敏被拒绝的 search/replace 正文，并把有界失败诊断作为尾部因果指令持续投影；只有真实 mutation receipt 才清除这组连续失败。失败后的一次成功目标读取由 ledger 证明，随即关闭读取并要求基于该可见范围提交 materially different mutation；重叠范围、从第一行重新开始和逐段翻完整文件都不能维持读取分支。
 

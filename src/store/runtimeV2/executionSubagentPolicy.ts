@@ -145,7 +145,7 @@ export function runtimeV2ChildTools(
     ...(loadSkill ? [loadSkill] : []),
   ].filter((definition) =>
     READ_ONLY_CHILD_TOOL_NAMES.has(definition.function.name) ||
-    (job.taskKind === "validate" &&
+    (job.taskKind === "validate" && !job.proactiveKey &&
       VALIDATION_CHILD_TOOL_NAMES.has(definition.function.name)) ||
     (job.taskKind === "implement" && job.accessMode === "write" &&
       MUTATION_CHILD_TOOL_NAMES.has(definition.function.name))

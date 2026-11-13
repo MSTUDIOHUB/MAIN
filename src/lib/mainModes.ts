@@ -1,15 +1,14 @@
-export const MAIN_MODE_KEYS = ["main_mode", "image_studio"] as const;
-
-export type MainModeKey = (typeof MAIN_MODE_KEYS)[number];
-
-export function mapLegacyNexusModeToMainMode(value: string | null | undefined): MainModeKey {
-  if (value === "image_studio") return "image_studio";
-  // Game Studio and every older Nexus/persona key now collapse into MAIN.
-  // Keep this tolerant read boundary so old app and Session snapshots remain
-  // loadable without allowing a removed mode back into new state.
-  return "main_mode";
+/** Tolerant read boundary for older snapshots. MAIN has one normal surface. */
+export const MAIN_MODE_KEYS = ["main_mode"] as const;
+export type MainModeKey = "main_mode";
+export type SessionModeAffinity = MainModeKey;
+export interface SessionModeAffinityLike {
+  sessionModeAffinity?: unknown;
+  runtimeSnapshot?: { sessionModeAffinity?: unknown; selectedMainModeKey?: unknown; selectedNexusModeKey?: unknown; selectedAgentKey?: unknown } | null;
 }
-
-export function isImageStudioMainMode(mode: MainModeKey): boolean {
-  return mode === "image_studio";
+export function mapLegacyNexusModeToMainMode(_value: unknown): MainModeKey { return "main_mode"; }
+export function normalizeSessionModeAffinity(_value: unknown, _fallback: SessionModeAffinity = "main_mode"): SessionModeAffinity { return "main_mode"; }
+export function resolveSessionModeAffinity(_session: SessionModeAffinityLike | null | undefined, _fallback: SessionModeAffinity = "main_mode"): SessionModeAffinity { return "main_mode"; }
+export function buildStandardSessionDefaultTitle(language: "zh" | "en", scopeKey: string, globalChatKey: string): string {
+  return scopeKey === globalChatKey ? (language === "en" ? "New Chat" : "新聊天") : (language === "en" ? "New Conversation" : "新会话");
 }

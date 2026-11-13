@@ -167,6 +167,29 @@ test("Unity metadata supplies versioned engine and UPM facts on Unix and Windows
   }
 });
 
+test("resumed engine context reads the installed version from the lock before manifest constraints", async () => {
+  const io = createMemoryIo({
+    ...unityMetadata,
+    "Packages/packages-lock.json": JSON.stringify({ dependencies: {
+      "com.unity.render-pipelines.universal": { version: "14.2.1-t1" },
+      "com.unity.mathematics": { version: "1.2.1" },
+    } }),
+    "AGENTS.md": "Manual rules",
+    "Assets/Scripts/Player.cs": "class Player {}",
+  });
+  const result = await baseline.buildProjectBaselineContext({ workspace: "/fixture", io, metadataOnly: true });
+  const locked = result.facts.packages.find(item => item.name === "com.unity.render-pipelines.universal");
+  assert.equal(locked.version, "14.2.1-t1");
+  assert.equal(locked.provenance.path, "Packages/packages-lock.json");
+  assert.equal(result.facts.packages.some(item => item.name === "com.example.git-package"), false);
+  assert.ok(!io.reads.includes("AGENTS.md"));
+  assert.deepEqual(result.topology, []);
+  const fallback = await baseline.buildProjectBaselineContext({ workspace: "/fixture", io: createMemoryIo(unityMetadata) });
+  const declared = fallback.facts.packages.find(item => item.name === locked.name);
+  assert.equal(declared.constraint, "14.2.0-t1");
+  assert.equal(declared.version, undefined);
+});
+
 test("Unity directory names and missing or damaged metadata do not assert engine or UPM identity", async () => {
   const empty = await baseline.buildProjectBaselineContext({
     workspace: "/fixture/repo",

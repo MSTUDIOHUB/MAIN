@@ -36,6 +36,7 @@ export interface PrepareSubmitTurnDraftInput {
   images?: string[];
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
+  knowledgeReferencesSnapshot?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
   runSessionKey?: string | null;
   runWorkspace?: string | null;
   preferredLanguage: "zh" | "en";
@@ -131,6 +132,7 @@ export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): Subm
   const userContextItems = buildUserContextItems({
     contextMentions: input.mentionSnapshot,
     attachedFiles: input.attachedFilesSnapshot,
+    knowledgeReferences: input.knowledgeReferencesSnapshot,
     images: currentImages,
     workspace: input.runWorkspace,
     language: input.preferredLanguage,

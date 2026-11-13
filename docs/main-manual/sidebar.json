@@ -48,16 +48,16 @@
         {
           "slug": "main-modes",
           "path": "main-modes.md",
-          "title": "MAIN 场景",
-          "sidebarTitle": "MAIN 场景",
-          "description": "理解统一 MAIN 工作流与图像工作室的能力边界。"
+          "title": "MAIN 工作流",
+          "sidebarTitle": "MAIN 工作流",
+          "description": "直接提出需求，或先计划、审阅再执行。"
         },
         {
           "slug": "run-modes",
           "path": "run-modes.md",
-          "title": "Chat / Plan / Fast",
+          "title": "对话与计划",
           "sidebarTitle": "工作方式",
-          "description": "选择执行策略；工作区中的 Chat、Plan 和 Fast 都以 Turn 运行。"
+          "description": "直接提出需求，或先审阅方案再批准执行。"
         },
         {
           "slug": "agent-loop",
@@ -129,13 +129,6 @@
           "title": "知识库",
           "sidebarTitle": "知识库",
           "description": "导入资料并让 MAIN 在需要时按需检索。"
-        },
-        {
-          "slug": "image-studio",
-          "path": "image-studio.md",
-          "title": "图像工作室",
-          "sidebarTitle": "图像工作室",
-          "description": "使用本地图片服务或 HiDream Web fallback 生成图片。"
         }
       ]
     },

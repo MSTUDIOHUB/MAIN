@@ -1,6 +1,7 @@
 import {
   deriveRuntimeV2SubagentConcurrency,
   runtimeV2SubagentModelHandle,
+  runtimeV2JobMatchesSchedule,
   scheduleRuntimeV2Subagents,
   type RuntimeV2EventDraft,
   type RuntimeV2SubagentJob,
@@ -16,7 +17,6 @@ import {
 import {
   runtimeV2ModelSelectedSubagentCandidate,
   runtimeV2SubagentCapacityFromCommand,
-  runtimeV2SubagentTotalBudgetFromCommand,
 } from "./executionSubagentCandidate";
 import { startRuntimeV2Child } from "./executionSubagentRunner";
 import { commitCompletedRuntimeV2ChildTransaction } from "./executionSubagentJoin";
@@ -33,10 +33,6 @@ import {
   deriveRuntimeV2ValidationCorrectionWindow,
 } from "./executionValidationCorrection";
 
-function boundedArgument(value: unknown, max: number): string {
-  return typeof value === "string" ? value.trim().slice(0, max) : "";
-}
-
 export function createRuntimeV2SchedulerPort(
   input: RuntimeV2ExecutionPortsInput,
 ): SchedulerPort {
@@ -48,12 +44,10 @@ export function createRuntimeV2SchedulerPort(
         (aggregateForCurrentTurn(input)?.subagents || []).filter((job) =>
           job.parentRunId === command.run.runId
         );
-      const turnChildLimit =
-        runtimeV2SubagentTotalBudgetFromCommand(command);
-      if (existingJobs.length >= turnChildLimit) {
+      const requestCapacity = runtimeV2SubagentCapacityFromCommand(command);
+      if (requestCapacity <= 0) {
         const detail =
-          `This Run has already used its bounded collaboration budget of ` +
-          `${turnChildLimit} child task(s). Continue the parent task directly.`;
+          "The current provider lane does not admit child requests. Continue the parent task directly.";
         closeCollaborationToolCall(
           input,
           command,
@@ -62,9 +56,8 @@ export function createRuntimeV2SchedulerPort(
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
           turnId: command.run.turnId,
           runId: command.run.runId,
-          reason: "turn_child_budget_exhausted",
-          childRuns: existingJobs.length,
-          turnChildLimit,
+          reason: "child_request_capacity_unavailable",
+          requestCapacity,
         });
         throw new Error(detail);
       }
@@ -120,8 +113,7 @@ export function createRuntimeV2SchedulerPort(
           parentRun: command.run,
           candidates: [candidate],
           existingJobs,
-          maxActiveJobs:
-            turnChildLimit,
+          maxActiveJobs: requestCapacity,
           requestedAt: input.now(),
           nextId: input.nextId,
         });
@@ -137,8 +129,8 @@ export function createRuntimeV2SchedulerPort(
       }
       if (decision.jobs.length !== 1) {
         const detail =
-          `The requested child duplicates an existing semantic task, exceeds ` +
-          `the current provider-lane capacity, or violates the access/scope contract: ${
+          `The requested child duplicates an existing semantic task ` +
+          `or violates the access/scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
           }. If required collaboration is still pending, delegate a genuinely different task; otherwise continue the parent task.`;
         closeCollaborationToolCall(
@@ -173,13 +165,9 @@ export function createRuntimeV2SchedulerPort(
         job.parentRunId === command.run.runId
       );
       if (command.kind === "schedule_subagents") {
-        const sourceToolCallId = boundedArgument(
-          command.payload.toolCallId,
-          256,
-        );
         const jobs = runSubagents.filter((job) =>
           (job.status === "queued" || job.status === "running") &&
-          (!sourceToolCallId || job.sourceToolCallId === sourceToolCallId)
+          runtimeV2JobMatchesSchedule(job, command)
         );
         if (jobs.length === 0) {
           closeCollaborationToolCall(
@@ -195,6 +183,7 @@ export function createRuntimeV2SchedulerPort(
         input.logStoreEvent("runtime_v2_subagent_batch_starting", {
           turnId: command.run.turnId,
           runId: command.run.runId,
+          sessionKey: command.run.sessionKey, commandKey: command.idempotencyKey,
           jobCount: jobs.length,
           modelRequestMode: String(
             command.payload.collaborationRequestMode || "serialized",
@@ -203,10 +192,7 @@ export function createRuntimeV2SchedulerPort(
           tasks: jobs.map((job) => ({
             id: job.id,
             taskKind: job.taskKind,
-            objective: job.objective.slice(0, 1_000),
-            successCriteria:
-              job.successCriteria?.slice(0, 1_000) || null,
-            allowedPaths: job.allowedPaths,
+            allowedPathCount: job.allowedPaths.length,
           })),
           concurrent: runSubagents.filter((job) =>
             job.status === "queued" || job.status === "running"
@@ -328,6 +314,14 @@ export function createRuntimeV2SchedulerPort(
             automaticJoinReason: automaticJoinReason || null,
           });
         }
+        if (command.payload.cancelUnusedProactive === true ||
+          (command.payload.finalJoin === true && !command.payload.automaticJoinReason && !command.payload.toolCallId)) {
+          for (const job of runSubagents) {
+            if (job.proactiveKey && jobIds.includes(job.id) && input.live.childTelemetry.get(job.id)?.closedAt == null) {
+              input.live.childAbortControllers.get(job.id)?.abort("optional_collaboration_no_longer_needed");
+            }
+          }
+        }
         const rawResults = await Promise.all(jobIds.map(async (jobId) => {
           const promise = input.live.childRuns.get(jobId);
           if (promise) return await promise;
@@ -408,6 +402,7 @@ export function createRuntimeV2SchedulerPort(
             run: command.run,
             jobId: result.job.id,
             status: result.status,
+            ...(result.resourceInterruption ? { resourceInterruption: result.resourceInterruption } : {}),
             summary: result.summary,
             ...(result.inheritedEvidence.length > 0
               ? { inheritedEvidence: result.inheritedEvidence }

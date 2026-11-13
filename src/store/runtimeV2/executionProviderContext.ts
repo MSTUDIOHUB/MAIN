@@ -4,18 +4,27 @@ import {
 } from "../../lib/providerLaneSettings";
 import {
   DEFAULT_PROVIDER_LANE_PROFILE_V1,
+  approvedRuntimeV2PlanContinuation,
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanExecutionFrontier,
   deriveRuntimeV2PlanSourceFreshness,
+  deriveRuntimeV2ValidationBoundary,
   runtimeV2DirectExecuteContractCoverage,
   type ProviderLaneProfileV1,
+  type RuntimeV2Event,
+  type TurnAggregateV1,
 } from "../../lib/runtime-v2";
+import { unresolvedUnityEditorCheck } from "../../lib/runtime-v2/unityCompilation";
+import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
+import { analyzeValidationCommand } from "../../lib/validationContract";
+import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import {
   aggregateForCurrentTurn,
   approvedPlanForCurrentTurn,
 } from "./executionAggregate";
-import { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
+import { RUNTIME_V2_CONTEXT_ANCHOR_PREFIX } from "./executionProviderAnchors";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
+import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import type {
   RuntimeV2ExecutionPortsInput,
 } from "./executionTypes";
@@ -50,51 +59,100 @@ export function baseProviderProfile(state: any): ProviderLaneProfileV1 {
 
 export function recordApprovedPlanContext(
   input: RuntimeV2ExecutionPortsInput,
-): void {
-  const aggregate = aggregateForCurrentTurn(input);
-  const approved = approvedPlanForCurrentTurn(input);
-  if (!aggregate || !approved) return;
-  const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
-  const frontier = deriveRuntimeV2PlanExecutionFrontier(aggregate);
+  aggregate = aggregateForCurrentTurn(input),
+) {
+  const prefix = `${RUNTIME_V2_CONTEXT_ANCHOR_PREFIX} approved-work-plan]`;
+  const existing = input.live.messages.findIndex(message =>
+    message.role === "system" && typeof message.content === "string" &&
+    message.content.startsWith(prefix)
+  );
+  const approved = resolveApprovedRuntimeV2WorkPlanFromAggregate(aggregate);
+  const approvalEvent = aggregate && approved && [...aggregate.events].reverse().find(
+    (event): event is Extract<RuntimeV2Event, { type: "work_plan.approved" }> =>
+      event.type === "work_plan.approved" &&
+      event.run.sessionKey === approved.commit.review.sessionKey &&
+      event.run.sessionEpoch === approved.commit.review.sessionEpoch &&
+      event.run.turnId === approved.commit.review.turnId &&
+      event.run.runId === approved.commit.review.runId &&
+      event.run.parentRunId === approved.commit.review.parentRunId &&
+      event.workPlan.id === approved.commit.authority.id &&
+      event.workPlan.revision === approved.commit.authority.revision &&
+      event.workPlan.digest === approved.commit.authority.digest &&
+      event.workPlan.projectionHash === approved.commit.authority.projectionHash,
+  );
+  if (!aggregate || !approved || !approvalEvent) {
+    if (existing >= 0) input.live.messages.splice(existing, 1);
+    return null;
+  }
+  const continuation = approvedRuntimeV2PlanContinuation(aggregate.events)?.continuation;
   const content = [
-    "This sealed WorkPlan is the mutation and validation authority for the current Run.",
+    prefix,
+    continuation
+      ? "MAIN verified the exact previously approved WorkPlan for the current continuation. Execute only its remaining bounded steps and validations under the current request's restrictions. Carry forward the confirmed choices and committed progress. Earlier interview answers supplied information, not execution approval. Changed plans, out-of-scope actions and separately gated high-risk operations still require their own approval. Existing source leases and tool permission checks remain in force."
+      : "The user has already separately approved this exact WorkPlan through MAIN's plan-review request. This independent plan-review approval is effective now: execute only its bounded steps and validations. Earlier interview answers supplied information, not execution approval. Changed plans, out-of-scope actions and separately gated high-risk operations still require their own approval. Existing source leases and tool permission checks remain in force.",
     JSON.stringify({
-      authority: approved.commit.authority,
+      status: "approved_for_execution",
+      approvalReceipt: {
+        eventType: approvalEvent.type,
+        eventId: approvalEvent.eventId,
+        sequence: approvalEvent.sequence,
+        at: approvalEvent.at,
+        requestId: approved.commit.review.requestId,
+        owner: {
+          sessionKey: approvalEvent.run.sessionKey,
+          sessionEpoch: approvalEvent.run.sessionEpoch,
+          turnId: approvalEvent.run.turnId,
+          runId: approvalEvent.run.runId,
+          parentRunId: approvalEvent.run.parentRunId,
+        },
+        authority: approved.commit.authority,
+        documentRef: approved.commit.artifact.documentRef ?? null,
+      },
       objective: approved.plan.draft.objective,
+      ...(continuation && approved.plan.decisionJournal ? { confirmedChoices: approved.plan.decisionJournal } : {}),
       summary: approved.plan.draft.summary,
       findings: approved.plan.draft.findings,
       steps: approved.plan.draft.steps,
       validations: approved.plan.draft.validations,
       risks: approved.plan.draft.risks,
       assumptions: approved.plan.draft.assumptions,
-      sourceFreshness: freshness
-        ? {
-            allFresh: freshness.allFresh,
-            missingTargets: freshness.missingTargets,
-            staleTargets: freshness.staleTargets,
-            unversionedTargets: freshness.unversionedTargets,
-          }
-        : null,
-      executionFrontier: frontier
-        ? {
-            completedStepIndexes: frontier.completedStepIndexes,
-            readyStepIndexes: frontier.readyStepIndexes,
-            blockedStepIndexes: frontier.blockedStepIndexes,
-            readyMutationTargets: frontier.readyMutationTargets,
-            validationReady: frontier.validationReady,
-          }
-        : null,
-    }, null, 2),
-    frontier && !frontier.validationReady
-      ? "Follow the approved WorkPlan steps and verify once changes are complete."
-      : frontier?.validationReady
-        ? "All mutation stages are complete. Run the planned validations."
-        : "",
+    }),
   ].join("\n\n");
-  upsertRuntimeV2ContextAnchor(input.live, {
-    key: "approved-work-plan",
-    content,
-  });
+  // Keep the immutable approval in the cacheable prefix. Only the decision
+  // instruction at the end carries the changing execution frontier.
+  if (existing < 0) {
+    input.live.messages.unshift({ role: "system", content });
+  } else if (input.live.messages[existing]?.content !== content) {
+    input.live.messages[existing] = { role: "system", content };
+  }
+  const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
+  const frontier = deriveRuntimeV2PlanExecutionFrontier(aggregate);
+  const compileFailed = unresolvedUnityEditorCheck(aggregate)?.result.status === "failed";
+  return {
+    approvalKey: approvalEvent.eventId,
+    frontierInstruction: [
+      "Approved WorkPlan progress:",
+      JSON.stringify({
+        sourceFreshness: freshness ? {
+          allFresh: freshness.allFresh,
+          missingTargets: freshness.missingTargets,
+          staleTargets: freshness.staleTargets,
+          unversionedTargets: freshness.unversionedTargets,
+        } : null,
+        executionFrontier: frontier ? {
+          completedStepIndexes: frontier.completedStepIndexes,
+          readyStepIndexes: frontier.readyStepIndexes,
+          blockedStepIndexes: frontier.blockedStepIndexes,
+          readyMutationTargets: frontier.readyMutationTargets,
+          validationReady: frontier.validationReady && !compileFailed,
+        } : null,
+      }),
+      compileFailed ? "Resolve the current compiler diagnostics before PlayMode."
+        : frontier?.validationReady
+        ? "All mutation stages are complete. Run the planned validations."
+        : "Follow the approved WorkPlan steps and verify once changes are complete.",
+    ].join(" "),
+  };
 }
 
 /** Resolve only a finite validator that already belongs to the Turn's sealed
@@ -137,6 +195,31 @@ export function preferredFiniteValidationCommand(
     String(validation.command || "").trim()
   );
   return String(contractedValidation?.command || "").trim();
+}
+
+/** Project scripts are suggestions for the next decision. Acceptance still
+ * requires a matching validation receipt under the current authority. */
+export function projectFiniteValidationCommands(input: Pick<RuntimeV2ExecutionPortsInput, "context">) {
+  const baseline = input.context.projectBaselineContext;
+  if (!isProjectBaselineForWorkspace(baseline, input.context.runWorkspace || "")) return [];
+  return baseline.facts.scripts.flatMap(script => {
+    if (!script.invocation || script.provenance.path !== "package.json") return [];
+    const spec = analyzeValidationCommand(script.invocation).spec;
+    return spec?.kind === "finite_command" ? [{ command: spec.command, capability: spec.capability,
+      manifestVersion: script.provenance.contentHash }] : [];
+  });
+}
+
+export function projectValidationRecoveryReceipt(aggregate: TurnAggregateV1 | null): string {
+  if (!aggregate?.run) return "";
+  const runId = aggregate.run.identity.runId;
+  const commandKeys = new Set(aggregate.events.flatMap(event => event.type === "command.scheduled" &&
+    event.run.runId === runId && event.command.payload.projectValidationManifestVersion ? [event.command.idempotencyKey] : []));
+  const result = [...aggregate.events].reverse().find(event => event.type === "validation.completed" &&
+    event.run.runId === runId && commandKeys.has(event.idempotencyKey));
+  if (result?.type !== "validation.completed" || result.mutationBoundarySequence !== deriveRuntimeV2ValidationBoundary(aggregate, []).mutationBoundarySequence) return "";
+  const status = result.passed ? "passed" : isRuntimeV2ValidationAttempt(result) ? "failed" : "not executed";
+  return `[Project validation receipt] ${result.presentation?.target || "run_command"}: ${status}${result.failureReasonCode ? ` (${result.failureReasonCode})` : ""}.`;
 }
 
 export function normalizeRuntimeV2WorkspacePath(

@@ -31,6 +31,8 @@ export interface ApplySubmitVisibleTurnInput {
   admittedUserBlockId?: number;
   uiParentTurnId?: string | null;
   parentPlanTurnId?: string | null;
+  sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
+  approvedPlanContinuation?: import("../lib/runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   isInternalTurn: boolean;
   shouldExplicitlyReuseCurrentTurn: boolean;
   shouldAutoResumeChoiceTurn: boolean;
@@ -43,6 +45,7 @@ export interface ApplySubmitVisibleTurnInput {
   effectiveIntentSummary: string;
   effectiveCommandDirective: CommandDirective | null;
   effectiveWorkflowMode: LegacyWorkflowMode;
+  preserveComposerMode?: boolean;
   initialTurnStatus: ConversationTurnStatus;
   operationProposalChoiceAction?: unknown;
   turnTitle: string;
@@ -140,7 +143,12 @@ export function applySubmitVisibleTurn(
   }
   input.sessionSet({
     taskFlow: visibleTurnPatch.taskFlow,
-    conversationTurns: visibleTurnPatch.conversationTurns,
+    conversationTurns: input.sourcePlanDraft || input.approvedPlanContinuation
+      ? visibleTurnPatch.conversationTurns.map(turn => turn.id === input.turnId ? { ...turn,
+        ...(input.sourcePlanDraft ? { sourcePlanDraft: input.sourcePlanDraft } : {}),
+        ...(input.approvedPlanContinuation ? { approvedPlanContinuation: input.approvedPlanContinuation } : {}),
+      } : turn)
+      : visibleTurnPatch.conversationTurns,
   });
 
   const userBlock = visibleTurnPatch?.userBlock ?? null;
@@ -170,6 +178,7 @@ export function applySubmitVisibleTurn(
       shouldArchiveChoiceFeedback,
       currentNormalizedStreamState: s.normalizedStreamState,
       effectiveWorkflowMode: input.effectiveWorkflowMode,
+      preserveComposerMode: input.preserveComposerMode,
       preservePlanState: input.preservePlanState,
       shouldGrantExecutionConsentForTurn: input.shouldGrantExecutionConsentForTurn,
       requiresPlanExecutionAdmission: input.requiresPlanExecutionAdmission,

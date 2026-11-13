@@ -1,3 +1,4 @@
+import { knowledgeLookupPolicy } from "./knowledgeReferences";
 // lib/toolExecutor.ts
 // Routes agent tool calls to the correct execution backend.
 // ALL file operations go through Tauri IPC (invoke) to the Rust backend,
@@ -28,6 +29,7 @@ import {
   getPtyStatus,
   findSymbolReferences,
   runCommand,
+  runUnityEditorOperation,
   getFileOutline,
   getFileMetadata,
   ingestAttachmentFile,
@@ -44,7 +46,8 @@ import {
 } from "./ipc";
 import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
-import { isMcpTool, executeMcpTool, getMcpServerUrl } from "./mcpClient";
+import { isMcpTool, executeMcpTool, getMcpServerUrl, getMcpToolOrigin } from "./mcpClient";
+import { executeUnityMcpObservation, normalizeMcpWorkspace } from "./workspaceMcp";
 import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import {
   classifyBuiltInTool,
@@ -53,9 +56,12 @@ import {
   normalizeLocalFileReadPath,
 } from "./toolCapabilities";
 import { getShellToolCwd } from "./toolExecutionContract";
+import { UNITY_CREATE_SCENE_TOOL } from "./workspaceMutationTools";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
+import { builtInToolRequiresWorkspace } from "./workspaceToolScope";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import { sha256Hex } from "./sha256";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
 import {
@@ -109,16 +115,6 @@ function parseOptionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-function parseOptionalStringList(value: unknown): string[] | undefined {
-  if (Array.isArray(value)) {
-    const items = value.map((item) => String(item || "").trim()).filter(Boolean);
-    return items.length > 0 ? items : undefined;
-  }
-  if (typeof value !== "string") return undefined;
-  const items = value.split(",").map((item) => item.trim()).filter(Boolean);
-  return items.length > 0 ? items : undefined;
-}
-
 const LOCAL_FILE_READ_TOOLS = new Set([
   "read_file",
   "read_document",
@@ -131,37 +127,6 @@ const GLOBAL_CHAT_CONTEXT_READ_TOOLS = new Set([
   "read_document",
   "analyze_tabular_document",
   "query_tabular_document",
-]);
-
-const WORKSPACE_REQUIRED_TOOL_NAMES = new Set([
-  "list_directory",
-  "glob_search",
-  "grep_search",
-  "repo_map_status",
-  "repo_map_search",
-  "repo_map_context",
-  "repo_map_files",
-  "repo_map_impact",
-  "code_ast_query",
-  "find_symbol_references",
-  "get_project_skeleton",
-  "get_file_outline",
-  "index_workspace_documents",
-  "replace_in_file",
-  "write_file",
-  "apply_patch",
-  "git_status",
-  "git_diff",
-  "delete_workspace_path",
-  "run_command",
-  "browser_evaluate",
-  "computer_use",
-  "execute_command",
-  "send_pty_input",
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
 ]);
 
 function isMissingPtySessionError(error: unknown): boolean {
@@ -232,7 +197,7 @@ function assertWorkspaceAvailableForTool(
 ): void {
   if (workspace.trim()) return;
   if (isGlobalChatContextReadToolCall(name, args, sessionKey)) return;
-  if (!WORKSPACE_REQUIRED_TOOL_NAMES.has(name) && !GLOBAL_CHAT_CONTEXT_READ_TOOLS.has(name)) return;
+  if (!builtInToolRequiresWorkspace(name) && !GLOBAL_CHAT_CONTEXT_READ_TOOLS.has(name)) return;
   throw new Error(
     `WORKSPACE_REQUIRED_FOR_TOOL: ${name} requires an active workspace. Global Chat can only read explicitly attached chat files; open a project conversation or attach/@ a specific file first.`,
   );
@@ -270,11 +235,18 @@ function buildChatTempSuccessMessage(
 export interface ToolExecutionOptions {
   /** Internal Runtime preparation fact; model arguments never supply this. */
   writeFileTarget?: import("./workspaceMutationPreflight").WorkspaceWriteFileTargetFact;
+  unitySceneAuthority?: { signal: AbortSignal; lifecycleDeadlineAt?: number };
+  unityConsoleRepairScope?: true;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
   toolCatalog?: ToolCatalog;
+  availableToolNames?: ReadonlySet<string>;
+  workspaceMcpSnapshot?: import("./workspaceMcp").WorkspaceMcpSnapshot | null;
   skillCatalog?: SkillCatalogSnapshot | null;
+  /** Captured message scope; model-supplied kb/source ids cannot widen it. */
+  knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
+  knowledgeLookup?: { allowOfficialDocuments: boolean; signal?: AbortSignal };
 }
 
 async function prepareExternalLocalReadArgs(
@@ -346,10 +318,16 @@ export async function executeTool(
       if (!resolution.entry.serverUrl) {
         throw new Error(`MCP server URL not found for tool "${resolution.entry.canonicalName}".`);
       }
+      const binding = options.workspaceMcpSnapshot?.unityBindings?.[resolution.entry.serverUrl];
+      const origin = resolution.entry.mcpTool && getMcpToolOrigin(resolution.entry.mcpTool);
+      if (origin?.connector === "unity" && (!binding || options.workspaceMcpSnapshot?.workspace !== normalizeMcpWorkspace(workspace))) {
+        throw new Error("MCP_UNITY_OBSERVATION_SCOPE_MISMATCH");
+      }
       return await executeMcpTool(
         resolution.entry.serverUrl,
         resolution.entry.executionName,
         args,
+        binding,
       );
     }
     if (resolution.entry.source === "skill") {
@@ -379,6 +357,10 @@ export async function executeTool(
     }
   }
 
+  if (executionName === "unity_mcp_scene" || executionName === "unity_mcp_console") {
+    return executeUnityMcpObservation({ snapshot: options.workspaceMcpSnapshot, workspace, name: executionName, args, repairScope: options.unityConsoleRepairScope });
+  }
+
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
   if (executionName === LOAD_SKILL_TOOL_NAME) {
@@ -388,7 +370,15 @@ export async function executeTool(
     return executeToolSearch(args, {
       sessionKey,
       toolCatalog: options.toolCatalog,
+      availableToolNames: options.availableToolNames,
     });
+  }
+  if (executionName === UNITY_CREATE_SCENE_TOOL) {
+    const authority = options.unitySceneAuthority;
+    if (!authority || !workspace) throw new Error("UNITY_SCENE_REQUIRES_APPROVED_PLAN");
+    return runUnityEditorOperation(UNITY_CREATE_SCENE_TOOL, {
+      workspace, path: args.path, rootName: args.root_name, scriptPath: args.script_path,
+    }, authority.signal, Math.min(Date.now() + 175_000, authority.lifecycleDeadlineAt ?? Infinity));
   }
   unlockToolsForSession(sessionKey, [executionName]);
 
@@ -912,11 +902,14 @@ export async function executeTool(
     case "knowledge_search": {
       const query = parseOptionalString(args.query);
       if (!query) throw new Error("Missing required parameter 'query'.");
-      return await knowledgeSearch(
-        query,
-        parseOptionalStringList(args.kb_ids ?? args.kbIds),
-        parseOptionalNumber(args.limit),
-      );
+      const references = options.knowledgeReferences || [];
+      const policy = knowledgeLookupPolicy({
+        references,
+        allowOfficialDocuments: options.knowledgeLookup?.allowOfficialDocuments,
+        networkRead: options.networkRead,
+        requestWebFallback: args.allow_web_fallback,
+      });
+      return await knowledgeSearch(query, references, parseOptionalNumber(args.limit), policy, options.knowledgeLookup?.signal);
     }
 
     case "knowledge_get_excerpt": {
@@ -924,7 +917,7 @@ export async function executeTool(
       const chunkId = parseOptionalString(args.chunk_id ?? args.chunkId);
       if (!sourceId) throw new Error("Missing required parameter 'source_id'.");
       if (!chunkId) throw new Error("Missing required parameter 'chunk_id'.");
-      return await knowledgeGetExcerpt(sourceId, chunkId);
+      return await knowledgeGetExcerpt(sourceId, chunkId, [...(options.knowledgeReferences || [])]);
     }
 
     case "replace_in_file": {
@@ -957,6 +950,7 @@ export async function executeTool(
       return JSON.stringify({
         success: true,
         changedPaths: [replacePath],
+        mutationVersions: [{ path: replacePath, version: `sha256-${sha256Hex(updated)}` }],
         message: `File ${replacePath} updated successfully.`,
       });
     }
@@ -976,12 +970,17 @@ export async function executeTool(
         } else {
           const current = temporary ? await readChatTempFile(sessionKey!, writePath) : await readFile(writePath, workspace);
           if (current !== reviewed.content) throw new Error("WRITE_FILE_SOURCE_STALE: target changed after mutation preparation");
+          if (current === writeContent) {
+            return JSON.stringify({ success: true, noOp: true, message: `File ${writePath} already matched requested content.` });
+          }
           if (temporary) temporaryPath = await writeChatTempFile(sessionKey!, writePath, writeContent);
           else await writeFile(writePath, writeContent, workspace);
         }
         return temporaryPath
           ? buildChatTempSuccessMessage("written", writePath, temporaryPath)
-          : JSON.stringify({ success: true, changedPaths: [writePath], message: `File ${writePath} written successfully.` });
+          : JSON.stringify({ success: true, changedPaths: [writePath],
+              mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}` }],
+              message: `File ${writePath} written successfully.` });
       }
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
         try {
@@ -1007,6 +1006,7 @@ export async function executeTool(
       return JSON.stringify({
         success: true,
         changedPaths: [writePath],
+        mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}` }],
         message: `File ${writePath} written successfully.`,
       });
     }
@@ -1072,10 +1072,21 @@ export async function executeTool(
       if (!result.ok) {
         throw new Error(result.error || "apply_patch failed.");
       }
+      const versions = new Map<string, { before: string | null; after: string | null }>();
+      for (const change of result.changes) {
+        const previous = versions.get(change.path);
+        versions.set(change.path, {
+          before: previous ? previous.before : change.existed ? change.oldContent : null,
+          after: change.kind === "delete" ? null : change.newContent,
+        });
+      }
       return JSON.stringify({
         success: true,
         message: `Patch applied to ${summarizeApplyPatchTarget(patch) || "workspace"}.`,
         changedFiles: result.changes.map((change) => change.path),
+        mutationVersions: [...versions].flatMap(([path, { before, after }]) => before === after ? [] : [{
+          path, version: after === null ? "deleted" : `sha256-${sha256Hex(after)}`,
+        }]),
       });
     }
 
@@ -1092,6 +1103,7 @@ export async function executeTool(
       await deleteWorkspacePath(targetPath, workspace);
       return JSON.stringify({
         success: true,
+        mutationVersions: [{ path: targetPath, version: "deleted" }],
         message: `Path ${targetPath} deleted successfully.`,
       });
     }

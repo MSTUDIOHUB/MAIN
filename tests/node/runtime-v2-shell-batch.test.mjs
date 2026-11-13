@@ -333,6 +333,47 @@ for (const failureIndex of [0, 1, 2]) {
   }
 }
 
+test("failed shell allows independent knowledge and Skill reads while fencing dependent operations", () => {
+  const { runtimeV2SequentialShellBatchInterruption: interruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
+  const calls = [
+    { id: "shell", name: "run_command", arguments: { command: "tool status" } },
+    { id: "manual", name: "knowledge_search", arguments: { query: "Editor version" } },
+    { id: "skill", name: "load_skill", arguments: { skill_id: "fixture-guidance" } },
+    { id: "source", name: "read_file", arguments: { path: "src/current.ts" } },
+  ];
+  const f = ledger(calls);
+  for (const [index, call] of calls.entries()) {
+    const [command] = runtime.decideNextCommands(f.aggregate);
+    assert.equal(command.payload.toolCallId, call.id);
+    assert.equal(interruption(f.aggregate, command)?.reasonCode, index === 3 ? "provider_batch_predecessor_failed" : undefined);
+    if (index === 3) break;
+    f.apply("command.scheduled", { run: f.run, command });
+    f.apply("tool.completed", { run: f.run, idempotencyKey: command.idempotencyKey, evidence: [],
+      status: index === 0 ? "failed" : "succeeded" });
+  }
+});
+
+test("blocked shell does not suppress independently bound Editor observations", () => {
+  const { runtimeV2SequentialShellBatchInterruption: interruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
+  const calls = [
+    { id: "shell", name: "run_command", arguments: { command: 'find / -name "*.hlsl"' } },
+    { id: "source", name: "read_file", arguments: { path: "Assets/Generated.shader" } },
+    { id: "console", name: "unity_mcp_console", arguments: {} },
+    { id: "scene", name: "unity_mcp_scene", arguments: {} },
+    { id: "dependent", name: "run_command", arguments: { command: "ls Assets" } },
+  ];
+  const f = ledger(calls);
+  for (const [index, call] of calls.entries()) {
+    const [command] = runtime.decideNextCommands(f.aggregate);
+    assert.equal(command.payload.toolCallId, call.id);
+    const blocked = index === 1 || index === 4;
+    assert.equal(interruption(f.aggregate, command)?.reasonCode, blocked ? "provider_batch_predecessor_failed" : undefined);
+    f.apply("command.scheduled", { run: f.run, command });
+    f.apply("tool.completed", { run: f.run, idempotencyKey: command.idempotencyKey, evidence: [],
+      status: index === 0 || blocked ? "blocked" : "succeeded" });
+  }
+});
+
 test("mixed observation sequencing accepts only actual predecessor tool receipts", () => {
   const { runtimeV2SequentialShellBatchInterruption: interruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
   for (const status of ["succeeded", "canceled"]) {

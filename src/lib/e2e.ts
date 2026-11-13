@@ -6,6 +6,7 @@ import {
 } from "../store/useAppStore";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
+  extractPlanTasks,
   getPlanArtifactTitle,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
@@ -17,13 +18,6 @@ import {
   type PlanCandidateV5,
 } from "./planContract";
 import { createPlanEvidenceReceipt } from "./planEvidenceReceipt";
-import {
-  createGoalDefinition,
-  createGoalProgress,
-  type GoalStatus,
-} from "./goalState";
-import { buildGoalRuntimeSnapshot } from "./goalRuntime";
-import { buildAcceptedGoalContinuationState } from "./goalResumeBoundary";
 import {
   buildPlanReviewActionRequest,
   buildUserChoiceActionRequest,
@@ -50,7 +44,6 @@ import {
   readHarnessRunMarker,
   type HarnessRunMarker,
 } from "./harnessCrashTelemetry";
-import { createGoalContinuationAuthorization } from "./submit/turnSubmission";
 import {
   appendRuntimeEventWithResult,
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
@@ -58,6 +51,7 @@ import {
 } from "./turnEvents";
 import {
   projectSubagentRuns,
+  resolveSubagentCapacityPolicy,
   SUBAGENT_CLOSURE_SCHEMA_VERSION,
 } from "./subagents";
 import {
@@ -131,7 +125,7 @@ const TOOL_GROUP_AWAITING_CHOICE_SCENARIO = "tool-group-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
 const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
 const CAPSULE_PHASE_FALLBACK_SCENARIO = "capsule-phase-fallback";
-const GOAL_CAPSULE_SCENARIO = "goal-capsule";
+
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
 const SUBAGENTS_PANEL_SCENARIO = "subagents-panel";
@@ -518,19 +512,14 @@ function bindBridgeSnapshot(scenario: string) {
         .map((block) => block.selectedOption)
         .filter(Boolean),
       themeMode: state.config.themeMode,
-      goalStatus: state.goalStatus,
-      activeGoalId: state.activeGoal?.id ?? null,
-      activeGoalObjective:
-        state.activeGoal?.rawText || state.activeGoal?.objective || null,
-      activeGoalRevision: state.activeGoal?.revision ?? null,
+
+
       activeActionRequestKind: state.activeActionRequest?.kind ?? null,
       pendingReplyOptionBlocks: agentBlocks.filter(
         (block) => Array.isArray(block.options) && block.options.length > 0,
       ).length,
-      queuedGoalContinuationSource:
-        state.queuedUserMessage?.goalContinuationAuthorization?.source ?? null,
-      queuedGoalContinuationGuidance:
-        state.queuedUserMessage?.goalContinuationGuidance ?? null,
+
+
       seedCount: readSeedCount(scenario),
     };
   };
@@ -3088,6 +3077,18 @@ function seedReadContextCollapseScenario() {
       type: "agent" as const,
       content: "已读取核心战斗上下文，失败项和写入项需要保持单独展示。",
       streaming: false,
+      visibility: "assistant_update",
+      publicProgress: {
+        schemaVersion: 1,
+        kind: "assistant_commentary",
+        source: "model_visible_content",
+        sessionKey: `/tmp/e2e-read-context-collapse:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId: `run-${turnId}`,
+        parentRunId: null,
+        createdAt: now,
+      },
     },
     {
       id: singleReadBlockId,
@@ -3105,6 +3106,7 @@ function seedReadContextCollapseScenario() {
       type: "agent" as const,
       content: "补充读取了 README 作为单项上下文，用于校验单项也能折叠。",
       streaming: false,
+      visibility: "assistant_final",
     },
   ];
 
@@ -3466,6 +3468,18 @@ function seedReadContextThinNarrationScenario() {
         "核心问题映射：CSV 数据已加载，但面板统计和图表未渲染，需要检查数据解析、状态管理和图表绑定。",
       ].join("\n"),
       streaming: false,
+      visibility: "assistant_update",
+      publicProgress: {
+        schemaVersion: 1,
+        kind: "assistant_commentary",
+        source: "model_visible_content",
+        sessionKey: `/tmp/e2e-read-context-thin-narration:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId: `run-${turnId}`,
+        parentRunId: null,
+        createdAt: now,
+      },
     },
     {
       id: nextId(),
@@ -4098,6 +4112,8 @@ function seedDiffReloadSummaryScenario() {
   const workspace = "/tmp/e2e-diff-reload";
   const sessionId = 999003;
   const now = Date.now();
+  const sessionEpoch = createPlanLifecycleSessionEpoch(now);
+  const sessionKey = `${workspace}:${sessionId}`;
 
   if (!hasDiffReloadSummaryState(workspace, sessionId)) {
     const turnId = "e2e-diff-reload-turn";
@@ -4116,20 +4132,28 @@ function seedDiffReloadSummaryScenario() {
         ...state.config,
         language: "zh",
         workflowMode: "edit",
+        workspace,
+        sessionRecordingEnabled: false,
       },
       currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      activeSessionByWorkspace: { [workspace]: sessionId },
       sessionsByWorkspace: {
         [workspace]: [
           {
             id: sessionId,
+            planLifecycleEpoch: sessionEpoch,
             title: "E2E Diff Reload Summary",
             date: new Date(now).toISOString(),
             active: true,
+            storageStatus: "temporary",
+            recordingDisabled: true,
             messages: [],
           },
         ],
       },
       currentSessionId: sessionId,
+      planLifecycle: createPlanLifecycleState({ sessionKey, sessionEpoch, updatedAt: now }),
       taskFlow: [
         {
           id: userBlockId,
@@ -4660,6 +4684,18 @@ function seedStageConclusionPreservedScenario() {
       type: "agent",
       content: stageText,
       streaming: false,
+      visibility: "assistant_update",
+      publicProgress: {
+        schemaVersion: 1,
+        kind: "assistant_commentary",
+        source: "model_visible_content",
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId: "run-e2e-stage-conclusion",
+        parentRunId: null,
+        createdAt: now,
+      },
     },
     {
       id: editBlockId,
@@ -4684,6 +4720,7 @@ function seedStageConclusionPreservedScenario() {
       type: "agent",
       content: "已完成当前修复并保留阶段性结论。",
       streaming: false,
+      visibility: "assistant_final",
     },
   ];
 
@@ -4752,6 +4789,8 @@ function seedPlanReplaceRefreshScenario() {
   const workspace = "/tmp/e2e-plan-replace-refresh";
   const sessionId = 999004;
   const now = Date.now();
+  const sessionEpoch = createPlanLifecycleSessionEpoch(now);
+  const sessionKey = `${workspace}:${sessionId}`;
   const turnId = "e2e-plan-replace-refresh-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
@@ -4775,20 +4814,28 @@ function seedPlanReplaceRefreshScenario() {
       ...state.config,
       language: "zh",
       workflowMode: "plan",
+      workspace,
+      sessionRecordingEnabled: false,
     },
     currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    activeSessionByWorkspace: { [workspace]: sessionId },
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E Plan Replace Refresh",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary",
+          recordingDisabled: true,
           messages: [],
         },
       ],
     },
     currentSessionId: sessionId,
+    planLifecycle: createPlanLifecycleState({ sessionKey, sessionEpoch, updatedAt: now }),
     taskFlow: [
       {
         id: userBlockId,
@@ -4811,7 +4858,15 @@ function seedPlanReplaceRefreshScenario() {
         userPrompt: "继续执行剩余任务，并同步刷新计划面板。",
         title: "Plan 替换刷新回归流",
         mode: "plan",
-        status: "executing",
+        status: "paused",
+        runtimeOutcome: {
+          status: "paused",
+          reason: "e2e_external_verification_pending",
+          pauseKind: "recoverable",
+          runId: "run-e2e-plan-replace-refresh",
+          parentRunId: null,
+          updatedAt: now,
+        },
         summary: "tasks.md 使用 replace_in_file 更新后，计划面板也应立即刷新。",
         blockIds: [userBlockId, agentBlockId],
         collapsed: false,
@@ -4948,7 +5003,10 @@ function seedPlanReplaceRefreshScenario() {
             updatedAt: Date.now(),
           });
         },
-        onPlanTasksUpdated: () => {},
+        // This fixture exercises the legacy artifact-rendering seam. Task
+        // completion still reconciles against its independent tool receipts;
+        // it does not create a Runtime v2 WorkPlan or renew approval.
+        onPlanTasksUpdated: (content) => useAppStore.getState().setPlanTasks(extractPlanTasks(content)),
       },
       {
         readFile: async () => updatedTasksContent,
@@ -4959,6 +5017,7 @@ function seedPlanReplaceRefreshScenario() {
     const current = useAppStore.getState();
     appendBridgeEvent("tasks-replaced", {
       statuses: current.planTasks.map((task) => task.status),
+      approvalRetained: current.isPlanApproved,
       artifactContent:
         current.planArtifacts.find((artifact) => artifact.kind === "tasks")
           ?.content ?? "",
@@ -4985,6 +5044,22 @@ function seedPlanReplaceRefreshScenario() {
   return cleanup;
 }
 
+function retainE2ELiveSessionFixture(workspace: string, sessionId: number): void {
+  const fixture = useAppStore.getState();
+  // App startup restores a selected Session from metadata. Publish the same
+  // live fixture and transcript counts before that restore can classify the
+  // metadata-only Session as empty and replace its pending runtime.
+  fixture.saveCurrentRuntimeToSession();
+  useAppStore.setState((state) => ({
+    sessionsByWorkspace: {
+      ...state.sessionsByWorkspace,
+      [workspace]: (state.sessionsByWorkspace[workspace] || []).map((session) => session.id === sessionId
+        ? { ...session, turnCount: fixture.conversationTurns.length, messageCount: fixture.taskFlow.filter((block) => block.type === "user" || block.type === "agent").length }
+        : session),
+    },
+  }));
+}
+
 function seedExecutionCapsuleExecutionProgressScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -4996,6 +5071,7 @@ function seedExecutionCapsuleExecutionProgressScenario() {
   const workspace = "/tmp/e2e-execution-capsule-execution-progress";
   const sessionId = 999601;
   const now = Date.now();
+  const sessionEpoch = `plan-session-${sessionId}`;
   const turnId = "e2e-execution-capsule-execution-progress-turn";
   const runId = "run-e2e-execution-capsule-execution-progress";
   const userBlockId = useAppStore.getState()._nextTaskId();
@@ -5014,13 +5090,19 @@ function seedExecutionCapsuleExecutionProgressScenario() {
       workflowMode: "edit",
     },
     currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    activeSessionByWorkspace: { [workspace]: sessionId },
+    planLifecycle: createPlanLifecycleState({ sessionKey: `${workspace}:${sessionId}`, sessionEpoch, updatedAt: now }),
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E ExecutionCapsule Execution Progress",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary" as const,
+          recordingDisabled: true,
           messages: [],
         },
       ],
@@ -5092,6 +5174,8 @@ function seedExecutionCapsuleExecutionProgressScenario() {
         type: "tool",
         toolName: "read_file",
         target: "src/components/ExecutionCapsule.tsx",
+        runId,
+        parentRunId: null,
         status: "done",
         toolStatus: "executed",
         message: "File read.",
@@ -5102,6 +5186,8 @@ function seedExecutionCapsuleExecutionProgressScenario() {
         type: "tool",
         toolName: "replace_in_file",
         target: "src/components/ExecutionCapsule.tsx",
+        runId,
+        parentRunId: null,
         status: "running",
         toolStatus: "running",
         message: "Executing...",
@@ -5191,10 +5277,39 @@ function seedExecutionCapsuleExecutionProgressScenario() {
     contextMentions: [],
   }));
 
+  retainE2ELiveSessionFixture(workspace, sessionId);
+
   appendBridgeEvent("seeded", {
     seedCount: readSeedCount(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO),
   });
   bindBridgeSnapshot(TOP_ISLAND_EXECUTION_PROGRESS_SCENARIO);
+  bridge.appendCapsulePhaseSnapshots = (title: string) => {
+    const marker = useAppStore.getState().harnessRunMarker;
+    if (!marker?.turnId) throw new Error("Expected the seeded execution Run");
+    const timestampMs = Date.now();
+    useAppStore.setState(state => ({
+      runtimeEvents: [
+        ...state.runtimeEvents,
+        ...[0, 1, 2].map(index => withEventSchema({
+          type: "progress.updated",
+          threadId: marker.sessionKey,
+          turnId: marker.turnId!,
+          runId: marker.runId,
+          parentRunId: marker.parentRunId,
+          timestampMs: timestampMs + index,
+          progress: {
+            phase: "planning",
+            title,
+            status: index === 2 ? "running" : "done",
+            action: title,
+            summary: title,
+            audience: "user",
+            dedupeKey: `runtime-v2:${marker.turnId}:phase:planning:${index}`,
+          },
+        })),
+      ],
+    }));
+  };
 
   const cleanup = () => {
     const latest = useAppStore.getState();
@@ -5222,10 +5337,12 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
   const workspace = "/tmp/e2e-execution-capsule-plan-task-progress";
   const sessionId = 999602;
   const now = Date.now();
+  const sessionEpoch = `plan-session-${sessionId}`;
   const turnId = "e2e-execution-capsule-plan-task-progress-turn";
   const reviewRunId = "run-e2e-execution-capsule-plan-review";
   const childRunId = "run-e2e-execution-capsule-plan-child";
   const userBlockId = useAppStore.getState()._nextTaskId();
+  const editBlockId = useAppStore.getState()._nextTaskId();
   const planTasks = Array.from({ length: 9 }, (_, index) => {
     const taskNumber = index + 1;
     const filePath = `src/task-${taskNumber}.ts`;
@@ -5263,13 +5380,19 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
       workflowMode: "plan",
     },
     currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    activeSessionByWorkspace: { [workspace]: sessionId },
+    planLifecycle: createPlanLifecycleState({ sessionKey: `${workspace}:${sessionId}`, sessionEpoch, updatedAt: now }),
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E ExecutionCapsule Plan Task Progress",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary" as const,
+          recordingDisabled: true,
           messages: [],
         },
       ],
@@ -5282,6 +5405,17 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
         type: "user",
         content: "/计划 执行 9 个任务并追踪进度。",
       },
+      {
+        id: editBlockId,
+        turnId,
+        type: "tool",
+        toolName: "apply_patch",
+        target: "src/task-9.ts",
+        runId: childRunId,
+        parentRunId: reviewRunId,
+        status: "running",
+        toolStatus: "running",
+      },
     ],
     conversationTurns: [
       {
@@ -5292,7 +5426,7 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
         intent: "plan",
         status: "executing",
         summary: "计划执行阶段 ExecutionCapsule 应展示完整任务列表。",
-        blockIds: [userBlockId],
+        blockIds: [userBlockId, editBlockId],
         collapsed: false,
         createdAt: now,
       },
@@ -5427,6 +5561,8 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     contextMentions: [],
   }));
 
+  retainE2ELiveSessionFixture(workspace, sessionId);
+
   appendBridgeEvent("seeded", {
     seedCount: readSeedCount(TOP_ISLAND_PLAN_TASK_PROGRESS_SCENARIO),
   });
@@ -5454,6 +5590,7 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
   const workspace = "/tmp/e2e-execution-capsule-strict-evidence-progress";
   const sessionId = 999604;
   const now = Date.now();
+  const sessionEpoch = `plan-session-${sessionId}`;
   const turnId = "e2e-execution-capsule-strict-evidence-progress-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const planTasks = Array.from({ length: 8 }, (_, index) => {
@@ -5497,13 +5634,19 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
       workflowMode: "plan",
     },
     currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    activeSessionByWorkspace: { [workspace]: sessionId },
+    planLifecycle: createPlanLifecycleState({ sessionKey: `${workspace}:${sessionId}`, sessionEpoch, updatedAt: now }),
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E ExecutionCapsule Strict Evidence Progress",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary" as const,
+          recordingDisabled: true,
           messages: [],
         },
       ],
@@ -5568,6 +5711,8 @@ function seedExecutionCapsuleStrictEvidenceProgressScenario() {
     contextMentions: [],
   }));
 
+  retainE2ELiveSessionFixture(workspace, sessionId);
+
   appendBridgeEvent("seeded", {
     seedCount: readSeedCount(TOP_ISLAND_STRICT_EVIDENCE_PROGRESS_SCENARIO),
   });
@@ -5595,6 +5740,7 @@ function seedExecutionCapsulePendingToolReviewScenario() {
   const workspace = "/tmp/e2e-execution-capsule-pending-tool-review";
   const sessionId = 999603;
   const now = Date.now();
+  const sessionEpoch = `plan-session-${sessionId}`;
   const turnId = "e2e-execution-capsule-pending-tool-review-turn";
   const runId = "run-e2e-pending-tool-review";
   const userBlockId = useAppStore.getState()._nextTaskId();
@@ -5673,13 +5819,19 @@ function seedExecutionCapsulePendingToolReviewScenario() {
       workflowMode: "plan",
     },
     currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    activeSessionByWorkspace: { [workspace]: sessionId },
+    planLifecycle: createPlanLifecycleState({ sessionKey: `${workspace}:${sessionId}`, sessionEpoch, updatedAt: now }),
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E ExecutionCapsule Pending Tool Review",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary" as const,
+          recordingDisabled: true,
           messages: [],
         },
       ],
@@ -5923,6 +6075,8 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     else state.rejectToolAction(identity.taskId, identity);
   };
 
+  retainE2ELiveSessionFixture(workspace, sessionId);
+
   appendBridgeEvent("seeded", {
     seedCount: readSeedCount(TOP_ISLAND_PENDING_TOOL_REVIEW_SCENARIO),
   });
@@ -5953,6 +6107,7 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
   const workspace = "/tmp/e2e-execution-capsule-orphan-pending-review";
   const sessionId = 999613;
   const now = Date.now();
+  const sessionEpoch = `plan-session-${sessionId}`;
   const turnId = "e2e-execution-capsule-orphan-pending-review-turn";
   const runId = "run-e2e-orphan-pending-review";
   const userBlockId = useAppStore.getState()._nextTaskId();
@@ -5976,13 +6131,19 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
       workflowMode: "edit",
     },
     currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    activeSessionByWorkspace: { [workspace]: sessionId },
+    planLifecycle: createPlanLifecycleState({ sessionKey: `${workspace}:${sessionId}`, sessionEpoch, updatedAt: now }),
     sessionsByWorkspace: {
       [workspace]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title: "E2E Orphan Pending Review",
           date: new Date(now).toISOString(),
           active: true,
+          storageStatus: "temporary" as const,
+          recordingDisabled: true,
           messages: [],
         },
       ],
@@ -6126,6 +6287,8 @@ function seedExecutionCapsuleOrphanPendingReviewScenario() {
     });
     appendBridgeEvent("orphan_pending_prompt_shown");
   };
+
+  retainE2ELiveSessionFixture(workspace, sessionId);
 
   appendBridgeEvent("seeded", {
     seedCount: readSeedCount(TOP_ISLAND_ORPHAN_PENDING_REVIEW_SCENARIO),
@@ -7445,6 +7608,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       runId,
       toolName: "read_file",
       target: "src/components/ChatArea.tsx",
+      parentRunId: null,
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
@@ -7458,6 +7622,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       runId,
       toolName: "run_command",
       target: "npm run test:workflow-assets",
+      parentRunId: null,
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
@@ -7501,6 +7666,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       runId,
       toolName: "read_file",
       target: "src/main.js",
+      parentRunId: null,
       status: "done",
       toolStatus: "executed" as const,
       message: "OK",
@@ -7522,6 +7688,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
       runId,
       toolName: "grep_search",
       target: "src/components/ChatArea.tsx",
+      parentRunId: null,
       status: "running",
       toolStatus: "running" as const,
       message: "Searching...",
@@ -7642,6 +7809,8 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
     showFilePanel: false,
   }));
 
+  retainE2ELiveSessionFixture(workspace, sessionId);
+
   bindBridgeSnapshot(
     kind === "model"
       ? CAPSULE_MODEL_EXPLANATION_SCENARIO
@@ -7658,455 +7827,6 @@ function seedCapsuleProcessScenario(kind: "model" | "progress" | "phase") {
   return cleanup;
 }
 
-function seedGoalCapsuleScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  const workspace = "/tmp/e2e-goal-capsule";
-  const sessionId = 999615;
-  const now = Date.now();
-  const turnId = "e2e-goal-capsule-turn";
-  const userBlockId = useAppStore.getState()._nextTaskId();
-  const agentBlockId = useAppStore.getState()._nextTaskId();
-  const goal = {
-    ...createGoalDefinition({
-      objective:
-        "重构 Goal Runtime；完成标准：Loop 与 Capsule 通过测试；约束：兼容 dark、black、light 三大主题",
-    iterationBudget: 40,
-    maxDurationMs: 2 * 60 * 60 * 1000,
-    sessionKey: `${workspace}:${sessionId}`,
-    ownerTurnId: turnId,
-    }),
-    id: "e2e_goal_capsule",
-  };
-  const progress = createGoalProgress(
-    goal.id,
-    `${workspace}/.MAIN/goals/${goal.id}/progress.md`,
-  );
-  progress.currentIteration = 3;
-  progress.totalIterationsUsed = 3;
-  progress.totalTokensUsed = 4820;
-  progress.estimatedTokens = true;
-  progress.iterations = [
-    {
-      index: 3,
-      phase: "execute",
-      startedAt: now - 20_000,
-      summary: "已完成 Goal Runtime 状态投影，正在验证 Capsule 菜单。",
-      toolCallCount: 3,
-      filesModified: ["src/lib/goalRuntime.ts", "src/components/GoalPanel.tsx"],
-      testsRun: ["npm run lint"],
-      testsPassed: true,
-      unresolvedBlockers: [],
-    },
-  ];
-  progress.evidence = [
-    {
-      id: "e2e-goal-evidence-file",
-      goalId: goal.id,
-      goalRevision: goal.revision || 1,
-      iteration: 3,
-      kind: "file_change",
-      status: "passed",
-      sourceTool: "apply_patch",
-      target: "src/components/GoalPanel.tsx",
-      summary: "Goal panel updated",
-      references: ["src/components/GoalPanel.tsx"],
-      createdAt: now - 15_000,
-    },
-    {
-      id: "e2e-goal-evidence-lint",
-      goalId: goal.id,
-      goalRevision: goal.revision || 1,
-      iteration: 3,
-      kind: "build",
-      status: "passed",
-      sourceTool: "run_command",
-      target: "npm run lint",
-      summary: "TypeScript passed",
-      references: [],
-      createdAt: now - 10_000,
-    },
-  ];
-  progress.milestones = [
-    {
-    id: "e2e-goal-milestone",
-    text: "验证 Capsule Goal 菜单与三主题",
-    status: "in_progress",
-    criterionIds: goal.criteria?.map((criterion) => criterion.id) || [],
-    },
-  ];
-  progress.currentMilestoneId = "e2e-goal-milestone";
-  progress.usage = {
-    modelIterations: 3,
-    toolCalls: 8,
-    totalTokensUsed: 4820,
-    activeDurationMs: 12 * 60 * 1000,
-    activeStartedAt: now - 20_000,
-    estimatedTokens: true,
-  };
-  const runtime = buildGoalRuntimeSnapshot({
-    goal,
-    progress,
-    phase: "execute",
-  });
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: { ...state.config, language: "zh", workflowMode: "edit" },
-    selectedMainModeKey: "main_mode",
-    currentWorkspace: workspace,
-    selectedWorkspace: workspace,
-    workspaces: [
-      {
-        path: workspace,
-        name: "E2E Goal Capsule",
-        addedAt: now,
-        lastActiveAt: now,
-      },
-    ],
-    activeSessionByWorkspace: { [workspace]: sessionId },
-    sessionsByWorkspace: {
-      [workspace]: [
-        {
-        id: sessionId,
-        title: "E2E Goal Capsule",
-        date: new Date(now).toISOString(),
-        active: true,
-        storageStatus: "ok" as const,
-        recordingDisabled: false,
-        messages: [],
-        },
-      ],
-      [GLOBAL_CHAT_KEY]: [],
-    },
-    currentSessionId: sessionId,
-    taskFlow: [
-      {
-        id: userBlockId,
-        turnId,
-        type: "user",
-        content: "持续完成 Goal Runtime 重构。",
-      },
-      {
-        id: agentBlockId,
-        turnId,
-        type: "agent",
-        content: "已进入持续目标执行。",
-        streaming: false,
-      },
-    ],
-    conversationTurns: [
-      {
-      id: turnId,
-      userPrompt: "持续完成 Goal Runtime 重构。",
-      title: "Goal Runtime 重构",
-      mode: "edit",
-      intent: "goal",
-      displayIntent: "goal",
-      status: "done",
-      summary: "Goal Runtime 正在后台持续推进。",
-      blockIds: [userBlockId, agentBlockId],
-      collapsed: false,
-      createdAt: now,
-      elapsedTime: 83,
-      },
-    ],
-    currentTurnId: turnId,
-    currentTurnState: {
-      interceptorHandled: false,
-      interceptorThought: "",
-      lastReportedThought: "",
-      lastReportedAssistantText: "",
-      capsuleExplanation: null,
-      turnId,
-    },
-    activeGoal: goal,
-    goalProgress: progress,
-    goalStatus: "active",
-    goalIterationBudget: goal.iterationBudget,
-    goalRuntime: runtime,
-    agentStatus: "idle",
-    isGenerating: false,
-    abortController: null,
-    showPlanPanel: false,
-    showDiff: false,
-    showTerminal: false,
-    showFilePanel: false,
-  }));
-
-  bindBridgeSnapshot(GOAL_CAPSULE_SCENARIO);
-  bridge.setGoalStatus = (status: GoalStatus) => {
-    const state = useAppStore.getState();
-    if (!state.activeGoal || !state.goalProgress) return;
-    const nextGoal = {
-      ...state.activeGoal,
-      status,
-      updatedAt: Date.now(),
-      criteria: state.activeGoal.criteria?.map((criterion) => ({
-        ...criterion,
-        status:
-          status === "completed" ? ("satisfied" as const) : criterion.status,
-        evidenceIds:
-          status === "completed"
-            ? state.goalProgress?.evidence?.map((entry) => entry.id) || []
-            : criterion.evidenceIds,
-      })),
-    };
-    const nextRuntime = {
-      ...(state.goalRuntime ||
-        buildGoalRuntimeSnapshot({
-          goal: nextGoal,
-          progress: state.goalProgress,
-          phase: "observe",
-        })),
-      goal: nextGoal,
-      status,
-      phase:
-        status === "completed" ? ("observe" as const) : ("re_plan" as const),
-      pauseReason: status === "paused" ? "E2E pause" : undefined,
-      updatedAt: Date.now(),
-    };
-    useAppStore.setState({
-      activeGoal: nextGoal,
-      goalStatus: status,
-      goalRuntime: nextRuntime,
-    });
-  };
-  bridge.setGoalUserChoicePending = () => {
-    const state = useAppStore.getState();
-    if (!state.activeGoal || !state.goalProgress) return;
-    const runId = "e2e-goal-capsule-choice-run";
-    const optionValues = ["继续修复按钮交互", "先暂停并检查日志"];
-    const request = {
-      ...buildUserChoiceActionRequest({
-        sessionKey: `${workspace}:${sessionId}`,
-        turnId,
-        runId,
-        title: "Goal 等待用户选择",
-        optionValues,
-        allowCustomReply: true,
-        now: Date.now(),
-      }),
-      requestId: "e2e-goal-capsule-choice-request",
-    };
-    const awaitingGoal = {
-      ...state.activeGoal,
-      status: "awaiting_input" as const,
-      updatedAt: Date.now(),
-    };
-    const awaitingRuntime = {
-      ...(state.goalRuntime ||
-        buildGoalRuntimeSnapshot({
-        goal: awaitingGoal,
-        progress: state.goalProgress,
-        phase: "re_plan",
-      })),
-      goal: awaitingGoal,
-      status: "awaiting_input" as const,
-      phase: "re_plan" as const,
-      updatedAt: Date.now(),
-    };
-    const marker: HarnessRunMarker = {
-      schemaVersion: 1,
-      runId,
-      parentRunId: null,
-      instanceId: "e2e-goal-capsule-choice-instance",
-      sessionKey: `${workspace}:${sessionId}`,
-      workspace,
-      sessionId,
-      turnId,
-      status: "paused",
-      workflowMode: "edit",
-      runtimeIntent: "goal",
-      planStage: state.planStage,
-      isPlanApproved: state.isPlanApproved,
-      iteration: 3,
-      maxIterations: 40,
-      messagesLen: state.agentMessages.length,
-      toolCount: 8,
-      latestTool: null,
-      latestToolTarget: null,
-      activeStreamId: null,
-      streamStatus: "closed",
-      streamChunkCount: 0,
-      streamByteCount: 0,
-      streamElapsedMs: 0,
-      streamLifecycleStatus: "completed",
-      lastStreamError: null,
-      startedAt: Date.now() - 1_000,
-      updatedAt: Date.now(),
-      closedAt: Date.now(),
-      closeReason: "awaiting_user_choice",
-    };
-    useAppStore.setState((latest) => ({
-      activeGoal: awaitingGoal,
-      goalStatus: "awaiting_input",
-      goalRuntime: awaitingRuntime,
-      activeActionRequest: request,
-      harnessRunMarker: marker,
-      taskFlow: latest.taskFlow.map((block) =>
-        block.type === "agent" && block.turnId === turnId
-          ? {
-              ...block,
-              content: "请选择 Goal 的下一步。",
-              options: optionValues.map((value) => ({ label: value, value })),
-              choiceRequest: request,
-            }
-          : block,
-      ),
-      conversationTurns: latest.conversationTurns.map((turn) =>
-        turn.id === turnId
-          ? { ...turn, status: "awaiting_input" as const }
-          : turn,
-      ),
-      agentStatus: "idle",
-      isGenerating: false,
-      abortController: null,
-    }));
-  };
-  bridge.setExactGoalContinuationQueued = (guidance = "继续修复按钮交互") => {
-    const state = useAppStore.getState();
-    if (!state.activeGoal) return;
-    state.queueUserMessage(guidance, undefined, {
-      runtimeIntentOverride: "goal",
-      goalContinuationAuthorization: createGoalContinuationAuthorization({
-        source: "goal_manual_resume",
-        workspaceKey: workspace,
-        sessionKey: `${workspace}:${sessionId}`,
-        goalId: state.activeGoal.id,
-        goalRevision: state.activeGoal.revision || 1,
-        ownerTurnId: String(state.activeGoal.ownerTurnId || "").trim(),
-      }),
-      goalContinuationGuidance: guidance,
-    });
-  };
-  bridge.resumeGoalIntoBusyQueue = () => {
-    const state = useAppStore.getState();
-    state.pauseGoal();
-    useAppStore.getState().resumeGoal();
-    useAppStore.setState({
-      isGenerating: true,
-      agentStatus: "running",
-      abortController: new AbortController(),
-    });
-  };
-  bridge.replaceQueuedGoalContinuation = (text = "普通排队消息") => {
-    useAppStore.getState().queueUserMessage(text);
-  };
-  bridge.consumeQueuedGoalContinuation = () => {
-    const queued = useAppStore.getState().queuedUserMessage;
-    const authorization = queued?.goalContinuationAuthorization;
-    if (!queued || !authorization) return false;
-    let runLeaseAccepted = false;
-    useAppStore.setState((latest) => {
-      if (latest.queuedUserMessage?.id !== queued.id) return {};
-      const transition = buildAcceptedGoalContinuationState({
-        goal: latest.activeGoal,
-        progress: latest.goalProgress || latest.goalRuntime?.progress,
-        runtime: latest.goalRuntime,
-        authorization,
-        ownerTurnId: authorization.ownerTurnId,
-      });
-      if (!transition) return {};
-      runLeaseAccepted = true;
-      return {
-        activeGoal: transition.goal,
-        goalProgress: transition.progress,
-        goalStatus: "active" as const,
-        goalRuntime: transition.runtime,
-      };
-    });
-    if (!runLeaseAccepted) return false;
-    return useAppStore.getState().clearQueuedUserMessage({
-      expectedId: queued.id,
-      disposition: "consumed",
-      reason: "e2e_replay_run_lease_acquired",
-    });
-  };
-  bridge.switchAwayFromGoalSession = () => {
-    const state = useAppStore.getState();
-    state.saveCurrentRuntimeToSession();
-    const nextSessionId = sessionId + 1;
-    useAppStore.setState((latest) => ({
-      currentSessionId: nextSessionId,
-      activeSessionByWorkspace: {
-        ...latest.activeSessionByWorkspace,
-        [workspace]: nextSessionId,
-      },
-      sessionsByWorkspace: {
-        ...latest.sessionsByWorkspace,
-        [workspace]: [
-          ...(latest.sessionsByWorkspace[workspace] || []).map((session) => ({
-            ...session,
-            active: session.id === nextSessionId,
-          })),
-          ...((latest.sessionsByWorkspace[workspace] || []).some(
-            (session) => session.id === nextSessionId,
-          )
-            ? []
-            : [
-                {
-                id: nextSessionId,
-                title: "E2E Goal Capsule Other Session",
-                date: new Date().toISOString(),
-                active: true,
-                storageStatus: "temporary" as const,
-                recordingDisabled: true,
-                messages: [],
-                },
-              ]),
-        ],
-      },
-      taskFlow: [],
-      agentMessages: [],
-      conversationTurns: [],
-      currentTurnId: null,
-      activeGoal: null,
-      goalProgress: null,
-      goalStatus: "paused" as const,
-      goalRuntime: null,
-      activeActionRequest: null,
-      harnessRunMarker: null,
-      pendingReviewResolve: null,
-      pendingReviewTaskId: null,
-      pendingToolCall: null,
-      abortController: null,
-      agentStatus: "idle" as const,
-      isGenerating: false,
-    }));
-  };
-  bridge.getGoalOwnerSnapshot = () => {
-    const state = useAppStore.getState();
-    const ownerRuntime = state.runtimeBySessionKey[`${workspace}:${sessionId}`];
-    const ownerSession = (state.sessionsByWorkspace[workspace] || []).find(
-      (session) => session.id === sessionId,
-    );
-    return {
-      runtimeGoalId:
-        ownerRuntime?.activeGoal?.id ||
-        ownerRuntime?.goalRuntime?.goal?.id ||
-        null,
-      sessionGoalId:
-        ownerSession?.runtimeSnapshot?.activeGoal?.id ||
-        ownerSession?.runtimeSnapshot?.goalRuntime?.goal?.id ||
-        null,
-      currentSessionId: state.currentSessionId,
-      currentGoalId: state.activeGoal?.id || null,
-    };
-  };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
 function seedComposerMainShortcutsScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -8115,17 +7835,9 @@ function seedComposerMainShortcutsScenario() {
   const originalDispatchNextWorkspaceInstruction =
     useAppStore.getState().dispatchNextWorkspaceInstruction;
   const holdProviderlessComposerAdmissionInFifo:
-    typeof originalDispatchNextWorkspaceInstruction = (expectedSessionKey) => {
+    typeof originalDispatchNextWorkspaceInstruction = () => {
       providerDispatchAttemptCount += 1;
-      const state = useAppStore.getState();
-      const hints = state.workspaceTurnQueue?.entries[0]?.instruction.payload
-        .dispatchHints;
-      if (
-        hints?.resolvedIntent === "goal" ||
-        hints?.runtimeIntentOverride === "goal"
-      ) {
-        return originalDispatchNextWorkspaceInstruction(expectedSessionKey);
-      }
+
       return false;
     };
 
@@ -8180,7 +7892,6 @@ function seedComposerMainShortcutsScenario() {
     // Direct and Plan cases here verify Composer input and durable admission
     // only. They have no provider/tool transport, so keep those Turns in FIFO
     // instead of feeding immediate null responses into the recovery loop.
-    // Goal cases retain their deterministic Goal admission lifecycle.
     dispatchNextWorkspaceInstruction: holdProviderlessComposerAdmissionInFifo,
   }));
 
@@ -8208,15 +7919,14 @@ function seedComposerMainShortcutsScenario() {
       workspaceContentVersion: state.workspaceContentVersion,
       instructionSourcePaths: state.instructionSources.map((source) => source.path || source.name),
       currentWorkspace: state.currentWorkspace,
-      activeGoalId: state.activeGoal?.id ?? null,
+
       isGenerating: state.isGenerating,
       agentStatus: state.agentStatus,
       queuedUserMessage: state.queuedUserMessage
         ? {
             id: state.queuedUserMessage.id,
             text: state.queuedUserMessage.text,
-            goalCreationAuthorizationSource:
-              state.queuedUserMessage.goalCreationAuthorization?.source ?? null,
+
           }
         : null,
       planStage: state.planStage,
@@ -8272,7 +7982,7 @@ function seedComposerMainShortcutsScenario() {
       contextMentionsSnapshot: queued.contextMentions || [],
       attachedFilesSnapshot: queued.attachedFiles || [],
       runtimeIntentOverride: queued.runtimeIntentOverride,
-      goalSourceContextSnapshot: queued.goalSourceContextSnapshot,
+
       queuedUserMessageId: queued.id,
     });
     if (started) {
@@ -9030,6 +8740,29 @@ function seedRealOmlxPlanFlowScenario() {
     ].slice(-40);
   });
 
+  bridge.setRealInputContext = (mentions: string[], attachments: string[]) => {
+    useAppStore.getState().setContextMentions(mentions);
+    useAppStore.getState().setAttachedFiles(attachments);
+  };
+  bridge.setRealInstructionSkills = (skills: any[]) => useAppStore.getState().setSkills(skills);
+  bridge.setRealToolProtocol = (toolProtocol: "auto" | "native" | "xml") =>
+    useAppStore.setState((state) => ({ config: {
+      ...state.config, local: { ...state.config.local, toolProtocol },
+    } }));
+  bridge.setRealMcpFixture = async (url: string, allowFixtureEditorChecks = false) => {
+    const servers = [{ name: "fixture", type: "http" as const, url, enabled: true }];
+    useAppStore.getState().setMcpServers(servers);
+    const { discoverAllMcpTools } = await import("./mcpClient");
+    const discovered = await discoverAllMcpTools(servers, { forceRefresh: true });
+    useAppStore.getState().setMcpDiscoveredTools(discovered.tools, discovered.toolServerMap);
+    if (allowFixtureEditorChecks) useAppStore.setState({ autoApproveTools: true, autoApproveToolScopes: ["workspace_write", "mcp_action"] });
+    return discovered.tools.length;
+  };
+  bridge.rejectPendingTool = () => useAppStore.getState().resolveReview("reject");
+  bridge.structuredChoiceSnapshot = () => JSON.parse(JSON.stringify(useAppStore.getState().activeActionRequest || null));
+  bridge.sendRealMessage = (text: string, options: any = {}) => useAppStore.getState().sendMessage(text, undefined, options);
+  bridge.setThemeMode = (mode: "light" | "dark" | "black") =>
+    useAppStore.getState().setConfig({ themeMode: mode });
   bridge.prepareReadOnlyChat = (web: boolean, provider: "duckduckgo" | "bing" | "baidu" = "bing") => {
     applyRealOmlxWorkspaceFixture();
     const chatSessionKey = `${GLOBAL_CHAT_KEY}:${sessionId}`;
@@ -9043,12 +8776,21 @@ function seedRealOmlxPlanFlowScenario() {
       webSearchEnabled: web, webSearchProvider: provider, showPlanPanel: false,
     }));
   };
-  bridge.sendReadOnlyMessage = (text: string) => useAppStore.getState().sendMessage(text, undefined, { resolvedIntent: "respond", skipIntentResolution: true });
+  bridge.sendReadOnlyMessage = (text: string, interpretIntent = false) => {
+    // Natural admission checks that the Composer draft is still current when
+    // preflight settles, just as it does for an actual user submission.
+    if (interpretIntent) useAppStore.setState({ input: text });
+    return useAppStore.getState().sendMessage(
+      text, undefined, interpretIntent ? undefined : { resolvedIntent: "respond", skipIntentResolution: true },
+    );
+  };
   bridge.readOnlySnapshot = () => {
     const state = useAppStore.getState();
     const turn = [...state.conversationTurns].reverse().find((turn) => !!state.runtimeV2Checkpoints?.[turn.id]);
     return { isGenerating: state.isGenerating, agentStatus: state.agentStatus, turnCount: state.conversationTurns.length,
       turn, aggregate: turn ? normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[turn.id])?.aggregate : null,
+      pendingRunDecision: state.pendingRunDecision,
+      debug: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-40),
       session: state.sessionsByWorkspace[GLOBAL_CHAT_KEY]?.find((session) => session.id === state.currentSessionId),
       finals: state.taskFlow.filter((block) => block.turnId === turn?.id && block.type === "agent" && block.visibility === "assistant_final").flatMap((block) => block.type === "agent" ? [block.content] : []),
     };
@@ -9126,34 +8868,6 @@ function seedRealOmlxPlanFlowScenario() {
     return true;
   };
 
-  bridge.sendGoalMessage = (text?: string) => {
-    const objective =
-      text ||
-      "修改 src/hooks/useCsvParser.ts，将 creator 正确映射到 creatorName，并运行验证。";
-    const ownerTurnId = `e2e-omlx-goal-${sessionId}`;
-    const state = useAppStore.getState();
-    state.startGoal(objective, {
-      sessionKey: `${workspace}:${sessionId}`,
-      ownerTurnId,
-      maxIterations: 6,
-      maxDurationMs: 20 * 60 * 1000,
-    });
-    const liveState = useAppStore.getState();
-    const goalContinuationEnvelope = liveState.captureGoalContinuationEnvelope(
-      objective,
-      { source: "goal_e2e_resume" },
-    );
-    return liveState.sendMessage(objective, undefined, {
-      resolvedIntent: "execute",
-      runtimeIntentOverride: "goal",
-      ...(goalContinuationEnvelope ? { goalContinuationEnvelope } : {}),
-      skipIntentResolution: true,
-      preservePlanState: true,
-      turnIdOverride: ownerTurnId,
-      turnTitle: "OMLX Goal Runtime",
-      intentSummary: "Run a bounded Goal Runtime loop with local OMLX",
-    });
-  };
 
   bridge.approvePlan = () => {
     const before = useAppStore.getState();
@@ -9561,6 +9275,12 @@ function seedRealOmlxPlanFlowScenario() {
         eventId: event.eventId,
         at: event.at,
         type: event.type,
+        ...(event.type === "provider.responded"
+          ? { actionReceipts: (event.result.actionReceipts || []).map((receipt: any) => ({
+              actionIdentity: receipt.actionIdentity, toolName: receipt.call.name, status: receipt.status,
+              reasonCode: receipt.reasonCode, priorFeedbackObserved: receipt.priorFeedbackObserved === true,
+            })) }
+          : {}),
         ...(event.type === "phase.changed"
           ? { phase: event.phase, reason: event.reason }
           : {}),
@@ -9586,6 +9306,8 @@ function seedRealOmlxPlanFlowScenario() {
               status: event.status,
               evidence: event.evidence || [],
               receiptOrigin: event.receiptOrigin || null,
+              effectKind: event.effectKind || null,
+              ...(event.editorConsole ? { editorConsole: event.editorConsole } : {}),
             }
           : {}),
         ...(event.type === "validation.completed"
@@ -9690,6 +9412,7 @@ function seedRealOmlxPlanFlowScenario() {
         requestCount: runtimeV2SubagentIntervals.length,
         peakInFlight: runtimeV2SubagentPeakInFlight,
         hasRequestOverlap: runtimeV2SubagentPeakInFlight >= 2,
+        observedWithParent: resolveSubagentCapacityPolicy(state.config).confirmedOverlappingChildren,
       },
       terminal: {
         runCompletedCount: runtimeV2RunCompleted.length,
@@ -9832,26 +9555,8 @@ function seedRealOmlxPlanFlowScenario() {
         observationStatus: entry.observationStatus,
         createdAt: entry.createdAt,
       })),
-      goalStatus: state.goalStatus,
-      activeGoal: state.activeGoal
-        ? {
-        id: state.activeGoal.id,
-        objective: state.activeGoal.rawText || state.activeGoal.objective,
-        revision: state.activeGoal.revision || 1,
-          }
-        : null,
-      goalIterations: state.goalProgress?.totalIterationsUsed || 0,
-      goalPauseReason:
-        state.goalRuntime?.pauseReason ||
-        state.goalProgress?.pauseReason ||
-        null,
-      goalLastError: state.goalRuntime?.lastError || null,
-      goalEvidence: (state.goalProgress?.evidence || []).map((entry) => ({
-        kind: entry.kind,
-        status: entry.status,
-        sourceTool: entry.sourceTool,
-        target: entry.target,
-      })),
+
+
       preferSubagents: state.preferSubagents,
       currentTurnId: currentTurn?.id ?? null,
       currentTurnClientSubmissionId: currentTurn?.clientSubmissionId ?? null,
@@ -9976,6 +9681,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
   incrementSeedCount(scenario);
 
   const now = Date.now();
+  const sessionEpoch = createPlanLifecycleSessionEpoch(now);
   const isGlobalChatScenario =
     scenario === GLOBAL_CHAT_TOOL_SCOPE_SCENARIO ||
     scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO;
@@ -10104,6 +9810,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     : scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO
     ? 999517
     : 999502;
+  const sessionKey = `${scopeKey}:${sessionId}`;
   const server = {
     id: `e2e-${scenario}-server`,
     name: "E2E Cloud",
@@ -10156,6 +9863,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       [scopeKey]: [
         {
           id: sessionId,
+          planLifecycleEpoch: sessionEpoch,
           title:
             scenario === CLOUD_TOOL_FALLBACK_SCENARIO
             ? "E2E Cloud Tool Fallback"
@@ -10179,6 +9887,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
       ],
     },
     currentSessionId: sessionId,
+    planLifecycle: createPlanLifecycleState({ sessionKey, sessionEpoch, updatedAt: now }),
     selectedMainModeKey: "main_mode",
     taskFlow: ordinaryContinueSeed?.taskFlow ?? [],
     agentMessages: ordinaryContinueSeed?.agentMessages ?? [],
@@ -10447,7 +10156,13 @@ function seedSessionAutoCreateScenario() {
         currentSession?.runtimeSnapshot?.conversationTurns?.length ?? 0,
       currentSessionRuntimeBlocks:
         currentSession?.runtimeSnapshot?.taskFlow?.length ?? 0,
+      currentSessionRuntimeBlockKinds:
+        (currentSession?.runtimeSnapshot?.taskFlow || []).map((block) =>
+          block.type === "agent" ? `${block.type}:${block.visibility}` : block.type),
       currentSessionMessages: currentSession?.messages?.length ?? 0,
+      currentSessionMessageKinds:
+        (currentSession?.messages || []).map((block) =>
+          block.type === "agent" ? `${block.type}:${block.visibility}` : block.type),
       staleSessionMessages: staleSession?.messages?.length ?? 0,
       taskFlowBlocks: state.taskFlow.length,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user")
@@ -11568,9 +11283,6 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedCapsuleProcessScenario("phase");
   }
 
-  if (scenario === GOAL_CAPSULE_SCENARIO) {
-    return seedGoalCapsuleScenario();
-  }
 
   if (scenario === USER_CONTEXT_PILLS_SCENARIO) {
     return seedUserContextPillsScenario();

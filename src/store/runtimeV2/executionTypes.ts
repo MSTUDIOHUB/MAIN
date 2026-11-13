@@ -29,6 +29,7 @@ export interface RuntimeV2ExecutionAuthorization {
 }
 
 export interface RuntimeV2ChildResult {
+  readonly resourceInterruption?: "memory" | "provider_capacity";
   readonly job: RuntimeV2SubagentJob;
   readonly status: "completed" | "degraded" | "failed" | "canceled";
   readonly summary: string;
@@ -128,6 +129,8 @@ export interface RuntimeV2LiveExecutionState {
     readonly content: string;
     readonly field: "reasoning_content" | "reasoning";
   } | null;
+  /** Confirmed decoding preference for this approved action scope only. */
+  approvedActionReasoningScope?: string;
   /** Process-local truth used only if persisting the mutation completion
    * itself fails. The normal completion event remains the durable authority. */
   hasExecutedMutationEffect: boolean;
@@ -143,6 +146,7 @@ export interface RuntimeV2LiveExecutionState {
   permissionRejection: {
     readonly reason: string;
     readonly finalMarkdown: string;
+    readonly continuationDriftTargets?: readonly string[];
   } | null;
 }
 

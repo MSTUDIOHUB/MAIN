@@ -70,6 +70,11 @@ test("process display ignores legacy hidden policy and keeps process text hierar
       Number.parseFloat(window.getComputedStyle(element).fontSize),
     ),
   ).toBeGreaterThan(initialAgentFontSize + 4);
+  await expect.poll(async () =>
+    processTimeline.evaluate((element) =>
+      Number.parseFloat(window.getComputedStyle(element).fontSize),
+    ),
+  ).toBeGreaterThan(initialProcessFontSize + 4);
 
   const processFontSize = await processTimeline.evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),

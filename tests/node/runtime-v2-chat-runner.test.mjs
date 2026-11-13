@@ -213,10 +213,9 @@ test("read-only Chat publishes one final and never reaches effect ports", async 
   assert.equal(finalProjection.projection.markdown, "这是完整的只读回答。");
   const liveChatProjection = testHarness.projections.find((entry) =>
     entry.audience === "capsule_live" &&
-    /理解当前问题/.test(entry.projection.markdown)
+    entry.projection.markdown === "正在准备模型请求。"
   );
   assert.ok(liveChatProjection);
-  assert.doesNotMatch(liveChatProjection.projection.markdown, /根本原因|代码证据/);
   const milestones = testHarness.projections.filter((entry) => entry.audience === "chat_milestone");
   assert.equal(milestones.length, 0);
 });

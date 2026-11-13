@@ -6,6 +6,13 @@ import type {
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { validateRuntimeV2SubagentReport } from "./subagentReport";
+import { buildPlanDecisionJournal } from "../planDecisionJournal";
+import { samePlanDocumentRef } from "../planDocuments";
+import { normalizePlanDraftRecord } from "../planDrafts";
+import { resolveSessionWorkspaceKey } from "../sessionTypes";
+import { sha256Hex } from "../sha256";
+import { isWorkPlanArtifactProjectionBound } from "./workPlan";
+import { isValidRuntimeV2PlanContinuation } from "./planContinuation";
 
 export function appendNovelRuntimeV2Evidence(
   existing: readonly RuntimeV2EvidenceReference[],
@@ -66,6 +73,7 @@ export function isValidRuntimeV2SubagentCompletion(input: {
       item.target === path || item.target.startsWith(`${path.replace(/\/$/, "")}/`)
     )
   );
+  const interrupted = input.event.resourceInterruption === "memory" || input.event.resourceInterruption === "provider_capacity";
   return eventEvidenceIdsAreUnique &&
     childEvidenceIdsKeepExistingMeaning &&
     inheritedIsKnown &&
@@ -84,7 +92,8 @@ export function isValidRuntimeV2SubagentCompletion(input: {
         inheritedEvidence,
       })
     ) &&
-    (input.event.status !== "degraded" || input.event.evidence.length > 0);
+    (!input.event.resourceInterruption || interrupted && input.event.status === "degraded") &&
+    (input.event.status !== "degraded" || input.event.evidence.length > 0 || interrupted);
 }
 
 export function isValidRuntimeV2SubagentJob(
@@ -100,6 +109,7 @@ export function isValidRuntimeV2SubagentJob(
     !!job.scopeKey &&
     !!job.objective &&
     job.allowedPaths.length > 0 &&
+    (!job.proactiveKey || (!job.sourceToolCallId && job.accessMode === "read" && job.taskKind !== "implement")) &&
     (
       job.taskKind === "implement"
         ? job.accessMode === "write" &&
@@ -114,6 +124,34 @@ export function isValidRuntimeV2SubagentJob(
     job.summary === null;
 }
 
+export function isValidRuntimeV2PlanDraftSourceAdmission(event: Extract<RuntimeV2Event, { type: "turn.admitted" }>): boolean {
+  if (event.sourcePlanDraft === undefined) return true;
+  const record = normalizePlanDraftRecord(event.sourcePlanDraft);
+  return !!record && event.strategy === "plan" && event.planPurpose !== "rules" && record.documentRef.kind === "plan" &&
+    record.documentRef.owner.sessionKey === event.turn.sessionKey && record.documentRef.owner.sessionEpoch === event.turn.sessionEpoch &&
+    record.documentRef.owner.turnId !== event.turn.turnId && resolveSessionWorkspaceKey(record.documentRef.owner.workspace) === event.turn.workspaceKey;
+}
+
+/** Only a runtime-authored exact-document observation can satisfy a selected
+ * draft's information-confirmation boundary. It grants no approval. */
+export function isValidRuntimeV2PlanDraftSourceObservation(state: TurnAggregateV1,
+  event: Extract<RuntimeV2Event, { type: "observation.recorded" }>): boolean {
+  const admission = state.events.find(item => item.type === "turn.admitted");
+  if (admission?.type !== "turn.admitted" || !admission.sourcePlanDraft || !isValidRuntimeV2PlanDraftSourceAdmission(admission)) return false;
+  const admitted = normalizePlanDraftRecord(admission.sourcePlanDraft);
+  const observed = normalizePlanDraftRecord(event.sourcePlanDraft);
+  if (!admitted || !observed || JSON.stringify(admitted) !== JSON.stringify(observed) || event.evidence.id !== "plan-draft-source" ||
+    event.evidence.kind !== "tool" || event.evidence.target !== admitted.documentRef.path || event.evidence.version !== admitted.documentRef.contentHash ||
+    !event.modelContent) return false;
+  try {
+    const context = JSON.parse(event.modelContent).sourcePlanDraftContext;
+    return !!context && samePlanDocumentRef(context.documentRef, admitted.documentRef) && typeof context.markdown === "string" &&
+      sha256Hex(context.markdown) === admitted.documentRef.contentHash && JSON.stringify(context.diagnostics) === JSON.stringify(admitted.diagnostics) &&
+      (context.confirmedChoices === undefined || typeof context.confirmedChoices === "string" && !!context.confirmedChoices.trim() &&
+        context.markdown.includes(context.confirmedChoices));
+  } catch { return false; }
+}
+
 export function hasMatchingRuntimeV2SealedPlanAuthority(input: {
   readonly event: Extract<
     RuntimeV2Event,
@@ -124,7 +162,31 @@ export function hasMatchingRuntimeV2SealedPlanAuthority(input: {
   const { event, state } = input;
   const plan = event.sealedPlan;
   const commit = event.reviewCommit;
-  return plan.status === "pending_review" &&
+  const hasDraftSourceAdmission = state.events.some(event => event.type === "turn.admitted" && !!event.sourcePlanDraft);
+  const draftSource = state.events.find(event => event.type === "observation.recorded" &&
+    event.evidence.id === "plan-draft-source" && isValidRuntimeV2PlanDraftSourceObservation(state, event));
+  const derivedFrom = draftSource?.type === "observation.recorded" ? draftSource.sourcePlanDraft?.documentRef : undefined;
+  const initialQuestion = state.events.find(event => event.type === "run.paused" && event.blocker.questionnaire?.purpose === "plan_confirmation");
+  const interviewed = hasDraftSourceAdmission ? !!derivedFrom : state.planPurpose === undefined || (state.planPurpose === "plan" && initialQuestion?.type === "run.paused" &&
+    state.events.some(event => event.type === "run.decision_recorded" && event.requestId === initialQuestion.blocker.requestId && event.choice !== "stop" &&
+      event.answer?.answers.some(answer => answer.questionId === "result_kind" && answer.selectedValues.includes("executable"))));
+  const savedDocument = !commit.artifact.documentRef ? !derivedFrom : state.events.some(receipt => {
+    if (receipt.type !== "tool.completed" || receipt.status !== "succeeded" || !receipt.modelContent) return false;
+    const command = state.events.find(event => event.type === "command.scheduled" && event.command.idempotencyKey === receipt.idempotencyKey);
+    if (command?.type !== "command.scheduled" || command.command.payload.toolName !== "save_plan_document" || command.command.payload.runtimeOwnedPlanArtifact !== true) return false;
+    try {
+      const record = JSON.parse(receipt.modelContent);
+      return record.markdown === plan.markdown && samePlanDocumentRef(record.planDocument, commit.artifact.documentRef) &&
+        (!derivedFrom || samePlanDocumentRef(command.command.payload.derivedFrom as typeof derivedFrom, derivedFrom) && samePlanDocumentRef(record.derivedFrom, derivedFrom));
+    } catch { return false; }
+  });
+  const journal = buildPlanDecisionJournal(state);
+  const journalMatches = derivedFrom ? plan.decisionJournal === journal :
+    plan.decisionJournal === undefined && state.planPurpose === undefined || typeof plan.decisionJournal === "string" && plan.decisionJournal === journal;
+  const ready = event.continuation !== undefined
+    ? isValidRuntimeV2PlanContinuation(state, event)
+    : interviewed && journalMatches && savedDocument;
+  return ready && plan.status === "pending_review" &&
     event.workPlan.id === plan.id &&
     event.workPlan.revision === plan.revision &&
     event.workPlan.digest === plan.digest &&
@@ -134,7 +196,7 @@ export function hasMatchingRuntimeV2SealedPlanAuthority(input: {
     commit.authority.revision === plan.revision &&
     commit.authority.digest === plan.digest &&
     commit.authority.projectionHash === plan.projectionHash &&
-    commit.artifact.path === ".MAIN/plans/plan.md" &&
+    isWorkPlanArtifactProjectionBound(commit.artifact, plan, state.turn) &&
     commit.artifact.content === plan.markdown &&
     commit.artifact.projectionHash === plan.projectionHash &&
     commit.panel.markdown === plan.markdown &&

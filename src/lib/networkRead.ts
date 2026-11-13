@@ -1,7 +1,16 @@
+export const WEB_SEARCH_PROVIDERS = ["yahoo", "quark", "duckduckgo", "bing", "baidu"] as const;
+export type WebSearchProvider = typeof WEB_SEARCH_PROVIDERS[number];
+export const DEFAULT_WEB_SEARCH_PROVIDER: WebSearchProvider = "yahoo";
+
+export function normalizeWebSearchProvider(value: unknown): WebSearchProvider {
+  return (WEB_SEARCH_PROVIDERS as readonly unknown[]).includes(value)
+    ? value as WebSearchProvider : DEFAULT_WEB_SEARCH_PROVIDER;
+}
+
 /** Immutable Turn capability. Missing historical snapshots never grant network access. */
 export interface NetworkReadPolicy {
   readonly enabled: boolean;
-  readonly provider: "duckduckgo" | "bing" | "baidu";
+  readonly provider: WebSearchProvider;
 }
 
 export function normalizeNetworkRead(value: unknown): NetworkReadPolicy {
@@ -9,10 +18,10 @@ export function normalizeNetworkRead(value: unknown): NetworkReadPolicy {
     ? value as Record<string, unknown>
     : {};
   const provider = candidate.provider;
-  const valid = provider === "duckduckgo" || provider === "bing" || provider === "baidu";
+  const valid = (WEB_SEARCH_PROVIDERS as readonly unknown[]).includes(provider);
   return Object.freeze({
     enabled: candidate.enabled === true && valid,
-    provider: valid ? provider : "duckduckgo",
+    provider: normalizeWebSearchProvider(provider),
   });
 }
 
@@ -22,6 +31,6 @@ export function captureNetworkRead(state: {
 }): NetworkReadPolicy {
   return normalizeNetworkRead({
     enabled: state.webSearchEnabled === true,
-    provider: state.webSearchProvider || "duckduckgo",
+    provider: state.webSearchProvider || DEFAULT_WEB_SEARCH_PROVIDER,
   });
 }

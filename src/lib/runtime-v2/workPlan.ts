@@ -1,6 +1,10 @@
+import { resolveSessionWorkspaceKey } from "../sessionTypes";
+import { appendPlanDecisionJournal } from "../planDecisionJournal";
 import { sha256Hex } from "../sha256";
 import type { PlanCandidateV5 } from "../planContract";
-import { analyzeValidationCommand } from "../validationContract";
+import { analyzeValidationCommand, unityValidationInvocations } from "../validationContract";
+import { projectEditorPlayModeFilter } from "../unityValidation";
+import { normalizePlanDocumentRef, type PlanDocumentRef } from "../planDocuments";
 
 export const WORK_PLAN_V1_SCHEMA_VERSION = "work-plan.v1" as const;
 
@@ -41,6 +45,8 @@ export interface WorkPlanDraftV1 {
     readonly kind: WorkPlanValidationKind;
     readonly command?: string;
     readonly cwd?: string;
+    readonly expectedTestCases?: number;
+    readonly useProjectEditor?: true;
     readonly expectedOutcome: string;
     readonly required: boolean;
     /** Admitted user criteria this receipt is expected to prove. */
@@ -66,6 +72,7 @@ export interface SealedWorkPlanV1 {
   readonly createdAt: number;
   readonly draft: WorkPlanDraftV1;
   readonly evidence: readonly WorkPlanRuntimeEvidence[];
+  readonly decisionJournal?: string;
   readonly digest: string;
   readonly projectionHash: string;
   readonly markdown: string;
@@ -111,9 +118,19 @@ export interface RuntimeV2PlanChatProjection {
 }
 
 export interface RuntimeV2PlanArtifactProjection {
-  readonly path: typeof RUNTIME_V2_PLAN_ARTIFACT_PATH;
+  readonly path: string;
   readonly content: string;
   readonly projectionHash: string;
+  readonly documentRef?: PlanDocumentRef;
+}
+
+export function isWorkPlanArtifactProjectionBound(artifact: RuntimeV2PlanArtifactProjection, plan: SealedWorkPlanV1,
+  owner: { readonly workspaceKey: string; readonly sessionKey: string; readonly sessionEpoch: string; readonly turnId: string }): boolean {
+  if (artifact.content !== plan.markdown || artifact.projectionHash !== plan.projectionHash) return false;
+  if (!artifact.documentRef) return artifact.path === RUNTIME_V2_PLAN_ARTIFACT_PATH;
+  const ref = normalizePlanDocumentRef(artifact.documentRef);
+  return !!ref && ref.kind === "plan" && resolveSessionWorkspaceKey(ref.owner.workspace) === owner.workspaceKey && ref.owner.sessionKey === owner.sessionKey && ref.owner.sessionEpoch === owner.sessionEpoch &&
+    ref.owner.turnId === owner.turnId && ref.path === artifact.path && ref.contentHash === sha256Hex(plan.markdown);
 }
 
 export interface RuntimeV2PlanReviewBinding {
@@ -295,6 +312,20 @@ export function validateWorkPlanDraftV1(
     if (!normalizeText(validation?.expectedOutcome, 2_000)) {
       issues.push({ path: `validations[${index}].expectedOutcome`, message: "Expected outcome is required." });
     }
+    if (validation?.expectedTestCases !== undefined) {
+      const checks = unityValidationInvocations(validation.command || "");
+      if (validation.kind !== "finite_command" || !Number.isSafeInteger(validation.expectedTestCases) ||
+        validation.expectedTestCases <= 0 || checks.length !== 1 || checks[0]?.kind === "recompile") {
+        issues.push({ path: `validations[${index}].expectedTestCases`, message: "Use a positive expected count with one Unity test runner." });
+      }
+    }
+    if (validation?.useProjectEditor !== undefined && (validation.useProjectEditor !== true ||
+      validation.kind !== "finite_command" || (validation.cwd !== undefined && validation.cwd !== ".") ||
+      !projectEditorPlayModeFilter(validation.command || "") ||
+      !Number.isSafeInteger(validation.expectedTestCases) || (validation.expectedTestCases ?? 0) <= 0)) {
+      issues.push({ path: `validations[${index}].useProjectEditor`,
+        message: "The project Editor route requires unity test . --mode PlayMode --filter SuiteName, the workspace root, and a positive expectedTestCases." });
+    }
     if (validation?.kind === "finite_command" && !normalizeText(validation.command, 2_000)) {
       issues.push({ path: `validations[${index}].command`, message: "Finite command validation needs a command." });
     } else if (
@@ -333,7 +364,7 @@ export function validateWorkPlanDraftV1(
   return issues;
 }
 
-export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "id" | "revision" | "digest">): string {
+export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "id" | "revision" | "digest" | "decisionJournal">): string {
   const draft = plan.draft;
   const narrative = normalizeText(draft.summary, 8_000);
   const lines: string[] = /^\s*#\s+\S/.test(narrative)
@@ -367,6 +398,8 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
       lines.push(`- 覆盖步骤：${validation.stepIndexes.map(stepId).join("、") || "未指定"}`);
       if (validation.command) lines.push(`- 命令：\`${validation.command.replace(/`/g, "")}\``);
       if (validation.cwd) lines.push(`- 工作目录：\`${validation.cwd.replace(/`/g, "")}\``);
+      if (validation.useProjectEditor) lines.push("- 执行方式：按工程版本使用已连接的 Editor，工程关闭时使用同版本 Editor 批处理。两种方式使用同一测试筛选和用例数。");
+      if (validation.expectedTestCases !== undefined) lines.push(`- 必须通过的测试用例数：${validation.expectedTestCases}`);
       lines.push(`- 要求：${validation.required ? "必须通过" : "建议执行"}`);
       if (validation.criterionIds?.length) lines.push(`- 验收条件：${validation.criterionIds.join("、")}`);
       lines.push(`- 预期结果：${validation.expectedOutcome}`, "");
@@ -376,7 +409,7 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
   if (draft.assumptions.length > 0) lines.push("## 假设", "", markdownList(draft.assumptions), "");
   if (draft.blockingQuestions.length > 0) lines.push("## 需要用户决定", "", markdownList(draft.blockingQuestions), "");
   lines.push("---", `计划 ID：${plan.id} · 修订：${plan.revision} · 摘要：${plan.digest}`);
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return appendPlanDecisionJournal(lines.join("\n").replace(/\n{3,}/g, "\n\n").trim(), plan.decisionJournal);
 }
 
 export function sealWorkPlanV1(input: {
@@ -386,7 +419,9 @@ export function sealWorkPlanV1(input: {
   readonly id?: string;
   readonly createdAt: number;
   readonly legacy?: SealedWorkPlanV1["legacy"];
+  readonly decisionJournal?: string;
 }): SealedWorkPlanV1 {
+  if (input.decisionJournal !== undefined && (typeof input.decisionJournal !== "string" || !input.decisionJournal.trim())) throw new Error("Invalid runtime decision journal");
   const evidence = input.evidence.map((item) => ({
     id: normalizeText(item.id, 128),
     target: normalizeText(item.target, 1_024),
@@ -402,7 +437,8 @@ export function sealWorkPlanV1(input: {
     throw new Error(`WorkPlanDraftV1 rejected: ${issues.map((issue) => `${issue.path}: ${issue.message}`).join(" ")}`);
   }
   const revision = Math.max(1, Math.floor(Number(input.revision) || 1));
-  const digest = hash("work-plan-sha256", { draft: input.draft, evidence });
+  const journal = input.decisionJournal === undefined ? {} : { decisionJournal: input.decisionJournal };
+  const digest = hash("work-plan-sha256", { draft: input.draft, evidence, ...journal });
   const id = normalizeText(input.id, 128) || `WP-${digest.slice(-12)}`;
   const provisional = {
     schemaVersion: WORK_PLAN_V1_SCHEMA_VERSION,
@@ -412,6 +448,7 @@ export function sealWorkPlanV1(input: {
     createdAt: Math.max(0, Math.floor(input.createdAt)),
     draft: input.draft,
     evidence,
+    ...journal,
     digest,
   };
   const markdown = projectWorkPlanMarkdown(provisional);

@@ -1,9 +1,15 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
+import { buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
+import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
+import type { ToolDefinition } from "../../lib/toolSchemas";
 import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
 import { normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
+import { normalizeNetworkRead } from "../../lib/networkRead";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from "../../lib/providerLaneSettings";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import { projectPlanSkillGuidance } from "./planSkillGuidance";
 import { isStreamOutputLimited, streamChatCompletion } from "../../lib/streaming";
 import {
   normalizeProviderResponseV1,
@@ -19,34 +25,35 @@ import {
   PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS,
   SUBMIT_WORK_PLAN_TOOL_NAME,
   WORK_PLAN_STRUCTURED_RESPONSE_FORMAT,
+  WORK_PLAN_VALIDATION_REPAIR_FORMAT,
+  applyWorkPlanValidationRepair,
   boundedPlanTranscript,
   decodeExactStructuredPlanResponse,
   isPlanProviderRequestTimeout,
   isPlanSubmissionStage,
   planModelTools,
   planProviderResponseDiagnostics,
+  planTextEnvelopeTranscript,
   selectPlanModelTools,
   synthesisPlanTranscript,
+  validationRepairTranscript,
   type PlanModelStage,
   type PlanProviderTransport,
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { withRuntimeV2HardDeadline, withRuntimeV2ProgressDeadline } from "./hardDeadline";
-import { containsProviderTextEnvelopePrompt } from "./executionProviderContext";
-import {
-  buildRuntimeV2TextEnvelopeCatalog,
-  normalizeRuntimeV2ProviderToolCalls,
-  runtimeV2ProviderToolArgumentViolation,
-} from "./executionProviderTools";
+import { normalizeRuntimeV2ProviderToolCalls, runtimeV2ProviderToolArgumentViolation } from "./executionProviderTools";
 import { PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE } from "./planCollaborationAcquisition";
 import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } from "../../lib/runtime-v2/lifecycle";
+import { planRequestMetrics } from "./planRequestMetrics";
+import { adaptPlanBlockingQuestions, admittedPlanQuestionPurpose, ASK_PLAN_QUESTIONS } from "./planQuestionTool";
+import { isPlanStreamRepetition, PLAN_REPETITION_FALLBACK_FAILED, PLAN_STREAM_REPETITION_CODE } from "./planRepetitionRecovery";
+import { PLAN_VALIDATION_REPAIR_FAILED } from "./planValidationRecovery";
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (event: string, data?: Record<string, unknown>) => void;
-export interface RuntimeV2PlanProviderResult extends
-  RuntimeV2NormalizedProviderResult {
-  /** Exact request-local tool surface, independent of native versus text
-   * transport. This port enforces it before durable settlement; the runner
-   * retains the snapshot for structured recovery telemetry. */
+const PLAN_REASONING_ONLY_TIMEOUT_MS = 60_000;
+export interface RuntimeV2PlanProviderResult extends RuntimeV2NormalizedProviderResult {
+  /** Request-local admission surface shared by all provider transports. */
   readonly advertisedToolNames: readonly string[];
   readonly transport: PlanProviderTransport;
 }
@@ -64,21 +71,23 @@ export async function requestPlanModel(input: {
   readonly submissionRepairPending: boolean;
   readonly compactRecovery?: boolean;
   readonly transport?: PlanProviderTransport;
+  readonly explicitFallback?: boolean;
+  readonly repetitionFallback?: boolean;
+  readonly validationRepair?: { candidate: Record<string, unknown>; feedback: string; rejectedCommands: readonly string[] };
   readonly logStoreEvent: RuntimeV2PlanLog;
+  readonly customTools?: readonly ToolDefinition[];
+  readonly focusedRevision?: boolean;
 }): Promise<RuntimeV2PlanProviderResult> {
-  const requiredCollaborationPending =
-    input.collaboration.collaborationRequired === true &&
-    input.collaboration.collaborationRequirementMet !== true;
+  const collaborationRequired = input.collaboration.collaborationRequired === true;
+  const collaborationRequirementMet = input.collaboration.collaborationRequirementMet === true;
+  const requiredCollaborationPending = collaborationRequired && !collaborationRequirementMet;
   const submissionStage = !requiredCollaborationPending && (
     input.submissionRepairPending || isPlanSubmissionStage(input.stage)
   );
   const budget = input.context.runtimeContextBudget;
-  const settings = deriveBudgetedStreamSettings(
-    input.get().config,
-    budget,
-  );
-  const requestedTransport = submissionStage
-    ? input.transport || "native_tool"
+  const settings = deriveBudgetedStreamSettings(input.get().config, budget);
+  const requestedTransport = submissionStage && (!input.submissionRepairPending || input.explicitFallback)
+    ? input.transport ?? "native_tool"
     : "native_tool";
   const adapterCapabilities = deriveProviderAdapterCapabilities(settings);
   const repairReasoningDisabled = (
@@ -94,26 +103,25 @@ export async function requestPlanModel(input: {
       ? "text_envelope"
       : requestedTransport;
   const structuredResponse = transport === "structured_response";
+  const responseFormat = structuredResponse ? input.validationRepair ? WORK_PLAN_VALIDATION_REPAIR_FORMAT : WORK_PLAN_STRUCTURED_RESPONSE_FORMAT : undefined;
   const textEnvelope = transport === "text_envelope";
-  const activeSubagents = Array.isArray(input.collaboration.activeSubagents)
-    ? input.collaboration.activeSubagents
-    : [];
+  const activeSubagents = Array.isArray(input.collaboration.activeSubagents) ? input.collaboration.activeSubagents : [];
+  const remainingSubagentCapacity = Math.max(0, Math.floor(Number(input.collaboration.remainingSubagentCapacity) || 0));
+  const collaborationAllowed = input.collaboration.collaborationAllowed === true;
   const planTools = selectPlanModelTools({
     submissionStage,
-    collaborationAllowed:
-      input.collaboration.collaborationAllowed === true,
-    collaborationRequired:
-      input.collaboration.collaborationRequired === true,
-    collaborationRequirementMet:
-      input.collaboration.collaborationRequirementMet === true,
-    remainingSubagentCapacity: Math.max(
-      0,
-      Math.floor(
-        Number(input.collaboration.remainingSubagentCapacity) || 0,
-      ),
-    ),
+    submissionRepairPending: input.submissionRepairPending,
+    collaborationAllowed,
+    collaborationRequired,
+    collaborationRequirementMet,
+    remainingSubagentCapacity,
     activeSubagentCount: activeSubagents.length,
-    baseTools: planModelTools(input.context, input.get()).filter((tool) =>
+    baseTools: (input.customTools || planModelTools({
+      ...input.context,
+      planPurpose: admittedPlanQuestionPurpose(input.ledger.snapshot()) ?? input.context.planPurpose,
+      networkRead: normalizeNetworkRead(input.ledger.snapshot()?.networkRead),
+    })).filter((tool) =>
+      (!input.focusedRevision || ["read_file", "load_skill", SUBMIT_WORK_PLAN_TOOL_NAME].includes(tool.function.name)) &&
       !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
         input.ledger.snapshot()?.objective.capabilityRestrictions,
       ), tool.function.name)
@@ -126,20 +134,11 @@ export async function requestPlanModel(input: {
     throw new Error("RUNTIME_V2_PLAN_REQUIRED_COLLABORATION_UNAVAILABLE");
   }
   const advertisedToolNames = planTools.map((tool) => tool.function.name);
+  const canAskPlanQuestions = advertisedToolNames.includes(ASK_PLAN_QUESTIONS);
   const offeredTools = structuredResponse || textEnvelope ? [] : planTools;
   const toolChoice = structuredResponse || textEnvelope
     ? undefined
-    : requiredSpawn
-    ? {
-        type: "function" as const,
-        function: { name: "spawn_subagent" },
-      }
-    : submissionStage
-    ? {
-        type: "function" as const,
-        function: { name: SUBMIT_WORK_PLAN_TOOL_NAME },
-      }
-    : "required" as const;
+    : requiredSpawn ? { type: "function" as const, function: { name: "spawn_subagent" } } : "required" as const;
   const command = await input.ledger.schedule(input.run, "request_model", {
     mode: "plan",
     stage: input.stage,
@@ -151,17 +150,18 @@ export async function requestPlanModel(input: {
     compactRecovery: !!input.compactRecovery,
     ...input.collaboration,
     requiredSpawn,
+    ...(input.explicitFallback ? { planExplicitFallback: true } : {}),
+    ...(input.repetitionFallback ? { planRepetitionFallback: true } : {}),
+    ...(input.validationRepair ? { planValidationOnlyRepair: true } : {}),
   });
+  const requestTrace = { turnId: input.run.turnId, runId: input.run.runId, commandKey: command.idempotencyKey };
   let streamedText = "";
   const requestAbort = new AbortController();
   let requestTimedOut = false;
   let lifecycleTimedOut = false;
   const forwardAbort = () => requestAbort.abort(input.context.abortCtrl.signal.reason);
-  if (input.context.abortCtrl.signal.aborted) {
-    forwardAbort();
-  } else {
-    input.context.abortCtrl.signal.addEventListener("abort", forwardAbort, { once: true });
-  }
+  input.context.abortCtrl.signal.addEventListener("abort", forwardAbort, { once: true });
+  if (input.context.abortCtrl.signal.aborted) forwardAbort();
   const requestTimeoutMs = Math.max(1,
     submissionStage
       ? input.compactRecovery || input.submissionRepairPending
@@ -169,59 +169,56 @@ export async function requestPlanModel(input: {
         : PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS
       : PLAN_MODEL_REQUEST_TIMEOUT_MS,
   );
+  const reasoningOnlyTimeoutMs = input.customTools ? undefined : PLAN_REASONING_ONLY_TIMEOUT_MS;
+  const activity = beginCapsuleModelActivity(input.run, command.idempotencyKey, requestAbort.signal);
   try {
-    const planRequestMessages = submissionStage
+    appendRuntimeV2GuidanceHistory(input.messages, input.ledger.snapshot(), input.run, command.idempotencyKey);
+    const planRequestMessages = input.validationRepair
+      ? validationRepairTranscript({ ...input.validationRepair, objective: input.ledger.snapshot()?.objective, decisionJournal: buildPlanDecisionJournal(input.ledger.snapshot()) })
+      : submissionStage
       ? synthesisPlanTranscript({
           ...input,
           submissionRepairPending: input.submissionRepairPending,
           compactRecovery: !!input.compactRecovery,
           transport,
+          canAskPlanQuestions,
         })
       : boundedPlanTranscript(input.messages);
+    if (input.validationRepair) {
+      appendRuntimeV2GuidanceHistory(planRequestMessages, input.ledger.snapshot(), input.run, command.idempotencyKey);
+    }
     const unboundedRequestMessages = textEnvelope
-      ? [
-          ...planRequestMessages,
-          {
-            role: "system" as const,
-            content: containsProviderTextEnvelopePrompt(
-              input.context.phaseLanguage,
-              true,
-            ),
-          },
-          {
-            role: "system" as const,
-            content: buildRuntimeV2TextEnvelopeCatalog(planTools),
-          },
-        ]
+      ? planTextEnvelopeTranscript(planRequestMessages, planTools, input.context.phaseLanguage)
       : planRequestMessages;
-    const maxOutputTokens = submissionStage
-      ? input.compactRecovery
-        ? Math.min(
-            budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
-            PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS,
-          )
-        : budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS
-      : budget?.outputBudget;
+    const maxOutputTokens = input.compactRecovery
+      ? Math.min(budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS, PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS)
+      : budget?.outputBudget ?? (submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined);
     const requestMessages = budget
       ? boundReadOnlyHistory(unboundedRequestMessages, {
           contextLimit: budget.contextLimit,
-          reservedOutputTokens:
-            maxOutputTokens || budget.outputBudget,
+          reservedOutputTokens: maxOutputTokens || budget.outputBudget,
           tools: offeredTools,
           preserveUserMessages: true,
+          compactSkillGuidance: true,
         })
-      : unboundedRequestMessages;
+      : projectPlanSkillGuidance(unboundedRequestMessages);
+    const requestMetrics = planRequestMetrics({ messages: requestMessages, tools: offeredTools, responseFormat });
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
-      turnId: input.run.turnId,
-      runId: input.run.runId,
+      ...requestTrace,
+      sessionKey: input.run.sessionKey,
+      guidanceIds: requestMessages.flatMap(message => message.runtimeGuidanceId ? [message.runtimeGuidanceId] : []),
       evidenceCount: input.ledger.snapshot()?.evidence.length || 0,
       stage: input.stage,
       compactRecovery: !!input.compactRecovery,
       submissionRepairPending: input.submissionRepairPending,
-      collaborationRequired:
-        input.collaboration.collaborationRequired === true,
-      collaborationRequirementMet:
-        input.collaboration.collaborationRequirementMet === true,
+      canAskPlanQuestions,
+      collaborationPreferred: input.collaboration.collaborationPreferred === true,
+      focusedRevision: input.focusedRevision === true,
+      proactiveSkipReason: input.collaboration.proactiveSkipReason ?? null,
+      collaborationAllowed,
+      remainingSubagentCapacity,
+      collaborationRequired,
+      collaborationRequirementMet,
       requiredSpawn,
       requestedTransport,
       transport,
@@ -230,23 +227,17 @@ export async function requestPlanModel(input: {
       repairReasoningDisabled,
       offeredToolCount: offeredTools.length,
       offeredToolNames: offeredTools.map((tool) => tool.function.name),
+      editorObservationTools: offeredTools.map(tool => tool.function.name).filter(name => name.startsWith("unity_mcp_")),
+      projectBaselineFingerprint: input.context.projectBaselineContext?.fingerprints.overall || null,
       catalogToolNames: advertisedToolNames,
       promptMessageCount: requestMessages.length,
-      promptChars: requestMessages.reduce(
-        (total, message) => total + String(message.content || "").length,
-        0,
-      ),
+      ...requestMetrics,
       contextLimit: budget?.contextLimit ?? null,
       maxOutputTokens: maxOutputTokens ?? null,
       timeoutMs: requestTimeoutMs,
+      reasoningOnlyTimeoutMs: reasoningOnlyTimeoutMs ?? null,
     });
-    const requestTokenBudget = Math.max(
-      2_048,
-      Math.ceil(requestMessages.reduce(
-        (total, message) => total + String(message.content || "").length,
-        0,
-      ) / 4) + (maxOutputTokens || 4_096),
-    );
+    const requestTokenBudget = Math.max(2_048, Math.ceil(requestMetrics.promptChars / 4) + (maxOutputTokens || 4_096));
     const lifecycleTimeoutMs = Math.max(1, input.deadlineAt - Date.now());
     const result = await withRuntimeV2HardDeadline({
       timeoutMs: lifecycleTimeoutMs,
@@ -256,15 +247,16 @@ export async function requestPlanModel(input: {
         requestAbort.abort("runtime_v2_plan_lifecycle_deadline");
       },
       task: async () => {
+        activity.acquiringLane();
         const lane = await acquireModelLane({
           config: input.get().config,
           contextLimit: budget?.contextLimit,
           requestTokenBudget,
           agentKind: "parent",
+          parentRunId: input.run.runId,
           signal: requestAbort.signal,
           onDebugEvent: (event, data) => input.logStoreEvent(event, {
-            turnId: input.run.turnId,
-            runId: input.run.runId,
+            ...requestTrace,
             ...data,
           }),
         });
@@ -274,13 +266,10 @@ export async function requestPlanModel(input: {
             ? "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT" : "Aborted");
         }
         lane.setPressureHandler((error) => requestAbort.abort(error));
-        const streamTimeoutMs = Math.max(
-          1,
-          requestTimeoutMs,
-        );
         try {
+          activity.preparing();
           return await withRuntimeV2ProgressDeadline({
-            timeoutMs: streamTimeoutMs,
+            timeoutMs: requestTimeoutMs,
             timeoutError: "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT",
             onTimeout: () => {
               requestTimedOut = true;
@@ -296,7 +285,9 @@ export async function requestPlanModel(input: {
                 },
                 onDone: () => undefined,
                 onError: () => undefined,
+                onRequestDispatched: activity.requestDispatched,
                 onLifecycle: (event) => {
+                  if (event.phase === "first_chunk") input.logStoreEvent("runtime_v2_provider_request_timing", { ...requestTrace, stage: "first_chunk", elapsedMs: event.elapsedMs });
                   if (
                     event.phase === "first_chunk" ||
                     event.phase === "chunk_progress"
@@ -306,6 +297,15 @@ export async function requestPlanModel(input: {
                   if (event.phase === "model_progress") {
                     lane.markFirstToken();
                   }
+                  if (event.phase === "response_format_downgraded") {
+                    input.logStoreEvent("runtime_v2_plan_provider_response_format_downgraded", {
+                      turnId: input.run.turnId,
+                      runId: input.run.runId,
+                      requestId: command.idempotencyKey,
+                      transport,
+                      reason: event.status,
+                    });
+                  }
                 },
               },
               requestAbort.signal,
@@ -313,11 +313,10 @@ export async function requestPlanModel(input: {
               maxOutputTokens,
               {
                 ...(toolChoice ? { toolChoice } : {}),
-                ...(structuredResponse
-                  ? { responseFormat: WORK_PLAN_STRUCTURED_RESPONSE_FORMAT }
-                  : {}),
-                timeoutMs: streamTimeoutMs,
+                responseFormat,
+                timeoutMs: requestTimeoutMs,
                 contextOwnership: "caller",
+                reasoningOnlyTimeoutMs,
               },
             ),
           });
@@ -325,6 +324,7 @@ export async function requestPlanModel(input: {
           lane.reportFailure(error);
           throw error;
         } finally {
+          activity.finish();
           lane.setPressureHandler(undefined);
           lane.release();
         }
@@ -332,19 +332,20 @@ export async function requestPlanModel(input: {
     });
     if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
     const outputTruncated = isStreamOutputLimited(result);
-    const rawVisibleText = result.content || streamedText;
-    const structuredCandidate = structuredResponse
+    const rawVisibleText = result.clientStopReason === "reasoning_only_timeout"
+      ? ""
+      : result.content || streamedText;
+    const decoded = (structuredResponse || input.submissionRepairPending) && !result.toolCalls?.length
       ? decodeExactStructuredPlanResponse(rawVisibleText)
       : null;
-    const adaptedToolCalls = structuredResponse
-      ? structuredCandidate
-        ? [{
+    const structuredCandidate = input.validationRepair ? applyWorkPlanValidationRepair(input.validationRepair, decoded) : decoded;
+    const adaptedToolCalls = structuredCandidate
+      ? [{
             id: `${command.idempotencyKey}:structured-response`,
             name: SUBMIT_WORK_PLAN_TOOL_NAME,
             arguments: structuredCandidate,
           }]
-        : []
-      : result.toolCalls;
+      : structuredResponse ? [] : result.toolCalls;
     const providerNormalized = normalizeProviderResponseV1({
       visibleText: structuredCandidate ? "" : rawVisibleText,
       toolCalls: adaptedToolCalls,
@@ -357,14 +358,11 @@ export async function requestPlanModel(input: {
         structuredResponseAdapted: !!structuredCandidate,
       }),
     });
-    const normalized: RuntimeV2NormalizedProviderResult = {
-      ...providerNormalized,
-      toolCalls: normalizeRuntimeV2ProviderToolCalls(
-        providerNormalized.toolCalls,
-        planTools,
-        input.context.runWorkspace,
-      ),
-    };
+    const normalizedCalls = normalizeRuntimeV2ProviderToolCalls(providerNormalized.toolCalls, planTools, input.context.runWorkspace);
+    const normalized: RuntimeV2NormalizedProviderResult = { ...providerNormalized, toolCalls:
+      canAskPlanQuestions && advertisedToolNames.includes(SUBMIT_WORK_PLAN_TOOL_NAME)
+        ? adaptPlanBlockingQuestions(normalizedCalls, SUBMIT_WORK_PLAN_TOOL_NAME, input.context.phaseLanguage)
+        : normalizedCalls };
     const unexpectedToolNames = [...new Set(
       normalized.toolCalls
         .map((call) => call.name)
@@ -372,7 +370,10 @@ export async function requestPlanModel(input: {
     )];
     const argumentViolation = unexpectedToolNames.length === 0
       ? runtimeV2ProviderToolArgumentViolation(
-          normalized.toolCalls,
+          // Effect-free WorkPlan readiness belongs to assessment; preserve
+          // useful Markdown. Ordinary tools retain exact schema admission.
+          normalized.toolCalls.filter(call => !(call.name === SUBMIT_WORK_PLAN_TOOL_NAME &&
+            typeof call.arguments.planMarkdown === "string" && call.arguments.planMarkdown.trim())),
           planTools,
         )
       : null;
@@ -507,23 +508,25 @@ export async function requestPlanModel(input: {
       transport,
     };
   } catch (error) {
+    activity.finish();
     const providerRequestTimedOut = !lifecycleTimedOut && (requestTimedOut || isPlanProviderRequestTimeout(
       error,
       requestAbort.signal,
       input.context.abortCtrl.signal,
     ));
+    const canceled = input.context.abortCtrl.signal.aborted;
+    const failureReasonCode = canceled ? undefined
+      : lifecycleTimedOut ? RUNTIME_V2_LIFECYCLE_DEADLINE_CODE
+      : providerRequestTimedOut && requiredSpawn ? PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE
+      : input.validationRepair ? PLAN_VALIDATION_REPAIR_FAILED
+      : isPlanStreamRepetition(error) ? PLAN_STREAM_REPETITION_CODE
+      : input.repetitionFallback ? PLAN_REPETITION_FALLBACK_FAILED : undefined;
     await input.ledger.settleCommand({
       type: "command.completed",
       run: input.run,
       idempotencyKey: command.idempotencyKey,
-      status: input.context.abortCtrl.signal.aborted ? "canceled" : "failed",
-      ...(lifecycleTimedOut ? { failureReasonCode: RUNTIME_V2_LIFECYCLE_DEADLINE_CODE } : {}),
-      ...(providerRequestTimedOut && requiredSpawn && !lifecycleTimedOut
-        ? {
-            failureReasonCode:
-              PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE,
-          }
-        : {}),
+      status: canceled ? "canceled" : "failed",
+      ...(failureReasonCode ? { failureReasonCode } : {}),
     });
     input.logStoreEvent("runtime_v2_plan_provider_request_closed", {
       turnId: input.run.turnId,

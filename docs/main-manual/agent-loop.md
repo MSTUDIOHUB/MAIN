@@ -10,7 +10,7 @@ sourceFeature: "orchestrator、toolExecutor、systemPrompt、streaming"
 
 # Agent 如何工作
 
-MAIN 的 Agent 循环会把每次普通工作区任务提交作为一个 Turn，转成一系列可观察步骤：理解目标、读取上下文、调用工具、等待审批、执行验证并输出结论。`/init` 是提交前的本地审阅命令，不进入 Agent loop。
+MAIN 的 Agent 循环会把每次普通工作区任务提交作为一个 Turn，转成一系列可观察步骤：理解目标、读取上下文、调用工具、等待审批、执行验证并输出结论。`/规则` 与 `/计划` 共享调查和结构化问答流程，也属于可恢复的 Turn；保存规则和批准计划执行分别确认。
 
 ## 适用场景
 

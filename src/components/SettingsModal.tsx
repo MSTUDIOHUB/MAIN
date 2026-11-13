@@ -68,6 +68,7 @@ import {
 import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
 import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
 import ToggleSwitch from "./ToggleSwitch";
+import ManagedProjectRulesSettings from "./ManagedProjectRulesSettings";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
@@ -3096,6 +3097,7 @@ export default function SettingsModal({
             {settingsTab === 'general' && (
               <div className="space-y-5">
                 <div className="flex items-center justify-between"><h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.general}</h3></div>
+                <ManagedProjectRulesSettings language={language} themeMode={config.themeMode || "dark"} busy={isModelRuntimeLocked} />
                 <div className={settingsSectionRowClass}>
                   <div>
                     <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.displayLanguage}</label>

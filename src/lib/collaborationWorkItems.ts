@@ -49,7 +49,6 @@ export interface CollaborationWorkItemV1 {
   dependsOn: string[];
   independentReviewOf?: string;
   /** Optional Goal-mode parent relation. Ordinary Turns leave it absent. */
-  goalSliceId?: string;
   semanticFingerprint: string;
 }
 
@@ -86,7 +85,6 @@ export interface CollaborationWorkItemDraft {
   accessMode?: unknown;
   dependsOn?: unknown;
   independentReviewOf?: unknown;
-  goalSliceId?: unknown;
 }
 
 export type CollaborationWorkItemValidation =
@@ -221,7 +219,6 @@ export function normalizeCollaborationWorkItemDraft(input: {
     maxChars: 128,
   });
   const independentReviewOf = compactString(input.draft.independentReviewOf, 128);
-  const goalSliceId = compactString(input.draft.goalSliceId, 128);
 
   const missingFields: string[] = [];
   if (!collaborationTaskId) missingFields.push("collaboration_task_id");
@@ -281,7 +278,6 @@ export function normalizeCollaborationWorkItemDraft(input: {
       accessMode: accessModeValue,
       dependsOn,
       ...(independentReviewOf ? { independentReviewOf } : {}),
-      ...(goalSliceId ? { goalSliceId } : {}),
       semanticFingerprint,
     },
   };
@@ -307,7 +303,6 @@ export function normalizeCollaborationWorkItem(
       accessMode: record.accessMode,
       dependsOn: record.dependsOn,
       independentReviewOf: record.independentReviewOf,
-      goalSliceId: record.goalSliceId,
     },
   });
   if (!normalized.ok || !normalized.workItem.collaborationTaskId) return null;

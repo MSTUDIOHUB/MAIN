@@ -35,7 +35,6 @@ export interface MainThreadHarnessTelemetry {
 export interface MainThreadRunIdentity {
   runId: string;
   parentRunId: string | null;
-  goalSliceId?: string;
 }
 
 export interface MainThreadProgressUpdate {
@@ -155,11 +154,6 @@ export type MainThreadEvent =
   // Keep the identity optional so persisted pre-v2 events remain readable.
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "progress.updated"; threadId: string; turnId: string; timestampMs: number; progress: MainThreadProgressUpdate } & Partial<MainThreadRunIdentity>)
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "plan.ready"; threadId: string; turnId: string; timestampMs: number; path?: string; summary?: string }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.started"; threadId: string; turnId?: string; timestampMs: number; goalId: string; revision: number }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.state_changed"; threadId: string; turnId?: string; timestampMs: number; goalId: string; from: string; to: string; phase?: string | null; reason?: string }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.checkpoint_saved"; threadId: string; turnId?: string; timestampMs: number; goalId: string; checkpointId: string; iteration: number }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.completed"; threadId: string; turnId?: string; timestampMs: number; goalId: string; evidenceCount: number }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.cleared"; threadId: string; turnId?: string; timestampMs: number; goalId: string; previousStatus: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.created"; threadId: string; turnId: string; timestampMs: number; collaborationTaskId?: string; subagentId?: string; runId?: string; parentRunId?: string | null; subagent: SubagentRunSnapshot }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.updated"; threadId: string; turnId: string; timestampMs: number; collaborationTaskId?: string; subagentId: string; runId?: string; parentRunId?: string | null; patch: SubagentRunPatch; activity?: SubagentActivity }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.completed"; threadId: string; turnId: string; timestampMs: number; collaborationTaskId?: string; subagentId: string; runId?: string; parentRunId?: string | null; completedAt: number; status: import("./subagents").SubagentStatus }
@@ -252,7 +246,6 @@ export function normalizePersistedMainThreadEvent(
       timestampMs: event.timestampMs,
       runId: event.runId,
       parentRunId: event.parentRunId,
-      ...(event.goalSliceId ? { goalSliceId: event.goalSliceId } : {}),
       resultKind: "error",
       summary: String(event.error?.message || "Persisted run error").trim() || "Persisted run error",
     });

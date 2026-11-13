@@ -1,13 +1,7 @@
 import { expect, test } from "@playwright/test";
+import { installCapsuleFixtureStartup } from "./capsuleFixtureStartup";
 
-test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => {
-    if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
-      window.localStorage.clear();
-      window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
-    }
-  });
-});
+test.beforeEach(({ page }) => installCapsuleFixtureStartup(page));
 
 test("ChatArea checkpoints stay durable while Capsule shows only live guidance", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-model-explanation");
@@ -16,10 +10,9 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   const guidance = capsule.getByTestId("capsule-guidance-label");
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
-  await expect(guidance).toHaveText(
-    "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
-  );
-  await expect(guidance.locator("strong")).toHaveText("ChatArea.tsx");
+  await expect(capsule).toHaveAttribute("data-activity-kind", "tool");
+  await expect(guidance).toHaveText("正在搜索内容");
+  await expect(capsule).not.toContainText("让我继续查看");
   await expect(capsule).not.toContainText("保留这条模型说明");
   await expect(capsule).not.toContainText("read_file");
   await expect(capsule).not.toContainText("grep_search");
@@ -55,18 +48,19 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
 
-  const runStatusTrigger = page.getByTitle("查看运行状态");
+  const runStatusTrigger = page.getByTitle("查看本轮活动");
   await runStatusTrigger.click();
   const progressPopover = page.getByTestId("effective-progress-popover");
   await expect(progressPopover).toBeVisible();
-  await expect(page.getByRole("button", { name: "关闭运行状态" })).toBeFocused();
-  await expect(progressPopover).toContainText("运行状态");
-  await expect(progressPopover).toContainText("当前活动");
-  await expect(progressPopover).toContainText("最近里程碑");
-  await expect(page.getByTestId("run-status-current-activity")).toContainText("ChatArea.tsx");
-  await expect(page.getByTestId("run-status-milestone")).toHaveCount(3);
-  await expect(progressPopover).toContainText("ChatArea.tsx");
-  await expect(progressPopover).toContainText("npm run test:workflow-assets");
+  await expect(page.getByRole("button", { name: "关闭本轮活动" })).toBeFocused();
+  await expect(progressPopover.getByRole("heading", { name: "本轮活动" })).toBeVisible();
+  await expect(progressPopover.getByTestId("run-status-current-activity")).toContainText("正在搜索内容");
+  const history = progressPopover.getByTestId("turn-activity-row");
+  await expect(history).toHaveCount(3);
+  await expect(history.filter({ hasText: "ChatArea.tsx" })).toHaveCount(1);
+  await expect(history.filter({ hasText: "运行命令" })).toHaveCount(1);
+  await expect(progressPopover).not.toContainText("npm run test:workflow-assets");
+  await expect(progressPopover).not.toContainText("已确认阶段性结论");
 
   for (const mode of ["light", "dark", "black"] as const) {
     await page.evaluate((themeMode) => (window as any).__CODELY_E2E__?.setThemeMode?.(themeMode), mode);
@@ -74,25 +68,21 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null)
     )).toBe(mode);
     await expect(progressPopover).toBeVisible();
-    await expect(guidance).toHaveText("让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。");
+    await expect(guidance).toHaveText("正在搜索内容");
     const capsuleSurface = await capsule.evaluate((element) => {
       const capsuleStyle = getComputedStyle(element);
       const guidance = element.querySelector<HTMLElement>('[data-testid="capsule-guidance-label"]');
-      const paragraph = guidance?.querySelector<HTMLElement>("p") || null;
-      const paragraphStyle = paragraph ? getComputedStyle(paragraph) : null;
+      const status = guidance?.querySelector<HTMLElement>("[aria-live]") || null;
+      const statusStyle = status ? getComputedStyle(status) : null;
       return {
         backgroundColor: capsuleStyle.backgroundColor,
-        thoughtColor: paragraphStyle?.color || "",
-        thoughtWhiteSpace: paragraphStyle?.whiteSpace || "",
-        thoughtTextOverflow: paragraphStyle?.textOverflow || "",
+        statusColor: statusStyle?.color || "",
+        statusTextOverflow: statusStyle?.textOverflow || "",
       };
     });
     expect(capsuleSurface.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
-    expect(capsuleSurface.thoughtColor).not.toBe("");
-    expect(capsuleSurface.thoughtColor).not.toBe("rgb(161, 161, 170)");
-    expect(capsuleSurface.thoughtColor).not.toBe("rgb(212, 212, 216)");
-    expect(capsuleSurface.thoughtWhiteSpace).toBe("pre-wrap");
-    expect(capsuleSurface.thoughtTextOverflow).not.toBe("ellipsis");
+    expect(capsuleSurface.statusColor).not.toBe("");
+    expect(capsuleSurface.statusTextOverflow).not.toBe("ellipsis");
     const surface = await progressPopover.evaluate((element) => {
       const style = getComputedStyle(element);
       return {
@@ -113,18 +103,17 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
   const processDisclosure = page.getByTestId("live-turn-process-toggle");
-  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
-  await expect(processDisclosure).toContainText("3 步");
-  await processDisclosure.click();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
+  await expect(processDisclosure).toContainText("本轮活动");
   await expect(timeline).toBeVisible();
   await expect(page.getByTestId("live-turn-process-details")).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
-  await expect(guidance).toContainText("让我继续查看 ChatArea.tsx");
+  await expect(guidance).toHaveText("正在搜索内容");
   await expect(firstUpdate).toHaveCount(1);
   await expect(secondUpdate).toHaveCount(1);
 
-  await processDisclosure.click();
+  await processDisclosure.focus();
+  await processDisclosure.press("Enter");
   await expect(timeline).toBeVisible();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
   await expect(timeline.getByTestId("tool-status-label")).toHaveCount(1);
@@ -133,9 +122,19 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(page.getByTestId("completed-tool-group-summary")).toHaveCount(0);
 
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
-  await expect(page.getByTestId("live-turn-process-details")).toContainText("运行回归测试确认折叠状态");
+  const completedCommandStep = page.getByTestId("live-turn-step").filter({
+    hasText: "npm run test:workflow-assets",
+  });
+  const completedCommandToggle = completedCommandStep.getByTestId("turn-archive-step-toggle");
+  await expect(completedCommandToggle).toHaveAttribute("aria-expanded", "false");
+  await completedCommandToggle.click();
+  await expect(completedCommandToggle).toHaveAttribute("aria-expanded", "true");
+  await completedCommandStep.getByRole("button", {
+    name: /运行命令：npm run test:workflow-assets/,
+  }).click();
+  await expect(completedCommandStep.getByTestId("turn-archive-step-details")).toContainText("运行回归测试确认折叠状态");
   const activeScopeStep = page.getByTestId("live-turn-step").filter({
-    hasText: "范围归纳",
+    hasText: "src/main.js",
   });
   await expect(activeScopeStep.getByTestId("turn-archive-step-toggle")).toBeVisible();
   await expect(activeScopeStep.getByTestId("turn-archive-step-toggle")).toHaveAttribute(
@@ -151,36 +150,32 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(page.getByText("已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。")).toHaveCount(1);
   await expect(page.getByText("已确认重复展示来自同一工具前言被同时投影；Capsule 只保留精简判断。")).toHaveCount(1);
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("保留这条模型说明");
-  await expect(page.getByTestId("capsule-guidance-label")).toContainText("让我继续查看 ChatArea.tsx");
+  await expect(page.getByTestId("capsule-guidance-label")).toHaveText("正在搜索内容");
   await expect(page.getByTestId("capsule-activity-label")).toHaveCount(0);
 });
 
-test("Capsule turns structured runtime activity into conversational guidance", async ({ page }) => {
+test("Capsule uses a concise action for a structured running tool", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-progress-only");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
-  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
-    "我正在搜索 src/components/ChatArea.tsx，缩小接下来要检查的范围。",
-  );
+  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText("正在搜索内容");
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveCount(0);
   await expect(capsule).not.toContainText("grep_search");
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
 });
 
-test("active Capsule uses a conversational phase sentence before concrete activity arrives", async ({ page }) => {
+test("active Capsule uses the known phase before concrete activity arrives", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-phase-fallback");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule).toHaveAttribute("data-guidance-source", "phase");
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
-  await expect(capsule.getByTestId("capsule-guidance-label")).toHaveText(
-    "我正在推进当前任务；下一项可验证的读取、修改或检查会在这里实时更新。",
-  );
-  await expect(capsule).not.toContainText("正在执行");
+  await expect(capsule.getByTestId("capsule-guidance-label")).toContainText("执行");
+  await expect(capsule).not.toContainText("下一项可验证的读取");
 });
 
 test("turn process timeline stays inside its frame in a narrow viewport", async ({ page }) => {
@@ -190,12 +185,12 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
   await expect(page.getByTestId("capsule-status-label")).toHaveCount(0);
   await expect(page.getByTestId("capsule-activity-label")).toHaveCount(0);
   const guidance = page.getByTestId("capsule-guidance-label");
-  await expect(guidance).toContainText("让我继续查看 ChatArea.tsx");
-  const thoughtMetrics = await guidance.evaluate((element) => {
-    const paragraph = element.querySelector<HTMLElement>("p");
-    const style = paragraph ? getComputedStyle(paragraph) : null;
+  await expect(guidance).toHaveText("正在搜索内容");
+  const statusMetrics = await guidance.evaluate((element) => {
+    const status = element.querySelector<HTMLElement>("[aria-live]");
+    const style = status ? getComputedStyle(status) : null;
     return {
-      whiteSpace: style?.whiteSpace || "",
+      overflowWrap: style?.overflowWrap || "",
       textOverflow: style?.textOverflow || "",
       height: element.getBoundingClientRect().height,
       clientWidth: element.clientWidth,
@@ -203,14 +198,15 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
       capsuleWidth: element.closest('[data-testid="agent-explanation-capsule"]')?.getBoundingClientRect().width || 0,
     };
   });
-  expect(thoughtMetrics.whiteSpace).toBe("pre-wrap");
-  expect(thoughtMetrics.textOverflow).not.toBe("ellipsis");
-  expect(thoughtMetrics.height).toBeGreaterThan(0);
-  expect(thoughtMetrics.clientWidth).toBeLessThanOrEqual(thoughtMetrics.capsuleWidth);
-  expect(thoughtMetrics.scrollWidth).toBeLessThanOrEqual(thoughtMetrics.clientWidth + 1);
+  expect(statusMetrics.overflowWrap).toBe("anywhere");
+  expect(statusMetrics.textOverflow).not.toBe("ellipsis");
+  expect(statusMetrics.height).toBeGreaterThan(0);
+  expect(statusMetrics.clientWidth).toBeLessThanOrEqual(statusMetrics.capsuleWidth);
+  expect(statusMetrics.scrollWidth).toBeLessThanOrEqual(statusMetrics.clientWidth + 1);
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
+  await page.getByTestId("live-turn-process-toggle").click();
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
 
   const overflowing = await page.evaluate(() => {

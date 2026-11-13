@@ -41,7 +41,7 @@ import { applyStreamResponseFormat, isUnsupportedStreamResponseFormat } from "./
 import { computeContextBudgets } from "./contextTrim";
 import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
-import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
+import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, normalizeOpenAiNativeToolPreambles, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
 import { sanitizeAssistantDisplayContent } from "./sanitize";
 import {
   detectVisibleTextRepetition,
@@ -148,6 +148,9 @@ export interface StreamRequestOptions {
    * null explicitly delegates active reasoning to the provider token budget;
    * undefined retains the legacy adapter character guard. */
   reasoningOnlyCharLimit?: number | null;
+  /** Limit decoded reasoning before the first semantic body or tool action.
+   * The clock begins on reasoning, not on dispatch or connection traffic. */
+  reasoningOnlyTimeoutMs?: number;
   /** Cancel a decision that emits excessive visible/hidden prose before any
    * structured action. Tool arguments are unaffected once a call begins. */
   actionOnlyCharLimit?: number;
@@ -175,7 +178,7 @@ export interface StreamResult {
   toolCalls: StreamedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
   /** A client character guard is distinct from a provider finish_reason. */
-  clientStopReason?: "reasoning_char_limit" | "action_char_limit";
+  clientStopReason?: "reasoning_char_limit" | "reasoning_only_timeout" | "action_char_limit";
   reasoningContent?: string;
   reasoningField?: "reasoning_content" | "reasoning";
   /** Provider returned a terminal response that violated the requested tool protocol. */
@@ -199,6 +202,7 @@ export interface StreamResult {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
+    cachedInputTokens?: number;
   };
   streamDiagnostics?: StreamSemanticDiagnostics;
   /** Receipt for the exact accepted request that produced this response. */
@@ -391,7 +395,15 @@ function extractProviderTokenUsage(payload: unknown): StreamResult["usage"] | un
     inputTokens + outputTokens,
   );
   if (inputTokens === 0 && outputTokens === 0 && totalTokens === 0) return undefined;
-  return { inputTokens, outputTokens, totalTokens: totalTokens || inputTokens + outputTokens };
+  const inputDetails = usage.prompt_tokens_details ?? usage.input_tokens_details;
+  const cacheCount = inputDetails && typeof inputDetails === "object"
+    ? (inputDetails as Record<string, unknown>).cached_tokens
+    : usage.cachedContentTokenCount;
+  return {
+    inputTokens, outputTokens, totalTokens: totalTokens || inputTokens + outputTokens,
+    ...(typeof cacheCount === "number" && Number.isInteger(cacheCount) && cacheCount >= 0 && cacheCount <= inputTokens
+      ? { cachedInputTokens: cacheCount } : {}),
+  };
 }
 
 const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;
@@ -410,7 +422,35 @@ export function isStreamOutputLimited(input: {
 }): boolean {
   return input.finishReason === "length" ||
     input.clientStopReason === "reasoning_char_limit" ||
+    input.clientStopReason === "reasoning_only_timeout" ||
     input.clientStopReason === "action_char_limit";
+}
+
+function createReasoningOnlyTimer(timeoutMs: number | undefined, onTimeout: () => void) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clear = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  return {
+    observe(input: {
+      readonly reasoningChars: number;
+      readonly visibleChars: number;
+      readonly toolCalls: Iterable<StreamedToolCall>;
+      readonly finished: boolean;
+    }) {
+      if (!timeoutMs || !Number.isFinite(timeoutMs) || timeoutMs < 0) return;
+      const hasToolProgress = Array.from(input.toolCalls).some(call =>
+        call.name.trim() || call.arguments.trim()
+      );
+      if (input.finished || input.visibleChars > 0 || hasToolProgress) {
+        clear();
+      } else if (input.reasoningChars > 0 && timer === undefined) {
+        timer = setTimeout(onTimeout, timeoutMs);
+      }
+    },
+    clear,
+  };
 }
 
 export function shouldStopReasoningOnlyStream(input: {
@@ -468,8 +508,11 @@ interface StreamCallbacks {
   onToken: (token: string) => void;
   onDone: (result: StreamResult) => void;
   onError: (err: Error) => void;
+  /** Presentation observer for a transport attempt. The returned callback
+   * observes decoded model output, separate from connection bytes or pings. */
+  onRequestDispatched?: () => (() => void);
   onLifecycle?: (event: {
-    phase: "stream_started" | "first_chunk" | "chunk_progress" | "model_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled";
+    phase: "stream_started" | "first_chunk" | "chunk_progress" | "model_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled" | "response_format_downgraded";
     streamId?: string;
     elapsedMs?: number;
     chunkCount?: number;
@@ -581,10 +624,11 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
   reasoningMode: OpenAiCompatibleContentMode;
   reasoningField: "reasoning_content" | "reasoning" | null;
   finishReason: "stop" | "length" | "tool_calls" | null;
+  providerTerminal: boolean;
   toolCalls: unknown[];
 } {
   if (!payload || typeof payload !== "object") {
-    return { content: "", contentMode: "none", reasoning: "", reasoningMode: "none", reasoningField: null, finishReason: null, toolCalls: [] };
+    return { content: "", contentMode: "none", reasoning: "", reasoningMode: "none", reasoningField: null, finishReason: null, providerTerminal: false, toolCalls: [] };
   }
 
   const root = payload as Record<string, unknown>;
@@ -670,6 +714,7 @@ function extractOpenAiCompatibleDelta(payload: unknown): {
     finishReason: toolCalls.length > 0
       ? "tool_calls"
       : normalizedFinishReason,
+    providerTerminal: normalizedFinishReason !== null,
     toolCalls,
   };
 }
@@ -1243,6 +1288,7 @@ async function postJsonRequest(
   body: Record<string, unknown>,
   settings: StreamSettings,
   signal?: AbortSignal,
+  onRequestDispatched?: StreamCallbacks["onRequestDispatched"],
 ): Promise<unknown> {
   if (signal?.aborted) throw createAbortError();
 
@@ -1261,6 +1307,7 @@ async function postJsonRequest(
       throw createAbortError();
     }
     try {
+      onRequestDispatched?.();
       result = await invoke<string>("proxy_request", {
         url,
         method: "POST",
@@ -1284,6 +1331,7 @@ async function postJsonRequest(
     return JSON.parse(result);
   }
 
+  onRequestDispatched?.();
   const response = await fetch(url, {
     method: "POST",
     headers,
@@ -1348,6 +1396,7 @@ async function requestOpenAiNonStreaming(
         requestBody,
         settings,
         signal,
+        callbacks.onRequestDispatched,
       );
       acceptedRequestBody = requestBody;
     } else if (apiFormat === "responses") {
@@ -1419,6 +1468,7 @@ async function requestOpenAiNonStreaming(
             candidateBody,
             settings,
             signal,
+            callbacks.onRequestDispatched,
           );
           const candidateTerminal = resolveOpenAiResponsesTerminalState(candidatePayload);
           if (candidateTerminal.status === "failed") {
@@ -1522,7 +1572,7 @@ async function requestOpenAiNonStreaming(
     } else {
       let chatBody: Record<string, unknown> = {
         model: settings.model,
-        messages: messages.map((message) => {
+        messages: normalizeOpenAiNativeToolPreambles(messages.map((message) => {
           const mapped = mapMessageForApi(message, false, {
             includeAssistantReasoning:
               settings.preserveAssistantReasoning === true,
@@ -1530,7 +1580,7 @@ async function requestOpenAiNonStreaming(
           return mapped.role === "tool"
             ? { role: "user", content: mapped.content }
             : mapped;
-        }),
+        })),
         stream: false,
         ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
         ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
@@ -1551,6 +1601,7 @@ async function requestOpenAiNonStreaming(
         chatBody,
         settings,
         signal,
+        callbacks.onRequestDispatched,
       );
       acceptedRequestBody = chatBody;
     }
@@ -1714,10 +1765,10 @@ async function streamViaRustProxy(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false, {
+          messages: normalizeOpenAiNativeToolPreambles(messages.map((m) => mapMessageForApi(m, false, {
             includeAssistantReasoning:
               settings.preserveAssistantReasoning === true,
-          })),
+          }))),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
@@ -1750,7 +1801,7 @@ async function streamViaRustProxy(
 
   if (isGemini) {
     try {
-      const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
+      const payload = await postJsonRequest(apiUrl, headers, body, settings, signal, callbacks.onRequestDispatched);
       const content = extractGeminiResponseText(payload);
       if (content) onToken(content);
       const result = attachVisualTransportReceipt({
@@ -1795,7 +1846,9 @@ async function streamViaRustProxy(
     rejectResult = reject;
   });
 
-  const anthropicProcessor = isAnthropic ? createAnthropicStreamProcessor(onToken) : null;
+  let onModelOutput: (() => void) | undefined;
+  const anthropicProcessor = isAnthropic
+    ? createAnthropicStreamProcessor(onToken, () => onModelOutput?.()) : null;
 
   // Accumulate results
   let fullContent = "";
@@ -1809,6 +1862,7 @@ async function streamViaRustProxy(
   let firstToolAt: number | null = null;
   let emittedMirrorSemanticContent = "";
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
+  let providerTerminalSeen = false;
   let clientStopReason: StreamResult["clientStopReason"];
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
@@ -1893,7 +1947,7 @@ async function streamViaRustProxy(
     content: fullContent,
     actionableContent: semanticProgress.actionableContent,
     semanticContent: semanticProgress.semanticContent,
-    toolCalls: finalizeStreamedToolCalls(toolCallsMap),
+    toolCalls: clientStopReason === "reasoning_only_timeout" ? [] : finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
     ...(clientStopReason ? { clientStopReason } : {}),
     streamDiagnostics: buildSemanticDiagnostics(),
@@ -1906,9 +1960,9 @@ async function streamViaRustProxy(
       : {}),
   }, messages, body, visualProtocol, options.visualTransportBinding);
 
-  const stopReasoningOnlyRunaway = () => {
-    if (resolved || anthropicProcessor || finishReason !== null) return false;
-    if (!shouldStopReasoningOnlyStream({
+  const stopReasoningOnlyRunaway = (reason: "reasoning_char_limit" | "reasoning_only_timeout") => {
+    if (resolved || providerTerminalSeen) return false;
+    if (reason === "reasoning_char_limit" && !shouldStopReasoningOnlyStream({
       reasoningChars: providerReasoningContent.length,
       visibleChars: semanticProgress.semanticVisibleChars,
       toolCallCount: toolCallsMap.size,
@@ -1919,18 +1973,20 @@ async function streamViaRustProxy(
     }
 
     resolved = true;
-    clientStopReason = "reasoning_char_limit";
+    clientStopReason = reason;
+    if (reason === "reasoning_only_timeout") finishReason = null;
     closeReasoningBlock();
     reasoningBuffer = "";
-    const dynamicLimit = Math.floor(
-      Number(options.reasoningOnlyCharLimit) || 0,
-    ) || (isLocalProfile(settings)
-      ? 96_000
-      : REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT);
+    const result = anthropicProcessor
+      ? attachVisualTransportReceipt({
+          ...anthropicProcessor.getResult(), toolCalls: [], finishReason: null, clientStopReason,
+        }, messages, body, visualProtocol, options.visualTransportBinding)
+      : buildCurrentOpenAiCompatibleResult();
     emitStreamingConsole(
       "streaming",
       "warn",
-      `Reasoning-only stream exceeded ${dynamicLimit} chars without visible output or tool calls; cancelling stream.`,
+      "Reasoning-only stream reached its limit before visible output or a tool call.",
+      { reason, reasoningChars: result.reasoningContent?.length || 0 },
     );
     callbacks.onLifecycle?.({
       phase: "stream_cancelled",
@@ -1941,12 +1997,15 @@ async function streamViaRustProxy(
       status: "reasoning_guard",
     });
     invoke("cancel_chat_stream", { streamId }).catch(() => {});
-    const result = buildCurrentOpenAiCompatibleResult();
     onDone(result);
     resolveResult?.(result);
     cleanup();
     return true;
   };
+
+  const reasoningOnlyTimer = createReasoningOnlyTimer(options.reasoningOnlyTimeoutMs, () => {
+    stopReasoningOnlyRunaway("reasoning_only_timeout");
+  });
 
   const stopActionlessRunaway = () => {
     if (resolved || anthropicProcessor || finishReason !== null) return false;
@@ -2065,6 +2124,7 @@ async function streamViaRustProxy(
   const processSseChunk = (rawChunk: string) => {
     if (anthropicProcessor) {
       anthropicProcessor.processChunk(rawChunk);
+      if (options.reasoningOnlyTimeoutMs) reasoningOnlyTimer.observe(anthropicProcessor.getProgress());
       return;
     }
 
@@ -2074,7 +2134,12 @@ async function streamViaRustProxy(
     sseBuffer = lines.pop() ?? "";
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed === "data: [DONE]") continue;
+      if (!trimmed) continue;
+      if (trimmed === "data: [DONE]" || trimmed === "data:[DONE]") {
+        providerTerminalSeen = true;
+        reasoningOnlyTimer.clear();
+        continue;
+      }
       try {
         const jsonText = trimmed.startsWith("data: ")
           ? trimmed.slice(6)
@@ -2141,6 +2206,7 @@ async function streamViaRustProxy(
           }
 
           if (extracted.finishReason) finishReason = extracted.finishReason;
+          if (extracted.providerTerminal) providerTerminalSeen = true;
           if (extracted.toolCalls.length > 0) {
             for (const tc of extracted.toolCalls as Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>) {
               const idx: number = tc.index ?? 0;
@@ -2161,6 +2227,7 @@ async function streamViaRustProxy(
             }
           }
           if (hasModelProgress) {
+            onModelOutput?.();
             callbacks.onLifecycle?.({
               phase: "model_progress",
               streamId,
@@ -2171,13 +2238,20 @@ async function streamViaRustProxy(
             });
           }
           if (stopActionlessRunaway()) return;
-          if (stopReasoningOnlyRunaway()) return;
+          if (stopReasoningOnlyRunaway("reasoning_char_limit")) return;
+          reasoningOnlyTimer.observe({
+            reasoningChars: providerReasoningContent.length,
+            visibleChars: semanticProgress.semanticVisibleChars,
+            toolCalls: toolCallsMap.values(),
+            finished: providerTerminalSeen || resolved,
+          });
           if (stopNoVisibleProgressStall()) return;
       } catch { /* skip */ }
     }
   };
 
   const cleanup = () => {
+    reasoningOnlyTimer.clear();
     unlistenChunk?.();
     unlistenDone?.();
     if (signal && abortSignalHandler) {
@@ -2195,7 +2269,7 @@ async function streamViaRustProxy(
   // chat-stream-done before the JS listeners are registered.
   const [chunkUnlisten, doneUnlisten] = await Promise.all([
     listen<{ stream_id: string; chunk: string }>("chat-stream-chunk", (event) => {
-      if (event.payload.stream_id !== streamId) return;
+      if (resolved || event.payload.stream_id !== streamId) return;
       try {
         const now = Date.now();
         rustProxyChunkCount++;
@@ -2398,6 +2472,7 @@ async function streamViaRustProxy(
 
   // Now safe to start the stream: listeners are fully registered before Rust emits chunks.
   startStreamInvoked = true;
+  onModelOutput = callbacks.onRequestDispatched?.();
   invoke("start_chat_stream", {
     streamId,
     url: apiUrl,
@@ -2455,6 +2530,7 @@ export async function streamChatCompletion(
   } catch (error) {
     if (!signal?.aborted && !outputStarted && isUnsupportedStreamResponseFormat(error instanceof Error ? error.message : String(error))) {
       emitStreamingConsole("streaming", "info", "optional response format unsupported; retrying the same request without that field");
+      callbacks.onLifecycle?.({ phase: "response_format_downgraded", status: "unsupported_response_format" });
       const { responseFormat: _format, ...remaining } = options;
       return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, remaining);
     }
@@ -2535,10 +2611,10 @@ async function streamChatCompletionAttempt(
         ? geminiRequest?.body ?? {}
       : {
           model: settings.model,
-          messages: messages.map((m) => mapMessageForApi(m, false, {
+          messages: normalizeOpenAiNativeToolPreambles(messages.map((m) => mapMessageForApi(m, false, {
             includeAssistantReasoning:
               settings.preserveAssistantReasoning === true,
-          })),
+          }))),
           stream: true,
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
@@ -2573,7 +2649,7 @@ async function streamChatCompletionAttempt(
 
   if (isGemini) {
     try {
-      const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
+      const payload = await postJsonRequest(apiUrl, headers, body, settings, signal, callbacks.onRequestDispatched);
       const content = extractGeminiResponseText(payload);
       if (content) onToken(content);
       const result = attachVisualTransportReceipt({
@@ -2592,7 +2668,9 @@ async function streamChatCompletionAttempt(
   }
 
   let response: Response;
+  let onModelOutput: (() => void) | undefined;
   try {
+    onModelOutput = callbacks.onRequestDispatched?.();
     response = await fetch(apiUrl, {
       method: "POST",
       headers,
@@ -2661,7 +2739,8 @@ async function streamChatCompletionAttempt(
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const anthropicProcessor = isAnthropic ? createAnthropicStreamProcessor(onToken) : null;
+  const anthropicProcessor = isAnthropic
+    ? createAnthropicStreamProcessor(onToken, onModelOutput) : null;
   let buffer = "";
 
   // Accumulate text content
@@ -2678,6 +2757,7 @@ async function streamChatCompletionAttempt(
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
+  let providerTerminalSeen = false;
   let clientStopReason: StreamResult["clientStopReason"];
 
   // Track reasoning phase for thinking models (e.g., Qwen3.5 with reasoning_content)
@@ -2749,7 +2829,7 @@ async function streamChatCompletionAttempt(
     content: fullContent,
     actionableContent: semanticProgress.actionableContent,
     semanticContent: semanticProgress.semanticContent,
-    toolCalls: finalizeStreamedToolCalls(toolCallsMap),
+    toolCalls: clientStopReason === "reasoning_only_timeout" ? [] : finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
     ...(clientStopReason ? { clientStopReason } : {}),
     streamDiagnostics: buildSemanticDiagnostics(),
@@ -2778,10 +2858,24 @@ async function streamChatCompletionAttempt(
     throw Object.assign(error, { _visibleTextRepetitionAbort: true });
   };
 
+  const reasoningOnlyTimer = createReasoningOnlyTimer(options.reasoningOnlyTimeoutMs, () => {
+    if (signal?.aborted || providerTerminalSeen) return;
+    clientStopReason = "reasoning_only_timeout";
+    finishReason = null;
+    callbacks.onLifecycle?.({
+      phase: "stream_cancelled",
+      elapsedMs: Date.now() - streamStartedAt,
+      chunkCount: frontendChunkCount,
+      byteCount: frontendByteCount,
+      status: "reasoning_guard",
+    });
+    void reader.cancel().catch(() => {});
+  });
+
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done || clientStopReason === "reasoning_only_timeout") break;
       const now = Date.now();
       frontendChunkCount += 1;
       frontendByteCount += value.byteLength;
@@ -2809,6 +2903,7 @@ async function streamChatCompletionAttempt(
 
       if (anthropicProcessor) {
         anthropicProcessor.processChunk(chunkText);
+        if (options.reasoningOnlyTimeoutMs) reasoningOnlyTimer.observe(anthropicProcessor.getProgress());
         continue;
       }
 
@@ -2821,7 +2916,12 @@ async function streamChatCompletionAttempt(
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || trimmed === "data: [DONE]") continue;
+        if (!trimmed) continue;
+        if (trimmed === "data: [DONE]" || trimmed === "data:[DONE]") {
+          providerTerminalSeen = true;
+          reasoningOnlyTimer.clear();
+          continue;
+        }
 
         try {
           const jsonText = trimmed.startsWith("data: ")
@@ -2881,6 +2981,7 @@ async function streamChatCompletionAttempt(
 
             // Detect finish_reason for truncation awareness
             if (extracted.finishReason) finishReason = extracted.finishReason;
+            if (extracted.providerTerminal) providerTerminalSeen = true;
 
             // Handle tool_call deltas (native function calling)
             if (extracted.toolCalls.length > 0) {
@@ -2908,6 +3009,7 @@ async function streamChatCompletionAttempt(
               }
             }
             if (hasModelProgress) {
+              onModelOutput?.();
               callbacks.onLifecycle?.({
                 phase: "model_progress",
                 elapsedMs: Date.now() - streamStartedAt,
@@ -2941,6 +3043,12 @@ async function streamChatCompletionAttempt(
               onDone(result);
               return result;
             }
+            reasoningOnlyTimer.observe({
+              reasoningChars: providerReasoningContent.length,
+              visibleChars: semanticProgress.semanticVisibleChars,
+              toolCalls: toolCallsMap.values(),
+              finished: providerTerminalSeen,
+            });
             if (finishReason === null && shouldStopActionlessStream({
               reasoningChars: providerReasoningContent.length,
               visibleChars: semanticProgress.semanticVisibleChars,
@@ -3017,12 +3125,14 @@ async function streamChatCompletionAttempt(
     }
     if ((err as Error).name !== "AbortError") onError(toError(err, "Streaming request failed."));
     throw err;
+  } finally {
+    reasoningOnlyTimer.clear();
   }
 
   // Flush any remaining buffer
   if (anthropicProcessor) {
-    anthropicProcessor.flush();
-  } else if (buffer.trim()) {
+    if (!clientStopReason) anthropicProcessor.flush();
+  } else if (!clientStopReason && buffer.trim()) {
     for (const line of buffer.trim().split("\n")) {
       const trimmed = line.trim();
       if (!trimmed || trimmed === "data: [DONE]") continue;
@@ -3106,7 +3216,10 @@ async function streamChatCompletionAttempt(
 
   const result: StreamResult = anthropicProcessor
     ? attachVisualTransportReceipt(
-        anthropicProcessor.getResult(),
+        {
+          ...anthropicProcessor.getResult(),
+          ...(clientStopReason ? { toolCalls: [], finishReason: null, clientStopReason } : {}),
+        },
         messages,
         body,
         visualProtocol,

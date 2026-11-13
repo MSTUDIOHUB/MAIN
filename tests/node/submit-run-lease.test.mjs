@@ -100,7 +100,6 @@ test("submit run lease builds multimodal user messages with images before text",
 test("submit run lease appends agent message, opens abort lease, and persists harness marker", () => {
   const agentMessages = [{ role: "assistant", content: "old" }];
   const abortController = { signal: { aborted: false } };
-  const goals = [];
   const persistedMarkers = [];
   const harnessMarkers = [];
   const lease = startSubmitRunLease({
@@ -112,13 +111,8 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
     runWorkspace: "/repo",
     runSessionId: 7,
     turnId: "turn-1",
-    effectiveRunIntent: "goal",
-    runtimeRunIntent: "goal",
-    goalCreationAuthorization: {
-      kind: "goal_creation_authorization",
-      intent: "goal",
-      source: "visible_goal_shortcut",
-    },
+    effectiveRunIntent: "execute",
+    runtimeRunIntent: "execute",
     getRuntimeSnapshot: () => ({
       agentMessagesLength: agentMessages.length,
       planStage: "executing",
@@ -130,9 +124,6 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
     createAbortController: () => abortController,
     setAbortController: (nextAbortController) => {
       assert.equal(nextAbortController, abortController);
-    },
-    startGoal: (objective, options) => {
-      goals.push({ objective, options });
     },
     getCurrentHarnessInstanceId: () => "instance-a",
     expectedHarnessRunMarker: null,
@@ -153,12 +144,6 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
     runtimeTurnId: "turn-1",
   });
   assert.equal(lease.abortController, abortController);
-  assert.deepEqual(goals, [
-    {
-      objective: "ship the visible goal",
-      options: { sessionKey: "workspace-a:7", sourceContext: "prior Plan conclusion", ownerTurnId: "turn-1" },
-    },
-  ]);
   assert.equal(persistedMarkers[0].instanceId, "instance-a");
   assert.match(persistedMarkers[0].runId, /^run-/);
   assert.equal(persistedMarkers[0].messagesLen, 2);
@@ -173,37 +158,7 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
   assert.equal(lease.parentRunId, null);
 });
 
-test("submit run lease refuses inferred or internally resolved Goal creation without explicit authority", () => {
-  const agentMessages = [];
-  let startGoalCalls = 0;
-  startSubmitRunLease({
-    userContent: "internal goal request",
-    canonicalUserText: "internal goal request",
-    currentImages: [],
-    runSessionKey: "workspace-a:7",
-    runWorkspace: "/repo",
-    runSessionId: 7,
-    turnId: "turn-internal-goal",
-    effectiveRunIntent: "goal",
-    runtimeRunIntent: "goal",
-    getRuntimeSnapshot: () => ({
-      agentMessagesLength: agentMessages.length,
-      planStage: "idle",
-      isPlanApproved: false,
-    }),
-    appendAgentMessage: (message) => agentMessages.push(message),
-    createAbortController: () => ({ signal: { aborted: false } }),
-    setAbortController: () => {},
-    startGoal: () => { startGoalCalls += 1; },
-    getCurrentHarnessInstanceId: () => "instance-a",
-    expectedHarnessRunMarker: null,
-    acquireHarnessRunMarker: (marker) => marker,
-    setHarnessRunMarker: () => {},
-    nowMs: () => 457,
-  });
 
-  assert.equal(startGoalCalls, 0);
-});
 
 test("submit run lease performs no local acquisition effects when Harness CAS loses", () => {
   const agentMessages = [];
@@ -373,46 +328,7 @@ test("approved handoffs preserve a preallocated child run id through the submiss
   assert.equal(persisted.parentRunId, "run-review");
 });
 
-test("Goal choice continuations append guidance without creating a replacement Goal", () => {
-  const agentMessages = [{ role: "assistant", content: "Choose startup behavior" }];
-  let persisted;
-  const lease = startSubmitRunLease({
-    userContent: "显示欢迎页",
-    canonicalUserText: "显示欢迎页",
-    currentImages: [],
-    runSessionKey: "workspace-a:7",
-    runWorkspace: "/repo",
-    runSessionId: 7,
-    turnId: "turn-goal",
-    effectiveRunIntent: "goal",
-    runtimeRunIntent: "goal",
-    continueExistingGoal: true,
-    parentRunIdOverride: "run-goal:slice:1",
-    getRuntimeSnapshot: () => ({
-      agentMessagesLength: agentMessages.length,
-      planStage: "idle",
-      isPlanApproved: false,
-    }),
-    appendAgentMessage: (message) => agentMessages.push(message),
-    createAbortController: () => ({ signal: { aborted: false } }),
-    setAbortController: () => {},
-    startGoal: () => assert.fail("a Goal continuation must retain the existing Goal"),
-    getCurrentHarnessInstanceId: () => "instance-a",
-    expectedHarnessRunMarker: null,
-    acquireHarnessRunMarker: (marker) => (persisted = marker),
-    setHarnessRunMarker: () => {},
-    nowMs: () => 792,
-  });
 
-  assert.deepEqual(agentMessages.at(-1), {
-    role: "user",
-    content: "显示欢迎页",
-    runtimeTurnId: "turn-goal",
-  });
-  assert.equal(lease.parentRunId, "run-goal:slice:1");
-  assert.equal(persisted.workflowMode, "edit");
-  assert.equal(persisted.runtimeIntent, "goal");
-});
 
 test("harness run ownership distinguishes sequential loops on the same conversation turn", () => {
   const marker = {

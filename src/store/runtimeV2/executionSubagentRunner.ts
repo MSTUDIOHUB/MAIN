@@ -66,6 +66,7 @@ import {
   VALIDATION_CHILD_TOOL_NAMES,
 } from "./executionSubagentPolicy";
 import { requestRuntimeV2ChildStep } from "./executionSubagentProvider";
+import { ModelLaneResourceInterruption } from "../../lib/modelLaneCoordinator";
 
 export {
   boundRuntimeV2ChildToolCalls,
@@ -108,6 +109,7 @@ async function childToolAllowed(input: {
   }
   if (
     input.job.taskKind !== "validate" ||
+    input.job.proactiveKey ||
     !VALIDATION_CHILD_TOOL_NAMES.has(input.name)
   ) {
     return false;
@@ -249,7 +251,7 @@ async function runRuntimeV2Child(input: {
         ? "You may submit exactly one provided mutation tool call matching the assigned operation and exclusive paths. Runtime stages it without changing the live workspace; after CHILD_MUTATION_STAGED, cite its evidence id and conclude. Do not broaden or redesign the parent plan."
         : "This child is read-only. Never request or simulate file changes.",
       "Use the parent context as current context; do not reread an unchanged fact merely to reconstruct the task.",
-      input.job.taskKind === "validate"
+      input.job.taskKind === "validate" && !input.job.proactiveKey
         ? "You may use the provided finite validation tools. Your result is advisory until the parent validates the final mutation."
         : input.job.taskKind === "implement"
           ? "Use the provided read/search tools only for the assigned source, then stage one coherent mutation transaction. Final project validation remains the parent's responsibility."
@@ -317,6 +319,7 @@ async function runRuntimeV2Child(input: {
           recoveryOccurrence: recoveryLease?.occurrence || 0,
         });
       } catch (error) {
+        if (error instanceof ModelLaneResourceInterruption) throw error;
         if (
           evidence.length + inheritedEvidence.length > 0 &&
           !input.signal.aborted
@@ -639,25 +642,28 @@ async function runRuntimeV2Child(input: {
         break;
       }
     }
-  } catch {
+  } catch (error) {
     const deadlineExceeded = runtimeV2ChildDeadlineExceeded({
       signal: input.signal,
       deadlineAt,
     });
     const canceled = input.signal.aborted && !deadlineExceeded;
+    const resource = !canceled && error instanceof ModelLaneResourceInterruption ? error.causeKind : undefined;
     const status = canceled
       ? "canceled"
-      : evidence.length > 0
+      : resource || evidence.length > 0
         ? "degraded"
         : "failed";
     if (telemetry) telemetry.closedAt = input.ports.now();
     return {
       job: input.job,
       status,
+      ...(resource ? { resourceInterruption: resource } : {}),
       summary: runtimeV2SubagentFailureSummary({
         canceled,
         recoveryStalled,
         deadlineExceeded,
+        resource,
         evidence,
       }),
       report: null,

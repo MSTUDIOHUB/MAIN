@@ -183,6 +183,8 @@ export default function WorkspaceTreePanel({
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
   const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
   const [fileTreeError, setFileTreeError] = useState("");
+  const [planCleanupByWorkspace, setPlanCleanupByWorkspace] = useState<Record<string, "pending" | "failed">>({});
+  const planCleanup = planCleanupByWorkspace[currentWorkspace];
   const treeNodesRef = useRef<Record<string, FileNode[]>>({});
   const loadingPathsRef = useRef<Record<string, boolean>>({});
   const loadDirectoryNodesRef = useRef<(path: string, options?: { force?: boolean }) => Promise<void>>(async () => {});
@@ -201,6 +203,8 @@ export default function WorkspaceTreePanel({
     empty: language === "en" ? "No files to display." : "暂无可显示文件。",
     refresh: language === "en" ? "Refresh" : "刷新",
     clearPlans: language === "en" ? "Clear Plans" : "清理计划文件",
+    clearingPlans: language === "en" ? "Clearing plan files…" : "正在清理计划文件…",
+    clearPlansFailed: language === "en" ? "Could not clear plan files. Please retry." : "清理计划文件失败，请重试。",
     clearBrowserValidation: language === "en" ? "Clear Validation Shots" : "清理验证截图",
     close: language === "en" ? "Close file tree" : "关闭文件树",
   }), [language]);
@@ -304,6 +308,21 @@ export default function WorkspaceTreePanel({
     await storeOpenFileViewer(path, currentWorkspace);
   }, [currentWorkspace, onOpenFile, storeOpenFileViewer]);
 
+  const handleClearPlanFiles = async () => {
+    if (!currentWorkspace || planCleanup === "pending") return;
+    setPlanCleanupByWorkspace((previous) => ({ ...previous, [currentWorkspace]: "pending" }));
+    try {
+      await deletePersistedPlanFiles();
+      setPlanCleanupByWorkspace((previous) => {
+        const next = { ...previous };
+        delete next[currentWorkspace];
+        return next;
+      });
+    } catch {
+      setPlanCleanupByWorkspace((previous) => ({ ...previous, [currentWorkspace]: "failed" }));
+    }
+  };
+
   const renderTree = useCallback((path: string, depth = 0) => {
     const nodes = treeNodesByPath[path] || [];
     return nodes.map((node) => {
@@ -393,10 +412,12 @@ export default function WorkspaceTreePanel({
         </button>
         <button
           data-testid="workspace-clear-plan-files-button"
-          onClick={() => void deletePersistedPlanFiles()}
-          className="rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7]"
+          type="button"
+          onClick={() => void handleClearPlanFiles()}
+          disabled={!currentWorkspace || planCleanup === "pending"}
+          className="rounded-md border border-[#27272a] bg-[#000000] px-2.5 py-1 text-[11px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#e4e4e7] disabled:opacity-60"
         >
-          {copy.clearPlans}
+          {planCleanup === "pending" ? copy.clearingPlans : copy.clearPlans}
         </button>
         <button
           onClick={() => void deleteBrowserValidationArtifacts()}
@@ -405,6 +426,15 @@ export default function WorkspaceTreePanel({
           {copy.clearBrowserValidation}
         </button>
       </div>
+
+      {planCleanup === "failed" && (
+        <p
+          role="alert"
+          className={`shrink-0 px-3 py-2 text-[11px] ${themeMode === "light" ? "text-[#be123c]" : "text-[#f48771]"}`}
+        >
+          {copy.clearPlansFailed}
+        </p>
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
         {!currentWorkspace ? (

@@ -4,6 +4,7 @@ import { deriveRuntimeV2ExecutionContract, runtimeV2ExecutionContractMutationTar
 import { workspacePathsReferToSameFile } from "../workspacePaths";
 import { analyzeValidationCommand } from "../validationContract";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
+import { runtimeV2WorkspaceChangeReceipts } from "./validationReceipt";
 
 /** Uses only already-admitted, passing validators at the current mutation
  * boundary. Declared checks are obligations, not optional report decoration. */
@@ -14,7 +15,7 @@ export function deriveRuntimeV2ExecutionContractCoverage(
   const contract = deriveRuntimeV2ExecutionContract(state);
   if (!contract) return { complete: true, pendingTargets: [], missingValidationIndexes: [] };
   const commands = scheduledCommandsByKey(state);
-  const mutations = state.events.flatMap((event) => event.type === "tool.completed" && event.status === "succeeded" && event.sequence > contract.recordedAtSequence
+  const mutations = runtimeV2WorkspaceChangeReceipts(state).flatMap((event) => event.type === "tool.completed" && event.sequence > contract.recordedAtSequence
     ? event.evidence.filter((item) => item.kind === "mutation") : []);
   const pendingTargets = runtimeV2ExecutionContractMutationTargets(contract).filter((target) =>
     !mutations.some((item) => workspacePathsReferToSameFile(item.target, target)));

@@ -1,39 +1,37 @@
-import type { RuntimeV2ExecutionBlocker, TurnAggregateV1 } from "../../lib/runtime-v2";
+import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { appendRuntimeV2Checkpoint, normalizeRuntimeV2Checkpoint } from "../../lib/runtime-v2/checkpoint";
 import type { UserChoiceActionRequest, UserChoiceResolutionIdentity } from "../../lib/actionRequest";
 import { isExactUserChoiceResolutionIdentity } from "../../lib/actionRequest";
-
-export function deriveRuntimeV2ExecutionBlocker(aggregate: TurnAggregateV1, requestId: string, language: "zh" | "en"): RuntimeV2ExecutionBlocker | null {
-  if (aggregate.scheduledCommands.length || aggregate.pendingToolCalls.length || aggregate.subagents.some(job => job.status === "running" || job.status === "queued")) return null;
-  const latest = [...aggregate.events].reverse().find(event => event.type === "provider.responded" || event.type === "run.resumed");
-  if (latest?.type !== "provider.responded") return null;
-  const receipt = latest.result.actionReceipts?.find(item => item.status === "rejected" && item.priorFeedbackObserved);
-  if (!receipt) return null;
-  const action = receipt.call.name;
-  const explanation = receipt.reasonCode === "tool_surface_rejected"
-    ? language === "zh" ? "该工具未在当前可用工具中提供。" : "This tool is not available in the current decision."
-    : receipt.reasonCode === "tool_arguments_rejected"
-      ? language === "zh" ? "工具参数未通过校验。" : "The tool arguments did not pass validation."
-      : language === "zh" ? "相同动作已被阻止或拒绝，未再次执行。" : "The same action was blocked or rejected and did not run again.";
-  return { requestId, reasonCode: "rejected_action_cycle", evidenceSequence: latest.sequence, actionIdentity: receipt.actionIdentity,
-    message: language === "zh" ? `模型在收到拒绝原因后再次提交了 ${action}，当前分支已暂停。${explanation}\n\n请处理所需条件后重新检查，或停止任务。重新检查不会扩大权限。`
-      : `The model repeated ${action} after receiving its rejection. This branch is paused. ${explanation}\n\nResolve the prerequisite and recheck, or stop. Rechecking grants no additional permissions.`, options: ["recheck", "stop"] };
-}
+import { renderUserChoiceAnswer, validateUserChoiceAnswer, type UserChoiceAnswer } from "../../lib/userQuestions";
 
 export function createRuntimeV2ExecutionBlockerView(aggregate: TurnAggregateV1, language: "zh" | "en", taskId: number) {
   const blocker = aggregate.run?.blocker;
   if (aggregate.run?.status !== "paused" || !blocker) return null;
-  const title = language === "zh" ? "执行需要你的选择" : "Execution needs your input";
+  const saveFailed = blocker.reasonCode === "document_save_failed";
+  const editorPending = blocker.reasonCode === "unity_editor_verification_pending";
+  const title = (editorPending ? (language === "zh" ? "等待 Editor 验证" : "Editor verification pending") : saveFailed ? (language === "zh" ? "计划文档保存失败" : "Plan document save failed") : blocker.questionnaire?.title) || (language === "zh" ? "执行需要你的选择" : "Execution needs your input");
   const labels = language === "zh" ? { recheck: "我已处理，重新检查", continue: "继续其他可行工作", stop: "停止任务" } : { recheck: "Recheck after my changes", continue: "Continue independent work", stop: "Stop task" };
-  const options = blocker.clarification ? [...(blocker.clarification.choices || []).map(value => ({ label: value, value })), { label: labels.stop, value: "stop" }]
+  if (saveFailed) labels.recheck = language === "zh" ? "重新保存文档" : "Retry document save";
+  if (editorPending) {
+    labels.recheck = language === "zh" ? "重新检查 Editor" : "Recheck Editor";
+    labels.continue = language === "zh" ? "保留修改并结束" : "Finish and retain changes";
+  }
+  const options = blocker.questionnaire ? [] : blocker.clarification ? [...(blocker.clarification.choices || []).map(value => ({ label: value, value })), { label: labels.stop, value: "stop" }]
     : blocker.options.map(value => ({ label: labels[value], value }));
   const request: UserChoiceActionRequest = { schemaVersion: 1, kind: "user_choice", requestId: blocker.requestId,
     sessionKey: aggregate.turn.sessionKey, turnId: aggregate.turn.turnId, runId: aggregate.run.identity.runId,
     parentRunId: aggregate.run.identity.parentRunId, title, status: "pending", createdAt: aggregate.updatedAt,
-    optionValues: options.map(option => option.value), allowCustomReply: !!blocker.clarification, executionBlocker: { sessionEpoch: aggregate.turn.sessionEpoch } };
+    optionValues: options.map(option => option.value), allowCustomReply: !!blocker.clarification,
+    ...(blocker.questionnaire ? { questionnaire: blocker.questionnaire } : {}), executionBlocker: { sessionEpoch: aggregate.turn.sessionEpoch } };
   const block = { id: taskId, type: "agent" as const, visibility: "assistant_update" as const, turnId: request.turnId,
     content: `${title}\n\n${blocker.message}`, options, choiceRequest: request };
   return { request, block };
+}
+
+export function resolveRuntimeV2StructuredUserChoice(input: Omit<Parameters<typeof resolveRuntimeV2ExecutionBlocker>[0], "choice" | "answer"> & {
+  answer: UserChoiceAnswer;
+}): Promise<boolean> {
+  return resolveRuntimeV2ExecutionBlocker({ ...input, choice: "recheck" });
 }
 
 export function projectRuntimeV2ExecutionBlocker(input: { aggregate: TurnAggregateV1; get: () => any; set: (value: any) => void; language: "zh" | "en" }): void {
@@ -53,7 +51,7 @@ export function projectRuntimeV2ExecutionBlocker(input: { aggregate: TurnAggrega
 const pendingDecisions = new WeakMap<() => any, Set<string>>();
 export async function resolveRuntimeV2ExecutionBlocker(input: {
   get: () => any; set: (value: any) => void;
-  identity: UserChoiceResolutionIdentity; choice: string; sessionEpoch: string;
+  identity: UserChoiceResolutionIdentity; choice: string; source?: "editor_reconnected"; sessionEpoch: string; answer?: UserChoiceAnswer;
   persist: (state: any, isCurrent: () => boolean) => Promise<unknown>;
   dispatch: (turn: any, requestId: string) => void; stop: (turnId: string) => void;
 }): Promise<boolean> {
@@ -63,7 +61,11 @@ export async function resolveRuntimeV2ExecutionBlocker(input: {
   const checkpoint = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints?.[request.turnId]);
   const aggregate = checkpoint?.aggregate;
   const blocker = aggregate?.run?.blocker;
-  const reply = blocker?.clarification && input.choice !== "stop" ? input.choice.trim() : undefined;
+  const validated = blocker?.questionnaire && input.choice !== "stop" ? validateUserChoiceAnswer(blocker.questionnaire, input.answer, blocker.requestId) : null;
+  if (validated && !validated.ok) return false;
+  const answer = validated?.ok ? validated.answer : undefined;
+  const reply = blocker?.questionnaire && answer ? renderUserChoiceAnswer(blocker.questionnaire, answer)
+    : blocker?.clarification && input.choice !== "stop" ? input.choice.trim() : undefined;
   const choice = reply ? "recheck" : input.choice;
   if (!checkpoint || !aggregate || !blocker || aggregate.turn.sessionEpoch !== input.sessionEpoch || request.executionBlocker.sessionEpoch !== input.sessionEpoch || aggregate.run?.status !== "paused" || aggregate.run.identity.runId !== request.runId || blocker.requestId !== request.requestId || !blocker.options.includes(choice as any) || (blocker.clarification && choice !== "stop" && !reply)) return false;
   if (blocker.decision && (blocker.decision !== choice || blocker.decisionReply !== reply)) return false;
@@ -82,7 +84,7 @@ export async function resolveRuntimeV2ExecutionBlocker(input: {
     owner: aggregate.turn, expectedRevision: checkpoint.revision,
     event: { schemaVersion: "runtime-v2-event.v1", type: "run.decision_recorded", eventId: `decision:${blocker.requestId}`,
       at: Math.max(Date.now(), aggregate.updatedAt), sequence: aggregate.nextSequence, run: aggregate.run.identity,
-      requestId: blocker.requestId, choice: choice as "recheck" | "continue" | "stop", ...(reply ? { reply } : {}) } });
+      requestId: blocker.requestId, choice: choice as "recheck" | "continue" | "stop", ...(input.source ? { source: input.source } : {}), ...(reply ? { reply } : {}), ...(answer ? { answer } : {}) } });
   if (appended.disposition !== "committed" || !appended.checkpoint || !current()) return false;
   const projected = { ...state, runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint } };
   const persisted: any = await input.persist(projected, current);

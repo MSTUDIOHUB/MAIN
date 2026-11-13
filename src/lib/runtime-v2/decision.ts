@@ -1,6 +1,10 @@
+import { runtimeV2PendingGuidance } from "./guidance";
 import type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import type { TurnAggregateV1 } from "./aggregate";
+import type { RuntimeV2ProactiveSkipReason } from "./collaborationDecision";
+import { deriveUnityCompilation, deriveUnityShaderImport, nextUnityEditorCheck, unresolvedUnityEditorCheck, UNITY_COMPILE_PROJECT_TOOL } from "./unityCompilation";
+import { analyzeValidationCommand } from "../validationContract";
 import { deriveReadOnlyRecoveryWindow } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
 import { runtimeV2ProviderAnswerText } from "./providerAnswer";
@@ -17,6 +21,7 @@ import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 import {
   resolveRuntimeV2SubagentReferences,
   runtimeV2SubagentModelHandle,
+  type RuntimeV2SubagentScopeCandidate,
 } from "./subagents";
 import {
   deriveRuntimeV2PlanExecutionCoverage,
@@ -28,6 +33,8 @@ import {
   runtimeV2DirectExecuteReadyForConclusion,
 } from "./phaseTransition";
 import {
+  deriveRuntimeV2ValidationBoundary,
+  latestRuntimeV2WorkspaceChange,
   resolveRuntimeV2DirectExecuteValidationAuthority,
 } from "./validationReceipt";
 
@@ -41,11 +48,7 @@ export interface RuntimeV2DecisionInput {
   /** User-visible, provider-authored conclusion after the adapter has already
    * checked the structured evidence gate. It is presentation data only. */
   readonly finalMarkdown?: string;
-  /**
-   * Admission-time collaboration policy. It controls only the model's tool
-   * surface; task identity, name, objective and scope must come from an actual
-   * spawn_subagent call.
-   */
+  /** Admission-time collaboration policy, independent of a hard requirement. */
   readonly subagentPreference?:
     | "unspecified"
     | "forbidden"
@@ -55,6 +58,10 @@ export interface RuntimeV2DecisionInput {
   readonly subagentCapacity?: number;
   /** Whether the admitted parent/child provider requests can really overlap. */
   readonly subagentRequestMode?: "parallel" | "serialized";
+  readonly proactiveCollaboration?: { readonly candidate: RuntimeV2SubagentScopeCandidate } | { readonly reason: RuntimeV2ProactiveSkipReason };
+  readonly settledProactiveJobIds?: readonly string[];
+  readonly checkUnityCompilation?: boolean;
+  readonly projectValidationRecovery?: { readonly command: string; readonly manifestVersion: string };
 }
 
 function commaSeparatedValues(value: unknown): string[] {
@@ -108,11 +115,11 @@ export function runtimeV2CollaborationPayload(
     0,
     Math.floor(Number(input.subagentCapacity) || 0),
   );
-  // Adaptive lane probing may discover more concurrency during a Run. Grow the
-  // durable child budget only to the currently observed bounded lane capacity;
-  // the provider-neutral ceiling still prevents an unbounded spawn loop.
+  // Keep the legacy capacity observation for persisted-command compatibility.
+  // It is not an admitted total task budget: queued jobs acquire the existing
+  // model lane before any provider request can start.
   const maxChildRuns = admittedMaxChildRuns(state, currentCapacity);
-  const maxActiveSubagents = Math.min(currentCapacity, maxChildRuns);
+  const maxActiveSubagents = currentCapacity;
   const runSubagents = currentRunSubagents(state);
   const activeSubagents = runSubagents
     .filter((job) => job.status === "queued" || job.status === "running")
@@ -144,17 +151,16 @@ export function runtimeV2CollaborationPayload(
       activeSubagents.length > 0
         ? "children_active"
         : "optional",
+    ...((input.proactiveCollaboration && "reason" in input.proactiveCollaboration)
+      ? { proactiveSkipReason: input.proactiveCollaboration.reason }
+      : {}),
     activeSubagents,
     failedSubagents,
     maxActiveSubagents,
     maxChildRuns,
-    remainingSubagentCapacity: Math.max(
-      0,
-      Math.min(
-        maxActiveSubagents - activeSubagents.length,
-        maxChildRuns - runSubagents.length,
-      ),
-    ),
+    // Explicitly requested jobs can queue. Proactive dispatch checks free
+    // slots separately, and the lane admits only as many streams as it can run.
+    remainingSubagentCapacity: maxActiveSubagents,
   };
 }
 
@@ -208,7 +214,9 @@ function makeCommand(
   if (!state.run || state.phase === "completed") {
     throw new Error("Cannot decide a command without an active Runtime v2 run.");
   }
-  const fingerprint = actionFingerprint(state, kind, payload);
+  const guidance = kind === "request_model" ? runtimeV2PendingGuidance(state) : undefined;
+  const commandPayload = guidance ? { ...payload, guidanceId: guidance.eventId } : payload;
+  const fingerprint = actionFingerprint(state, kind, commandPayload);
   const attempt = actionAttemptCount(state, fingerprint) + 1;
   return {
     idempotencyKey: deterministicCommandKey(state, kind, fingerprint, attempt),
@@ -216,7 +224,7 @@ function makeCommand(
     run: state.run.identity,
     phase: state.phase,
     payload: {
-      ...payload,
+      ...commandPayload,
       actionFingerprint: fingerprint,
       attempt,
     },
@@ -459,31 +467,16 @@ export function deriveRuntimeV2EffectPressure(
   readonly sourceBoundarySequence: number;
   readonly latestSourceEvidenceId: string;
 } | null {
-  let mutationBoundarySequence = 0;
+  const mutationBoundarySequence = latestRuntimeV2WorkspaceChange(state)?.sequence ?? 0;
   let sourceBoundarySequence = 0;
   let latestSourceEvidenceId = "";
 
   for (const event of state.events) {
     if (
-      event.type === "subagent.completed" &&
-      event.status === "completed" &&
-      event.evidence.some((evidence) => evidence.kind === "mutation")
-    ) {
-      mutationBoundarySequence = event.sequence;
-      sourceBoundarySequence = 0;
-      latestSourceEvidenceId = "";
-      continue;
-    }
-    if (
+      event.sequence <= mutationBoundarySequence ||
       event.type !== "tool.completed" ||
       event.status !== "succeeded"
     ) {
-      continue;
-    }
-    if (event.evidence.some((evidence) => evidence.kind === "mutation")) {
-      mutationBoundarySequence = event.sequence;
-      sourceBoundarySequence = 0;
-      latestSourceEvidenceId = "";
       continue;
     }
     if (event.receiptOrigin === "replayed") continue;
@@ -511,10 +504,14 @@ function executeModelRequest(
   state: TurnAggregateV1,
   input: RuntimeV2DecisionInput,
 ): RuntimeV2Command {
-  const ready = executeReadyForConclusion(state);
+  const compilation = unresolvedUnityEditorCheck(state);
+  // A missing Editor verdict stays pending in the terminal result.
+  // Only an observed failure keeps this request in correction mode.
+  const ready = compilation?.result.status !== "failed" &&
+    !runtimeV2PendingGuidance(state) && executeReadyForConclusion(state);
   const mode = ready
     ? "conclude"
-    : state.phase === "validating"
+    : state.phase === "validating" && compilation?.result.status !== "failed"
       ? "validate"
       : "execute";
   const effectPressure = mode === "execute"
@@ -537,6 +534,31 @@ function executeModelRequest(
   });
 }
 
+function projectValidationRecoveryCommand(state: TurnAggregateV1, option: RuntimeV2DecisionInput["projectValidationRecovery"]): RuntimeV2Command | undefined {
+  if (!option || state.strategy !== "execute" || state.workPlan || state.sealedWorkPlan ||
+      deriveRuntimeV2ExecutionContract(state) || runtimeV2PendingGuidance(state) ||
+      state.objective.acceptanceEvidenceRequirements?.includes("interaction") ||
+      state.objective.capabilityRestrictions?.includes("workspace_read") || state.objective.approvalRequiredCapabilities?.includes("workspace_read") ||
+      unresolvedUnityEditorCheck(state) || runtimeV2DirectExecuteReadyForConclusion(state) ||
+      deriveRuntimeV2ProviderRecoveryPressure(state)?.reason !== "non_actionable_response") return;
+  const spec = analyzeValidationCommand(option.command).spec;
+  if (spec?.kind !== "finite_command" || spec.capability !== "test" || !/^sha256-[a-f0-9]{64}$/.test(option.manifestVersion)) return;
+  const { mutationBoundarySequence } = deriveRuntimeV2ValidationBoundary(state, []);
+  const checkedLatestMutation = [deriveUnityCompilation(state), deriveUnityShaderImport(state)].some(check =>
+    check?.sequence === mutationBoundarySequence && check.receipt?.result.status === "passed");
+  if (!checkedLatestMutation || state.events.some(event => event.sequence > mutationBoundarySequence &&
+    "run" in event && event.run.runId === state.run?.identity.runId &&
+    (event.type === "validation.completed" && isRuntimeV2ValidationAttempt(event) ||
+      event.type === "command.scheduled" && event.command.payload.projectValidationManifestVersion))) return;
+  const validationAuthority = resolveRuntimeV2DirectExecuteValidationAuthority({ aggregate: state,
+    turnId: state.turn.turnId, objective: state.objective, validationId: `project-test:${mutationBoundarySequence}` });
+  if (!validationAuthority) return;
+  return boundedCommand(state, "execute_validation", {
+    toolName: "run_command", arguments: { command: spec.command, description: "Run the project's declared test suite" },
+    validationAuthority, projectValidationManifestVersion: option.manifestVersion,
+  });
+}
+
 /**
  * Pure next-command policy. It never chooses an outcome from model prose and
  * it never hides an Execute tool because the current phase looks inconvenient.
@@ -551,6 +573,17 @@ export function decideNextCommands(
   if (!state.run || state.run.status === "completed" || state.terminalOutcome) return [];
   if (state.scheduledCommands.length > 0) return [];
   if (input.resultKind && input.resultReason) {
+    if ((input.resultKind === "success" || input.resultKind === "partial") &&
+      runtimeV2PendingGuidance(state) && !state.recovery.exhausted && !state.pendingToolCalls.length &&
+      state.phase !== "finalizing" && state.phase !== "reviewing") {
+      if (state.strategy === "execute" || state.workPlan?.status === "approved") return [executeModelRequest(state, input)];
+      if (state.strategy === "chat" || state.strategy === "analyze") {
+        return [boundedCommand(state, "request_model", {
+          mode: state.strategy, toolExpectation: "optional",
+          objective: state.objective.text, evidenceIds: state.evidence.map(item => item.id),
+        })];
+      }
+    }
     const activeJobIds = currentRunSubagents(state)
       .filter((job) => job.status === "queued" || job.status === "running")
       .map((job) => job.id);
@@ -586,6 +619,20 @@ export function decideNextCommands(
         : exhaustedRuntimeV2ResultKind(state),
       resultReason: state.recovery.exhausted.reason,
     })];
+  }
+  if (input.checkUnityCompilation) {
+    const compilation = nextUnityEditorCheck(state);
+    if (compilation) {
+      return [boundedCommand(state, "execute_tool", {
+        toolName: UNITY_COMPILE_PROJECT_TOOL,
+        runtimeOwnedUnityCompile: true,
+        editorCheckKind: compilation.kind,
+        ...(compilation.importTargets ? { shaderImportTargets: compilation.importTargets } : {}),
+        mutationSequence: compilation.sequence,
+        target: compilation.targets.join(", "),
+      })];
+    }
+    return [];
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
@@ -686,6 +733,24 @@ export function decideNextCommands(
     return [command];
   }
 
+  const settledProactive = currentRunSubagents(state).filter(job => job.proactiveKey &&
+    (job.status === "queued" || job.status === "running") && input.settledProactiveJobIds?.includes(job.id));
+  if (settledProactive.length) return [boundedCommand(state, "join_subagents", { jobIds: settledProactive.map(job => job.id) })];
+  if (input.subagentPreference === "preferred" && state.subagentRequirement !== "required" &&
+      input.subagentRequestMode === "parallel" && input.subagentCapacity &&
+      input.proactiveCollaboration && "candidate" in input.proactiveCollaboration) {
+    const candidate = input.proactiveCollaboration.candidate;
+    if (candidate.proactiveKey && candidate.accessMode === "read" && candidate.taskKind !== "implement") {
+      return [boundedCommand(state, "schedule_subagents", {
+        proactiveKey: candidate.proactiveKey,
+        arguments: { task_key: candidate.scopeKey, name: candidate.name, task_kind: candidate.taskKind, access_mode: "read",
+          objective: candidate.objective, success_criteria: candidate.successCriteria, allowed_paths: candidate.allowedPaths.join("\n") },
+        maxActiveSubagents: input.subagentCapacity,
+        collaborationRequestMode: input.subagentRequestMode,
+      })];
+    }
+  }
+
   switch (state.phase) {
     case "preparing":
       return [boundedCommand(state, "collect_observation", {
@@ -715,8 +780,9 @@ export function decideNextCommands(
       })];
     case "reviewing":
       return [];
-    case "acting":
     case "validating":
+      return [projectValidationRecoveryCommand(state, input.projectValidationRecovery) || executeModelRequest(state, input)];
+    case "acting":
       return [executeModelRequest(state, input)];
     case "finalizing":
       if (!input.resultKind || !input.resultReason) return [];

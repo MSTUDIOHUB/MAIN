@@ -1,3 +1,4 @@
+import { canonicalJson as stableJson, canonicalJsonWithEncodedObjects } from "../canonicalJson";
 import { sha256Hex } from "../sha256";
 import {
   RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
@@ -103,6 +104,49 @@ export interface RuntimeV2PersistedCheckpointV5 {
 export type RuntimeV2PersistedCheckpointMap =
   Record<string, RuntimeV2PersistedCheckpointV5>;
 
+export interface RuntimeV2CheckpointRejection {
+  readonly code: "invalid_value" | "unsupported_schema" | "unsupported_engine" |
+    "invalid_revision" | "invalid_updated_at" | "invalid_owner" | "owner_mismatch" |
+    "serialization_failed" | "size_budget_exceeded" | "legacy_replay_failed" |
+    "events_missing" | "event_budget_exceeded" | "event_replay_rejected" |
+    "replay_owner_mismatch" | "aggregate_digest_mismatch" | "aggregate_cache_mismatch" |
+    "scheduled_cache_mismatch" | "updated_at_stale";
+  readonly turnId?: string;
+  readonly sessionKey?: string;
+  readonly sessionEpoch?: string;
+  readonly revision?: number;
+  readonly eventCount?: number;
+  readonly serializedChars?: number;
+}
+
+export interface RuntimeV2CheckpointNormalizationOptions {
+  readonly onRejected?: (diagnostic: RuntimeV2CheckpointRejection) => void;
+  /** Read/restore may quarantine a damaged entry. A save must not acknowledge
+   * a snapshot after silently removing its own canonical event ledger. */
+  readonly rejectInvalid?: boolean;
+}
+
+function boundedIdentity(value: unknown): string | undefined {
+  return typeof value === "string" ? value.replace(/[\u0000\r\n]/g, "").slice(0, 180) : undefined;
+}
+
+function checkpointRejection(
+  value: unknown,
+  code: RuntimeV2CheckpointRejection["code"],
+  serializedChars?: number,
+): RuntimeV2CheckpointRejection {
+  const record = isPlainRecord(value) ? value : {};
+  const owner = isPlainRecord(record.owner) ? record.owner : {};
+  return { code,
+    ...(boundedIdentity(owner.turnId) ? { turnId: boundedIdentity(owner.turnId) } : {}),
+    ...(boundedIdentity(owner.sessionKey) ? { sessionKey: boundedIdentity(owner.sessionKey) } : {}),
+    ...(boundedIdentity(owner.sessionEpoch) ? { sessionEpoch: boundedIdentity(owner.sessionEpoch) } : {}),
+    ...(Number.isSafeInteger(record.revision) ? { revision: Number(record.revision) } : {}),
+    ...(Array.isArray(record.events) ? { eventCount: record.events.length } : {}),
+    ...(serializedChars !== undefined ? { serializedChars } : {}),
+  };
+}
+
 export interface CreateRuntimeV2CheckpointInput {
   readonly revision: number;
   readonly aggregate: TurnAggregateV1;
@@ -119,18 +163,10 @@ export interface CreateRuntimeV2CheckpointInput {
  * the incremental CAS path without replaying the whole ledger on every event.
  */
 const trustedRuntimeV2Checkpoints = new WeakSet<object>();
+const serializedRuntimeV2Checkpoints = new WeakMap<object, RuntimeV2CheckpointV3>();
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (!value || typeof value !== "object") return JSON.stringify(value);
-  return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
-    .join(",")}}`;
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -144,6 +180,8 @@ function sameOwner(left: RuntimeV2TurnIdentity, right: RuntimeV2TurnIdentity): b
     left.clientSubmissionId === right.clientSubmissionId &&
     left.turnId === right.turnId;
 }
+
+export { sameOwner as sameRuntimeV2CheckpointOwner };
 
 function isFinitePositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0;
@@ -167,25 +205,6 @@ function checkpointOwner(
   return owner;
 }
 
-function hasValidCheckpointHeader(
-  value: Record<string, unknown>,
-  expectedOwner?: Partial<RuntimeV2TurnIdentity>,
-): value is Record<string, unknown> & {
-  revision: number;
-  updatedAt: number;
-  owner: RuntimeV2TurnIdentity;
-} {
-  return (
-      value.schemaVersion === RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION ||
-      value.schemaVersion === RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION ||
-      value.schemaVersion === RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION
-    ) &&
-    value.engineVersion === RUNTIME_V2_ENGINE_VERSION &&
-    isFinitePositiveInteger(value.revision) &&
-    isFiniteTimestamp(value.updatedAt) &&
-    !!checkpointOwner(value, expectedOwner);
-}
-
 /** The digest covers the full replayed state, including scheduled effects. */
 export function runtimeV2AggregateDigest(aggregate: TurnAggregateV1): string {
   return `runtime-v2-aggregate-sha256-${sha256Hex(stableJson(aggregate))}`;
@@ -206,6 +225,11 @@ export function replayRuntimeV2Events(events: readonly RuntimeV2Event[]): TurnAg
 export function createRuntimeV2Checkpoint(
   input: CreateRuntimeV2CheckpointInput,
 ): RuntimeV2CheckpointV3 {
+  assertCheckpointInput(input);
+  return checkpointWithDigest(input, runtimeV2AggregateDigest(input.aggregate));
+}
+
+function assertCheckpointInput(input: CreateRuntimeV2CheckpointInput): void {
   const revision = Math.floor(Number(input.revision));
   const updatedAt = Number(input.updatedAt);
   if (!isFinitePositiveInteger(revision) || !isFiniteTimestamp(updatedAt)) {
@@ -216,20 +240,22 @@ export function createRuntimeV2Checkpoint(
       "checkpoint_event_budget_exceeded",
     );
   }
-  const digest = runtimeV2AggregateDigest(input.aggregate);
+}
+
+function checkpointWithDigest(input: CreateRuntimeV2CheckpointInput, digest: string): RuntimeV2CheckpointV3 {
   if (input.aggregateDigest && input.aggregateDigest !== digest) {
     throw new Error("Runtime v2 checkpoint aggregate digest mismatch.");
   }
   const checkpoint: RuntimeV2CheckpointV3 = {
     schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
     engineVersion: RUNTIME_V2_ENGINE_VERSION,
-    revision,
+    revision: Math.floor(Number(input.revision)),
     owner: input.aggregate.turn,
     aggregate: input.aggregate,
     events: input.aggregate.events,
     scheduledCommands: input.aggregate.scheduledCommands,
     aggregateDigest: digest,
-    updatedAt,
+    updatedAt: Number(input.updatedAt),
   };
   assertRuntimeV2CheckpointPersistable(checkpoint);
   trustedRuntimeV2Checkpoints.add(checkpoint);
@@ -476,16 +502,30 @@ function normalizeLegacyRuntimeV2Checkpoint(
 export function normalizeRuntimeV2Checkpoint(
   value: unknown,
   expectedOwner?: Partial<RuntimeV2TurnIdentity>,
+  onRejected?: (diagnostic: RuntimeV2CheckpointRejection) => void,
 ): RuntimeV2CheckpointV3 | null {
-  if (!isPlainRecord(value)) return null;
-  if (!hasValidCheckpointHeader(value, expectedOwner)) return null;
+  const reject = (code: RuntimeV2CheckpointRejection["code"], serializedChars?: number) => {
+    onRejected?.(checkpointRejection(value, code, serializedChars));
+    return null;
+  };
+  if (!isPlainRecord(value)) return reject("invalid_value");
+  if (![RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION, RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION,
+    RUNTIME_V2_LEGACY_CHECKPOINT_SCHEMA_VERSION].includes(value.schemaVersion as typeof RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION)) return reject("unsupported_schema");
+  if (value.engineVersion !== RUNTIME_V2_ENGINE_VERSION) return reject("unsupported_engine");
+  if (!isFinitePositiveInteger(value.revision)) return reject("invalid_revision");
+  if (!isFiniteTimestamp(value.updatedAt)) return reject("invalid_updated_at");
+  if (!checkpointOwner(value)) return reject("invalid_owner");
+  if (!checkpointOwner(value, expectedOwner)) return reject("owner_mismatch");
   if (trustedRuntimeV2Checkpoints.has(value)) {
     return value as unknown as RuntimeV2CheckpointV3;
   }
+  const cached = serializedRuntimeV2Checkpoints.get(value);
+  if (cached) return cached;
   try {
-    if (JSON.stringify(value).length > MAX_RUNTIME_V2_CHECKPOINT_CHARS) return null;
+    const serializedChars = JSON.stringify(value).length;
+    if (serializedChars > MAX_RUNTIME_V2_CHECKPOINT_CHARS) return reject("size_budget_exceeded", serializedChars);
   } catch {
-    return null;
+    return reject("serialization_failed");
   }
   const owner = value.owner as unknown as RuntimeV2TurnIdentity;
   if (
@@ -494,22 +534,26 @@ export function normalizeRuntimeV2Checkpoint(
     value.schemaVersion ===
       RUNTIME_V2_PREVIOUS_CHECKPOINT_SCHEMA_VERSION
   ) {
-    return normalizeLegacyRuntimeV2Checkpoint(value, owner);
+    return normalizeLegacyRuntimeV2Checkpoint(value as Record<string, unknown> & {
+      readonly revision: number; readonly updatedAt: number;
+    }, owner) || reject("legacy_replay_failed");
   }
-  if (!Array.isArray(value.events)) return null;
+  if (!Array.isArray(value.events) || value.events.length === 0) return reject("events_missing");
+  if (value.events.length > MAX_RUNTIME_V2_CHECKPOINT_EVENTS) return reject("event_budget_exceeded");
   const replayed = replayRuntimeV2Events(value.events as RuntimeV2Event[]);
-  if (!replayed || !sameOwner(replayed.turn, owner)) return null;
+  if (!replayed) return reject("event_replay_rejected");
+  if (!sameOwner(replayed.turn, owner)) return reject("replay_owner_mismatch");
   const digest = runtimeV2AggregateDigest(replayed);
-  if (value.aggregateDigest !== digest) return null;
+  if (value.aggregateDigest !== digest) return reject("aggregate_digest_mismatch");
   if (
     value.aggregate !== undefined &&
     !sameJson(value.aggregate, replayed)
-  ) return null;
+  ) return reject("aggregate_cache_mismatch");
   if (
     value.scheduledCommands !== undefined &&
     !sameJson(value.scheduledCommands, replayed.scheduledCommands)
-  ) return null;
-  if (value.updatedAt < replayed.updatedAt) return null;
+  ) return reject("scheduled_cache_mismatch");
+  if (value.updatedAt < replayed.updatedAt) return reject("updated_at_stale");
   const normalized: RuntimeV2CheckpointV3 = {
     schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
     engineVersion: RUNTIME_V2_ENGINE_VERSION,
@@ -528,14 +572,32 @@ export function normalizeRuntimeV2Checkpoint(
 export function normalizeRuntimeV2CheckpointMap(
   value: unknown,
   expectedOwner?: Partial<RuntimeV2TurnIdentity>,
+  options: RuntimeV2CheckpointNormalizationOptions = {},
 ): RuntimeV2CheckpointMap {
   if (!isPlainRecord(value)) return {};
-  return Object.fromEntries(Object.entries(value)
-    .map(([turnId, checkpoint]) => [turnId, normalizeRuntimeV2Checkpoint(checkpoint, {
-      ...expectedOwner,
-      turnId,
-    })] as const)
-    .filter((entry): entry is [string, RuntimeV2CheckpointV3] => !!entry[1]));
+  const rejected: RuntimeV2CheckpointRejection[] = [];
+  const result: RuntimeV2CheckpointMap = {};
+  let invalidOwnLedger = false;
+  for (const [turnId, checkpoint] of Object.entries(value)) {
+    const normalized = normalizeRuntimeV2Checkpoint(checkpoint, { ...expectedOwner, turnId }, diagnostic => {
+      rejected.push(diagnostic);
+      options.onRejected?.(diagnostic);
+      const owner = isPlainRecord(checkpoint) ? checkpointOwner(checkpoint) : null;
+      const unrelatedOwner = owner && expectedOwner &&
+        (["workspaceKey", "sessionKey", "sessionEpoch"] as const).some(field =>
+          expectedOwner[field] !== undefined && owner[field] !== expectedOwner[field]);
+      if (!unrelatedOwner) invalidOwnLedger = true;
+    });
+    if (normalized) result[turnId] = normalized;
+  }
+  if (rejected.length && !options.onRejected) {
+    // Emit only identities and machine reasons, never event/source bodies.
+    console.warn("[runtime_v2_checkpoint_filtered]", JSON.stringify({ rejectedCount: rejected.length, diagnostics: rejected.slice(0, 8) }));
+  }
+  if (options.rejectInvalid && invalidOwnLedger) {
+    throw new RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed");
+  }
+  return result;
 }
 
 /**
@@ -546,9 +608,10 @@ export function normalizeRuntimeV2CheckpointMap(
 export function serializeRuntimeV2CheckpointMap(
   value: unknown,
   expectedOwner?: Partial<RuntimeV2TurnIdentity>,
+  options: RuntimeV2CheckpointNormalizationOptions = {},
 ): RuntimeV2PersistedCheckpointMap {
-  const normalized = normalizeRuntimeV2CheckpointMap(value, expectedOwner);
-  return Object.fromEntries(
+  const normalized = normalizeRuntimeV2CheckpointMap(value, expectedOwner, { ...options, rejectInvalid: true });
+  const persisted = Object.fromEntries(
     Object.entries(normalized).map(([turnId, checkpoint]) => [
       turnId,
       {
@@ -568,6 +631,16 @@ export function serializeRuntimeV2CheckpointMap(
       } satisfies RuntimeV2PersistedCheckpointV5,
     ]),
   );
+  for (const [turnId, checkpoint] of Object.entries(normalized)) {
+    const saved = persisted[turnId];
+    assertRuntimeV2CheckpointPersistable(checkpoint);
+    if (!saved || saved.events !== checkpoint.events || saved.events.length !== checkpoint.events.length ||
+      saved.aggregateDigest !== checkpoint.aggregateDigest || !sameOwner(saved.owner, checkpoint.owner)) {
+      throw new RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed");
+    }
+    serializedRuntimeV2Checkpoints.set(saved, checkpoint);
+  }
+  return persisted;
 }
 
 export type AppendRuntimeV2CheckpointResult =
@@ -575,13 +648,14 @@ export type AppendRuntimeV2CheckpointResult =
   | { readonly disposition: "idempotent"; readonly checkpoint: RuntimeV2CheckpointV3 }
   | { readonly disposition: "conflict"; readonly checkpoint: null };
 
-/** Pure CAS append used by the Store port and deterministic tests. */
-export function appendRuntimeV2Checkpoint(input: {
+type RuntimeV2CheckpointAppendInput = {
   readonly checkpoint: RuntimeV2CheckpointV3 | null;
   readonly owner: RuntimeV2TurnIdentity;
   readonly expectedRevision: number;
   readonly event: RuntimeV2Event;
-}): AppendRuntimeV2CheckpointResult {
+};
+
+function prepareCheckpointAppend(input: RuntimeV2CheckpointAppendInput): AppendRuntimeV2CheckpointResult | CreateRuntimeV2CheckpointInput {
   const current = input.checkpoint;
   if (current && !sameOwner(current.owner, input.owner)) {
     return { disposition: "conflict", checkpoint: null };
@@ -597,13 +671,39 @@ export function appendRuntimeV2Checkpoint(input: {
   const previous = current?.aggregate || null;
   const transition = tryTransition(previous, input.event);
   if (transition.disposition === "rejected") return { disposition: "conflict", checkpoint: null };
-  return {
-    disposition: "committed",
-    checkpoint: createRuntimeV2Checkpoint({
-      revision: revision + 1,
-      aggregate: transition.state,
-      updatedAt: input.event.at,
-    }),
+  return { revision: revision + 1, aggregate: transition.state, updatedAt: input.event.at };
+}
+
+/** Pure CAS append for sync replay and callers outside the live Store port. */
+export function appendRuntimeV2Checkpoint(input: RuntimeV2CheckpointAppendInput): AppendRuntimeV2CheckpointResult {
+  const prepared = prepareCheckpointAppend(input);
+  return "disposition" in prepared ? prepared : {
+    disposition: "committed", checkpoint: createRuntimeV2Checkpoint(prepared),
+  };
+}
+
+/** The live port owns this cache for one Run. Canonical event objects are
+ * immutable after the reducer admits them. The digest and schema are identical
+ * to sync replay, while hashing the serialized ledger no longer blocks input. */
+export function createAsyncRuntimeV2CheckpointAppender() {
+  const encodedEvents = new WeakMap<object, string>();
+  return async (input: RuntimeV2CheckpointAppendInput): Promise<AppendRuntimeV2CheckpointResult> => {
+    const prepared = prepareCheckpointAppend(input);
+    if ("disposition" in prepared) return prepared;
+    assertCheckpointInput(prepared);
+    for (const event of prepared.aggregate.events) {
+      if (!encodedEvents.has(event)) encodedEvents.set(event, stableJson(event));
+    }
+    const body = canonicalJsonWithEncodedObjects(prepared.aggregate, encodedEvents);
+    const subtle = globalThis.crypto?.subtle;
+    let hex: string;
+    if (subtle) {
+      const hash = await subtle.digest("SHA-256", new TextEncoder().encode(body));
+      hex = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+    } else {
+      hex = sha256Hex(body);
+    }
+    return { disposition: "committed", checkpoint: checkpointWithDigest(prepared, `runtime-v2-aggregate-sha256-${hex}`) };
   };
 }
 

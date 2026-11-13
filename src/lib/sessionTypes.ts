@@ -1,9 +1,5 @@
 import type { AttachedFile } from "./attachments";
 import type { ResolvedRunIntent } from "./runIntent";
-import type {
-  GoalContinuationAuthorization,
-  GoalCreationAuthorization,
-} from "./submit/turnSubmission";
 import type { CanonicalRunIdentity } from "./turnRuntimeContract";
 
 export const GLOBAL_CHAT_KEY = "__MAIN_GLOBAL_CHAT__";
@@ -49,16 +45,13 @@ export interface QueuedUserMessage {
   images?: string[];
   contextMentions?: string[];
   attachedFiles?: AttachedFile[];
+  knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
   /** Preserve the resolved workflow contract across the busy-run queue. */
   runtimeIntentOverride?: ResolvedRunIntent;
-  /** Immutable Goal source captured before Plan state can change or reset. */
-  goalSourceContextSnapshot?: string;
-  /** Explicit Goal authority bound to this queued message id. */
-  goalCreationAuthorization?: GoalCreationAuthorization;
-  /** Exact existing-Goal continuation contract bound to this queue id. */
-  goalContinuationAuthorization?: GoalContinuationAuthorization;
+
+
   /** User guidance captured with the authorized continuation; never rebuilt from queue text. */
-  goalContinuationGuidance?: string;
+
   createdAt: number;
   status: "queued";
 }

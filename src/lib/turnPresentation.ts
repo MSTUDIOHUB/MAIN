@@ -10,7 +10,6 @@ import type { ActionRequestKind, ActionRequestStatus } from "./actionRequest";
 export type TurnPresentationKind =
   | "ordinary"
   | "plan"
-  | "goal"
   | "awaiting"
   | "paused"
   | "partial"
@@ -64,7 +63,6 @@ export interface TurnPresentationModel extends TurnPresentationIdentity {
   resultKind?: "success" | "partial" | "blocked" | "error" | "canceled";
   intent: string;
   isPlan: boolean;
-  isGoal: boolean;
   isAwaiting: boolean;
   showStateAnchor: boolean;
   processCollapsed: boolean;
@@ -295,57 +293,6 @@ export function resolvePlanPresentationBehavior(input: {
     showChoiceCheckpoint: mode === "choice",
     showContinuePlanning: mode === "resumable" && input.canContinuePlanning === true,
     showResumeExecution: mode === "resumable" && input.canResumeExecution === true,
-  };
-}
-
-export type GoalPresentationTone = "active" | "paused" | "completed" | "failed";
-export type GoalPresentationPrimaryAction = "pause" | "resume" | null;
-
-export interface GoalPresentationBehavior {
-  tone: GoalPresentationTone;
-  primaryAction: GoalPresentationPrimaryAction;
-  primaryActionPending: boolean;
-  canEdit: boolean;
-  canResume: boolean;
-}
-
-/** Goal controls consume the same lifecycle projection as chat and Plan UI. */
-export function resolveGoalPresentationBehavior(input: {
-  lifecycle: TurnPresentationLifecycle;
-  status?: string;
-  actionKind?: ActionRequestKind;
-}): GoalPresentationBehavior {
-  const status = String(input.status || "").trim().toLowerCase();
-  const primaryActionPending = status === "pausing";
-  const tone: GoalPresentationTone = input.lifecycle === "success" || input.lifecycle === "partial"
-    ? "completed"
-    : input.lifecycle === "failed" || input.lifecycle === "error"
-    ? "failed"
-    : input.lifecycle === "active"
-    ? "active"
-    : "paused";
-  const isNonGoalConfirmationAction = input.lifecycle === "action_required" &&
-    !!input.actionKind &&
-    input.actionKind !== "goal_confirmation";
-  const primaryAction: GoalPresentationPrimaryAction = input.lifecycle === "active" || primaryActionPending
-    ? "pause"
-    : isNonGoalConfirmationAction && status === "awaiting_input"
-    ? "pause"
-    : input.lifecycle === "resumable" || (input.lifecycle === "action_required" && !isNonGoalConfirmationAction)
-    ? "resume"
-    : null;
-  const canResume = primaryAction === "resume";
-
-  return {
-    tone,
-    primaryAction,
-    primaryActionPending,
-    canEdit: !primaryActionPending && (
-      input.lifecycle === "active" ||
-      input.lifecycle === "resumable" ||
-      (input.lifecycle === "action_required" && !isNonGoalConfirmationAction)
-    ),
-    canResume,
   };
 }
 
@@ -638,7 +585,7 @@ const GENERIC_TURN_TITLES = new Set([
 
 function compactTitle(value: unknown, maxLength: number): string {
   const normalized = String(value || "")
-    .replace(/^\s*[/／](?:plan|计划|goal|目标|execute|执行|chat|讨论)\b[:：]?\s*/i, "")
+    .replace(/^\s*[/／](?:plan|计划|execute|执行|chat|讨论)\b[:：]?\s*/i, "")
     .replace(/\s+/g, " ")
     .trim();
   if (normalized.length <= maxLength) return normalized;
@@ -668,7 +615,6 @@ function resolvePresentationKind(input: {
   if (input.status === "awaiting_input" || input.status === "awaiting_approval") return "awaiting";
   if (input.status === "paused") return "paused";
   if (input.status === "stopped_no_action" || input.status === "stopped_no_output") return "blocked";
-  if (input.intent === "goal") return "goal";
   if (input.intent === "plan") return "plan";
   return "ordinary";
 }
@@ -709,7 +655,6 @@ export function buildTurnPresentationModel(
   const kind = resolvePresentationKind({ intent, status, lifecycle, kindOverride: input.kindOverride });
   const isAwaiting = kind === "awaiting";
   const isPlan = intent === "plan";
-  const isGoal = intent === "goal";
 
   return {
     kind,
@@ -732,7 +677,6 @@ export function buildTurnPresentationModel(
       : {}),
     intent,
     isPlan,
-    isGoal,
     isAwaiting,
     showStateAnchor: input.showStateAnchorOverride ?? kind !== "ordinary",
     // `collapsed` remains a persisted compatibility fallback only. Both fields

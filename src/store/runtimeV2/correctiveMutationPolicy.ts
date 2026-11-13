@@ -388,6 +388,7 @@ export function validateRuntimeV2MutationLease(input: {
   readonly args: Record<string, unknown>;
   readonly target: string;
   readonly writeFileTarget?: WorkspaceWriteFileTargetFact;
+  readonly requireApprovedPlanSource?: boolean;
 }): {
   readonly allowed: boolean;
   readonly lease: RuntimeV2MutationLease | null;
@@ -404,7 +405,7 @@ export function validateRuntimeV2MutationLease(input: {
     input.toolCallId,
   );
   const aggregate = aggregateForCurrentTurn(input.ports);
-  if (aggregate?.strategy === "plan" && !input.writeFileTarget) return null;
+  if (aggregate?.strategy === "plan" && !input.writeFileTarget && !input.requireApprovedPlanSource) return null;
   const workspace = input.ports.context.runWorkspace || "";
   const requestedTargets = resolveWorkspaceMutationTargets(
     input.toolName,

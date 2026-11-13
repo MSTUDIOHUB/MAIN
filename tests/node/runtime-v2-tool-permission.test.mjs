@@ -462,6 +462,7 @@ test('explicit review also applies to source reads, writes and enabled network t
   for (const [capability, toolName, args] of [['workspace_read', 'read_file', { path: 'private.txt' }], ['workspace_write', 'write_file', { path: 'result.txt', content: 'value' }], ['network', 'web_search', { query: 'fixture' }]]) {
     const f = fixture({ consent: { turnId: 'turn', granted: true }, autoApproveTools: true, autoApproveToolScopes: ['workspace_write', 'external_read'], approvalRequiredCapabilities: [capability] });
     f.state.webSearchEnabled = true;
+    f.ports.context.networkRead = { enabled: true, provider: "bing" };
     Object.assign(f.request, { toolName, args, target: args.path || 'fixture', failureContextTarget: args.path || 'fixture' });
     const { pending, resolve } = await pendingReview(f);
     assert.equal(f.state.activeActionRequest.approvalRequiredCapability, capability);

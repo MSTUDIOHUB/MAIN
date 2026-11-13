@@ -1,9 +1,11 @@
 import { readOnlyEvidenceVersion, webEvidenceVersions } from "../../lib/runtime-v2/readOnlyProgress";
+import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   runtimeV2EvidenceVersion,
   type RuntimeV2Command,
   type RuntimeV2EvidenceReference,
   type RuntimeV2EventDraft,
+  type RuntimeV2ToolEffectKind,
   type RuntimeV2ToolPresentation,
   type RuntimeV2ExecutionValidationAuthority,
   deriveRuntimeV2ValidationBoundary,
@@ -15,6 +17,7 @@ import {
   type ValidationPrimitiveSpec,
 } from "../../lib/validationContract";
 import type { ToolDiffPreview } from "../../lib/toolDiff";
+import { boundedPresentationDiff } from "./toolOutcomePresentation";
 import { authorizationFor } from "./executionAuthorizationContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { appendRuntimeV2ToolResultHistory } from "./executionProviderHistory";
@@ -80,13 +83,17 @@ function toolResultEvent(
   failureKind?: RuntimeV2ToolFailureKind,
   presentation?: RuntimeV2ToolPresentation,
   failureReasonCode?: string,
-): RuntimeV2EventDraft {
+  effectKind?: RuntimeV2ToolEffectKind,
+  operationName?: string,
+): Extract<RuntimeV2EventDraft, { type: "tool.completed" }> {
   return {
     type: "tool.completed",
     run: command.run,
     idempotencyKey: command.idempotencyKey,
     status,
     evidence,
+    ...(effectKind ? { effectKind } : {}),
+    ...(operationName ? { operationName } : {}),
     ...(presentation ? { presentation } : {}),
     ...(status !== "succeeded" && failureKind ? { failureKind } : {}),
     ...(status !== "succeeded" && failureReasonCode ? { failureReasonCode } : {}),
@@ -105,6 +112,7 @@ function validationResultEvent(
   }>,
   failureKind?: RuntimeV2ValidationFailureKind,
   presentation?: RuntimeV2ToolPresentation,
+  failureReasonCode?: string,
 ): RuntimeV2EventDraft {
   const authority = command.payload.validationAuthority
     ? command.payload.validationAuthority as unknown as
@@ -124,6 +132,7 @@ function validationResultEvent(
     ...(validationBoundary || {}),
     ...(presentation ? { presentation } : {}),
     ...(!passed && failureKind ? { failureKind } : {}),
+    ...(!passed && failureReasonCode ? { failureReasonCode } : {}),
   };
 }
 
@@ -162,6 +171,11 @@ export function toolResultContentForModel(output: unknown): string {
       : typeof result.exitCodeAfter === "number"
         ? result.exitCodeAfter
         : null;
+  // MCP diagnostics carry a display summary and a separate data payload.
+  // The summary alone omits the actual evidence delivered to the model.
+  if (exitCode === null && result.stdout === undefined && result.stderr === undefined && result.data !== undefined) {
+    return typeof output === "string" ? output : JSON.stringify(result);
+  }
   // Failed builds often emit a very large stdout preamble before putting the
   // actionable path:line diagnostics in stderr. Failure detail must lead the
   // bounded context so truncation cannot hide the source recovery authority.
@@ -365,81 +379,6 @@ function boundedPresentationText(value: unknown, max: number): string {
     : `${text.slice(0, max - 38).trim()}\n[Tool output truncated by Runtime v2.]`;
 }
 
-function compactDiffText(
-  value: string,
-  start: number,
-  end: number,
-): string {
-  const prefixOmitted = start > 0;
-  const suffixOmitted = end < value.length;
-  return [
-    prefixOmitted ? "[... earlier unchanged content omitted ...]\n" : "",
-    value.slice(start, end),
-    suffixOmitted ? "\n[... later unchanged content omitted ...]" : "",
-  ].join("");
-}
-
-function boundedPresentationDiff(
-  preview: ToolDiffPreview | undefined,
-): RuntimeV2ToolPresentation["diff"] | undefined {
-  if (!preview) return undefined;
-  const oldText = String(preview.old || "");
-  const newText = String(preview.new || "");
-  const maxCombinedChars = 120_000;
-  if (oldText.length + newText.length <= maxCombinedChars) {
-    return {
-      old: oldText,
-      new: newText,
-      ...(preview.path ? { path: preview.path } : {}),
-      ...(typeof preview.existed === "boolean"
-        ? { existed: preview.existed }
-        : {}),
-      ...(typeof preview.fullFile === "boolean"
-        ? { fullFile: preview.fullFile }
-        : {}),
-    };
-  }
-  let commonPrefix = 0;
-  const maxPrefix = Math.min(oldText.length, newText.length);
-  while (
-    commonPrefix < maxPrefix &&
-    oldText.charCodeAt(commonPrefix) === newText.charCodeAt(commonPrefix)
-  ) {
-    commonPrefix += 1;
-  }
-  let commonSuffix = 0;
-  while (
-    commonSuffix < oldText.length - commonPrefix &&
-    commonSuffix < newText.length - commonPrefix &&
-    oldText.charCodeAt(oldText.length - 1 - commonSuffix) ===
-      newText.charCodeAt(newText.length - 1 - commonSuffix)
-  ) {
-    commonSuffix += 1;
-  }
-  const contextChars = 24_000;
-  const oldStart = Math.max(0, commonPrefix - contextChars);
-  const newStart = Math.max(0, commonPrefix - contextChars);
-  const oldEnd = Math.min(
-    oldText.length,
-    oldText.length - commonSuffix + contextChars,
-  );
-  const newEnd = Math.min(
-    newText.length,
-    newText.length - commonSuffix + contextChars,
-  );
-  return {
-    old: compactDiffText(oldText, oldStart, oldEnd),
-    new: compactDiffText(newText, newStart, newEnd),
-    ...(preview.path ? { path: preview.path } : {}),
-    ...(typeof preview.existed === "boolean"
-      ? { existed: preview.existed }
-      : {}),
-    ...(typeof preview.fullFile === "boolean"
-      ? { fullFile: preview.fullFile }
-      : {}),
-  };
-}
-
 function toolPresentation(input: {
   toolName: string;
   target: string;
@@ -478,32 +417,42 @@ export function toolCompletionFor(
     diffPreview,
   });
   if (command.kind !== "execute_validation") {
+    const toolFailureKind = failureKind === "assertion_failed" || failureKind === "not_executed"
+      ? "protocol_invalid"
+      : failureKind;
+    if (status !== "succeeded") {
+      const failure = toolResultEvent(command, status, [], toolFailureKind, presentation, failureReasonCode);
+      return toolName === "run_command" && failureReasonCode === "command_exit_nonzero"
+        ? { ...failure, diagnosticVersion: runtimeV2ValidationEvidenceVersion(output) }
+        : failure;
+    }
     const projection = runtimeV2ToolEvidenceProjection({
       ports: input,
       toolName,
       args,
       target,
+      result: parseResultRecord(output),
     });
     return toolResultEvent(
       command,
       status,
-      status === "succeeded" && webEvidenceVersions(toolName, output)?.length !== 0
-        ? projection.targets.map((resolvedTarget) => ({
+      !RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(toolName) || (webEvidenceVersions(toolName, output)?.length || 0) > 0
+        ? projection.targets.map(({ target: resolvedTarget, version }) => ({
             id: nextEvidenceId(input.live),
             kind: projection.kind,
             target: resolvedTarget,
-            version: projection.kind === "source"
+            version: version || (projection.kind === "source"
               ? sourceVersion || runtimeV2EvidenceVersion(output)
               : projection.kind === "tool"
                 ? readOnlyEvidenceVersion(toolName, output) || runtimeV2ValidationEvidenceVersion(output)
-                : null,
+                : null),
           }))
         : [],
-      failureKind === "assertion_failed" || failureKind === "not_executed"
-        ? "protocol_invalid"
-        : failureKind,
+      undefined,
       presentation,
       failureReasonCode,
+      projection.effectKind,
+      projection.operationName,
     );
   }
   const passed = status === "succeeded" &&
@@ -532,6 +481,7 @@ export function toolCompletionFor(
           ? "assertion_failed"
           : "execution_failed"),
     presentation,
+    failureReasonCode,
   );
 }
 

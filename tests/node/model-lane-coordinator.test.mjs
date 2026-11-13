@@ -344,6 +344,45 @@ test("critical admission pressure rejects the child while preserving the parent"
   parent.release();
 });
 
+test("optional streams wait below reserve while the parent progresses, then overlap at recovered capacity", { timeout: 8_000 }, async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const config = localConfig();
+  const gib = 1024 ** 3;
+  let availableGb = 8.1;
+  let childAdmitted = false;
+  const wait = new AbortController();
+  const logs = [];
+  lanes.setModelLaneMemoryReaderForTests(async () => ({ total_bytes: 68.7 * gib, available_bytes: availableGb * gib }));
+  const childPromise = lanes.acquireModelLane({ config, agentKind: "subagent", optionalOverlap: true, signal: wait.signal,
+    onDebugEvent: (event, data) => logs.push({ event, ...data }) }).then(lease => { childAdmitted = true; return lease; });
+  const parent = await lanes.acquireModelLane({ config, agentKind: "parent" });
+  let child;
+  let sibling;
+  try {
+    parent.markFirstToken();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(childAdmitted, false);
+    assert.ok(logs.some(item => item.queueReason === "memory_reserve"));
+    availableGb = 8.4;
+    await lanes.sampleModelLaneMemoryForTests(parent.laneKey);
+    assert.equal(lanes.getModelLaneCapacityObservation(config).maxActiveSubagents, 1);
+    availableGb = 30;
+    child = await childPromise;
+    child.markFirstToken();
+    sibling = await lanes.acquireModelLane({ config, agentKind: "subagent", optionalOverlap: true });
+    sibling.markFirstToken();
+    const observed = lanes.getModelLaneCapacityObservation(config);
+    assert.equal(observed.maxConfirmedOverlappingChildren, 2);
+    assert.equal(observed.maxActiveSubagents, 3);
+  } finally {
+    wait.abort();
+    await childPromise.catch(() => {});
+    sibling?.release();
+    child?.release();
+    parent.release();
+  }
+});
+
 for (const failureMessage of ["OOM", "429 rate limited", "concurrency limit reached"]) {
   test(`capacity failure '${failureMessage}' hands the newest child back before the parent`, async () => {
     lanes.resetModelLaneCoordinatorForTests();

@@ -136,7 +136,8 @@ export async function runSubmitRuntimeV2ReadOnly(
   }
 
   // A checkpoint's admission fact wins over both UI state and a newer Turn projection.
-  input = { ...input, context: { ...input.context, networkRead: normalizeNetworkRead(existing ? existing.aggregate.networkRead : turn.networkRead) } };
+  input = { ...input, context: { ...input.context, networkRead: normalizeNetworkRead(existing ? existing.aggregate.networkRead : turn.networkRead), knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext,
+    workspaceInstructionContext: existing ? existing.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext : input.context.workspaceInstructionContext } };
   const live = createRuntimeV2LiveExecutionState();
   if (existing) restoreReadOnlyHistory(live, existing.aggregate);
   const checkpoint = createRuntimeV2CheckpointPort({
@@ -205,7 +206,8 @@ export async function runSubmitRuntimeV2ReadOnly(
       strategy, collectWorkspace: !(existing?.aggregate.objective.capabilityRestrictions || input.context.capabilityRestrictions)?.includes("workspace_read") && !(existing ? existing.aggregate.objective.approvalRequiredCapabilities : input.context.approvalRequiredCapabilities)?.includes("workspace_read") && !!workspace && !isProjectBaselineForWorkspace(
         input.context.projectBaselineContext,
         workspace,
-      ), networkRead: input.context.networkRead,
+      ), networkRead: input.context.networkRead, knowledgeContext: input.context.knowledgeContext,
+      workspaceInstructionContext: input.context.workspaceInstructionContext,
       allowSkillLoad: !!buildLoadSkillToolDefinition(input.context.skillCatalog),
       signal: input.context.abortCtrl.signal, now, deadlineMs: input.deadlineMs,
       initial: existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined,

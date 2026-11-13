@@ -159,123 +159,7 @@ test("user choices require the exact pending request identity and selected optio
   }), false);
 });
 
-test("Goal controls cannot cross a confirmation request or run boundary", () => {
-  const request = actionRequests.buildGoalConfirmationActionRequest({
-    sessionKey: "session-1",
-    turnId: "turn-goal",
-    runId: "run-goal-2",
-    title: "Long goal",
-    goalId: "goal-1",
-    goalRevision: 3,
-    reason: "periodic checkpoint",
-    now: 11,
-  });
-  const runOwner = {
-    status: "paused",
-    sessionKey: "session-1",
-    turnId: "turn-goal",
-    runId: "run-goal-2",
-  };
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request,
-    identity: { goalId: "goal-1", goalRevision: 3, requestId: request.requestId },
-    goalId: "goal-1",
-    goalRevision: 3,
-    runOwner,
-  }), true);
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request,
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-    runOwner,
-  }), false, "a control rendered before confirmation cannot resolve a newer confirmation");
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request,
-    identity: { goalId: "goal-1", goalRevision: 3, requestId: request.requestId },
-    goalId: "goal-1",
-    goalRevision: 3,
-    runOwner: { ...runOwner, runId: "run-stale" },
-  }), false);
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request: null,
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-  }), true);
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request: { ...request, goalId: "goal-2" },
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-    runOwner,
-  }), false, "a control must not consume another Goal's confirmation request");
 
-  const toolPermission = {
-    schemaVersion: 1,
-    requestId: "permission-1",
-    kind: "tool_permission",
-    sessionKey: "session-1",
-    turnId: "turn-goal",
-    runId: "run-goal-2",
-    title: "Read a protected file",
-    status: "pending",
-    createdAt: 12,
-    taskId: 9,
-    toolName: "read_file",
-    target: "src/main.ts",
-  };
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request: toolPermission,
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-    runOwner,
-  }), false, "a Goal resume control cannot consume an exact pending tool permission");
-  const userChoice = actionRequests.buildUserChoiceActionRequest({
-    sessionKey: "session-1",
-    turnId: "turn-goal",
-    runId: "run-goal-2",
-    title: "Choose recovery",
-    optionValues: ["Retry", "Stop"],
-    now: 13,
-  });
-  assert.equal(actionRequests.isCurrentGoalControlResolution({
-    request: userChoice,
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-    runOwner,
-  }), false, "a Goal resume control cannot bypass a pending user choice");
-
-  assert.equal(actionRequests.isCurrentGoalAdministrativeControl({
-    request: toolPermission,
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-  }), true, "pause and clear remain available without consuming another request");
-  assert.equal(actionRequests.isCurrentGoalAdministrativeControl({
-    request,
-    identity: { goalId: "goal-1", goalRevision: 3 },
-    goalId: "goal-1",
-    goalRevision: 3,
-  }), false, "an administrative control rendered before confirmation cannot clear a newer checkpoint");
-  assert.equal(actionRequests.isCurrentGoalAdministrativeControl({
-    request,
-    identity: { goalId: "goal-1", goalRevision: 3, requestId: request.requestId },
-    goalId: "goal-1",
-    goalRevision: 3,
-  }), true);
-  assert.equal(
-    actionRequests.clearGoalConfirmationActionRequest(toolPermission, "goal-1", 3),
-    toolPermission,
-  );
-  assert.equal(
-    actionRequests.clearGoalConfirmationActionRequest({ ...request, goalId: "goal-2" }, "goal-1", 3)?.goalId,
-    "goal-2",
-  );
-  assert.equal(actionRequests.clearGoalConfirmationActionRequest(request, "goal-1", 3), null);
-});
 
 test("runtime restore revives only exact resumable action checkpoints", () => {
   const owner = {
@@ -343,32 +227,9 @@ test("runtime restore revives only exact resumable action checkpoints", () => {
     planReviewIdentity: { revision: 3, artifactHash: "hash-3", artifactPaths: [], artifactCount: 1 },
   }), null);
 
-  const confirmation = actionRequests.buildGoalConfirmationActionRequest({
-    sessionKey: owner.sessionKey,
-    turnId: owner.turnId,
-    runId: owner.runId,
-    title: "Confirm",
-    goalId: "goal-1",
-    goalRevision: 4,
-    reason: "checkpoint",
-    now: 22,
-  });
-  assert.equal(actionRequestRestore.restorePendingActionRequest({
-    request: confirmation,
-    runOwner: owner,
-    goalRuntime: {
-      status: "awaiting_input",
-      goal: { id: "goal-1", revision: 4, sessionKey: "session-1", ownerTurnId: "turn-1" },
-    },
-  })?.requestId, confirmation.requestId);
-  assert.equal(actionRequestRestore.restorePendingActionRequest({
-    request: confirmation,
-    runOwner: owner,
-    goalRuntime: {
-      status: "paused",
-      goal: { id: "goal-1", revision: 4, sessionKey: "session-1", ownerTurnId: "turn-1" },
-    },
-  }), null);
+  const retired = { schemaVersion: 1, requestId: "old-goal", kind: "goal_confirmation", ...owner, title: "Retired Goal", status: "pending", createdAt: 22, goalId: "goal-1", goalRevision: 4 };
+  assert.equal(actionRequests.normalizeActionRequest(retired), null);
+  assert.equal(actionRequestRestore.restorePendingActionRequest({ request: retired, runOwner: owner }), null, "retired autonomous controls never revive");
 
   const permission = {
     schemaVersion: 1,
@@ -437,19 +298,10 @@ test("terminal action requests cannot be rendered as pending permissions", () =>
 });
 
 test("workflow-specific terminal actions clear only their own request kind", () => {
-  const confirmation = actionRequests.buildGoalConfirmationActionRequest({
-    sessionKey: "session-1",
-    turnId: "turn-1",
-    runId: "run-goal",
-    title: "Long goal",
-    goalId: "goal-1",
-    goalRevision: 2,
-    reason: "periodic checkpoint",
-    now: 2,
-  });
-  assert.equal(actionRequests.clearActionRequestOfKind(confirmation, "goal_confirmation"), null);
-  assert.equal(actionRequests.clearActionRequestOfKind(confirmation, "plan_review"), confirmation);
-  assert.equal(actionRequests.clearActionRequestOfKind(null, "goal_confirmation"), null);
+  const choice = actionRequests.buildUserChoiceActionRequest({ sessionKey: "session-1", turnId: "turn-1", runId: "run-1", title: "Choose", optionValues: ["A"] });
+  assert.equal(actionRequests.clearActionRequestOfKind(choice, "user_choice"), null);
+  assert.equal(actionRequests.clearActionRequestOfKind(choice, "plan_review"), choice);
+  assert.equal(actionRequests.clearActionRequestOfKind(null, "user_choice"), null);
 });
 
 test("run transition reducer atomically enforces action-request lifecycle invariants", () => {

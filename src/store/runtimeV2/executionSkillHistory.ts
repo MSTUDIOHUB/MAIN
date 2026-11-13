@@ -1,8 +1,9 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import type { RuntimeV2RunIdentity, TurnAggregateV1 } from "../../lib/runtime-v2";
+import { approvedRuntimeV2PlanContinuation, normalizeRuntimeV2Checkpoint, type RuntimeV2RunIdentity, type TurnAggregateV1 } from "../../lib/runtime-v2";
 import type { RuntimeV2LiveExecutionState } from "./executionTypes";
 import { runtimeV2TranscriptSkillDocumentReads } from "./executionProviderSkillTranscript";
 import { runtimeV2ProviderToolCallIdentity } from "./providerReadReceipts";
+import { resolveHistoricalRuntimeV2ApprovedWorkPlan } from "./workPlanAdapter";
 
 function sameSkillArguments(left: unknown, right: unknown): boolean {
   if (!left || !right || typeof left !== "object" || typeof right !== "object" || Array.isArray(left) || Array.isArray(right)) return false;
@@ -27,6 +28,47 @@ export function restoreRuntimeV2SkillHistory(
     !sameRun(aggregate.run.identity, run) || aggregate.turn.turnId !== run.turnId ||
     aggregate.turn.sessionKey !== run.sessionKey || aggregate.turn.sessionEpoch !== run.sessionEpoch ||
     aggregate.events.some((event) => event.type === "run.aborted" && sameRun(event.run, run))) return;
+  appendSkillHistory(live.messages, skillCallIds(live.messages), aggregate, run, false);
+}
+
+/** Recover guidance only along the exact, already-approved continuation
+ * lineage. A source Turn's pending tools and effect receipts stay there. */
+export function approvedContinuationSkillHistory(
+  aggregate: TurnAggregateV1,
+  checkpoints: Readonly<Record<string, unknown>>,
+  currentTranscript: readonly AgentMessage[],
+): AgentMessage[] {
+  const history: AgentMessage[] = [];
+  const visited = new Set([aggregate.turn.turnId]);
+  const ids = skillCallIds(currentTranscript);
+  let binding = approvedRuntimeV2PlanContinuation(aggregate.events);
+  while (binding) {
+    const { source } = binding.continuation;
+    if (visited.has(source.turn.turnId) || source.turn.workspaceKey !== aggregate.turn.workspaceKey ||
+      source.turn.sessionKey !== aggregate.turn.sessionKey || source.turn.sessionEpoch !== aggregate.turn.sessionEpoch) break;
+    visited.add(source.turn.turnId);
+    const prior = normalizeRuntimeV2Checkpoint(checkpoints[source.turn.turnId], source.turn)?.aggregate;
+    const approval = resolveHistoricalRuntimeV2ApprovedWorkPlan(prior)?.approvalEvent;
+    if (!prior || !approval || approval.eventId !== source.approvalEventId || !sameRun(approval.run, source.run) ||
+      approval.workPlan.id !== source.workPlan.id || approval.workPlan.revision !== source.workPlan.revision ||
+      approval.workPlan.digest !== source.workPlan.digest || approval.workPlan.projectionHash !== source.workPlan.projectionHash) break;
+    const messages: AgentMessage[] = [];
+    appendSkillHistory(messages, ids, prior, source.run, true);
+    history.unshift(...messages);
+    binding = approvedRuntimeV2PlanContinuation(prior.events);
+  }
+  return history;
+}
+
+function skillCallIds(messages: readonly AgentMessage[]): Set<string> {
+  return new Set(messages.flatMap((message) => [
+    ...(message.tool_calls?.map((call) => call.id) || []),
+    ...(message.tool_call_id ? [message.tool_call_id] : []),
+  ]));
+}
+
+function appendSkillHistory(messages: AgentMessage[], existingIds: Set<string>,
+  aggregate: TurnAggregateV1, run: RuntimeV2RunIdentity, historical: boolean): void {
   const commands = new Map(aggregate.events.flatMap((event, index) =>
     event.type === "command.scheduled" && sameRun(event.run, run) && sameRun(event.command.run, run) &&
       event.command.kind === "execute_tool" && event.command.payload.toolName === "load_skill"
@@ -36,10 +78,16 @@ export function restoreRuntimeV2SkillHistory(
       event.status !== "succeeded" || typeof event.modelContent !== "string") return [];
     const scheduled = commands.get(event.idempotencyKey);
     const callId = scheduled?.command.payload.toolCallId;
+    // Plan labels successful results so the model can cite E# in its draft.
+    // Restore the original typed body at the Execute boundary. The paired
+    // receipt is still validated against the exact scheduled Skill arguments.
+    const content = scheduled?.command.phase === "planning"
+      ? event.modelContent.replace(/^\[E\d+\] [^\n]*\n/, "")
+      : event.modelContent;
     return scheduled && scheduled.index < index && typeof callId === "string"
-      ? [[callId, { content: event.modelContent, scheduled }] as const] : [];
+      ? [[callId, { content, scheduled }] as const] : [];
   }));
-  const pending = new Map(aggregate.scheduledCommands.flatMap((command) => {
+  const pending = new Map((historical ? [] : aggregate.scheduledCommands).flatMap((command) => {
     const scheduled = commands.get(command.idempotencyKey);
     return command.kind === "execute_tool" && command.payload.toolName === "load_skill" && sameRun(command.run, run) &&
       scheduled && typeof command.payload.toolCallId === "string" &&
@@ -47,10 +95,6 @@ export function restoreRuntimeV2SkillHistory(
       sameSkillArguments(scheduled.command.payload.arguments, command.payload.arguments)
       ? [[command.payload.toolCallId, scheduled] as const] : [];
   }));
-  const existingIds = new Set(live.messages.flatMap((message) => [
-    ...(message.tool_calls?.map((call) => call.id) || []),
-    ...(message.tool_call_id ? [message.tool_call_id] : []),
-  ]));
   for (const [index, event] of aggregate.events.entries()) {
     if (event.type !== "provider.responded" || !sameRun(event.run, run)) continue;
     const calls = event.result.toolCalls.filter((call) => {
@@ -61,7 +105,7 @@ export function restoreRuntimeV2SkillHistory(
     });
     if (!calls.length) continue;
     const assistant: AgentMessage = {
-      role: "assistant", content: event.result.visibleText || "",
+      role: "assistant", content: historical ? "" : event.result.visibleText || "",
       tool_calls: calls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } })),
     };
     const results: AgentMessage[] = calls.flatMap((call) => {
@@ -71,7 +115,7 @@ export function restoreRuntimeV2SkillHistory(
     const validIds = new Set(runtimeV2TranscriptSkillDocumentReads([assistant, ...results]).map((window) => window.callId));
     for (const call of calls) if (pending.has(call.id) && !receipts.has(call.id)) validIds.add(call.id);
     if (!validIds.size) continue;
-    live.messages.push({ ...assistant, tool_calls: assistant.tool_calls!.filter((call) => validIds.has(call.id)) },
+    messages.push({ ...assistant, tool_calls: assistant.tool_calls!.filter((call) => validIds.has(call.id)) },
       ...results.filter((result) => validIds.has(result.tool_call_id!)));
     for (const id of validIds) existingIds.add(id);
   }

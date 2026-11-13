@@ -18,7 +18,7 @@ Rust 先 canonicalize 工作区根目录，再解析请求路径：
 - 工作区外的绝对路径、`..`、平台前缀和经 symlink 逃逸的路径被拒绝；resolver 只在绝对路径明确位于原始或 canonical workspace root 下时把它转换为工作区相对路径；
 - 真实 mutation 前必须重新校验路径身份，不跨越无关 await 长期持有旧解析结果。
 
-生产文件入口通过 `resolve_existing_path()` / `resolve_write_path()` 进入同一个 root resolver。主要工作区、临时文件、附件、Image Studio 输出和 MCP workspace 写入会在真实 mutation 前调用 `revalidate_write_path()` 或现有目标复验；新文件使用 `create_new`，原子写入在临时文件创建和 rename 前分别复验。MCP `filesystem.*` 与 Unity 工作区资产路径通过 `workspace_path()` 复用同一 resolver。
+生产文件入口通过 `resolve_existing_path()` / `resolve_write_path()` 进入同一个 root resolver。主要工作区、临时文件、附件和 MCP workspace 写入会在真实 mutation 前调用 `revalidate_write_path()` 或现有目标复验；新文件使用 `create_new`，原子写入在临时文件创建和 rename 前分别复验。MCP `filesystem.*` 与 Unity 工作区资产路径通过 `workspace_path()` 复用同一 resolver。
 
 mutation-adjacent revalidation 能显著缩窄 symlink/rename 竞态窗口，但在没有 OS capability 的情况下不能数学上消除外部 TOCTOU。文件删除等高风险操作仍需要自己的最终目标复核；没有迁移到统一入口的功能也不能仅凭模块名称宣称受到同等约束。
 
@@ -55,7 +55,7 @@ PTY 以 `sessionKey` 隔离，提供 spawn、write、resize、增量读取、tai
 
 ## 应用管理的网络请求
 
-已经迁移的 `proxy_request` / detailed proxy、chat stream、`web_search` / `web_fetch` / raw fetch，以及 Image Studio 的 engine check、proxy 和远程图片下载都使用 root `network_guard`。这些入口按 exact-origin grant 校验：scheme、规范化 host 和有效 port 必须全部匹配。
+已经迁移的 `proxy_request` / detailed proxy、chat stream、`web_search` / `web_fetch` / raw fetch都使用 root `network_guard`。这些入口按 exact-origin grant 校验：scheme、规范化 host 和有效 port 必须全部匹配。
 
 - 默认只允许无内嵌凭证的 public HTTP(S) 目标；DNS 为空、混有私网/loopback/link-local/metadata 地址时 fail closed。
 - 用户明确配置的本地模型或本地 MCP origin 可以获得窄范围 local grant，允许 loopback、RFC1918 或 IPv6 ULA；metadata、link-local、multicast 与 unspecified 地址仍被拒绝。

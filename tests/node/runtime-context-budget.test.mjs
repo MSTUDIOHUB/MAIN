@@ -508,6 +508,10 @@ test("one resolved Run budget drives provider settings and read_file windows", (
   assert.ok(args.max_chars > 32_000);
 });
 
+test("knowledge and Skill receipts share the same batch read window", () => {
+  assert.equal(executionText.runtimeV2ParallelReadCount([{ name: "knowledge_search" }, { name: "knowledge_get_excerpt" }, { name: "read_file" }, { name: "load_skill" }]), 4);
+});
+
 test("Skill reference windows share the Run read budget and support explicit continuation", () => {
   const resolved = budget.computeRuntimeContextBudget({
     configuredContextLimit: 32_768, providerContextLimit: 262_144,
@@ -526,6 +530,11 @@ test("Skill reference windows share the Run read budget and support explicit con
   assert.equal(continuation.max_chars, Math.floor(resolved.readWindowChars / 2));
   const providerManaged = executionText.runtimeV2ContextBoundToolArguments("load_skill", { skill_id: "s:12345678" });
   assert.ok(providerManaged.max_chars > 0);
+  const planDefault = { skillDefaultWindowChars: 10_000 };
+  assert.equal(executionText.runtimeV2ContextBoundToolArguments("load_skill", { skill_id: "s:12345678" }, undefined, planDefault).max_chars, 10_000);
+  assert.equal(executionText.runtimeV2ContextBoundToolArguments("load_skill", {
+    skill_id: "s:12345678", resource: "references/test.md", max_chars: 12_000,
+  }, undefined, planDefault).max_chars, 12_000);
 });
 
 test("small and parallel Skill reads cannot exceed the admitted Run window", () => {

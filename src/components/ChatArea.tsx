@@ -1,16 +1,23 @@
 // @ts-nocheck
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useUnityEditorReconnect } from "./useUnityEditorReconnect";
+import { runtimeV2GuidanceDelivery } from "../lib/runtime-v2/guidance";
+import React, { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
-import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconGoal, IconImageIcon, IconLogoM, IconSettings, IconStop, IconSubagent, IconSubagentClosed, IconTerminal, IconZap } from "./Icons";
+import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconImageIcon, IconLogoM, IconSettings, IconStop, IconSubagent, IconSubagentClosed, IconTerminal, IconZap } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
-import ImageGenerationCard from "./ImageGenerationCard";
 import JobListCard from "./JobListCard";
 import MarkdownRenderer from "./MarkdownRenderer";
 import StreamingCursor from "./StreamingCursor";
 import ExecutionCapsule from "./ExecutionCapsule";
-import GoalPanel from "./GoalPanel";
+import KnowledgeEvidence from "./KnowledgeEvidence";
+import PlanDocumentCard from "./PlanDocumentCard";
+import { continuePlanDraft } from "../store/planDraftContinuation";
+import { resolvePlanDocumentFromAggregate, resolvePlanDraftFromAggregate, resolveRulesDraftReviewFromAggregate, resolveSessionPlanDocument } from "../lib/planDocumentRecords";
+import { formatSavedPlanDraftForDisplay } from "../lib/planDrafts";
 import PlanReviewCapsule from "./PlanReviewCapsule";
+import PlanApprovalDialog from "./PlanApprovalDialog";
+import { samePlanDocumentRef } from "../lib/planDocuments";
 import { resolveAutoScrollState } from "../lib/chatScroll";
 import { parseMessageContent } from "../lib/messageParser";
 import { sanitizeAIOutput, sanitizeAssistantDisplayContent, sanitizeVisibleAssistantText } from "../lib/sanitize";
@@ -45,18 +52,13 @@ import {
   type ConversationTurn,
   type ReplyOption,
 } from "../lib/workflowModels";
-import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
+import { resolveConversationTurnIntent } from "../lib/runIntent";
 import { formatPlanExecutionProgressSnapshot, summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import {
   countCompletedToolCalls,
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
-import {
-  buildCapsuleGuidanceText,
-  buildRuntimeProgressLedger,
-  buildRunStatusProjection,
-} from "../lib/runtimeProgressLedger";
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import { appendDebugLog } from "../lib/debugLog";
 import type { UserContextItem } from "../lib/userContextItems";
@@ -105,6 +107,7 @@ import {
   getToolPermissionResolutionIdentity,
   isExactToolPermissionResolutionIdentity,
   shouldRenderPermissionCapsule,
+  type PlanReviewActionRequest,
 } from "../lib/actionRequest";
 import {
   buildCapsuleStatusProjection,
@@ -116,11 +119,13 @@ import {
 import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
-import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
 import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
-import { buildCapsulePhaseGuidance } from "../lib/assistantProgressPresentation";
-import { buildRuntimeV2CompatibleCapsuleProjection } from "../lib/runtimeV2Presentation";
+import { getCapsuleLiveActivitySnapshot, subscribeCapsuleLiveActivity } from "../lib/capsuleLiveActivity";
+import { buildCapsuleActivityHistory } from "../lib/capsuleActivityHistory";
+import { describeCapsuleToolActivity } from "../lib/capsuleToolActivity";
+import CapsuleActivityPopover, { CapsuleActivityText, type CapsuleActivityLine } from "./CapsuleActivityPopover";
 import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
+import UserQuestionAnswerHistory from "./UserQuestionAnswerHistory";
 import {
   resolveTurnStrategyFromIntent,
   selectTurnIngressAvailability,
@@ -151,6 +156,20 @@ function resolveTurnProcessFontSize(chatFontSize: number): number {
 const TURN_PROCESS_FONT_REFERENCE_SIZE = 13;
 const TURN_PROCESS_FONT_STEPS = [9, 10, 10.5, 11, 12, 12.5, 13] as const;
 const EMPTY_CHAT_BLOCKS: any[] = [];
+const turnActivityByBlocks = new WeakMap<any[], {
+  changes: ReturnType<typeof collectTurnChangeEntries>;
+  summaries: Map<"zh" | "en", ReturnType<typeof buildToolExecutionSummary>>;
+  models: Map<string, ReturnType<typeof buildTurnProcessArchiveModel>>;
+}>();
+
+function turnBlockActivity(blocks: any[]) {
+  let activity = turnActivityByBlocks.get(blocks);
+  if (!activity) {
+    activity = { changes: collectTurnChangeEntries(blocks), summaries: new Map(), models: new Map() };
+    turnActivityByBlocks.set(blocks, activity);
+  }
+  return activity;
+}
 
 function getTurnProcessFontStyle(fontSize: number): React.CSSProperties {
   const style = {
@@ -1115,7 +1134,7 @@ function ThoughtBlock({
           </button>
 
           {isRawOpen && (
-            <div 
+            <div
               className="mt-2 max-h-[300px] overflow-y-auto rounded-lg border border-[#202023] bg-[#030304] p-2.5 text-[#d4d4d8] scrollbar-thin scrollbar-thumb-zinc-800 scrollbar-track-transparent"
               style={{ contentVisibility: "auto" }}
             >
@@ -1127,8 +1146,8 @@ function ThoughtBlock({
               {hasMore && (
                 <div className="mt-3 border-t border-[#27272a]/40 pt-2 flex justify-between items-center">
                   <span className="text-[10px] text-[#71717a]">
-                    {language === "zh" 
-                      ? `已加载 ${renderLimit} / ${rawContent.length} 字符` 
+                    {language === "zh"
+                      ? `已加载 ${renderLimit} / ${rawContent.length} 字符`
                       : `Loaded ${renderLimit} / ${rawContent.length} chars`}
                   </span>
                   <button
@@ -1213,8 +1232,6 @@ function TurnChangesCard({
   totalExecutedEdits,
   language,
   onOpenDiff,
-  defaultExpanded = false,
-  embedded = false,
   chatFontSize,
 }: {
   entries: Array<{
@@ -1228,11 +1245,9 @@ function TurnChangesCard({
   totalExecutedEdits: number;
   language: "zh" | "en";
   onOpenDiff: (taskId: number) => void;
-  defaultExpanded?: boolean;
-  embedded?: boolean;
   chatFontSize?: number;
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [expanded, setExpanded] = useState(false);
   if (entries.length === 0) return null;
 
   const headerText = language === "zh"
@@ -1247,7 +1262,7 @@ function TurnChangesCard({
 
   return (
     <div
-      className={`${embedded ? "" : "turn-process-font-scope ml-9"} rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3`}
+      className="turn-process-font-scope ml-9 rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3"
       style={chatFontSize ? getTurnProcessFontStyle(chatFontSize) : undefined}
     >
       <button
@@ -1653,103 +1668,6 @@ function ChatOperationClusterBlock({
   );
 }
 
-function TurnProcessArchive({
-  archive,
-  language,
-  chatFontSize,
-  renderArchivedItem,
-  onOpenDiff,
-}: {
-  archive: ReturnType<typeof buildTurnProcessArchiveModel>;
-  language: "zh" | "en";
-  chatFontSize: number;
-  renderArchivedItem: (item: any) => React.ReactNode;
-  onOpenDiff: (taskId: number) => void;
-}) {
-  const hasChangeSummary = !!archive && archive.steps.some((step) =>
-    step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
-  );
-  const [expanded, setExpanded] = useState(hasChangeSummary);
-  useEffect(() => {
-    if (hasChangeSummary) setExpanded(true);
-  }, [hasChangeSummary]);
-  if (archive.totalCount === 0) return null;
-
-  const title = language === "zh" ? "本轮过程归档" : "Turn Process Archive";
-  const fallbackSummary = language === "zh" ? "过程记录已折叠保留，可展开追溯。" : "Process records are folded and kept for review.";
-  const previewText = archive.previewTargets.length > 0
-    ? archive.previewTargets.join(language === "zh" ? "、" : ", ")
-    : "";
-  const toggleText = expanded
-    ? language === "zh" ? "收起过程" : "Collapse"
-    : language === "zh" ? "展开过程" : "Expand";
-  const containerClassName = expanded
-    ? "turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
-    : "turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
-
-  const thoughtSteps = archive.steps.filter((step) => step.kind === "thinking");
-  const timelineSteps = archive.steps.filter((step) => step.kind !== "thinking");
-
-  return (
-    <div className={containerClassName} style={getTurnProcessFontStyle(chatFontSize)}>
-      <button
-        type="button"
-        data-testid="turn-process-archive-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
-      >
-        <span className="min-w-0 flex-1">
-          <span className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-              <IconColumns className="h-3.5 w-3.5" />
-              {title}
-            </span>
-            <span className="text-[10px] text-[var(--surface-text-muted)]">
-              {language === "zh" ? `${archive.stepCount} 步` : `${archive.stepCount} step${archive.stepCount > 1 ? "s" : ""}`}
-            </span>
-          </span>
-          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">
-            {archive.summaryText || fallbackSummary}{previewText ? ` · ${previewText}` : ""}
-          </span>
-        </span>
-        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
-      </button>
-
-      {expanded && (
-        <div data-testid="turn-process-archive-details" className="mt-2 space-y-3 px-2">
-          {thoughtSteps.map((step) => (
-            <div key={step.id} data-testid="turn-archive-thought-step">
-              {buildBlockRenderItems(step.items, false, false, language).map((item: any, index: number) => (
-                <React.Fragment key={`archived-thought-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
-                  {renderArchivedItem(item)}
-                </React.Fragment>
-              ))}
-            </div>
-          ))}
-          {timelineSteps.length > 0 && (
-            <div data-testid="turn-archive-timeline" className="space-y-2">
-              {timelineSteps.map((step) => (
-                <TurnArchiveStepCard
-                  key={step.id}
-                  step={step}
-                  language={language}
-                  chatFontSize={chatFontSize}
-                  renderArchivedItem={renderArchivedItem}
-                  onOpenDiff={onOpenDiff}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function getArchiveStepLabel(step: TurnArchiveStep, language: "zh" | "en") {
   if (step.activity?.label) return step.activity.label;
   if (step.phase?.title) return step.phase.title;
@@ -1882,21 +1800,15 @@ function renderCompactMarkdownText(text: string): React.ReactNode {
 function TurnArchiveStepCard({
   step,
   language,
-  chatFontSize,
   renderArchivedItem,
-  onOpenDiff,
   variant = "archive",
 }: {
   step: TurnArchiveStep;
   language: "zh" | "en";
-  chatFontSize: number;
   renderArchivedItem: (item: any) => React.ReactNode;
-  onOpenDiff: (taskId: number) => void;
   variant?: "archive" | "live";
 }) {
   const isLive = variant === "live";
-  const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
-  const hasChangeSummary = step.kind === "edit" && entries.length > 0;
   const hasSettledDetailItems = step.items.some((item: any) =>
     item?.status === "done" ||
     item?.status === "error" ||
@@ -1904,26 +1816,14 @@ function TurnArchiveStepCard({
     item?.toolStatus === "executed" ||
     item?.toolStatus === "failed"
   );
-  const defaultExpanded =
-    (!isLive && (step.expandedByDefault || hasChangeSummary)) ||
-    (isLive && (
-      hasChangeSummary ||
-      (step.status === "running" && hasSettledDetailItems)
-    ));
+  const runningWithDetail = isLive && step.status === "running" && hasSettledDetailItems;
+  const defaultExpanded = (!isLive && step.expandedByDefault) || runningWithDetail;
   const [expanded, setExpanded] = useState(defaultExpanded);
   useEffect(() => {
-    if (
-      isLive &&
-      (
-        hasChangeSummary ||
-        (step.status === "running" && hasSettledDetailItems)
-      )
-    ) {
-      setExpanded(true);
-    }
-  }, [isLive, hasChangeSummary, hasSettledDetailItems, step.status]);
+    if (runningWithDetail) setExpanded(true);
+  }, [runningWithDetail]);
   const detailItems = buildBlockRenderItems(step.items, false, false, language);
-  const canExpandDetails = hasChangeSummary || detailItems.length > 0;
+  const canExpandDetails = detailItems.length > 0;
   const toggleText = expanded
     ? isLive
       ? language === "zh" ? "收起操作" : "Hide actions"
@@ -1998,115 +1898,126 @@ function TurnArchiveStepCard({
 
       {canExpandDetails && expanded && (
         <div data-testid="turn-archive-step-details" className="mt-2 min-w-0 max-w-full space-y-2 overflow-hidden pl-6 sm:pl-8">
-          {hasChangeSummary ? (
-            <TurnChangesCard
-              entries={entries}
-              totalExecutedEdits={totalExecutedEdits}
-              language={language}
-              onOpenDiff={onOpenDiff}
-              embedded
-              defaultExpanded={hasChangeSummary}
-              chatFontSize={chatFontSize}
-            />
-          ) : (
-            detailItems.map((item: any, index: number) => (
-              <React.Fragment key={`archived-step-${step.id}-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
-                {renderArchivedItem(item)}
-              </React.Fragment>
-            ))
-          )}
+          {detailItems.map((item: any, index: number) => (
+            <React.Fragment key={`archived-step-${step.id}-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
+              {renderArchivedItem(item)}
+            </React.Fragment>
+          ))}
         </div>
       )}
     </div>
   );
 }
 
-function LiveTurnProcessTimeline({
+function TurnActivityDisclosure({
   model,
+  variant,
   language,
   chatFontSize,
-  renderLiveItem,
-  onOpenDiff,
+  renderItem,
 }: {
-  model: ReturnType<typeof buildLiveTurnProcessTimelineModel> | null;
+  model: ReturnType<typeof buildLiveTurnProcessTimelineModel>;
+  variant: "live" | "archive";
   language: "zh" | "en";
   chatFontSize: number;
-  renderLiveItem: (item: any) => React.ReactNode;
-  onOpenDiff: (taskId: number) => void;
+  renderItem: (item: any) => React.ReactNode;
 }) {
-  const hasChangeSummary = !!model && model.steps.some((step) =>
-    step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
-  );
-  // The turn-level disclosure is the primary process collapse control. When
-  // that disclosure is open, expose the step rows immediately instead of
-  // requiring a second nested expansion just to inspect the same process.
-  const [expanded, setExpanded] = useState(true);
-  useEffect(() => {
-    if (hasChangeSummary) setExpanded(true);
-  }, [hasChangeSummary]);
-  if (!model || model.totalCount === 0) return null;
-  const title = language === "zh" ? "本轮步骤" : "Turn steps";
-  const stepCount = model.stepCount;
-  const summary = model.summaryText || (language === "zh" ? "操作已按步骤折叠。" : "Actions are folded by step.");
-  const toggleText = expanded
-    ? language === "zh" ? "收起步骤" : "Collapse steps"
-    : language === "zh" ? "展开步骤" : "Expand steps";
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const isLive = variant === "live";
+  const relevantSteps = model.steps.filter((step) => step.kind !== "thinking");
+  const currentStep = isLive
+    ? [...relevantSteps].reverse().find((step) => step.status === "running") ?? relevantSteps.at(-1)
+    : null;
+  const summary = (currentStep?.activity?.title || currentStep?.intent)?.replace(/\s+/g, " ").trim();
+  const failedCount = relevantSteps.filter((step) => step.status === "failed").length;
+  const blockedCount = relevantSteps.filter((step) => step.status === "blocked" || step.status === "rejected").length;
+  const notRunCount = relevantSteps.filter((step) => step.status === "not_executed").length;
+  const issues = [
+    failedCount > 0 && (language === "zh" ? `失败 ${failedCount}` : `${failedCount} failed`),
+    blockedCount > 0 && (language === "zh" ? `受阻 ${blockedCount}` : `${blockedCount} blocked`),
+    notRunCount > 0 && (language === "zh" ? `未执行 ${notRunCount}` : `${notRunCount} not run`),
+  ].filter(Boolean).join(" · ");
+  const activityCount = language === "zh"
+    ? `${model.stepCount} 项活动`
+    : `${model.stepCount} activit${model.stepCount === 1 ? "y" : "ies"}`;
+  const label = language === "zh" ? "本轮活动" : "Turn activity";
 
   return (
     <div
-      data-testid="live-turn-process-timeline"
-      className="turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
+      data-testid={isLive ? "live-turn-process-timeline" : "turn-activity-archive"}
+      className="turn-process-font-scope ml-9 min-w-0 max-w-[calc(100%-2.25rem)]"
       style={getTurnProcessFontStyle(chatFontSize)}
     >
       <button
+        ref={triggerRef}
         type="button"
-        data-testid="live-turn-process-toggle"
+        data-testid={isLive ? "live-turn-process-toggle" : "turn-process-archive-toggle"}
         aria-expanded={expanded}
+        aria-controls={detailsId}
         onClick={() => setExpanded((value) => !value)}
-        className="group flex w-full min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg px-2 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+        className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-[var(--surface-text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--surface-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
       >
-        <span className="min-w-0 flex-1">
-          <span className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-              <IconColumns className="h-3.5 w-3.5" />
-              {title}
-            </span>
-            <span className="text-[10px] text-[var(--surface-text-muted)]">
-              {language === "zh" ? `${stepCount} 步` : `${stepCount} step${stepCount > 1 ? "s" : ""}`}
-            </span>
+        {expanded
+          ? <IconChevronDown aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+          : <IconChevronRight aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />}
+        <span className="shrink-0">{label}</span>
+        <span className="min-w-0 flex-1 truncate" title={summary}>
+          {summary ? renderCompactMarkdownInline(summary, "turn-activity-summary") : activityCount}
+        </span>
+        {issues && (
+          <span data-testid="turn-activity-issues" className="min-w-0 max-w-[50%] truncate font-medium text-[var(--surface-text-strong)]" title={issues}>
+            {issues}
           </span>
-          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">{summary}</span>
-        </span>
-        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
+        )}
       </button>
-      {expanded && (
-        <div data-testid="live-turn-process-details" className="min-w-0 max-w-full space-y-2 overflow-hidden px-2 pt-2">
-          {model.steps.map((step) => (
-            <TurnArchiveStepCard
-              key={step.id}
-              step={step}
-              language={language}
-              chatFontSize={chatFontSize}
-              renderArchivedItem={renderLiveItem}
-              onOpenDiff={onOpenDiff}
-              variant="live"
-            />
-          ))}
-          <button
-            type="button"
-            data-testid="live-turn-process-collapse-bottom"
-            aria-expanded={expanded}
-            onClick={() => setExpanded(false)}
-            className="flex w-full items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] text-[var(--surface-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] hover:text-[var(--surface-text)]"
+      <div id={detailsId} hidden={!expanded}>
+        {expanded && (
+          <div
+            data-testid={isLive ? "live-turn-process-details" : "turn-process-archive-details"}
+            className="ml-3 mt-1 min-w-0 space-y-1 border-l border-[var(--surface-border-soft)] pl-3"
           >
-            <IconChevronDown className="h-3.5 w-3.5" />
-            {language === "zh" ? "收起步骤" : "Collapse steps"}
-          </button>
-        </div>
-      )}
+            {model.steps.filter((step) => step.kind === "thinking").map((step) => (
+              <div key={step.id} data-testid="turn-archive-thought-step">
+                {buildBlockRenderItems(step.items, false, false, language).map((item: any, index: number) => (
+                  <React.Fragment key={`activity-thought-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
+                    {renderItem(item)}
+                  </React.Fragment>
+                ))}
+              </div>
+            ))}
+            {relevantSteps.length > 0 && (
+              <div data-testid={isLive ? undefined : "turn-archive-timeline"} className="space-y-1">
+                {relevantSteps.map((step) => (
+                  <TurnArchiveStepCard
+                    key={step.id}
+                    step={step}
+                    language={language}
+                    renderArchivedItem={renderItem}
+                    variant={variant}
+                  />
+                ))}
+              </div>
+            )}
+            {isLive && (
+              <button
+                type="button"
+                data-testid="live-turn-process-collapse-bottom"
+                aria-controls={detailsId}
+                onClick={() => {
+                  setExpanded(false);
+                  triggerRef.current?.focus();
+                }}
+                className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[11px] text-[var(--surface-text-muted)] hover:bg-[var(--surface-2)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+              >
+                <IconChevronDown aria-hidden="true" className="h-3.5 w-3.5" />
+                {language === "zh" ? "收起活动" : "Collapse activity"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2332,7 +2243,7 @@ function AgentContentBlock({
                 : attempt.reason === "missing_tool"
                 ? (language === "zh" ? `尝试 ${attIdx + 1} (缺失工具纠错)` : `Attempt ${attIdx + 1} (Missing Tool)`)
                 : (language === "zh" ? `尝试 ${attIdx + 1} (${attempt.reason})` : `Attempt ${attIdx + 1} (${attempt.reason})`);
-              
+
               return (
                 <details key={attIdx} className="group rounded-xl border border-[#27272a]/50 bg-[#07070a] px-3 py-2">
                   <summary className="flex cursor-pointer items-center justify-between font-mono text-[10.5px] text-[#a1a1aa] hover:text-[#e4e4e7]">
@@ -2496,8 +2407,8 @@ const TurnTimer = memo(function TurnTimer({
 
   return (
     <span data-testid="turn-elapsed-time" className={`rounded-full border px-2 py-0.5 text-[10px] flex items-center gap-1.5 ${
-      isActive 
-        ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]" 
+      isActive
+        ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]"
         : isLightThemeMode
         ? "border-[#d4d4d8] bg-[#f4f4f5] text-[#71717a]"
         : "border-[#27272a] bg-[#09090b] text-[#a1a1aa]"
@@ -2531,11 +2442,6 @@ export default function ChatArea({
   attachedFiles,
   setAttachedFiles,
   onAttachFile,
-  showAgentPicker,
-  setShowAgentPicker,
-  selectedMainModeKey,
-  setSelectedMainModeKey,
-  mainModes,
   currentWorkspace,
   handleAcceptInline,
   handleRejectInline,
@@ -2549,6 +2455,7 @@ export default function ChatArea({
   const resolvedTurnProcessFontSize = resolveTurnProcessFontSize(resolvedChatFontSize);
   const copy = useMemo(() => ({
     planLabel: language === "zh" ? "计划" : "Plan",
+    planRevisionLabel: language === "zh" ? "复核修订" : "Plan revision",
     stopLabel: language === "zh" ? "停止" : "Stop",
     processingLabel: language === "zh" ? "处理中..." : "Processing...",
     turnDetails: language === "zh" ? "回合详情" : "Turn Details",
@@ -2623,13 +2530,6 @@ export default function ChatArea({
     pendingRunDecision,
     resolvePendingRunDecision,
     dismissPendingRunDecision,
-    imageStudio,
-    setImageStudioSetupGuideOpen,
-    checkImageStudioEngine,
-    activeGoal,
-    goalProgress,
-    goalStatus,
-    goalRuntime,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -2667,17 +2567,15 @@ export default function ChatArea({
     pendingToolCall: useAppStore((s) => s.pendingToolCall),
     pendingRunDecision: useAppStore((s) => s.pendingRunDecision),
     resolvePendingRunDecision: useAppStore((s) => s.resolvePendingRunDecision),
-    dismissPendingRunDecision: useAppStore((s) => s.dismissPendingRunDecision),
-    imageStudio: useAppStore((s) => s.imageStudio),
-    setImageStudioSetupGuideOpen: useAppStore((s) => s.setImageStudioSetupGuideOpen),
-    checkImageStudioEngine: useAppStore((s) => s.checkImageStudioEngine),
-    activeGoal: useAppStore((s) => s.activeGoal),
-    goalProgress: useAppStore((s) => s.goalProgress),
-    goalStatus: useAppStore((s) => s.goalStatus),
-    goalRuntime: useAppStore((s) => s.goalRuntime),
+    dismissPendingRunDecision: useAppStore((s) => s.dismissPendingRunDecision)
   };
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  useUnityEditorReconnect();
   const turnRuntimeCheckpoints = useAppStore((s) => s.turnRuntimeCheckpoints);
+  const workspaceTurnQueue = useAppStore((s) => s.workspaceTurnQueue);
+  const queuedTurnIds = useMemo(() => new Set(workspaceTurnQueue && workspaceTurnQueue.sessionKey === activeSessionKey
+    ? workspaceTurnQueue.entries.filter(entry => entry.status === "queued" || entry.status === "persisting").map(entry => entry.receipt.turnId)
+    : []), [activeSessionKey, workspaceTurnQueue]);
   const activeSessionEpoch = useAppStore((s) => {
     const workspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
     const session = (s.sessionsByWorkspace[workspaceKey] || []).find(
@@ -2720,19 +2618,6 @@ export default function ChatArea({
       ]),
     );
   }, [runtimeEvents]);
-  const isImageStudioMode = selectedMainModeKey === "image_studio";
-  const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
-  const imageStudioLocalFamilyLabel = imageStudio.config.local.serviceFamily === "ollama"
-    ? "Ollama"
-    : imageStudio.config.local.serviceFamily === "omlx"
-    ? "OMLX"
-    : (language === "en" ? "OpenAI-compatible" : "OpenAI 兼容");
-  const imageStudioProviderLabel = isWebFallbackImageEngine
-    ? (language === "en" ? "HiDream Web" : "HiDream 网页")
-    : (language === "en" ? "Local Image Service" : "本地图片服务");
-  const imageStudioProviderDetail = isWebFallbackImageEngine
-    ? (language === "en" ? "Hosted fallback" : "托管 fallback")
-    : `${imageStudioLocalFamilyLabel} · ${imageStudio.status.activeModel || imageStudio.config.local.model || imageStudio.config.local.endpoint}`;
   const isGlobalChat = !currentWorkspace;
   const emptyStatePrompts = language === "zh"
     ? [
@@ -2748,6 +2633,8 @@ export default function ChatArea({
         "Give me a plan first before execution",
       ];
 
+  const chatAreaRef = useRef<HTMLDivElement>(null);
+  const restoreComposerDraft = useRef<((text: string) => void) | null>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const turnRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const lastScrollTopRef = useRef(0);
@@ -2759,34 +2646,26 @@ export default function ChatArea({
   // region: 输入区上方执行胶囊状态
   const [composerHeight, setComposerHeight] = useState(220);
   const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
-  const [chatAreaHeight, setChatAreaHeight] = useState(0);
+  const [approvalDialogRequest, setApprovalDialogRequest] = useState<PlanReviewActionRequest | null>(null);
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
-  const [capsulePopover, setCapsulePopover] = useState<"progress" | "tasks" | "goal" | null>(null);
+  const [capsulePopover, setCapsulePopover] = useState<"progress" | "tasks" | null>(null);
   const showProgressPopover = capsulePopover === "progress";
   const showTasksPopover = capsulePopover === "tasks";
-  const showGoalPopover = capsulePopover === "goal";
   const popoverRef = useRef<HTMLDivElement>(null);
   const mButtonRef = useRef<HTMLButtonElement>(null);
   const runStatusCloseButtonRef = useRef<HTMLButtonElement>(null);
   const wasProgressPopoverOpenRef = useRef(false);
   const tasksPopoverRef = useRef<HTMLDivElement>(null);
   const tasksButtonRef = useRef<HTMLButtonElement>(null);
-  const goalPopoverRef = useRef<HTMLDivElement>(null);
-  const goalButtonRef = useRef<HTMLButtonElement>(null);
-
   useEffect(() => {
     if (!capsulePopover) return;
     const handleDocumentClick = (event: MouseEvent) => {
       const popoverElement = capsulePopover === "progress"
         ? popoverRef.current
-        : capsulePopover === "tasks"
-        ? tasksPopoverRef.current
-        : goalPopoverRef.current;
+        : tasksPopoverRef.current;
       const triggerElement = capsulePopover === "progress"
         ? mButtonRef.current
-        : capsulePopover === "tasks"
-        ? tasksButtonRef.current
-        : goalButtonRef.current;
+        : tasksButtonRef.current;
       const eventPath = event.composedPath();
       if (
         (!popoverElement || !eventPath.includes(popoverElement))
@@ -2829,16 +2708,21 @@ export default function ChatArea({
   // endregion
 
   useEffect(() => {
-    if (!chatContainerRef.current) return;
-    const resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        setChatAreaHeight(entry.contentRect.height);
-      }
+    const container = chatContainerRef.current;
+    const area = chatAreaRef.current;
+    if (!container || !area) return;
+    let height = 0;
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      if (!entry || entry.contentRect.height === height) return;
+      height = entry.contentRect.height;
+      if (height > 0) area.style.setProperty("--chat-visible-height", `${height}px`);
+      else area.style.removeProperty("--chat-visible-height");
     });
-    resizeObserver.observe(chatContainerRef.current);
+    resizeObserver.observe(container);
     return () => resizeObserver.disconnect();
   }, []);
 
+  const committedBlockGroups = useRef(new Map<string, any[]>());
   const blocksByTurnId = useMemo(() => {
     const next = new Map<string, any[]>();
     const legacyBlocks: any[] = [];
@@ -2856,8 +2740,17 @@ export default function ChatArea({
         next.set(turnId, [block]);
       }
     }
+    for (const [turnId, blocks] of next) {
+      const previous = committedBlockGroups.current.get(turnId);
+      if (previous?.length === blocks.length && blocks.every((block, index) => block === previous[index])) {
+        next.set(turnId, previous);
+      }
+    }
     return { byTurnId: next, legacyBlocks };
   }, [taskFlow]);
+  useLayoutEffect(() => {
+    committedBlockGroups.current = blocksByTurnId.byTurnId;
+  }, [blocksByTurnId]);
   const visibleConversationTurns = useMemo(
     () => conversationTurns.filter((turn) => turn?.uiVisibility !== "internal"),
     [conversationTurns],
@@ -2872,19 +2765,9 @@ export default function ChatArea({
 
     return visibleConversationTurns.map((turn) => ({
       turn,
-      blocks: blocksByTurnId.byTurnId.get(turn.id) || [],
+      blocks: blocksByTurnId.byTurnId.get(turn.id) || EMPTY_CHAT_BLOCKS,
     }));
   }, [blocksByTurnId, visibleConversationTurns]);
-  const recentImageBlocks = useMemo(
-    () =>
-      taskFlow
-        .filter((block) => block?.type === "imageGeneration")
-        .slice()
-        .reverse()
-        .slice(0, 8),
-    [taskFlow],
-  );
-
   useEffect(() => {
     const nextSessionKey = activeSessionKey ?? null;
     const firstTurnId = visibleConversationTurns[0]?.id ?? null;
@@ -2939,6 +2822,7 @@ export default function ChatArea({
     );
   const composerTurnIngress = useMemo(() => selectTurnIngressAvailability({
     checkpoint: pinnedTurn ? turnRuntimeCheckpoints?.[pinnedTurn.id] : null,
+    runtimeV2Checkpoint: pinnedTurn ? runtimeV2Checkpoints[pinnedTurn.id] : null,
     expectedOwner: pinnedTurn && activeSessionKey && activeSessionEpoch
       ? {
           workspaceKey: resolveSessionWorkspaceKey(currentWorkspace),
@@ -2956,6 +2840,7 @@ export default function ChatArea({
     currentWorkspace,
     pinnedTurn,
     turnRuntimeCheckpoints,
+    runtimeV2Checkpoints,
   ]);
   const shouldKeepExecutionCapsuleResident =
     !!pinnedTurn &&
@@ -2998,6 +2883,7 @@ export default function ChatArea({
           revision: runtimeV2PlanReview.commit.authority.revision,
           artifactHash: runtimeV2PlanReview.commit.authority.projectionHash,
           artifactPaths: [runtimeV2PlanReview.commit.artifact.path],
+          ...(runtimeV2PlanReview.commit.artifact.documentRef ? { documentRef: runtimeV2PlanReview.commit.artifact.documentRef } : {}),
           artifactCount: 1,
         }
       : buildTypedPlanApprovalIdentity(planArtifacts),
@@ -3026,6 +2912,22 @@ export default function ChatArea({
     })
       ? activeActionRequest
       : null;
+  const reviewCommit = runtimeV2PlanReview?.pending ? runtimeV2PlanReview.commit : null;
+  const reviewDialogBinding = reviewCommit && planReviewActionRequest &&
+    planReviewActionRequest.requestId === reviewCommit.review.requestId &&
+    planReviewActionRequest.sessionEpoch === reviewCommit.review.sessionEpoch &&
+    planReviewActionRequest.documentRef &&
+    samePlanDocumentRef(planReviewActionRequest.documentRef, reviewCommit.artifact.documentRef)
+    ? { request: planReviewActionRequest, markdown: reviewCommit.artifact.content }
+    : null;
+  const openApprovalDialog = reviewDialogBinding
+    ? () => setApprovalDialogRequest(reviewDialogBinding.request)
+    : undefined;
+  useEffect(() => {
+    if (approvalDialogRequest && approvalDialogRequest !== reviewDialogBinding?.request) {
+      setApprovalDialogRequest(null);
+    }
+  }, [approvalDialogRequest, reviewDialogBinding?.request]);
   const planProgressOwnerTurn = planExecutionProgressSnapshot?.turnId
     ? conversationTurns.find((turn) =>
         turn.id === planExecutionProgressSnapshot.turnId && isPlanConversationTurn(turn)
@@ -3060,6 +2962,7 @@ export default function ChatArea({
     harnessActionRunId === activeActionRequest.runId
       ? activeActionRequest
       : null;
+  const resolveStructuredUserChoice = useAppStore(s => s.resolveStructuredUserChoice);
   const userChoiceOwnerTurn = userChoiceActionRequest
     ? conversationTurns.find((turn) => turn.id === userChoiceActionRequest.turnId) || null
     : null;
@@ -3200,36 +3103,14 @@ export default function ChatArea({
         harnessRunMarker?.sessionKey === activeSessionKey
       ? harnessRunMarker.turnId
       : null;
-  const capsuleProgressLedger = useMemo(() => {
-    if (!capsuleTurn) return [];
-    return buildRuntimeProgressLedger({
-      blocks: capsuleTurnBlocks,
-      events: runtimeEvents,
-      turnId: capsuleTurn.id,
-      language,
-      maxItems: 12,
-      activeRunId: capsuleActiveRunId,
-      planExecutionSnapshot: capsulePlanExecutionSnapshot,
-    });
-  }, [
-    capsuleActiveRunId,
-    capsulePlanExecutionSnapshot,
-    capsuleTurn,
-    capsuleTurnBlocks,
-    language,
-    runtimeEvents,
-  ]);
-  const capsuleRunStatus = useMemo(
-    () => buildRunStatusProjection(capsuleProgressLedger, language, 3),
-    [capsuleProgressLedger, language],
-  );
-
-  const hasLivePlanWorkspaceContent = useMemo(() => hasLivePlanWorkspace({
+  const hasLivePlanWorkspaceContent = useMemo(() => !!resolveSessionPlanDocument(conversationTurns, {
+    sessionKey: activeSessionKey, sessionEpoch: activeSessionEpoch,
+  }) || hasLivePlanWorkspace({
     planArtifacts,
     planTasks,
     planStage,
     fallbackPlanPreview: activePlanFallbackPreview,
-  }), [activePlanFallbackPreview, planArtifacts, planStage, planTasks]);
+  }), [activePlanFallbackPreview, activeSessionEpoch, activeSessionKey, conversationTurns, planArtifacts, planStage, planTasks]);
   const permissionActionRequest = activeActionRequest?.kind === "tool_permission" &&
     !!activeSessionKey &&
     activeActionRequest.sessionKey === activeSessionKey
@@ -3340,19 +3221,19 @@ export default function ChatArea({
     setIsAutoScroll((value) => (value === nextAutoScroll ? value : nextAutoScroll));
     lastScrollTopRef.current = currentScrollTop;
 
-    const turnEntries = groupedTurns
-      .map((entry) => {
-        const turnId = entry.turn?.id;
-        if (!turnId) return null;
-        const node = turnRefs.current[turnId];
-        if (!node) return null;
-        return { turnId, offset: node.offsetTop };
-      })
-      .filter(Boolean) as Array<{ turnId: string; offset: number }>;
-
-    const current = [...turnEntries].reverse().find((entry) => entry.offset <= el.scrollTop + 120);
-    setActiveVisibleTurnId(current?.turnId || visibleConversationTurns[visibleConversationTurns.length - 1]?.id || null);
-  }, [groupedTurns, visibleConversationTurns]);
+    // Live output keeps the newest turn active. Measuring all previous DOM
+    // offsets here would force layout again on every automatic scroll.
+    if (nextAutoScroll) return;
+    for (let index = visibleConversationTurns.length - 1; index >= 0; index -= 1) {
+      const { id } = visibleConversationTurns[index];
+      const node = turnRefs.current[id];
+      if (node && node.offsetTop <= currentScrollTop + 120) {
+        setActiveVisibleTurnId(id);
+        return;
+      }
+    }
+    setActiveVisibleTurnId(visibleConversationTurns.at(-1)?.id || null);
+  }, [visibleConversationTurns]);
 
   useEffect(() => {
     if (!isAutoScroll) return;
@@ -3360,12 +3241,8 @@ export default function ChatArea({
     const el = chatContainerRef.current;
     if (!el) return;
 
-    el.scrollTo({
-      top: el.scrollHeight,
-      behavior: isStreaming ? "auto" : "smooth",
-    });
-
     const rafId = window.requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: isStreaming ? "auto" : "smooth" });
       lastScrollTopRef.current = el.scrollTop;
     });
 
@@ -3430,6 +3307,11 @@ export default function ChatArea({
           };
         });
       const userContextItems = [...hydratedContextItems, ...legacyImageItems];
+      const planAggregate = normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate;
+      const savedPlan = resolvePlanDocumentFromAggregate(planAggregate);
+      const savedDraft = resolvePlanDraftFromAggregate(planAggregate);
+      const guidanceDelivery = block.runtimeGuidance?.id
+        ? runtimeV2GuidanceDelivery(planAggregate, block.runtimeGuidance.id) : null;
       const hasImageContext = userContextItems.some((item: UserContextItem) => item.kind === "image");
       const visualContextProgress = hasImageContext
         ? visualContextProgressByTurnId.get(String(block.turnId || ""))
@@ -3441,10 +3323,26 @@ export default function ChatArea({
               <div
                 data-testid="runtime-guidance-record"
                 data-guidance-id={block.runtimeGuidance.id}
-                className="mb-2 flex items-center justify-end gap-1.5 text-[10px] font-semibold text-emerald-400"
+                className="mb-2 flex items-center justify-end gap-1.5 text-[10px] font-semibold"
+                style={{ color: "var(--surface-text-muted)" }}
               >
                 <IconZap className="h-3 w-3" />
-                {language === "en" ? "Guided this Turn" : "已引导本回合"}
+                {(!guidanceDelivery || guidanceDelivery === "waiting")
+                  ? (language === "en" ? "Waiting to guide this turn" : "等待引导本回合")
+                  : guidanceDelivery === "unapplied"
+                    ? (language === "en" ? "Guidance not applied" : "引导未应用")
+                    : (language === "en" ? "Guided this Turn" : "已引导本回合")}
+                {guidanceDelivery === "unapplied" && block.content && (
+                  <button
+                    type="button"
+                    data-testid="restore-unapplied-guidance"
+                    className="ml-2 rounded border px-1.5 py-0.5"
+                    style={{ borderColor: "var(--surface-border)", color: "var(--surface-text)" }}
+                    onClick={() => restoreComposerDraft.current?.(block.content)}
+                  >
+                    {language === "en" ? "Restore to composer" : "恢复到输入框"}
+                  </button>
+                )}
               </div>
             )}
             {block.content && (
@@ -3464,6 +3362,17 @@ export default function ChatArea({
               language={language}
               onPreviewImage={setPreviewImageItem}
             />
+            <KnowledgeEvidence packet={planAggregate?.knowledgeContext} language={language} />
+            <PlanDocumentCard reference={savedPlan?.documentRef} draft={savedDraft}
+              language={language} continuationDisabled={agentStatus !== "idle" || isStreaming || activeActionRequest?.status === "pending"}
+              onCompleteValidation={savedDraft ? async (supplement) => (await continuePlanDraft({ get: useAppStore.getState, record: savedDraft, supplement })).accepted : undefined}
+              onReviewPlan={savedPlan && reviewDialogBinding?.request.turnId === block.turnId &&
+                samePlanDocumentRef(savedPlan.documentRef, reviewDialogBinding.request.documentRef) ? openApprovalDialog : undefined}
+              onReviewRules={() => {
+                const aggregate = normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate;
+                const draft = resolveRulesDraftReviewFromAggregate(aggregate);
+                if (draft?.documentRef.owner.sessionKey === activeSessionKey) useAppStore.setState({ rulesDraftReview: draft });
+              }} />
             {visualContextProgress && (
               <VisualContextDeliveryBadge
                 progress={visualContextProgress}
@@ -3533,19 +3442,6 @@ export default function ChatArea({
     if (block.type === "progress") {
       return null;
     }
-
-    if (block.type === "imageGeneration") {
-      return (
-        <div key={`${block.id}-${index}`} className="flex w-full justify-start">
-          <ImageGenerationCard
-            block={block}
-            language={language}
-            onRegenerate={(prompt) => onSendMessage?.(prompt)}
-          />
-        </div>
-      );
-    }
-
     if (block.type === "jobList") {
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-start">
@@ -3616,10 +3512,13 @@ export default function ChatArea({
 
     if (block.type === "agent") {
       if (block.hiddenProcess && !block.streaming) return null;
+      const finalDraft = block.visibility === "assistant_final" && !block.streaming
+        ? resolvePlanDraftFromAggregate(normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate)
+        : null;
       return (
           <AgentContentBlock
           key={`${block.id}-${index}`}
-          block={block}
+          block={finalDraft ? { ...block, content: formatSavedPlanDraftForDisplay(block.content, finalDraft) } : block}
           language={language}
           chatFontSize={resolvedChatFontSize}
         />
@@ -3675,15 +3574,13 @@ export default function ChatArea({
     }
 
     const turn: ConversationTurn = entry.turn;
+    const turnIsQueued = queuedTurnIds.has(turn.id);
     const blocks = entry.blocks;
     const turnIntent = resolveConversationTurnIntent(turn);
     const displayTurnIntent = turn.displayIntent || turnIntent;
     const isChatIntent = turnIntent === "respond" || turnIntent === "discuss";
-    const turnIntentPolicy = getIntentPolicy(displayTurnIntent);
-    const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
-      ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
-      : (language === "zh" ? "任务" : "Task");
-    const shouldShowIntentBadge = displayTurnIntent === "plan";
+    const isPlanRevision = turn.approvedPlanContinuation?.revise === true;
+    const shouldShowPlanBadge = isPlanRevision || displayTurnIntent === "plan";
     const isPlanTurn = turnIntent === "plan";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
@@ -3713,7 +3610,7 @@ export default function ChatArea({
     const turnPresentation = buildTurnPresentationModel({
       turn,
       language,
-      statusLabel: copy.turnStatusLabels[turn.status] || turn.status,
+      statusLabel: turnIsQueued ? (language === "en" ? "Queued" : "已排队") : copy.turnStatusLabels[turn.status] || turn.status,
       // A workspace submission is always a durable Turn. Keep its title,
       // lifecycle, and timer visible even when intent resolution says respond.
       // Only global chat uses the anchorless continuous transcript.
@@ -3729,7 +3626,8 @@ export default function ChatArea({
           .filter(({ block }) => block.type === "user" && block.id !== userBlock.id)
       : [];
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
-    const { entries: turnChangeEntries, totalExecutedEdits } = collectTurnChangeEntries(blocks);
+    const activity = turnBlockActivity(blocks);
+    const { entries: turnChangeEntries, totalExecutedEdits } = activity.changes;
     const shouldShowTurnChanges = turnChangeEntries.length > 0 || totalExecutedEdits > 0;
     const explicitFinalAgentIndex = [...blocks]
       .map((block, idx) => ({ block, idx }))
@@ -3826,15 +3724,15 @@ export default function ChatArea({
       finalVisibleAgentIndex >= 0 &&
       !hasSubstantiveIntermediateAgentText &&
       !shouldKeepContinuousProcessTimeline;
-    const processArchive = shouldArchiveCompletedProcess
-      ? buildTurnProcessArchiveModel({
-          blocks,
-          finalVisibleAgentIndex,
-          language,
-          includeThoughts: false,
-          includeThoughtNotes: true,
-        })
-      : null;
+    let processArchive = null;
+    if (shouldArchiveCompletedProcess) {
+      const key = `archive:${language}:${finalVisibleAgentIndex}`;
+      processArchive = activity.models.get(key);
+      if (!processArchive) {
+        processArchive = buildTurnProcessArchiveModel({ blocks, finalVisibleAgentIndex, language, includeThoughts: false });
+        activity.models.set(key, processArchive);
+      }
+    }
     const collapsedProcessCount = finalVisibleAgentBlock
       ? processArchive?.stepCount ?? blocks.filter((block, idx) => block.type !== "user" && idx !== finalVisibleAgentIndex).length
       : hiddenCount + (shouldShowTurnChanges ? 1 : 0);
@@ -3874,17 +3772,22 @@ export default function ChatArea({
             planExecutionProgress: turnProgressSnapshot,
           }
         : null;
-    const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
+    if (!activity.summaries.has(language)) activity.summaries.set(language, buildToolExecutionSummary(blocks, language));
+    const toolExecutionSummary = activity.summaries.get(language);
     const turnToolCount = blocks.filter((block) =>
       block.type === "tool" && ["executed", "running", "failed"].includes(String(block.toolStatus || ""))
     ).length;
     const turnSubagentRuns = subagentRuns.filter((run) => run.parentTurnId === turn.id);
-    const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
-      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
-      : null;
-    const liveProcessHasChangeSummary = !!liveProcessTimeline && liveProcessTimeline.steps.some((step) =>
-      step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
-    );
+    let liveProcessTimeline = null;
+    if (!shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline) {
+      const key = `live:${language}:${showReasoningDebug}`;
+      liveProcessTimeline = activity.models.get(key);
+      if (!liveProcessTimeline) {
+        liveProcessTimeline = buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug });
+        activity.models.set(key, liveProcessTimeline);
+      }
+    }
+    const activityModel = processArchive ?? liveProcessTimeline;
     const liveProcessBlockIds = new Set(
       (liveProcessTimeline?.blocks || [])
         .map((block: any) => block?.id)
@@ -4157,23 +4060,25 @@ export default function ChatArea({
             className={turnHeaderClass}
           >
             <div className="min-w-0 flex flex-wrap items-center gap-2">
-              {shouldShowIntentBadge && turnIntentLabel && (
-                <span data-testid={`turn-intent-badge-${displayTurnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${displayTurnIntent === "plan" ? "theme-plan-pill" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
-                  {turnIntentLabel}
+              {shouldShowPlanBadge && (
+                <span data-testid={isPlanRevision ? "turn-intent-badge-plan-revision" : "turn-intent-badge-plan"} className="theme-plan-pill rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em]">
+                  {isPlanRevision ? copy.planRevisionLabel : copy.planLabel}
                 </span>
               )}
               <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turnPresentation.status)}`}>
                 {turnPresentation.statusLabel}
               </span>
-              <TurnTimer
-                turnId={turn.id}
-                status={turnPresentation.status}
-                isStreaming={isStreaming}
-                currentTurnId={currentTurnId}
-                activeSessionKey={activeSessionKey}
-                savedElapsedTime={turn.elapsedTime}
-                isLightThemeMode={isLightThemeMode}
-              />
+              {!turnIsQueued && (
+                <TurnTimer
+                  turnId={turn.id}
+                  status={turnPresentation.status}
+                  isStreaming={isStreaming}
+                  currentTurnId={currentTurnId}
+                  activeSessionKey={activeSessionKey}
+                  savedElapsedTime={turn.elapsedTime}
+                  isLightThemeMode={isLightThemeMode}
+                />
+              )}
               {shouldShowTurnChanges && (
                 <span className="rounded-full border border-[rgba(37,99,235,0.25)] bg-[rgba(37,99,235,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
                   {language === "zh" ? `${turnChangeEntries.length} 个变更文件` : `${turnChangeEntries.length} changed file${turnChangeEntries.length > 1 ? "s" : ""}`}
@@ -4208,6 +4113,11 @@ export default function ChatArea({
 
         <div className={`${turnPresentation.showStateAnchor ? "mt-4 " : ""}space-y-4`}>
           {userBlock ? renderBlock(userBlock, blocks.indexOf(userBlock)) : null}
+          <UserQuestionAnswerHistory
+            aggregate={normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[turn.id])?.aggregate}
+            language={language}
+            chatFontSize={resolvedChatFontSize}
+          />
           {!turnPresentation.showStateAnchor && canToggleProcess && (
             <TurnProcessDisclosure
               collapsed={!isTurnExpanded}
@@ -4220,14 +4130,41 @@ export default function ChatArea({
               onToggle={() => toggleConversationTurnCollapsed(turn.id)}
             />
           )}
-          {false && livePlanProgressBlock ? (
-            <PlanExecutionSystemNotice
-              key={`${turn.id}-live-plan-progress`}
-              block={livePlanProgressBlock}
-              language={language}
-            />
-          ) : null}
-          {isTurnExpanded && shouldShowTurnChanges && !shouldArchiveCompletedProcess && !liveProcessHasChangeSummary && (
+
+          {isTurnExpanded && shouldArchiveCompletedProcess && hasProposalCheckpoint && proposalCheckpointBlock && (
+            <>
+              <TurnPhaseDivider label={phaseLabels.analysis} />
+              <AgentContentBlock
+                key={`${proposalCheckpointBlock.id}-${proposalBlockIndex}-archived-proposal`}
+                block={{ ...proposalCheckpointBlock, archivedAfterChoice: false }}
+                language={language}
+                chatFontSize={resolvedChatFontSize}
+              />
+            </>
+          )}
+          {isTurnExpanded && shouldArchiveCompletedProcess && hasProposalCheckpoint && proposalApprovalBlock && (
+            <>
+              <TurnPhaseDivider label={phaseLabels.approval} />
+              {renderBlock(proposalApprovalBlock, approvalBlockIndex)}
+            </>
+          )}
+          {isTurnExpanded && activityModel && activityModel.stepCount > 0 && (
+            <React.Fragment key="turn-activity">
+              {shouldArchiveCompletedProcess && hasProposalCheckpoint && (
+                <TurnPhaseDivider label={phaseLabels.execution} />
+              )}
+              <TurnActivityDisclosure
+                key="activity-disclosure"
+                model={activityModel}
+                variant={shouldArchiveCompletedProcess ? "archive" : "live"}
+                language={language}
+                chatFontSize={resolvedTurnProcessFontSize}
+                renderItem={shouldArchiveCompletedProcess ? renderArchivedBlockItem : renderBlockItem}
+              />
+            </React.Fragment>
+          )}
+
+          {shouldShowTurnChanges && (
             <TurnChangesCard
               key="turn-changes-card"
               entries={turnChangeEntries}
@@ -4246,61 +4183,9 @@ export default function ChatArea({
                 ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
                 : null}
             </React.Fragment>
-          ) : (
-            <React.Fragment key="turn-details">
-              {shouldArchiveCompletedProcess ? (
-                <React.Fragment key="archived-process">
-                  {hasProposalCheckpoint && proposalCheckpointBlock && (
-                    <>
-                      <TurnPhaseDivider key={`${turn.id}-archived-phase-analysis`} label={phaseLabels.analysis} />
-                      <AgentContentBlock
-                        key={`${proposalCheckpointBlock.id}-${proposalBlockIndex}-archived-proposal`}
-                        block={{ ...proposalCheckpointBlock, archivedAfterChoice: false }}
-                        language={language}
-                        chatFontSize={resolvedChatFontSize}
-                      />
-                    </>
-                  )}
-                  {hasProposalCheckpoint && proposalApprovalBlock && (
-                    <>
-                      <TurnPhaseDivider key={`${turn.id}-archived-phase-approval`} label={phaseLabels.approval} />
-                      {renderBlock(proposalApprovalBlock, approvalBlockIndex)}
-                    </>
-                  )}
-                  {hasProposalCheckpoint && processArchive && processArchive.totalCount > 0 && (
-                    <TurnPhaseDivider key={`${turn.id}-archived-phase-execution`} label={phaseLabels.execution} />
-                  )}
-                  {processArchive && processArchive.totalCount > 0 && (
-                    <TurnProcessArchive
-                      key="turn-process-archive"
-                      archive={processArchive}
-                      language={language}
-                      chatFontSize={resolvedTurnProcessFontSize}
-                      renderArchivedItem={renderArchivedBlockItem}
-                      onOpenDiff={openDiffForTask}
-                    />
-                  )}
-                  {finalVisibleAgentBlock
-                    ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
-                    : null}
-                </React.Fragment>
-              ) : (
-                <React.Fragment key="live-process">
-                  {liveProcessTimeline && liveProcessTimeline.totalCount > 0 && (
-                    <LiveTurnProcessTimeline
-                      key="live-turn-timeline"
-                      model={liveProcessTimeline}
-                      language={language}
-                      chatFontSize={resolvedTurnProcessFontSize}
-                      renderLiveItem={renderBlockItem}
-                      onOpenDiff={openDiffForTask}
-                    />
-                  )}
-                  {buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
-                </React.Fragment>
-              )}
-            </React.Fragment>
-          )}
+          ) : shouldArchiveCompletedProcess ? (
+            finalVisibleAgentBlock ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex) : null
+          ) : buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
           {isTurnExpanded && turnSubagentRuns.length > 0 && (
             <SubagentActivityNotice
               key="subagent-activity-notice"
@@ -4404,59 +4289,6 @@ export default function ChatArea({
     runId: permissionActionRequest?.runId || capsuleHarnessIdentity?.runId || undefined,
     requestId: permissionActionRequest?.requestId || undefined,
   });
-  const goalOwnerTurn = activeGoal
-    ? conversationTurns.find((turn) => turn.id === activeGoal.ownerTurnId) ||
-      (capsuleTurn?.intent === "goal" ? capsuleTurn : null)
-    : null;
-  const goalBlockingActionRequest = activeGoal && activeActionRequest?.status === "pending" &&
-    activeActionRequest.sessionKey === activeSessionKey &&
-    harnessRunMarker?.status === "paused" &&
-    harnessRunMarker.sessionKey === activeActionRequest.sessionKey &&
-    harnessRunMarker.turnId === activeActionRequest.turnId &&
-    harnessActionRunId === activeActionRequest.runId
-    ? activeActionRequest
-    : null;
-  const goalActionRequest = goalBlockingActionRequest?.kind === "goal_confirmation" &&
-    goalBlockingActionRequest.goalId === activeGoal?.id &&
-    goalBlockingActionRequest.goalRevision === (activeGoal?.revision || 1) &&
-    (!activeGoal?.ownerTurnId || goalBlockingActionRequest.turnId === activeGoal.ownerTurnId)
-    ? goalBlockingActionRequest
-    : null;
-  const goalControlIdentity = activeGoal
-    ? {
-        goalId: activeGoal.id,
-        goalRevision: activeGoal.revision || 1,
-        ...(goalActionRequest ? { requestId: goalActionRequest.requestId } : {}),
-      }
-    : null;
-  const goalPresentationOwnerTurn = activeGoal && shouldDetachGoalPresentationFromOwnerTurn({
-    goalStatus,
-    ownerTurn: goalOwnerTurn,
-    ownerTurnId: activeGoal.ownerTurnId,
-    sessionKey: activeSessionKey || "",
-    runtimeEvents,
-  })
-    ? null
-    : goalOwnerTurn;
-  const goalPresentation = activeGoal
-    ? buildTurnPresentationModel({
-        turn: goalPresentationOwnerTurn,
-        language,
-        fallbackTitle: activeGoal.objective,
-        statusOverride: goalStatus,
-        statusLabel: goalStatus,
-        kindOverride: "goal",
-        hasActionRequest: !!goalBlockingActionRequest,
-        actionKind: goalBlockingActionRequest?.kind,
-        turnId: activeGoal.ownerTurnId || goalOwnerTurn?.id,
-        runId: goalBlockingActionRequest?.runId || (
-          harnessRunMarker?.turnId === (activeGoal.ownerTurnId || goalOwnerTurn?.id)
-            ? harnessActionRunId || undefined
-            : undefined
-        ),
-        requestId: goalBlockingActionRequest?.requestId,
-      })
-    : null;
   const capsuleActionKind = planReviewActionRequest?.kind ||
     userChoiceActionRequest?.kind ||
     (shouldShowExecutionCapsule ? permissionActionRequest?.kind : undefined) ||
@@ -4466,7 +4298,7 @@ export default function ChatArea({
     : null;
   const capsuleStatusProjection = buildCapsuleStatusProjection({
     language,
-    presentation: activeGoal ? goalPresentation : capsulePresentation,
+    presentation: capsulePresentation,
     actionKind: capsuleActionKind,
     planStage,
     planExecutionPhase: capsulePlanExecutionSnapshot?.phase,
@@ -4474,88 +4306,121 @@ export default function ChatArea({
     agentStatus,
     isRunActive: capsuleIsRunActive,
   });
-  const capsuleStructuredGuidanceText = capsuleIsRunActive &&
-    !capsuleActionKind &&
-    ["analyzing", "planning", "executing", "validating", "recovering"].includes(
-      capsuleStatusProjection.kind,
-    )
-      ? buildCapsuleGuidanceText(
-          capsuleRunStatus,
-          language,
-        )
-      : "";
-  const capsuleLiveGuidanceText = capsuleIsRunActive &&
-    !capsuleActionKind &&
-    activeSessionKey &&
-    capsuleTurn?.id &&
-    capsuleActiveRunId &&
-    capsuleActiveLogicalTurnId &&
-    ["analyzing", "planning", "executing", "validating", "recovering"].includes(
-      capsuleStatusProjection.kind,
-    )
-      ? selectCapsuleLiveGuidance({
-          blocks: capsuleTurnBlocks,
-          sessionKey: activeSessionKey,
-          logicalTurnId: capsuleActiveLogicalTurnId,
-          displayTurnId: capsuleTurn.id,
-          runId: capsuleActiveRunId,
-          language,
-          // Only a newer renderable progress item or health signal retires an
-          // older model-visible line. Non-display telemetry must not replace
-          // the last useful Capsule content with a generic lifecycle sentence.
-          notOlderThan: Math.max(
-            0,
-            capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
-            ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
-          ),
-        })
-      : "";
-  const capsuleRuntimeV2Projection = capsuleIsRunActive &&
-    !capsuleActionKind &&
-    capsuleTurn?.id
-      ? buildRuntimeV2CompatibleCapsuleProjection({
-          events: runtimeEvents,
-          turnId: capsuleTurn.id,
-          runId: capsuleActiveRunId,
-          language,
-        })
-      : null;
-  const capsulePhaseGuidanceText = capsuleIsRunActive && !capsuleActionKind
-    ? buildCapsulePhaseGuidance(capsuleStatusProjection.kind, language)
+  const capsuleRequest = planReviewActionRequest || userChoiceActionRequest ||
+    (shouldShowExecutionCapsule ? permissionActionRequest : null);
+  const capsuleActivityTurnId = capsuleRequest?.turnId || capsuleActiveLogicalTurnId || capsuleTurn?.id;
+  const capsuleActivityRunId = capsuleRequest?.runId || capsuleActiveRunId ||
+    (harnessRunMarker?.sessionKey === activeSessionKey && harnessRunMarker?.turnId === capsuleActivityTurnId
+      ? harnessActionRunId
+      : null);
+  const rawCapsuleCheckpoint = capsuleActivityTurnId ? runtimeV2Checkpoints[capsuleActivityTurnId] : null;
+  const capsuleAggregate = useMemo(() => activeSessionKey && capsuleActivityTurnId
+    ? normalizeRuntimeV2Checkpoint(rawCapsuleCheckpoint, {
+        sessionKey: activeSessionKey,
+        turnId: capsuleActivityTurnId,
+        ...(activeSessionEpoch ? { sessionEpoch: activeSessionEpoch } : {}),
+      })?.aggregate
+    : undefined, [rawCapsuleCheckpoint, activeSessionKey, activeSessionEpoch, capsuleActivityTurnId]);
+  const runtimeRun = capsuleAggregate?.run;
+  const activityOwner = runtimeRun && runtimeRun.identity.runId === capsuleActivityRunId ? runtimeRun.identity : null;
+  const capsuleActivityParentRunId = activityOwner ? activityOwner.parentRunId
+    : capsuleRequest ? capsuleRequest.parentRunId
+    : harnessRunMarker?.activeRunId === capsuleActivityRunId ? harnessRunMarker?.activeParentRunId ?? null
+    : harnessRunMarker?.parentRunId ?? null;
+  const capsuleActivities = useSyncExternalStore(subscribeCapsuleLiveActivity, getCapsuleLiveActivitySnapshot, getCapsuleLiveActivitySnapshot);
+  const currentActivities = capsuleIsRunActive && !capsuleActionKind && activityOwner && runtimeRun?.status === "running"
+    ? capsuleActivities.filter(({ run }) =>
+        run.sessionKey === activityOwner.sessionKey && run.sessionEpoch === activityOwner.sessionEpoch &&
+        run.turnId === activityOwner.turnId && run.runId === activityOwner.runId &&
+        run.parentRunId === activityOwner.parentRunId && run.attemptId === activityOwner.attemptId)
+    : [];
+  // Snapshot order reflects starts, so a completed parallel tool reveals the
+  // most recently started tool still in flight.
+  const runningTools = currentActivities.filter(activity => activity.kind === "tool");
+  const currentTool = runningTools[runningTools.length - 1];
+  const currentModelRequest = currentActivities.find(activity => activity.kind === "model");
+  const requestStage = currentModelRequest?.stage;
+
+  const legacyTool = !rawCapsuleCheckpoint && capsuleIsRunActive && !capsuleActionKind && capsuleActivityRunId
+    ? [...capsuleTurnBlocks].reverse().find(block => block.type === "tool" && block.audience !== "internal" &&
+        block.toolStatus === "running" && block.runId === capsuleActivityRunId &&
+        (block.parentRunId ?? null) === capsuleActivityParentRunId)
+    : null;
+  const legacyGuidance = !rawCapsuleCheckpoint && capsuleIsRunActive && !capsuleActionKind && activeSessionKey &&
+    capsuleActivityTurnId && capsuleActivityRunId && capsuleTurn?.id
+    ? selectCapsuleLiveGuidance({
+        blocks: capsuleTurnBlocks,
+        sessionKey: activeSessionKey,
+        logicalTurnId: capsuleActivityTurnId,
+        displayTurnId: capsuleTurn.id,
+        runId: capsuleActivityRunId,
+        language,
+      })
     : "";
-  const capsuleGuidanceText =
-    capsuleRuntimeV2Projection?.markdown ||
-    capsuleLiveGuidanceText ||
-    capsuleStructuredGuidanceText ||
-    capsulePhaseGuidanceText;
-  const capsuleGuidanceSource = capsuleRuntimeV2Projection
-    ? "runtime_v2"
-    : capsuleLiveGuidanceText
-    ? "model"
-    : capsuleStructuredGuidanceText
-      ? "runtime"
-      : capsulePhaseGuidanceText
-        ? "phase"
-        : "status";
-  const capsuleGuidanceUpdatedAt = Math.max(
-    0,
-    capsuleRuntimeV2Projection?.updatedAt || 0,
-    capsuleRunStatus.currentActivity?.lastSeenAt || 0,
-    capsuleRunStatus.lastGuidanceActivity?.lastSeenAt || 0,
-    ...capsuleRunStatus.healthSignals.map((signal) => signal.lastSeenAt),
-  );
+  const capsuleActivityKind = capsuleActionKind ? "action"
+    : currentTool || legacyTool ? "tool"
+    : requestStage || (legacyGuidance ? "model" : capsuleIsRunActive ? "phase" : "status");
+  let capsuleActivityLine: CapsuleActivityLine = { title: capsuleStatusProjection.label };
+  if (currentTool || legacyTool) {
+    capsuleActivityLine = {
+      ...describeCapsuleToolActivity({
+        toolName: currentTool?.toolName || legacyTool?.executionName || legacyTool?.toolName || "",
+        target: currentTool?.target || legacyTool?.target,
+        validation: currentTool?.validation,
+        workspaceKey: capsuleAggregate?.turn.workspaceKey || currentWorkspace,
+        language,
+        live: true,
+      }),
+      count: runningTools.length,
+      live: true,
+    };
+  } else if (requestStage) {
+    const modelStatus = {
+      preparing: { zh: "正在准备模型请求", en: "Preparing the model request" },
+      acquiring_lane: { zh: "正在等待可用模型通道", en: "Waiting for an available model slot" },
+      waiting: { zh: "等待模型响应", en: "Waiting for the model" },
+      receiving: { zh: "正在接收模型输出", en: "Receiving model output" },
+    };
+    capsuleActivityLine = {
+      title: modelStatus[requestStage][language],
+      live: true,
+      waitingSince: requestStage === "waiting" ? currentModelRequest?.startedAt : undefined,
+    };
+  } else if (legacyGuidance) {
+    capsuleActivityLine = { title: legacyGuidance.replace(/\*\*([^*]+)\*\*|\x60([^\x60]+)\x60/g, "$1$2"), live: true };
+  }
+  const capsuleGuidanceSource = currentTool || requestStage ? "runtime_v2"
+    : legacyTool ? "runtime" : legacyGuidance ? "model" : capsuleActivityKind;
+  const capsuleHistory = useMemo(() =>
+    showProgressPopover && activeSessionKey && capsuleActivityTurnId && capsuleActivityRunId
+      ? buildCapsuleActivityHistory({
+          aggregate: capsuleAggregate,
+          sessionKey: activeSessionKey,
+          sessionEpoch: activeSessionEpoch,
+          turnId: capsuleActivityTurnId,
+          runId: capsuleActivityRunId,
+          parentRunId: capsuleActivityParentRunId,
+          legacyEvents: runtimeEvents,
+          legacyBlocks: capsuleTurnBlocks,
+          workspaceKey: capsuleAggregate?.turn.workspaceKey || currentWorkspace,
+          language,
+        })
+      : [],
+  [showProgressPopover, activeSessionKey, activeSessionEpoch, capsuleActivityTurnId, capsuleActivityRunId,
+    capsuleAggregate, capsuleActivityParentRunId, runtimeEvents, capsuleTurnBlocks, currentWorkspace, language]);
 
   useEffect(() => {
     setIsCapsuleCollapsed(false);
   }, [capsuleTurn?.id]);
 
-  const planReviewCapsuleControls = planReviewActionRequest ? (
+  const planReviewCapsuleControls = planReviewActionRequest && (!planReviewActionRequest.documentRef || openApprovalDialog) ? (
     <PlanReviewCapsule
       request={planReviewActionRequest}
       language={language}
       themeMode={config.themeMode}
       onOpenPlan={() => openRightPanelTab("plan")}
-      onApprove={() => approvePlan(undefined, planReviewActionRequest)}
+      opensApprovalDialog={Boolean(openApprovalDialog)}
+      onApprove={openApprovalDialog || (() => approvePlan(undefined, planReviewActionRequest))}
     />
   ) : null;
 
@@ -4589,6 +4454,8 @@ export default function ChatArea({
       progressMode="execution"
       isAwaitingChoice
       replyOptions={userChoiceReplyOptions}
+      choiceRequest={userChoiceActionRequest}
+      onSubmitChoiceAnswer={resolveStructuredUserChoice}
       allowCustomReply={userChoiceActionRequest.allowCustomReply}
       pendingRunDecision={null}
       canApprovePlan={false}
@@ -4686,25 +4553,17 @@ export default function ChatArea({
     !!planReviewCapsuleControls ||
     !!userChoiceCapsuleControls ||
     !!planExecutionCapsuleProjection ||
-    !!activeGoal;
+    false;
 
   return (
-    <div className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
+    <div ref={chatAreaRef} className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
       <div className="h-[48px] shrink-0 border-b border-[#27272a] bg-[#000000] px-4 flex items-center justify-between select-none" data-tauri-drag-region>
-        <button data-testid={isImageStudioMode ? "image-studio-settings-button" : "model-settings-button"} onClick={() => {
-          if (isImageStudioMode) {
-            setImageStudioSetupGuideOpen(true);
-            return;
-          }
+        <button data-testid={"model-settings-button"} onClick={() => {
+
           setSettingsTab(config.activeProfile === "cloud" ? "cloud" : "local");
           setIsSettingsOpen(true);
         }} className="flex min-w-0 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-2.5 py-1.5 text-xs font-medium text-[#e4e4e7] transition-colors hover:bg-[#18181b]" style={{ height: 28 }}>
-          {isImageStudioMode ? (
-            <>
-              <span className={`h-1.5 w-1.5 rounded-full ${imageStudio.status.state === "ready" ? "bg-green-500 shadow-[0_0_5px_#22c55e]" : isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-zinc-500"}`} />
-              {language === "en" ? "Image Studio" : "图像工作室"}: <span className="max-w-[200px] truncate font-normal text-[#a1a1aa]">{imageStudioProviderLabel} · {imageStudioProviderDetail}</span>
-            </>
-          ) : config.activeProfile === "local" ? (
+          {config.activeProfile === "local" ? (
             <>
               <span className={`h-1.5 w-1.5 rounded-full ${isStreaming ? "bg-amber-400 shadow-[0_0_5px_#fbbf24] animate-pulse" : "bg-green-500 shadow-[0_0_5px_#22c55e]"}`} />
               {config.local.provider}: <span className="max-w-[150px] truncate font-normal text-[#a1a1aa]">{config.local.model || copy.modelUnselected}</span>
@@ -4790,110 +4649,7 @@ export default function ChatArea({
       >
 
         {groupedTurns.length === 0 ? (
-          isImageStudioMode ? (
-            <div
-              data-testid="image-studio-empty-state"
-              className="flex min-h-full items-center justify-center pb-12"
-            >
-              <div className="w-full max-w-5xl">
-                <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-[16px] font-semibold text-[#f4f4f5]">
-                      <IconImageIcon className="h-4 w-4 text-[var(--accent-light)]" />
-                      {language === "en" ? "Image Studio" : "图像工作室"}
-                    </div>
-                    <div className="mt-1 text-[12px] text-[#a1a1aa]">
-                      {language === "en"
-                        ? "A dedicated image conversation workspace. Local image services stay primary, and HiDream Web remains available as a lighter browser fallback."
-                        : "一个独立的图像对话工作区。本地图片服务是主路径，HiDream Web 保留为更轻量的网页 fallback。"}
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      data-testid="image-studio-empty-check-engine"
-                      onClick={() => void checkImageStudioEngine()}
-                      className="inline-flex h-8 items-center gap-2 rounded-md border border-[#27272a] bg-[#09090b] px-3 text-[11px] text-[#d4d4d8] transition-colors hover:bg-[#18181b] hover:text-white"
-                    >
-                      <IconZap className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-                      {language === "en" ? "Check Provider" : "检测 provider"}
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="image-studio-empty-open-setup"
-                      onClick={() => setImageStudioSetupGuideOpen(true)}
-                      className="inline-flex h-8 items-center gap-2 rounded-md border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-3 text-[11px] font-semibold text-[var(--accent-light)] transition-colors hover:border-[var(--accent)]"
-                    >
-                      <IconSettings className="h-3.5 w-3.5" />
-                      {language === "en" ? "Setup" : "设置"}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="grid gap-3 md:grid-cols-[minmax(260px,0.8fr)_minmax(300px,1.2fr)]">
-                  <div className="rounded-lg border border-[#27272a] bg-[#09090b] p-4">
-                    <div className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#71717a]">
-                      {language === "en" ? "Provider" : "Provider 状态"}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className={`h-2 w-2 rounded-full ${imageStudio.status.state === "ready" ? "bg-emerald-400" : imageStudio.status.state === "error" ? "bg-red-400" : "bg-zinc-500"}`} />
-                      <span className="text-[13px] font-semibold text-[#e4e4e7]">
-                        {imageStudio.status.state === "ready"
-                          ? (language === "en" ? "Ready" : "已就绪")
-                          : (language === "en" ? "Not connected" : "未连接")}
-                      </span>
-                    </div>
-                    <div className="mt-2 break-words text-[12px] leading-relaxed text-[#a1a1aa]">
-                      {imageStudio.status.message}
-                    </div>
-                    <div className="mt-4 grid grid-cols-2 gap-2 text-[11px] text-[#a1a1aa]">
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudioProviderLabel}</span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">{imageStudio.config.aspectRatio}</span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">
-                        {isWebFallbackImageEngine
-                          ? `Refine ${imageStudio.config.web.promptRefine ? "On" : "Off"}`
-                          : `${imageStudio.config.steps} steps`}
-                      </span>
-                      <span className="rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">
-                        {isWebFallbackImageEngine
-                          ? "Hosted"
-                          : `CFG ${imageStudio.config.guidanceScale}`}
-                      </span>
-                      <span className="truncate rounded-md border border-[#27272a] bg-[#050507] px-2 py-1">
-                        {isWebFallbackImageEngine ? imageStudio.config.web.endpoint : imageStudio.config.local.endpoint}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    {[
-                      language === "en"
-                        ? "A quiet product photo of a titanium desk lamp on smoked glass, softbox lighting"
-                        : "钛金属桌灯放在烟灰玻璃桌面上的安静产品照，柔和棚拍光",
-                      language === "en"
-                        ? "A cinematic mountain observatory above a sea of clouds, dawn, ultra detailed"
-                        : "云海之上的电影感山顶天文台，黎明，超细节",
-                      language === "en"
-                        ? "A minimalist interface concept for a future music workstation, precise panels"
-                        : "未来音乐工作站的极简界面概念图，精密面板",
-                      language === "en"
-                        ? "A hand-painted botanical study of luminous glass flowers, ink and watercolor"
-                        : "发光玻璃花朵的手绘植物学研究，墨线与水彩",
-                    ].map((prompt) => (
-                      <button
-                        key={prompt}
-                        type="button"
-                        onClick={() => onSendMessage?.(prompt)}
-                        className="min-h-[92px] rounded-lg border border-[#27272a] bg-[#09090b] p-3 text-left text-[12px] leading-relaxed text-[#d4d4d8] transition-colors hover:border-[var(--accent-subtle-border)] hover:bg-[#131316]"
-                      >
-                        {prompt}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : (
+          (
             <div
               data-testid="chat-empty-state"
               className="flex h-full items-center justify-center select-none pointer-events-none"
@@ -4906,83 +4662,6 @@ export default function ChatArea({
               </div>
             </div>
           )
-        ) : isImageStudioMode ? (
-          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
-            <div className="space-y-5">
-              {onLoadOlderSessionHistory && (
-                <div className="flex justify-center">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (olderHistoryLoading) return;
-                      const el = chatContainerRef.current;
-                      const previousScrollHeight = el?.scrollHeight ?? 0;
-                      const previousScrollTop = el?.scrollTop ?? 0;
-                      setOlderHistoryLoading(true);
-                      Promise.resolve(onLoadOlderSessionHistory()).finally(() => {
-                        window.requestAnimationFrame(() => {
-                          const latestEl = chatContainerRef.current;
-                          if (latestEl && previousScrollHeight > 0) {
-                            latestEl.scrollTop = latestEl.scrollHeight - previousScrollHeight + previousScrollTop;
-                            lastScrollTopRef.current = latestEl.scrollTop;
-                          }
-                          setOlderHistoryLoading(false);
-                        });
-                      });
-                    }}
-                    className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1.5 text-[11px] text-[#a1a1aa] transition-colors hover:border-[var(--accent)] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    disabled={olderHistoryLoading}
-                  >
-                    {olderHistoryLoading
-                      ? (language === "zh" ? "加载中..." : "Loading...")
-                      : (language === "zh" ? "加载更早历史" : "Load Older History")}
-                  </button>
-                </div>
-              )}
-              {groupedTurns.map((entry, index) => renderTurn(entry, index))}
-            </div>
-
-            <aside className="hidden xl:block">
-              <div className="sticky top-5 rounded-xl border border-[#27272a] bg-[#09090b] p-3">
-                <div className="mb-3 flex items-center gap-2 text-[12px] font-semibold text-[#f4f4f5]">
-                  <IconImageIcon className="h-3.5 w-3.5 text-[var(--accent-light)]" />
-                  {language === "en" ? "Recent Results" : "最近结果"}
-                </div>
-                <div className="space-y-3">
-                  {recentImageBlocks.length > 0 ? recentImageBlocks.map((block: any) => {
-                    const imageUrl = block.imageUrl || block.previewUrl || "";
-                    return (
-                      <button
-                        key={String(block.id)}
-                        type="button"
-                        onClick={() => onSendMessage?.(block.prompt || "")}
-                        className="w-full rounded-lg border border-[#27272a] bg-[#050507] p-2 text-left transition-colors hover:border-[var(--accent-subtle-border)] hover:bg-[#131316]"
-                      >
-                        <div className="mb-2 aspect-square overflow-hidden rounded-md border border-[#27272a] bg-[#09090b]">
-                          {imageUrl ? (
-                            <img src={imageUrl} alt={block.prompt || "generated image"} className="h-full w-full object-cover" />
-                          ) : (
-                            <div className="flex h-full items-center justify-center text-[10px] text-[#71717a]">
-                              {block.status === "completed"
-                                ? (language === "en" ? "Saved result" : "已保存结果")
-                                : (language === "en" ? "Generating" : "生成中")}
-                            </div>
-                          )}
-                        </div>
-                        <div className="line-clamp-3 text-[11px] leading-relaxed text-[#d4d4d8]">{block.prompt}</div>
-                      </button>
-                    );
-                  }) : (
-                    <div className="rounded-lg border border-dashed border-[#27272a] px-3 py-4 text-[11px] leading-relaxed text-[#71717a]">
-                      {language === "en"
-                        ? "Your finished images will collect here for quick variants and reruns."
-                        : "完成后的图片会收集到这里，方便快速做变体和重跑。"}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </aside>
-          </div>
         ) : (
           <div className="space-y-5">
             {onLoadOlderSessionHistory && (
@@ -5041,183 +4720,14 @@ export default function ChatArea({
           }}
         >
           {showProgressPopover && !isCapsuleCollapsed && (
-            <div
-              ref={popoverRef}
-              id="run-status-popover"
-              data-testid="effective-progress-popover"
-              data-runtime-surface="run-status"
-              role="dialog"
-              aria-modal="false"
-              aria-labelledby="run-status-popover-title"
-              className={`pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border p-4 backdrop-blur-md text-left transition-all duration-200 ${
-                isLightThemeMode
-                  ? "border-[#d4d4d8] bg-white/95 shadow-[0_12px_40px_rgba(0,0,0,0.12)] text-[#18181b]"
-                  : isBlackThemeMode
-                  ? "border-[#202026] bg-[#030304]/95 shadow-[0_12px_40px_rgba(0,0,0,0.95)] text-[#e7e7ea]"
-                  : "border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] shadow-[0_12px_40px_rgba(0,0,0,0.85)] text-[#e4e4e7]"
-              }`}
-              style={{
-                fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
-              }}
-            >
-              <div className={`flex items-center justify-between border-b pb-2 mb-2 ${
-                isLightThemeMode ? "border-[#e4e4e7]" : "border-[rgba(255,255,255,0.08)]"
-              }`}>
-                <span id="run-status-popover-title" className="font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent-light)] font-semibold">
-                  {language === "zh" ? "运行状态" : "Run Status"}
-                </span>
-                <button
-                  ref={runStatusCloseButtonRef}
-                  type="button"
-                  onClick={() => setCapsulePopover(null)}
-                  aria-label={language === "zh" ? "关闭运行状态" : "Close run status"}
-                  className={`rounded p-1 transition-colors ${
-                    isLightThemeMode
-                      ? "text-[#71717a] hover:bg-[#f4f4f5] hover:text-[#18181b]"
-                      : "text-[#71717a] hover:bg-[rgba(255,255,255,0.06)] hover:text-white"
-                  }`}
-                >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-
-              {!capsuleRunStatus.currentActivity &&
-              capsuleRunStatus.milestones.length === 0 &&
-              capsuleRunStatus.healthSignals.length === 0 ? (
-                <div className={`py-6 text-center italic ${
-                  isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                }`}>
-                  {language === "zh" ? "暂无运行状态" : "No run status yet"}
-                </div>
-              ) : (
-                <div className="max-h-[260px] overflow-y-auto space-y-3 pr-1">
-                  {capsuleRunStatus.currentActivity && (
-                    <section data-testid="run-status-current-activity">
-                      <div className={`mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
-                        isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                      }`}>
-                        {language === "zh" ? "当前活动" : "Current activity"}
-                      </div>
-                      <div
-                        className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border text-[11px] ${
-                          isLightThemeMode
-                            ? "border-[#e4e4e7] bg-[#f8fafc]"
-                            : isBlackThemeMode
-                            ? "border-[#202026] bg-[#030304]"
-                            : "border-[#202026] bg-[#09090b]"
-                        }`}
-                      >
-                        <span className={`mt-1.5 h-2 w-2 rounded-full ${
-                          capsuleRunStatus.currentActivity.status === "running"
-                            ? "bg-[var(--accent-light)] shadow-[0_0_8px_var(--accent)]"
-                            : "bg-[#10b981]"
-                        }`} />
-                        <span className="min-w-0 flex-1">
-                          <span className={`block font-medium truncate ${
-                            isLightThemeMode ? "text-[#18181b]" : "text-white"
-                          }`}>{capsuleRunStatus.currentActivity.title}</span>
-                          {capsuleRunStatus.currentActivity.summary && (
-                            <span className={`mt-0.5 block truncate ${
-                              isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                            }`}>{capsuleRunStatus.currentActivity.summary}</span>
-                          )}
-                        </span>
-                        {(capsuleRunStatus.currentActivity.repeatCount > 1 || capsuleRunStatus.currentActivity.cacheHits > 0) && (
-                          <span className="shrink-0 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-1.5 py-0.5 text-[9px] text-[var(--accent-light)]">
-                            ×{capsuleRunStatus.currentActivity.repeatCount}
-                          </span>
-                        )}
-                      </div>
-                    </section>
-                  )}
-
-                  {capsuleRunStatus.milestones.length > 0 && (
-                    <section data-testid="run-status-milestones">
-                      <div className={`mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
-                        isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                      }`}>
-                        {language === "zh" ? "最近里程碑" : "Recent milestones"}
-                      </div>
-                      <div className="space-y-1.5">
-                        {capsuleRunStatus.milestones.map((item) => (
-                          <div
-                            key={item.key}
-                            data-testid="run-status-milestone"
-                            className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border text-[11px] ${
-                              isLightThemeMode
-                                ? "border-[#e4e4e7] bg-[#f8fafc]"
-                                : isBlackThemeMode
-                                ? "border-[#202026] bg-[#030304]"
-                                : "border-[#202026] bg-[#09090b]"
-                            }`}
-                          >
-                            <span className="mt-1.5 h-2 w-2 rounded-full bg-[#10b981]" />
-                            <span className="min-w-0 flex-1">
-                              <span className={`block font-medium truncate ${
-                                isLightThemeMode ? "text-[#18181b]" : "text-white"
-                              }`}>{item.title}</span>
-                              {item.summary && (
-                                <span className={`mt-0.5 block truncate ${
-                                  isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                                }`}>{item.summary}</span>
-                              )}
-                            </span>
-                            {item.repeatCount > 1 && (
-                              <span className="shrink-0 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-1.5 py-0.5 text-[9px] text-[var(--accent-light)]">
-                                ×{item.repeatCount}
-                              </span>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </section>
-                  )}
-
-                  {capsuleRunStatus.healthSignals.length > 0 && (
-                    <section data-testid="run-status-health-signals">
-                      <div className={`mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
-                        isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                      }`}>
-                        {language === "zh" ? "运行健康" : "Run health"}
-                      </div>
-                      <div className="space-y-1.5">
-                        {capsuleRunStatus.healthSignals.map((signal) => (
-                          <div
-                            key={signal.key}
-                            data-testid="run-status-health-signal"
-                            className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-2.5 rounded-lg border px-2 py-1.5 text-[11px] ${
-                              isLightThemeMode
-                                ? "border-[#e4e4e7] bg-[#f8fafc]"
-                                : isBlackThemeMode
-                                ? "border-[#202026] bg-[#030304]"
-                                : "border-[#202026] bg-[#09090b]"
-                            }`}
-                          >
-                            <span className={`mt-1.5 h-2 w-2 rounded-full ${
-                              signal.kind === "failure" || signal.kind === "pause"
-                                ? "bg-[#f87171]"
-                                : "bg-[#f59e0b]"
-                            }`} />
-                            <span className="min-w-0">
-                              <span className={`block font-medium truncate ${
-                                isLightThemeMode ? "text-[#18181b]" : "text-white"
-                              }`}>{signal.title}</span>
-                              {signal.summary && (
-                                <span className={`mt-0.5 block truncate ${
-                                  isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                                }`}>{signal.summary}</span>
-                              )}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </section>
-                  )}
-                </div>
-              )}
-            </div>
+            <CapsuleActivityPopover
+              dialogRef={popoverRef}
+              closeRef={runStatusCloseButtonRef}
+              onClose={() => setCapsulePopover(null)}
+              language={language}
+              current={capsuleActivityLine}
+              history={capsuleHistory}
+            />
           )}
           {showTasksPopover && !isCapsuleCollapsed && (
             <div
@@ -5268,7 +4778,7 @@ export default function ChatArea({
                       ? "border-[#202026] bg-[#030304]"
                       : "border-[#202026] bg-[#09090b]";
                     const currentTaskRowClass = `${taskRowClass} ring-2 ring-inset ring-[color-mix(in_srgb,var(--accent)_72%,transparent)]`;
-                    
+
                     return capsuleProgressItems.map((task, index) => {
                       const isCurrentPlanTask = capsuleProgressMode === "plan" && task.id === currentPlanTaskId && !task.complete;
                       return (
@@ -5320,39 +4830,16 @@ export default function ChatArea({
               )}
             </div>
           )}
-          {showGoalPopover && !isCapsuleCollapsed && activeGoal && (
-            <div
-              ref={goalPopoverRef}
-              data-testid="goal-progress-popover"
-              className="pointer-events-auto mb-3 w-full max-w-xl text-left transition-all duration-200"
-            >
-              <GoalPanel
-                presentation={goalPresentation || undefined}
-                goal={activeGoal}
-                progress={goalProgress}
-                status={goalStatus}
-                runtime={goalRuntime}
-                language={language}
-                themeMode={config.themeMode}
-                onPause={() => goalControlIdentity && useAppStore.getState().pauseGoal(goalControlIdentity)}
-                onResume={() => goalControlIdentity && useAppStore.getState().resumeGoal(goalControlIdentity)}
-                onEdit={(objective) => goalControlIdentity && useAppStore.getState().updateGoalText(objective, goalControlIdentity)}
-                onStop={() => goalControlIdentity
-                  ? useAppStore.getState().clearGoal(goalControlIdentity)
-                  : false}
-                onClose={() => setCapsulePopover(null)}
-              />
-            </div>
-          )}
+
           {(() => {
-            const headerLabel = capsuleStatusProjection.label;
             const hasTypedCapsuleControls = hasExecutionCapsuleControls || !!planReviewCapsuleControls || !!userChoiceCapsuleControls;
             return (
               <div
                 data-testid="agent-explanation-capsule"
                 data-capsule-status={capsuleStatusProjection.kind}
                 data-guidance-source={capsuleGuidanceSource}
-                data-guidance-updated-at={capsuleGuidanceUpdatedAt || undefined}
+                data-guidance-updated-at={(currentTool || currentModelRequest)?.startedAt}
+                data-activity-kind={capsuleActivityKind}
                 data-action-kind={planReviewActionRequest?.kind || userChoiceActionRequest?.kind || permissionActionRequest?.kind || undefined}
                 data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || activeSessionKey || undefined}
                 data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || capsuleTurn?.id || undefined}
@@ -5364,8 +4851,8 @@ export default function ChatArea({
                 style={{
                   fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
                   lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
-                  maxHeight: !isCapsuleCollapsed && chatAreaHeight
-                    ? `${chatAreaHeight * (hasTypedCapsuleControls ? 1 : 0.58)}px`
+                  maxHeight: !isCapsuleCollapsed
+                    ? `calc(var(--chat-visible-height, 100vh) * ${hasTypedCapsuleControls ? 1 : 0.58})`
                     : undefined,
                   // The inner scroll container is the sole overflow owner.
                   // Keeping a second scrollbar on the Capsule shell produced
@@ -5382,12 +4869,9 @@ export default function ChatArea({
                 />
                 {isCapsuleCollapsed ? (
                   <div
-                    className={`flex items-center justify-center w-full h-full ${activeGoal ? `capsule-goal-icon is-${goalStatus}` : "animate-pulse"}`}
-                    data-goal-status={activeGoal ? goalStatus : undefined}
+                    className={`flex items-center justify-center w-full h-full ${"animate-pulse"}`}
                   >
-                    {activeGoal
-                      ? <IconGoal className="h-5 w-5 pointer-events-none" />
-                      : <IconLogoM className="h-5 w-5 theme-text pointer-events-none" />}
+                    {<IconLogoM className="h-5 w-5 theme-text pointer-events-none" />}
                   </div>
                 ) : (
                   <div className="agent-explanation-scroll-container">
@@ -5402,38 +4886,18 @@ export default function ChatArea({
                               setCapsulePopover(showProgressPopover ? null : "progress");
                             }}
                             aria-expanded={showProgressPopover}
+                            aria-haspopup="dialog"
                             aria-controls="run-status-popover"
                             className="mt-0.5 shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
-                            title={language === "zh" ? "查看运行状态" : "View Run Status"}
+                            title={language === "zh" ? "查看本轮活动" : "View turn activity"}
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>
                           <div className="min-w-0 flex-1 text-left">
-                            {capsuleGuidanceText ? (
-                              <div
-                                data-testid="capsule-guidance-label"
-                                aria-live="polite"
-                                aria-atomic="true"
-                                className="capsule-guidance-markdown block min-w-0 font-medium"
-                              >
-                                <MarkdownRenderer
-                                  content={capsuleGuidanceText}
-                                  baseFontSize={Math.max(12, resolvedChatFontSize - 1)}
-                                  sourceId={`capsule-guidance-${capsuleTurn?.id || "active"}`}
-                                />
-                              </div>
-                            ) : (
-                              <span
-                                data-testid="capsule-status-label"
-                                aria-live="polite"
-                                aria-atomic="true"
-                                className={`block whitespace-normal break-words font-semibold ${
-                                  isLightThemeMode ? "text-[#18181b]" : "text-white"
-                                }`}
-                              >
-                                {headerLabel}
-                              </span>
-                            )}
+                            <div data-testid={["action", "status"].includes(capsuleActivityKind) ? "capsule-status-label" : "capsule-guidance-label"}
+                              className="min-w-0 text-[var(--surface-text-strong)]">
+                              <CapsuleActivityText line={capsuleActivityLine} language={language} announce />
+                            </div>
                           </div>
                         </div>
 
@@ -5453,25 +4917,8 @@ export default function ChatArea({
                             </svg>
                           </button>
                         )}
-                        
-                        {activeGoal && (
-                          <button
-                            ref={goalButtonRef}
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setCapsulePopover(showGoalPopover ? null : "goal");
-                            }}
-                            title={language === "zh" ? "目标进度" : "Goal Progress"}
-                            aria-label={language === "zh" ? "目标进度" : "Goal Progress"}
-                            aria-expanded={showGoalPopover}
-                            data-testid="goal-capsule-trigger"
-                            data-goal-status={goalStatus}
-                            className={`capsule-goal-trigger is-${goalStatus} ${showGoalPopover ? "is-open" : ""}`}
-                          >
-                            <IconGoal className="w-3.5 h-3.5" />
-                          </button>
-                        )}
+
+
 
                         {!planReviewActionRequest && !userChoiceActionRequest && (
                           <button
@@ -5528,11 +4975,7 @@ export default function ChatArea({
         attachedFiles={attachedFiles}
         setAttachedFiles={setAttachedFiles}
         onAttachFile={onAttachFile}
-        showAgentPicker={showAgentPicker}
-        setShowAgentPicker={setShowAgentPicker}
-        selectedMainModeKey={selectedMainModeKey}
-        setSelectedMainModeKey={setSelectedMainModeKey}
-        mainModes={mainModes}
+
         currentWorkspace={currentWorkspace}
         t={t}
         activeDiffTask={activeDiffTask}
@@ -5544,6 +4987,9 @@ export default function ChatArea({
         isRunActive={composerRunActive}
         turnIngressMode={composerTurnIngress.mode}
         guidanceTarget={composerTurnIngress.guidanceTarget}
+        runtimeV2Guidance={composerTurnIngress.runtimeV2Guidance}
+        restoreDraftRef={restoreComposerDraft}
+        guidancePending={composerTurnIngress.guidancePending}
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}
@@ -5557,6 +5003,14 @@ export default function ChatArea({
         item={previewImageItem}
         onClose={() => setPreviewImageItem(null)}
       />
+      {approvalDialogRequest && approvalDialogRequest === reviewDialogBinding?.request && (
+        <PlanApprovalDialog request={approvalDialogRequest} markdown={reviewDialogBinding.markdown} language={language}
+          onClose={() => setApprovalDialogRequest(null)}
+          onApprove={request => {
+            setApprovalDialogRequest(null);
+            approvePlan(undefined, request);
+          }} />
+      )}
     </div>
   );
 }

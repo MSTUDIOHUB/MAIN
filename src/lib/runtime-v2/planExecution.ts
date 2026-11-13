@@ -8,11 +8,10 @@ import type {
 import type { RuntimeV2ExecutionValidationAuthority } from "./contracts";
 import { runtimeV2ValidationBoundaryMatchesCurrent } from "./validationReceipt";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
-import {
-  normalizeWorkspacePathIdentity,
-  workspacePathsReferToSameFile,
-} from "../workspacePaths";
+import { workspacePathsReferToSameFile } from "../workspacePaths";
 import { resolveWorkspaceMutationRequests } from "../workspaceMutationTools";
+import { normalizeValidationWorkspaceCwd } from "../validationContract";
+import { approvedRuntimeV2PlanContinuation } from "./planContinuationBaseline";
 
 export interface RuntimeV2PlanMutationScope {
   readonly allowed: boolean;
@@ -111,13 +110,6 @@ function normalizedCommand(value: unknown): string {
     : "";
 }
 
-function normalizedCwd(value: unknown): string {
-  const normalized = normalizeWorkspacePathIdentity(
-    typeof value === "string" ? value : "",
-  );
-  return !normalized || normalized === "." ? "." : normalized;
-}
-
 function argumentsForEvent(
   aggregate: TurnAggregateV1,
   event: Extract<RuntimeV2Event, { type: "validation.completed" }>,
@@ -145,11 +137,15 @@ function validationMatches(
   validation: WorkPlanDraftV1["validations"][number],
   toolName: string,
   args: Readonly<Record<string, unknown>>,
+  workspace?: string,
 ): boolean {
   if (validation.kind === "finite_command") {
+    const expectedCwd = normalizeValidationWorkspaceCwd(validation.cwd, workspace);
+    const actualCwd = normalizeValidationWorkspaceCwd(args.cwd ?? args.workdir ?? args.Cwd, workspace);
     return toolName === "run_command" &&
       normalizedCommand(args.command) === normalizedCommand(validation.command) &&
-      normalizedCwd(args.cwd ?? args.workdir) === normalizedCwd(validation.cwd);
+      (!validation.useProjectEditor || args.input === undefined || args.input === "") &&
+      expectedCwd !== null && actualCwd === expectedCwd;
   }
   if (validation.kind === "browser") return toolName === "browser_evaluate";
   if (validation.kind === "desktop") return toolName === "computer_use";
@@ -248,6 +244,7 @@ export function deriveRuntimeV2PlanExecutionFrontier(
   const approvalSequence = approvalIndex >= 0
     ? aggregate.events[approvalIndex]!.sequence
     : -1;
+  const carried = new Set(approvedRuntimeV2PlanContinuation(aggregate.events)?.continuation.completedStepIndexes);
   const receipts = successfulPlanMutationReceipts(aggregate);
   const consumed = new Set<string>();
   const steps: RuntimeV2PlanExecutionFrontierStep[] = [];
@@ -273,7 +270,7 @@ export function deriveRuntimeV2PlanExecutionFrontier(
         steps[dependency]?.completionSequence ?? approvalSequence
       ),
     );
-    if (step.operation === "preserve") {
+    if (step.operation === "preserve" || carried.has(stepIndex)) {
       steps.push({
         stepIndex,
         operation: step.operation,
@@ -454,7 +451,7 @@ export function resolveRuntimeV2PlanValidationScope(input: {
 }): RuntimeV2PlanValidationScope {
   const matchingValidationIndexes = input.plan.draft.validations
     .map((validation, index) =>
-      validationMatches(validation, input.toolName, input.args) ? index : -1
+      validationMatches(validation, input.toolName, input.args, input.aggregate?.turn.workspaceKey) ? index : -1
     )
     .filter((index) => index >= 0);
   return {
@@ -486,6 +483,8 @@ export function runtimeV2PlanValidationAuthority(input: {
     targetPaths: uniquePaths(validation.stepIndexes.flatMap((stepIndex) =>
       input.plan.draft.steps[stepIndex]?.targets || []
     )),
+    ...(validation.expectedTestCases !== undefined ? { expectedTestCases: validation.expectedTestCases } : {}),
+    ...(validation.useProjectEditor ? { useProjectEditor: true } : {}),
   };
 }
 
@@ -618,20 +617,18 @@ export function deriveRuntimeV2PlanSourceFreshness(
     return null;
   }
   const approvalBoundary = approvedEventIndex(aggregate);
-  const entries = uniquePaths(plan.draft.steps.flatMap((step) =>
-    step.operation === "modify" || step.operation === "delete"
-      ? [...step.targets]
-      : []
-  )).map((target): RuntimeV2PlanSourceFreshnessEntry => {
-    const basisIds = new Set(plan.draft.steps
-      .filter((step) =>
-        (step.operation === "modify" || step.operation === "delete") &&
-        step.targets.some((candidate) =>
-          workspacePathsReferToSameFile(candidate, target)
-        )
-      )
+  const baseline = approvedRuntimeV2PlanContinuation(aggregate.events)?.continuation;
+  const carried = new Set(baseline?.completedStepIndexes);
+  const mutableSteps = plan.draft.steps.filter((step, index) => !carried.has(index) &&
+    (step.operation === "modify" || step.operation === "delete"));
+  const entries = uniquePaths(mutableSteps.flatMap(step => [...step.targets])).map((target): RuntimeV2PlanSourceFreshnessEntry => {
+    const path = normalizeValidationWorkspaceCwd(target, aggregate.turn.workspaceKey);
+    const carriedVersion = path && baseline?.carriedTargets.find(item =>
+      normalizeValidationWorkspaceCwd(item.target, aggregate.turn.workspaceKey) === path)?.version;
+    const basisIds = new Set(mutableSteps
+      .filter(step => step.targets.some(candidate => workspacePathsReferToSameFile(candidate, target)))
       .flatMap((step) => [...step.basis]));
-    const expectedVersions = [...new Set(plan.evidence
+    const expectedVersions = carriedVersion ? [carriedVersion] : [...new Set(plan.evidence
       .filter((evidence) =>
         basisIds.has(evidence.id) &&
         !!evidence.version &&
@@ -682,11 +679,11 @@ export function deriveRuntimeV2PlanExecutionCoverage(
   }
 
   const plannedMutationTargets = collectRuntimeV2PlanMutationTargets(plan);
-  const committedMutationTargets = uniquePaths(
-    aggregate.evidence
-      .filter((evidence) => evidence.kind === "mutation")
-      .map((evidence) => evidence.target),
-  );
+  const continuation = approvedRuntimeV2PlanContinuation(aggregate.events);
+  const committedMutationTargets = uniquePaths([
+    ...aggregate.evidence.filter(evidence => evidence.kind === "mutation").map(evidence => evidence.target),
+    ...(continuation?.continuation.carriedTargets.map(receipt => receipt.target) || []),
+  ]);
   const missingMutationTargets = plannedMutationTargets.filter((planned) =>
     !committedMutationTargets.some((committed) =>
       workspacePathsReferToSameFile(committed, planned)
@@ -707,7 +704,7 @@ export function deriveRuntimeV2PlanExecutionCoverage(
   const requiredValidationIndexes = plan.draft.validations
     .map((validation, index) => validation.required ? index : -1)
     .filter((index) => index >= 0);
-  const mutationBoundary = latestMutationIndex(aggregate);
+  const mutationBoundary = Math.max(latestMutationIndex(aggregate), continuation ? approvedEventIndex(aggregate) : -1);
   const passedValidations = aggregate.events.filter(
     (event): event is Extract<RuntimeV2Event, { type: "validation.completed" }> =>
       isRuntimeV2ValidationAttempt(event) &&
@@ -735,6 +732,8 @@ export function deriveRuntimeV2PlanExecutionCoverage(
       authority.revision === expectedAuthority.revision &&
       authority.digest === expectedAuthority.digest &&
       authority.validationId === expectedAuthority.validationId &&
+      authority.expectedTestCases === expectedAuthority.expectedTestCases &&
+      authority.useProjectEditor === expectedAuthority.useProjectEditor &&
       authority.criterionIds.length ===
         expectedAuthority.criterionIds.length &&
       authority.criterionIds.every((id) =>
@@ -750,7 +749,7 @@ export function deriveRuntimeV2PlanExecutionCoverage(
       if (!authorityMatches(event.authority)) return false;
       const invocation = argumentsForEvent(aggregate, event);
       return !!invocation &&
-        validationMatches(required, invocation.toolName, invocation.args);
+        validationMatches(required, invocation.toolName, invocation.args, aggregate.turn.workspaceKey);
     });
   });
   const missingRequiredValidationIndexes = requiredValidationIndexes.filter(

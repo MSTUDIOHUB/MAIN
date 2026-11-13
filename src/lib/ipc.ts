@@ -2,8 +2,14 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { KnowledgeReference } from "./knowledgeReferences";
+export type { KnowledgeReference } from "./knowledgeReferences";
+import type { PlanDocumentRef, PlanDocumentScope, SavePlanDocumentInput } from "./planDocuments";
+export type { PlanDocumentOwner, PlanDocumentRef, PlanDocumentScope, SavePlanDocumentInput } from "./planDocuments";
 import type { GithubSkillSource } from "./githubSkillSource";
+import type { WebSearchProvider } from "./networkRead";
 import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
+import { mergeRuntimeV2CheckpointMaps } from "./runtime-v2/checkpointMerge";
 import {
   createProjectSessionMutationCoordinator,
   isProjectSessionAdmissionProjectionOwned,
@@ -12,6 +18,7 @@ import {
 
 const projectSessionMutations = createProjectSessionMutationCoordinator();
 const projectSessionRevisionByOwner = new Map<string, number>();
+const projectSessionLedgerByOwner = new Map<string, { revision: number; checkpoints: unknown }>();
 
 function projectSessionOwnerKey(workspace: string, sessionId: number | string): string {
   return `${workspace}\u0000${String(sessionId)}`;
@@ -37,6 +44,18 @@ function rememberProjectSessionRevision(ownerKey: string, session: unknown): voi
   }
 }
 
+function rememberProjectSessionLedger(ownerKey: string, session: any): void {
+  const revision = normalizeProjectSessionStorageRevision(session?.storageRevision);
+  if (revision === null || revision !== projectSessionRevisionByOwner.get(ownerKey) ||
+      !isProjectSessionObject(session?.runtimeSnapshot)) return;
+  projectSessionLedgerByOwner.delete(ownerKey);
+  projectSessionLedgerByOwner.set(ownerKey, { revision, checkpoints: session.runtimeSnapshot.runtimeV2Checkpoints });
+  if (projectSessionLedgerByOwner.size > 8) {
+    const oldest = projectSessionLedgerByOwner.keys().next().value;
+    if (oldest !== undefined) projectSessionLedgerByOwner.delete(oldest);
+  }
+}
+
 function rememberProjectSessionList(workspace: string, sessions: unknown): void {
   if (!Array.isArray(sessions)) return;
   sessions.forEach((session) => {
@@ -48,13 +67,14 @@ function rememberProjectSessionList(workspace: string, sessions: unknown): void 
 
 function clearProjectSessionRevision(ownerKey: string): void {
   projectSessionRevisionByOwner.delete(ownerKey);
+  projectSessionLedgerByOwner.delete(ownerKey);
 }
 
 function clearWorkspaceProjectSessionRevisions(workspace: string): void {
   const ownerPrefix = `${workspace}\u0000`;
   for (const ownerKey of projectSessionRevisionByOwner.keys()) {
     if (ownerKey.startsWith(ownerPrefix)) {
-      projectSessionRevisionByOwner.delete(ownerKey);
+      clearProjectSessionRevision(ownerKey);
     }
   }
 }
@@ -149,7 +169,9 @@ export function prepareProjectSessionSnapshotForSave(session: any, existing: unk
     conversationTurns: turns,
   };
   if ("runtimeV2Checkpoints" in runtimeSnapshot) {
-    runtimeSnapshot.runtimeV2Checkpoints = serializeRuntimeV2CheckpointMap(runtimeSnapshot.runtimeV2Checkpoints);
+    runtimeSnapshot.runtimeV2Checkpoints = serializeRuntimeV2CheckpointMap(mergeRuntimeV2CheckpointMaps(
+      currentRuntime?.runtimeV2Checkpoints, incomingRuntime?.runtimeV2Checkpoints,
+    ));
   }
   return {
     ...current,
@@ -458,8 +480,26 @@ export interface KnowledgeBase {
   sourceCount: number;
   indexStatus: string;
   embeddingProfile: string;
+  indexRevision: string;
   createdAtMs: number;
   updatedAtMs: number;
+  presetId?: string | null;
+  tocEntryCount?: number;
+  tocIndexedSourceCount?: number;
+  presetSyncStatus?: "done" | "partial";
+}
+
+export interface EngineManualPreset {
+  presetId: string;
+  name: string;
+  description: string;
+  engineFamily: string;
+  entryUrl: string;
+  tocUrls: string[];
+  seedUrls: string[];
+  officialDomains: string[];
+  searchSiteFilter: string;
+  documentationVersion: string;
 }
 
 export interface KnowledgeSource {
@@ -474,6 +514,8 @@ export interface KnowledgeSource {
   status: string;
   metadata: Record<string, unknown> | null;
   lastIndexedAtMs: number;
+  sourceRevision: string;
+  provenance?: "official_document" | "builtin_summary" | "unverified_legacy";
 }
 
 export interface KnowledgeCitation {
@@ -485,12 +527,24 @@ export interface KnowledgeCitation {
   page?: number | null;
   block?: string | null;
   score: number;
+  indexRevision: string;
+  admittedIndexRevision?: string;
+  sourceRevision: string;
+  sourceKind?: "official_document" | "builtin_summary";
+  documentationVersion?: string;
+  documentationCoverage?: string;
+  sourceUrl?: string | null;
 }
 
 export interface KnowledgeSearchHit {
   text: string;
   excerpt: string;
   citation: KnowledgeCitation;
+  returnedCharRange: { start: number; end: number };
+  totalChars: number;
+  complete: boolean;
+  retrievalKind: "lexical_match" | "source_overview" | "source_excerpt";
+  sourceOverview?: { totalChunks: number; totalChars: number; nextChunkId?: string | null } | null;
 }
 
 export interface KnowledgeSearchResult {
@@ -498,6 +552,8 @@ export interface KnowledgeSearchResult {
   searchedKnowledgeBaseIds: string[];
   hits: KnowledgeSearchHit[];
   note: string;
+  attemptedTiers?: string[];
+  hydratedCount?: number;
 }
 
 export interface KnowledgeImportResult {
@@ -930,40 +986,7 @@ export interface AttachmentIngestResult {
   sizeBytes: number;
 }
 
-export interface ImageStudioEngineCheckResult {
-  ready: boolean;
-  message: string;
-  capabilities?: Record<string, unknown>;
-}
-
-export interface ImageStudioProxyRequestInput {
-  engine?: string;
-  endpoint: string;
-  path: string;
-  method: "GET" | "POST" | "DELETE";
-  body?: string;
-  streamId?: string;
-}
-
-export interface ImageStudioProxyResponse {
-  status: number;
-  ok: boolean;
-  body: string;
-  contentType?: string | null;
-}
-
-export interface ImageStudioStreamChunkPayload {
-  streamId: string;
-  chunk: string;
-}
-
-export interface ImageStudioStreamDonePayload {
-  streamId: string;
-  status: "ok" | "error" | "cancelled";
-  error?: string | null;
-}
-
-export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
+export type { WebSearchProvider } from "./networkRead";
 
 export interface WebSearchResultItem {
   title: string;
@@ -1202,43 +1225,69 @@ export function readAttachmentImageDataUrl(sourcePath: string): Promise<string> 
   return invoke<string>("read_attachment_image_data_url", { sourcePath });
 }
 
-export function checkImageStudioEngine(config: { engine: string; endpoint: string }): Promise<ImageStudioEngineCheckResult> {
-  return invoke<ImageStudioEngineCheckResult>("check_image_studio_engine", {
-    engine: config.engine,
-    endpoint: config.endpoint,
-  });
+export interface ProjectSessionSnapshotRecord {
+  workspace: string;
+  sessionId: string;
+  revision: number;
+  snapshot: Record<string, unknown>;
+  updatedAtMs: number;
 }
 
-export function proxyImageStudioRequest(input: ImageStudioProxyRequestInput): Promise<ImageStudioProxyResponse> {
-  return invoke<ImageStudioProxyResponse>("proxy_image_studio_request", input as unknown as Record<string, unknown>);
+/** Full maintenance enumeration, including known legacy project owners. */
+export function listAllSessionSnapshots(knownWorkspaces?: readonly string[]): Promise<ProjectSessionSnapshotRecord[]> {
+  return invoke<ProjectSessionSnapshotRecord[]>("list_all_session_snapshots", { knownWorkspaces });
 }
 
-export function cancelImageStudioJob(): Promise<void> {
-  return invoke<void>("cancel_image_studio_job");
+/** Exact CAS; deliberately bypasses autosave revision reconciliation. */
+export function compareAndSwapSessionSnapshot(input: {
+  workspace: string;
+  sessionId: string;
+  expectedRevision: number;
+  snapshot: Record<string, unknown>;
+  mutationDeadlineMs?: number;
+}): Promise<ProjectSessionSnapshotRecord> {
+  return invoke<ProjectSessionSnapshotRecord>("compare_and_swap_session_snapshot", { input });
 }
 
-export function saveImageStudioOutput(sessionKey: string, fileName: string, dataUrl: string): Promise<string> {
-  return invoke<string>("save_image_studio_output", { sessionKey, fileName, dataUrl });
+export interface LegacySessionFile {
+  workspace: string;
+  sessionId: string;
+  fileName: "session.json" | "messages.jsonl" | "turns.jsonl" | "runtime.json";
+  contentHash: string;
+  value: unknown;
+}
+export function listLegacySessionFiles(knownWorkspaces?: readonly string[]): Promise<LegacySessionFile[]> {
+  return invoke("list_legacy_session_files", { knownWorkspaces });
+}
+export function compareAndSwapLegacySessionFile(input: Omit<LegacySessionFile, "contentHash"> & { expectedHash: string }): Promise<string> {
+  return invoke("compare_and_swap_legacy_session_file", { input });
 }
 
-export function saveImageStudioRemoteOutput(sessionKey: string, fileName: string, imageUrl: string): Promise<string> {
-  return invoke<string>("save_image_studio_remote_output", { sessionKey, fileName, imageUrl });
+/** Reclaim only exact imported app-owned legacy copies after their SQLite CAS. */
+export function finalizeLegacySessionImport(input: {
+  workspace: string;
+  sessionId: string;
+  expectedRevision: number;
+  expectedSnapshot: Record<string, unknown>;
+}): Promise<number> {
+  return invoke<number>("finalize_legacy_session_import", { input });
 }
 
-export function openImageStudioOutput(path: string): Promise<OpenFileExternalResult> {
-  return invoke<OpenFileExternalResult>("open_image_studio_output", { path });
+/** Only the retired feature's trusted temp folders; accepts no filesystem path. */
+export function cleanupLegacyImageStudioOutputs(): Promise<{ removedDirectories: number }> {
+  return invoke("cleanup_legacy_image_studio_outputs");
 }
 
-export function listenImageStudioStreamChunk(
-  handler: (payload: ImageStudioStreamChunkPayload) => void,
-): Promise<UnlistenFn> {
-  return listen<ImageStudioStreamChunkPayload>("image-studio-stream-chunk", (event) => handler(event.payload));
+export function savePlanDocument(input: SavePlanDocumentInput): Promise<PlanDocumentRef> {
+  return invoke<PlanDocumentRef>("save_plan_document", { input });
 }
 
-export function listenImageStudioStreamDone(
-  handler: (payload: ImageStudioStreamDonePayload) => void,
-): Promise<UnlistenFn> {
-  return listen<ImageStudioStreamDonePayload>("image-studio-stream-done", (event) => handler(event.payload));
+export function readPlanDocument(reference: PlanDocumentRef): Promise<PlanDocumentRef & { markdown: string }> {
+  return invoke("read_plan_document", { reference });
+}
+
+export function listPlanDocuments(scope: PlanDocumentScope): Promise<PlanDocumentRef[]> {
+  return invoke<PlanDocumentRef[]>("list_plan_documents", { scope });
 }
 
 export function deleteWorkspacePath(path: string, workspace?: string): Promise<void> {
@@ -1298,18 +1347,24 @@ export function saveProjectSession(
       // enqueue-time fence above deliberately excludes already-stale callers.
       let existingSession: any = null;
       let reconciledStorageRevision: number | null = null;
+      const cachedLedger = projectSessionLedgerByOwner.get(ownerKey);
+      const knownRevision = projectSessionRevisionByOwner.get(ownerKey) ?? capturedStorageRevision;
+      const ledgerMayBePresent = isProjectSessionObject(session?.runtimeSnapshot) &&
+        "runtimeV2Checkpoints" in session.runtimeSnapshot || cachedLedger?.checkpoints !== undefined;
       if (projectSessionSaveNeedsTranscriptBase(session)) {
         existingSession = await invoke<any>("load_project_session", {
           workspace,
           sessionId,
         });
         rememberProjectSessionRevision(ownerKey, existingSession);
+        rememberProjectSessionLedger(ownerKey, existingSession);
         if (lease.revisionReconciliationRequired) {
           reconciledStorageRevision = normalizeProjectSessionStorageRevision(
             existingSession?.storageRevision,
           ) ?? 0;
         }
-      } else if (lease.revisionReconciliationRequired) {
+      } else if (lease.revisionReconciliationRequired ||
+          (ledgerMayBePresent && knownRevision > 0 && cachedLedger?.revision !== knownRevision)) {
         // A previous invoke crossed the JavaScript settlement boundary. It
         // may have committed before its response was lost, so refresh Rust's
         // authoritative CAS revision before this writer selects its base.
@@ -1318,9 +1373,13 @@ export function saveProjectSession(
           sessionId,
         });
         rememberProjectSessionRevision(ownerKey, meta);
+        rememberProjectSessionLedger(ownerKey, meta);
+        existingSession = meta;
         reconciledStorageRevision = normalizeProjectSessionStorageRevision(
           meta?.storageRevision,
         ) ?? 0;
+      } else if (cachedLedger?.revision === knownRevision && cachedLedger.checkpoints !== undefined) {
+        existingSession = { runtimeSnapshot: { runtimeV2Checkpoints: cachedLedger.checkpoints } };
       }
       const storageRevision = mayAdvanceQueuedRevision
         ? reconciledStorageRevision ??
@@ -1337,6 +1396,7 @@ export function saveProjectSession(
         mutationDeadlineMs: lease.mutationDeadlineMs,
       });
       rememberProjectSessionRevision(ownerKey, saved);
+      rememberProjectSessionLedger(ownerKey, { ...queuedSession, storageRevision: saved?.storageRevision });
       return saved;
     },
     {
@@ -1348,7 +1408,9 @@ export function saveProjectSession(
 
 export async function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
   const session = await invoke<any>("load_project_session", { workspace, sessionId });
-  rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  const ownerKey = projectSessionOwnerKey(workspace, sessionId);
+  rememberProjectSessionRevision(ownerKey, session);
+  rememberProjectSessionLedger(ownerKey, session);
   return session;
 }
 
@@ -1365,7 +1427,9 @@ export interface ProjectSessionPage {
 
 export async function loadProjectSessionMeta(workspace: string, sessionId: number | string): Promise<any> {
   const session = await invoke<any>("load_project_session_meta", { workspace, sessionId });
-  rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  const ownerKey = projectSessionOwnerKey(workspace, sessionId);
+  rememberProjectSessionRevision(ownerKey, session);
+  rememberProjectSessionLedger(ownerKey, session);
   return session;
 }
 
@@ -1521,6 +1585,14 @@ export function knowledgeListBases(): Promise<KnowledgeBase[]> {
   return invoke<KnowledgeBase[]>("knowledge_list_bases");
 }
 
+export function knowledgeListPresets(): Promise<EngineManualPreset[]> {
+  return invoke<EngineManualPreset[]>("knowledge_list_presets");
+}
+
+export function knowledgeBootstrapPreset(presetId: string): Promise<KnowledgeBase> {
+  return invoke<KnowledgeBase>("knowledge_bootstrap_preset", { presetId });
+}
+
 export function knowledgeCreateBase(name: string, description?: string): Promise<KnowledgeBase> {
   return invoke<KnowledgeBase>("knowledge_create_base", { name, description });
 }
@@ -1549,19 +1621,32 @@ export function knowledgeRebuildBase(kbId: string): Promise<KnowledgeBase> {
   return invoke<KnowledgeBase>("knowledge_rebuild_base", { kbId });
 }
 
-export function knowledgeSearch(
+/** Only frozen selections from this message or workspace-active engine manual bindings may authorize a search. */
+export async function knowledgeSearch(
   query: string,
-  kbIds?: string[],
+  references: readonly KnowledgeReference[],
   limit?: number,
+  policy: import("./knowledgeReferences").KnowledgeLookupPolicy = { mode: "local" },
+  signal?: AbortSignal,
 ): Promise<KnowledgeSearchResult> {
-  return invoke<KnowledgeSearchResult>("knowledge_search", { query, kbIds, limit });
+  signal?.throwIfAborted();
+  const requestId = `knowledge-${globalThis.crypto.randomUUID()}`;
+  const cancel = () => { void invoke("cancel_proxy_request", { requestId }).catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    signal?.throwIfAborted();
+    return await invoke<KnowledgeSearchResult>("knowledge_search", { query, references, limit, policy, requestId });
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+  }
 }
 
 export function knowledgeGetExcerpt(
   sourceId: string,
   chunkId: string,
+  references: readonly KnowledgeReference[],
 ): Promise<KnowledgeSearchHit | null> {
-  return invoke<KnowledgeSearchHit | null>("knowledge_get_excerpt", { sourceId, chunkId });
+  return invoke<KnowledgeSearchHit | null>("knowledge_get_excerpt", { sourceId, chunkId, references });
 }
 
 export function knowledgeImportUrl(
@@ -1584,8 +1669,12 @@ export function knowledgeCancelImportUrl(kbId: string): Promise<void> {
   return invoke<void>("knowledge_cancel_import_url", { kbId });
 }
 
-export function deletePlanFiles(): Promise<void> {
-  return invoke<void>("delete_plan_files");
+export function deletePlanFiles(scope: {
+  workspace?: string;
+  chatTempSessionKey?: string;
+  protectedTurnIds?: string[];
+}): Promise<{ removedDocumentIds: string[]; removedLegacyFiles: number }> {
+  return invoke("delete_plan_files", scope);
 }
 
 export function runHookCommand(
@@ -1598,6 +1687,25 @@ export function runHookCommand(
     input,
     timeoutMs,
   });
+}
+
+export async function runUnityEditorOperation(
+  command: "unity_create_scene" | "unity_compile_project" | "unity_probe_editor" | "unity_test_project",
+  args: Record<string, unknown>,
+  signal: AbortSignal,
+  deadlineAt: number,
+): Promise<unknown> {
+  signal.throwIfAborted();
+  const operationId = crypto.randomUUID();
+  const cancel = () => { void invoke("cancel_unity_editor_operation", { operationId }).catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    const result = await invoke(command, { ...args, operationId, deadlineAt });
+    signal.throwIfAborted();
+    return result;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
 }
 
 export function runCommand(
@@ -1684,10 +1792,14 @@ export function codeAstQuery(input: {
 export function checkSourceSyntax(
   path: string,
   content: string,
+  workspace?: string,
+  patchPaths?: Readonly<Record<string, boolean>>,
 ): Promise<SourceSyntaxCheckResult> {
+  const shader = /\.(shader|hlsl|cginc|compute)$/i.test(path);
   return invoke<SourceSyntaxCheckResult>("check_source_syntax", {
     path,
     content,
+    ...(shader && workspace ? { workspace, patchPaths } : {}),
   });
 }
 

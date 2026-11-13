@@ -27,6 +27,14 @@ export interface MCPToolOrigin {
   serverName: string;
   serverUrl: string;
   remoteName: string;
+  connector?: "unity";
+}
+
+export interface UnityMcpWorkspaceBinding {
+  readonly serverUrl: string;
+  readonly projectHash: string;
+  readonly instanceId: string;
+  readonly editorVersion: string;
 }
 
 export function getMcpToolOrigin(tool: MCPTool): MCPToolOrigin | undefined {
@@ -55,7 +63,7 @@ interface JsonRpcRequest {
 
 interface JsonRpcResponse {
   jsonrpc: "2.0";
-  id?: number;
+  id?: number | null;
   result?: any;
   error?: { code: number; message: string; data?: any };
 }
@@ -72,6 +80,8 @@ interface McpSessionState {
   sessionId?: string;
   initialized: boolean;
   protocolVersion: string;
+  serverName?: string;
+  initializing?: Promise<void>;
 }
 
 type InvokeFn = <T = any>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -287,7 +297,22 @@ function extractSessionId(headers?: Record<string, string>): string | undefined 
   return headers[MCP_SESSION_HEADER] || headers["Mcp-Session-Id"] || headers["MCP-Session-Id"];
 }
 
-function parseSseJsonRpc(body: string): JsonRpcResponse | null {
+function isMatchingRpcResponse(
+  response: JsonRpcResponse | null,
+  requestId: number | undefined,
+  allowUncorrelatedError: boolean,
+): boolean {
+  if (!response || typeof response !== "object") return false;
+  if (requestId === undefined) return true;
+  if (response.id === requestId && ("result" in response || "error" in response)) return true;
+  return allowUncorrelatedError && response.id == null && !!response.error;
+}
+
+function parseSseJsonRpc(
+  body: string,
+  requestId: number | undefined,
+  allowUncorrelatedError: boolean,
+): JsonRpcResponse | null {
   const payloads: string[] = [];
   const dataLines: string[] = [];
   for (const line of body.split(/\r?\n/)) {
@@ -302,29 +327,39 @@ function parseSseJsonRpc(body: string): JsonRpcResponse | null {
   }
   if (dataLines.length > 0) payloads.push(dataLines.join("\n"));
 
+  let uncorrelatedError: JsonRpcResponse | null = null;
   for (const payload of payloads) {
     if (!payload || payload === "[DONE]") continue;
     try {
       const parsed = JSON.parse(payload) as JsonRpcResponse;
-      if (parsed && typeof parsed === "object") return parsed;
+      // A server may log progress before sending the response and may
+      // interleave frames for other requests. Only this request settles it.
+      if (isMatchingRpcResponse(parsed, requestId, false)) return parsed;
+      if (isMatchingRpcResponse(parsed, requestId, allowUncorrelatedError)) uncorrelatedError = parsed;
     } catch {
       // ignore invalid chunk
     }
   }
-  return null;
+  return uncorrelatedError;
 }
 
-function parseJsonRpcBody(body: string, contentType?: string): JsonRpcResponse | null {
+function parseJsonRpcBody(
+  body: string,
+  contentType: string | undefined,
+  requestId: number | undefined,
+  allowUncorrelatedError: boolean,
+): JsonRpcResponse | null {
   const text = String(body || "").trim();
   if (!text) return null;
   const normalizedType = String(contentType || "").toLowerCase();
 
   if (normalizedType.includes("text/event-stream") || text.startsWith("event:") || text.includes("\ndata:")) {
-    return parseSseJsonRpc(text);
+    return parseSseJsonRpc(text, requestId, allowUncorrelatedError);
   }
 
   try {
-    return JSON.parse(text) as JsonRpcResponse;
+    const parsed = JSON.parse(text) as JsonRpcResponse;
+    return isMatchingRpcResponse(parsed, requestId, allowUncorrelatedError) ? parsed : null;
   } catch {
     return null;
   }
@@ -411,7 +446,7 @@ async function sendJsonRpcRequest(
   if (sessionIdFromHeader) session.sessionId = sessionIdFromHeader;
 
   const snippet = getResponseSnippet(response.body);
-  const json = parseJsonRpcBody(response.body, response.contentType);
+  const json = parseJsonRpcBody(response.body, response.contentType, request.id, !response.ok);
 
   if (!response.ok) {
     if (json?.error) {
@@ -472,8 +507,15 @@ function shouldRecoverSession(err: unknown): boolean {
 }
 
 async function ensureMcpInitialized(server: MCPServer, session: McpSessionState): Promise<void> {
+  if (session.initializing) return session.initializing;
   if (session.initialized) return;
+  const initializing = initializeMcpSession(server, session);
+  session.initializing = initializing;
+  try { await initializing; }
+  finally { if (session.initializing === initializing) delete session.initializing; }
+}
 
+async function initializeMcpSession(server: MCPServer, session: McpSessionState): Promise<void> {
   const initializeRequest: JsonRpcRequest = {
     jsonrpc: "2.0",
     id: ++rpcIdCounter,
@@ -493,6 +535,7 @@ async function ensureMcpInitialized(server: MCPServer, session: McpSessionState)
   let initialized = false;
   try {
     const initJson = await runInitialize();
+    session.serverName = String(initJson.result?.serverInfo?.name || "");
     const protocolVersion = String(initJson.result?.protocolVersion || "").trim();
     if (protocolVersion) session.protocolVersion = protocolVersion;
     initialized = true;
@@ -500,6 +543,7 @@ async function ensureMcpInitialized(server: MCPServer, session: McpSessionState)
     if (err instanceof MCPRequestError && err.sessionId && !session.sessionId) {
       session.sessionId = err.sessionId;
       const initJson = await runInitialize();
+      session.serverName = String(initJson.result?.serverInfo?.name || "");
       const protocolVersion = String(initJson.result?.protocolVersion || "").trim();
       if (protocolVersion) session.protocolVersion = protocolVersion;
       initialized = true;
@@ -641,6 +685,7 @@ export async function discoverAllMcpTools(
               serverName: server.name,
               serverUrl: server.url,
               remoteName: tool.name,
+              ...(getSession(server.url).serverName === "mcp-for-unity-server" ? { connector: "unity" as const } : {}),
             },
           });
           map[tool.name] = server.url;
@@ -671,13 +716,9 @@ export async function discoverAllMcpTools(
         statusSnapshots.push(failureSnapshot);
         rememberMcpDiscoveryFailure(server, failureSnapshot, options);
         if (options.logFailures !== false) {
-          console.warn(`[MCP] Failed to discover tools from ${server.name} (${server.url}): ${diagnostic.message}`);
           console.warn("[MCP] Discovery diagnostics", {
-            server: server.name,
-            url: server.url,
             category: diagnostic.category,
             status: diagnostic.status,
-            responseSnippet: diagnostic.responseSnippet,
           });
         }
       }
@@ -685,13 +726,11 @@ export async function discoverAllMcpTools(
   );
 
   for (const r of results) {
-    if (r.status === "rejected") {
+    if (r.status === "rejected" && options.logFailures !== false) {
       const diagnostic = toMcpDiagnostic(r.reason);
       console.warn("[MCP] Unexpected rejection during discovery:", {
         category: diagnostic.category,
-        message: diagnostic.message,
         status: diagnostic.status,
-        responseSnippet: diagnostic.responseSnippet,
       });
     }
   }
@@ -724,11 +763,106 @@ export async function discoverAllMcpTools(
   return { tools: allTools, toolServerMap: deterministicToolServerMap, serverStatuses: statusSnapshots };
 }
 
+const mcpToolCalls = new Map<string, Promise<unknown>>();
+
+async function unityMcpInstances(url: string, session: McpSessionState): Promise<Array<Record<string, unknown>>> {
+  if (session.serverName !== "mcp-for-unity-server") return [];
+  const response = await sendJsonRpcRequest(url, {
+    jsonrpc: "2.0", id: ++rpcIdCounter, method: "resources/read",
+    params: { uri: "mcpforunity://instances" },
+  }, session);
+  const data = JSON.parse(response.result?.contents?.[0]?.text || "{}");
+  return data.success === true && Array.isArray(data.instances) ? data.instances : [];
+}
+
+export async function bindUnityMcpWorkspace(input: {
+  serverUrl: string;
+  canonicalWorkspace: string;
+  editorVersion: string;
+}): Promise<UnityMcpWorkspaceBinding | null> {
+  const root = input.canonicalWorkspace.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!root || !input.editorVersion || !globalThis.crypto?.subtle) return null;
+  // MCP for Unity uses the SHA-1 of Application.dataPath, truncated to
+  // 16 hex characters, as the HTTP project's routing identity.
+  const bytes = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(`${root}/Assets`));
+  const projectHash = Array.from(new Uint8Array(bytes), value => value.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  const session = getSession(input.serverUrl);
+  const matches = (await unityMcpInstances(input.serverUrl, session)).filter(instance =>
+    instance.hash === projectHash && instance.unity_version === input.editorVersion &&
+    typeof instance.id === "string" && instance.id.endsWith(`@${projectHash}`));
+  return matches.length === 1
+    ? { serverUrl: input.serverUrl, projectHash, instanceId: String(matches[0]!.id), editorVersion: input.editorVersion }
+    : null;
+}
+
+async function selectUnityMcpWorkspace(
+  binding: UnityMcpWorkspaceBinding,
+  session: McpSessionState,
+  assertDispatchAllowed?: () => void,
+) {
+  const instances = await unityMcpInstances(binding.serverUrl, session);
+  const matches = instances.filter(instance =>
+    instance.hash === binding.projectHash && instance.id === binding.instanceId &&
+    instance.unity_version === binding.editorVersion);
+  if (matches.length !== 1) throw new Error("MCP_UNITY_WORKSPACE_UNAVAILABLE");
+  assertDispatchAllowed?.();
+  const response = await sendJsonRpcRequest(binding.serverUrl, {
+    jsonrpc: "2.0", id: ++rpcIdCounter, method: "tools/call",
+    params: { name: "set_active_instance", arguments: { instance: binding.instanceId } },
+  }, session);
+  const selected = response.result?.structuredContent || JSON.parse(formatMcpToolCallResult("set_active_instance", response.result));
+  if (response.result?.isError || selected.success !== true || selected.data?.instance !== binding.instanceId) {
+    throw new Error("MCP_UNITY_WORKSPACE_SELECTION_FAILED");
+  }
+}
+
 export async function executeMcpTool(
   serverUrl: string,
   toolName: string,
   args: Record<string, unknown>,
+  binding?: UnityMcpWorkspaceBinding,
+  assertDispatchAllowed?: () => void,
 ): Promise<string> {
+  if (binding && (binding.serverUrl !== serverUrl || toolName === "set_active_instance")) {
+    throw new Error("MCP_UNITY_WORKSPACE_SCOPE_MISMATCH");
+  }
+  if (!binding && getSession(serverUrl).serverName !== "mcp-for-unity-server" && !mcpToolCalls.has(serverUrl)) {
+    return callMcpTool(serverUrl, toolName, args, undefined, assertDispatchAllowed);
+  }
+  return serializeUnityMcpRequest(serverUrl, () => callMcpTool(serverUrl, toolName, args, binding, assertDispatchAllowed));
+}
+
+async function serializeUnityMcpRequest<T>(serverUrl: string, task: () => Promise<T>): Promise<T> {
+  const predecessor = mcpToolCalls.get(serverUrl) || Promise.resolve();
+  const call = predecessor.catch(() => {}).then(task);
+  mcpToolCalls.set(serverUrl, call);
+  try { return await call; }
+  finally { if (mcpToolCalls.get(serverUrl) === call) mcpToolCalls.delete(serverUrl); }
+}
+
+export function readBoundUnityMcpEditorState(binding: UnityMcpWorkspaceBinding, assertDispatchAllowed?: () => void): Promise<unknown> {
+  return serializeUnityMcpRequest(binding.serverUrl, async () => {
+    assertDispatchAllowed?.();
+    const session = getSession(binding.serverUrl);
+    await ensureMcpInitialized({ name: "MCP", type: "http", url: binding.serverUrl }, session);
+    await selectUnityMcpWorkspace(binding, session, assertDispatchAllowed);
+    assertDispatchAllowed?.();
+    const response = await sendJsonRpcRequest(binding.serverUrl, {
+      jsonrpc: "2.0", id: ++rpcIdCounter, method: "resources/read",
+      params: { uri: "mcpforunity://editor/state" },
+    }, session);
+    return JSON.parse(response.result?.contents?.[0]?.text || "null");
+  });
+}
+
+async function callMcpTool(
+  serverUrl: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  binding?: UnityMcpWorkspaceBinding,
+  assertDispatchAllowed?: () => void,
+): Promise<string> {
+  assertDispatchAllowed?.();
   const session = getSession(serverUrl);
   await ensureMcpInitialized({ name: "MCP", type: "http", url: serverUrl }, session);
 
@@ -741,6 +875,8 @@ export async function executeMcpTool(
 
   let json: JsonRpcResponse;
   try {
+    if (binding) await selectUnityMcpWorkspace(binding, session, assertDispatchAllowed);
+    assertDispatchAllowed?.();
     json = await sendJsonRpcRequest(serverUrl, request, session);
   } catch (err) {
     try {
@@ -748,6 +884,8 @@ export async function executeMcpTool(
       resetSession(serverUrl);
       const refreshed = getSession(serverUrl);
       await ensureMcpInitialized({ name: "MCP", type: "http", url: serverUrl }, refreshed);
+      if (binding) await selectUnityMcpWorkspace(binding, refreshed, assertDispatchAllowed);
+      assertDispatchAllowed?.();
       json = await sendJsonRpcRequest(serverUrl, request, refreshed);
     } catch (finalErr) {
       const diagnostic = toMcpDiagnostic(finalErr);
@@ -772,15 +910,18 @@ export function formatMcpToolCallResult(toolName: string, result: any): string {
   const content = result?.content;
   const formatted = Array.isArray(content)
     ? content
-        .map((c: any) => (typeof c === "string" ? c : c.text ?? JSON.stringify(c)))
+        .map((c: any) => (typeof c === "string" ? c : c?.text ?? JSON.stringify(c)))
         .join("\n")
     : JSON.stringify(result ?? {});
   if (result?.isError === true) {
     const diagnostic = formatted.trim() || "MCP tool returned isError=true without diagnostic content.";
     throw new Error(`MCP_TOOL_ERROR[${toolName}] ${diagnostic}`);
   }
-  if (Array.isArray(content)) {
-    return formatted;
+  const structured = result?.structuredContent;
+  const hasSingleTextRepresentation = !Array.isArray(content) || (content.length <= 1 && content.every(block =>
+    typeof block === "string" || (typeof block?.text === "string" && (!block.type || block.type === "text"))));
+  if (hasSingleTextRepresentation && structured && typeof structured === "object" && !Array.isArray(structured)) {
+    return JSON.stringify(structured);
   }
   return formatted;
 }

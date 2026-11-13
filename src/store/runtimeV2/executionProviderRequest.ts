@@ -1,4 +1,6 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
@@ -10,6 +12,7 @@ import {
   streamChatCompletion,
   type OpenAiToolChoice,
 } from "../../lib/streaming";
+import { runtimeV2ExecutionEditorGuidance } from "./executionEditorGuidance";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   normalizeProviderResponseV1,
@@ -36,6 +39,7 @@ import {
 import {
   prioritizeRuntimeV2ProviderToolDefinitions,
 } from "./executionProviderTools";
+import { projectFiniteValidationCommands, projectValidationRecoveryReceipt } from "./executionProviderContext";
 import {
   deriveRuntimeV2ExecutionContract,
 } from "./executionContract";
@@ -49,6 +53,7 @@ import {
 import {
   RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT,
   RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT,
+  RUNTIME_V2_EXECUTION_REASONING_ONLY_TIMEOUT_MS,
   RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
   providerMessageChars,
   runtimeV2CurrentToolSurfaceInstruction,
@@ -67,7 +72,7 @@ export {
   runtimeV2EditableSourceAnchor,
 } from "./executionProviderInstruction";
 
-export async function requestRuntimeV2ProviderOnce(input: {
+interface RuntimeV2ProviderRequestInput {
   live: RuntimeV2LiveExecutionState;
   ports: RuntimeV2ExecutionPortsInput;
   command: RuntimeV2Command;
@@ -76,7 +81,28 @@ export async function requestRuntimeV2ProviderOnce(input: {
   toolChoice: OpenAiToolChoice | null;
   signal: AbortSignal;
   timeoutMs?: number;
-}): Promise<RuntimeV2NormalizedProviderResult> {
+}
+
+type RuntimeV2ProviderRequestResult = RuntimeV2NormalizedProviderResult & {
+  /** Consumed by the provider port after it admits the normalized tool call. */
+  readonly reasoningActionScope?: string;
+};
+
+export async function requestRuntimeV2ProviderOnce(
+  input: RuntimeV2ProviderRequestInput,
+): Promise<RuntimeV2ProviderRequestResult> {
+  const activity = beginCapsuleModelActivity(input.command.run, input.command.idempotencyKey, input.signal);
+  try {
+    return await performRuntimeV2ProviderRequest(input, activity);
+  } finally {
+    activity.finish();
+  }
+}
+
+async function performRuntimeV2ProviderRequest(
+  input: RuntimeV2ProviderRequestInput,
+  activity: ReturnType<typeof beginCapsuleModelActivity>,
+): Promise<RuntimeV2ProviderRequestResult> {
   const state = input.ports.get();
   const budget = input.ports.context.runtimeContextBudget;
   const settings = deriveBudgetedStreamSettings(state.config, budget);
@@ -87,10 +113,27 @@ export async function requestRuntimeV2ProviderOnce(input: {
   input.live.latestProviderRequestSkillGuidanceWindows = [];
   const requestMode = String(input.command.payload.mode || "").trim();
   let streamedText = "";
-  recordApprovedPlanContext(input.ports);
   const aggregate = aggregateForCurrentTurn(input.ports);
+  const approvedPlan = recordApprovedPlanContext(input.ports, aggregate);
+  const projectValidationReceipt = projectValidationRecoveryReceipt(aggregate);
+  const editorGuidance = runtimeV2ExecutionEditorGuidance(aggregate);
+  const { editorRepair } = editorGuidance;
+  const reasoningActionScope = approvedPlan && input.tools.length > 0 &&
+    state.config.activeProfile === "local" && settings.reasoningRequest === "auto" &&
+    adapterCapabilities.reasoningToggle && (requestMode === "execute" || requestMode === "validate")
+      ? JSON.stringify([
+          input.command.run.runId, input.command.run.attemptId, approvedPlan.approvalKey, requestMode,
+          settings.provider, settings.baseUrl, settings.model, settings.toolProtocol, input.textEnvelope,
+        ])
+      : undefined;
+  const reuseReasoningFallback = !!reasoningActionScope &&
+    input.live.approvedActionReasoningScope === reasoningActionScope;
+  // Carry the preference forward only if the provider port admits a call
+  // from this response. Rejection, cancellation and scope changes clear it.
+  delete input.live.approvedActionReasoningScope;
   restoreRuntimeV2ProviderRecoveryHistory(input.ports, aggregate, input.command);
-  const history = providerHistory(input.live, input.ports);
+  appendRuntimeV2GuidanceHistory(input.live.messages, aggregate, input.command.run, input.command.idempotencyKey);
+  const history = providerHistory(input.live, input.ports, approvedPlan ? aggregate : null);
   const sealedPreferredValidation = String(input.command.payload.mode || "") === "validate"
     ? preferredFiniteValidationCommand(input.ports)
     : "";
@@ -126,6 +169,10 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const toolNames = new Set(
     providerTools.map((tool) => tool.function.name),
   );
+  const projectValidationCommands = requestMode === "validate" && !editorRepair && toolNames.has("run_command") &&
+    !approvedPlan && !executionContract && !validationCorrection.active && !validationCorrection.validationCommandUnavailable &&
+    !aggregate?.evidence.some(evidence => evidence.kind === "mutation" && evidence.target === "package.json")
+    ? projectFiniteValidationCommands(input.ports).slice(0, 4) : [];
   const effectPressure =
     input.command.payload.effectPressure &&
       typeof input.command.payload.effectPressure === "object" &&
@@ -182,7 +229,10 @@ export async function requestRuntimeV2ProviderOnce(input: {
     recoveryStage,
     actionWindow,
   });
-  const reasoningRequest = derivedReasoningRequest;
+  const reasoningRequest = reuseReasoningFallback ? "off" : derivedReasoningRequest;
+  const reasoningOnlyTimeoutMs = reasoningActionScope && reasoningRequest !== "off"
+    ? RUNTIME_V2_EXECUTION_REASONING_ONLY_TIMEOUT_MS
+    : undefined;
   const requestSettings = reasoningRequest === settings.reasoningRequest
     ? settings
     : {
@@ -193,6 +243,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
   const decisionInstructionFor = (coverage: typeof input.live.latestProviderRequestSourceCoverage) => ({
     role: "system" as const,
     content: [
+      approvedPlan?.frontierInstruction || "",
+      editorGuidance.instruction,
+      projectValidationReceipt,
       aggregate?.strategy === "execute" && executionContract
         ? `Execution contract coverage (current mutation boundary): ${JSON.stringify(runtimeV2DirectExecuteContractCoverage(aggregate))}. Complete the missing targets and declared checks before a success report.`
         : "",
@@ -201,6 +254,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
         preferredValidation,
         {
           hasReadFile: toolNames.has("read_file"),
+          editorDiagnosticRepair: editorRepair,
           hasMutation: hasMutationTool,
           hasCreateFile: toolNames.has("write_file"),
           hasSpawnSubagent: toolNames.has("spawn_subagent"),
@@ -234,6 +288,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
             validationCorrection.repeatedFailedValidations >= 1,
         },
       ),
+      projectValidationCommands.length
+        ? `Project validation commands from package.json: ${projectValidationCommands.map(option => JSON.stringify(option.command)).join(", ")}. Call run_command with a command that covers the outstanding check, then continue from its result.`
+        : "",
       runtimeV2CurrentToolSurfaceInstruction(
         providerTools,
         structuredActionRequired,
@@ -308,6 +365,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     contextLimit: budget.contextLimit,
     reservedOutputTokens: maxOutputTokens + (toolsClosed ? 40 : 0),
     tools: providerTools,
+    preserveUserMessages: unboundedMessages.some(message => "runtimeGuidanceId" in message && !!message.runtimeGuidanceId),
   }) : unboundedMessages;
   const messages = executeRequest?.messages || (
     toolsClosed && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
@@ -326,6 +384,9 @@ export async function requestRuntimeV2ProviderOnce(input: {
   input.ports.logStoreEvent("runtime_v2_context_prepared", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
+    commandKey: input.command.idempotencyKey,
+    sessionKey: input.command.run.sessionKey,
+    guidanceIds: messages.flatMap(message => "runtimeGuidanceId" in message && message.runtimeGuidanceId ? [message.runtimeGuidanceId] : []),
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
     sourceReadAvailable: toolNames.has("read_file"),
@@ -338,10 +399,12 @@ export async function requestRuntimeV2ProviderOnce(input: {
       0,
     ),
     approximateToolSchemaChars: JSON.stringify(providerTools).length,
-    preferredValidationCommand: preferredValidation || null,
+    preferredValidationAvailable: !!preferredValidation,
     allowedToolCount: providerTools.length,
     nativeToolCount: input.textEnvelope ? 0 : providerTools.length,
     allowedToolNames: providerTools.map((tool) => tool.function.name),
+    editorObservationTools: providerTools.map(tool => tool.function.name).filter(name => name.startsWith("unity_mcp_")),
+    projectBaselineFingerprint: input.ports.context.projectBaselineContext?.fingerprints.overall || null,
     toolChoice: effectiveToolChoice || null,
     collaborationAllowed:
       input.command.payload.collaborationAllowed === true,
@@ -384,6 +447,8 @@ export async function requestRuntimeV2ProviderOnce(input: {
     inputBudget,
     estimatedInputTokens,
     reasoningRequest: requestSettings.reasoningRequest || null,
+    reasoningOnlyTimeoutMs: reasoningOnlyTimeoutMs ?? null,
+    reuseReasoningFallback,
     effectPressureActionDecoding:
       reasoningRequest === "off" &&
       settings.reasoningRequest !== "off",
@@ -411,36 +476,80 @@ export async function requestRuntimeV2ProviderOnce(input: {
       ) / 4,
     ) + maxOutputTokens,
   );
+  const logRequestTiming = (stage: string, data: Record<string, unknown> = {}) =>
+    input.ports.logStoreEvent("runtime_v2_provider_request_timing", {
+      turnId: input.command.run.turnId,
+      runId: input.command.run.runId,
+      commandKey: input.command.idempotencyKey,
+      phase: input.command.phase,
+      textEnvelope: input.textEnvelope,
+      stage,
+      ...data,
+    });
+  activity.acquiringLane();
+  const laneStartedAt = Date.now();
+  logRequestTiming("lane_requested");
   const lane = await acquireModelLane({
     config: state.config,
     contextLimit: budget?.contextLimit,
     requestTokenBudget,
     agentKind: "parent",
+    parentRunId: input.command.run.runId,
     signal: input.signal,
     onDebugEvent: (event, data) =>
       input.ports.logStoreEvent(event, {
         turnId: input.command.run.turnId,
         runId: input.command.run.runId,
+        commandKey: input.command.idempotencyKey,
         ...data,
       }),
   });
+  logRequestTiming("lane_acquired", { elapsedMs: Date.now() - laneStartedAt });
   let result: Awaited<ReturnType<typeof streamChatCompletion>>;
   let reasoningFallbackApplied = false;
+  let carryReasoningFallback = reuseReasoningFallback;
+  const wireCallbacks = (attempt: "initial" | "reasoning_retry"): Parameters<typeof streamChatCompletion>[2] => {
+    let dispatchAt = 0;
+    let dispatchCount = 0;
+    let modelProgressSeen = false;
+    const onModelProgress = () => {
+      lane.markFirstToken();
+      if (modelProgressSeen) return;
+      modelProgressSeen = true;
+      logRequestTiming("first_model_progress", {
+        attempt, dispatchCount, elapsedMs: dispatchAt ? Date.now() - dispatchAt : null,
+      });
+    };
+    return {
+      onToken: token => {
+        onModelProgress();
+        streamedText += token;
+      },
+      onDone: () => undefined,
+      onError: () => undefined,
+      onRequestDispatched() {
+        dispatchAt = Date.now();
+        dispatchCount += 1;
+        modelProgressSeen = false;
+        logRequestTiming("dispatched", { attempt, dispatchCount });
+        return activity.requestDispatched();
+      },
+      onLifecycle(event) {
+        if (event.phase === "model_progress") onModelProgress();
+        if (event.phase === "first_chunk") {
+          logRequestTiming("first_chunk", {
+            attempt, dispatchCount, streamId: event.streamId, elapsedMs: event.elapsedMs,
+          });
+        }
+      },
+    };
+  };
   try {
+    activity.preparing();
     result = await streamChatCompletion(
       messages,
       requestSettings,
-      {
-        onToken: (token) => {
-          lane.markFirstToken();
-          streamedText += token;
-        },
-        onDone: () => undefined,
-        onError: () => undefined,
-        onLifecycle: (event) => {
-          if (event.phase === "model_progress") lane.markFirstToken();
-        },
-      },
+      wireCallbacks("initial"),
       input.signal,
       input.textEnvelope ? [] : providerTools,
       maxOutputTokens,
@@ -449,11 +558,12 @@ export async function requestRuntimeV2ProviderOnce(input: {
         timeoutMs: input.timeoutMs,
         contextOwnership: "caller",
         reasoningOnlyCharLimit,
+        reasoningOnlyTimeoutMs,
         actionOnlyCharLimit,
       },
     );
     if (
-      shouldRetryRuntimeV2WithoutReasoning({
+      !reuseReasoningFallback && shouldRetryRuntimeV2WithoutReasoning({
         finishReason: result.finishReason,
         clientStopReason: result.clientStopReason,
         reasoningChars: result.reasoningContent?.length || 0,
@@ -469,28 +579,34 @@ export async function requestRuntimeV2ProviderOnce(input: {
         structuredActionRequired,
       })
     ) {
+      activity.preparing();
       reasoningFallbackApplied = true;
+      const partialToolCall = result.streamDiagnostics?.firstToolElapsedMs != null;
+      const reasoningOnly = !!result.reasoningContent?.trim() && !partialToolCall &&
+        !(result.actionableContent || result.semanticContent || result.content).trim();
+      carryReasoningFallback = !!reasoningActionScope && reasoningOnly;
       input.ports.logStoreEvent(
         "runtime_v2_provider_reasoning_truncated",
         {
           turnId: input.command.run.turnId,
           runId: input.command.run.runId,
+          commandKey: input.command.idempotencyKey,
           phase: input.command.phase,
           mode: String(input.command.payload.mode || ""),
           finishReason: result.finishReason,
           stopSource: result.clientStopReason ? "client_guard" : "provider",
           clientStopReason: result.clientStopReason || null,
           reasoningChars: result.reasoningContent?.length || 0,
-            actionChars:
-              result.actionableContent?.length ||
-              result.semanticContent?.length ||
-              result.content.length,
-            truncationKind: (result.reasoningContent?.length || 0) > 0
+          actionChars: result.actionableContent?.length || result.semanticContent?.length || result.content.length,
+          truncationKind: partialToolCall ? "incomplete_tool_call"
+            : reasoningOnly
               ? "reasoning_without_action"
               : "visible_prose_without_action",
-            recovery: adapterCapabilities.reasoningToggle
-              ? "provider_reasoning_toggle_off"
-              : "bounded_structured_action_feedback",
+          recovery: adapterCapabilities.reasoningToggle
+            ? "provider_reasoning_toggle_off"
+            : "bounded_structured_action_feedback",
+          inputTokens: result.usage?.inputTokens ?? null,
+          outputTokens: result.usage?.outputTokens ?? null,
         },
       );
       const truncatedVisibleText = result.semanticContent || streamedText;
@@ -530,6 +646,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
               contextLimit: budget.contextLimit,
               reservedOutputTokens: maxOutputTokens,
               tools: providerTools,
+              preserveUserMessages: unboundedRecoveryMessages.some(message => "runtimeGuidanceId" in message && !!message.runtimeGuidanceId),
             })
         : unboundedRecoveryMessages);
       input.live.latestProviderRequestSourceCoverage = recoveredExecuteRequest?.coverage ||
@@ -549,17 +666,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
               preserveAssistantReasoning: false,
             }
           : requestSettings,
-        {
-          onToken: (token) => {
-            lane.markFirstToken();
-            streamedText += token;
-          },
-          onDone: () => undefined,
-          onError: () => undefined,
-          onLifecycle: (event) => {
-            if (event.phase === "model_progress") lane.markFirstToken();
-          },
-        },
+        wireCallbacks("reasoning_retry"),
         input.signal,
         input.textEnvelope ? [] : providerTools,
         maxOutputTokens,
@@ -588,6 +695,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
   input.ports.logStoreEvent("runtime_v2_provider_wire_shape", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
+    commandKey: input.command.idempotencyKey,
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
     textEnvelope: input.textEnvelope,
@@ -605,6 +713,13 @@ export async function requestRuntimeV2ProviderOnce(input: {
       protocolContent.match(/<\/runtime-v2-tools>/g)?.length || 0,
     protocolViolation: result.protocolViolation || null,
     reasoningFallbackApplied,
+    inputTokens: result.usage?.inputTokens ?? null,
+    outputTokens: result.usage?.outputTokens ?? null,
+    cachedInputTokens: result.usage?.cachedInputTokens ?? null,
+    uncachedInputTokens: result.usage?.cachedInputTokens === undefined ? null
+      : result.usage.inputTokens - result.usage.cachedInputTokens,
+    firstSemanticVisibleElapsedMs: result.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
+    firstToolElapsedMs: result.streamDiagnostics?.firstToolElapsedMs ?? null,
   });
   const providerReasoning = String(result.reasoningContent || "").trim();
   if (
@@ -658,5 +773,7 @@ export async function requestRuntimeV2ProviderOnce(input: {
     explicitActionMarkers: [...new Set(protocolContent.match(/<\/?(?:runtime-v2-tools|tool_call|function_call|tool_use|tool_code)\b/gi) || [])],
     visibleTextChars: normalized.visibleText?.length || 0,
   });
-  return normalized;
+  return carryReasoningFallback && normalized.toolCalls.length > 0 && !normalized.diagnostics.length
+    ? { ...normalized, reasoningActionScope }
+    : normalized;
 }

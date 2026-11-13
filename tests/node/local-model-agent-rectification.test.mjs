@@ -293,8 +293,6 @@ test("Phase 2 regression (main-debug.log): natural workspace requests use semant
     mainDebugShortcut: null,
     mainIntentShortcut: null,
     lockedComposerIntent: null,
-    goalCreationAuthorization: null,
-    goalContinuationAuthorization: null,
     currentTurn: null,
     currentTurnIntent: "respond",
     hasPlanArtifacts: false,
@@ -349,7 +347,7 @@ test("Phase 2 regression (main-debug.log): natural workspace requests use semant
     assert.equal(preflights.length, previousCount + 1, "consuming one semantic result must not request a second preflight");
     assert.equal(resolveRuntimeV2VisibleRunnerKind({ effectiveIntent: "execute", runtimeIntent: admitted.effectiveRunIntent, runWorkspace: "/Users/michael/Documents/Unity/ProjectM" }), runner,
       "immutable admitted intent owns the runner even if a later projection says execute");
-    assert.equal(admitted.goalCreationAuthorization, null);
+    assert.equal(Object.hasOwn(admitted, "goalCreationAuthorization"), false);
   }
   assert.deepEqual(preRunPatches, [], "heuristic hints and semantic classification cannot approve tools or plans");
   assert.equal(approvals, 0);

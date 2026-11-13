@@ -152,6 +152,9 @@ export function decideRuntimeV2CommandFailureRecovery(input: {
       publish: false,
     };
   }
+  if (input.command.kind === "schedule_subagents" && input.command.payload.proactiveKey) {
+    return { kind: "continue", publish: true };
+  }
   if (isRuntimeV2ProviderProtocolError(input.error)) {
     return {
       kind: "signal",

@@ -87,6 +87,7 @@ export interface SubmitSessionRuntimeControllerInput<
   get: () => TState;
   set: (patchOrUpdater: Partial<TState> | ((state: TState) => Partial<TState>)) => void;
   runSessionKey: string;
+  borrowExistingRuntimeOwnership?: boolean;
   createRuntimeFromState: (state: Partial<TState>) => TRuntime;
   pickRuntimePatch: (source: SubmitSessionPatch<TState>) => Partial<TRuntime>;
   normalizePatch?: (patch: SubmitSessionPatch<TState>) => SubmitSessionPatch<TState>;
@@ -440,6 +441,7 @@ export function createSubmitSessionRuntimeController<
     get: input.get,
     set: input.set,
     runSessionKey: input.runSessionKey,
+    borrowExistingRuntimeOwnership: input.borrowExistingRuntimeOwnership,
     createRuntimeFromState: input.createRuntimeFromState,
     pickRuntimePatch: input.pickRuntimePatch,
     normalizePatch: input.normalizePatch,

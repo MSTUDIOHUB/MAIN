@@ -1,3 +1,4 @@
+import { knowledgeReferenceScopeHash, type KnowledgeReference } from "../../lib/knowledgeReferences";
 import type { AgentMessage } from "../../lib/agentMessages";
 import {
   extractReadFileWindowMetadata,
@@ -17,6 +18,10 @@ import type {
 } from "./executionTypes";
 
 const RUNTIME_V2_REJECTED_ACTION_RESULT_PREFIXES = [
+  "[runtime-v2 rejected action:",
+  "[runtime-v2 failed action:",
+  "ACTION_NOT_EXECUTED:",
+  "TOOL_NOT_EXECUTED:",
   "REPEATED_ACTION_REJECTED:",
   "UNCHANGED_SOURCE_COVERAGE_REUSED:",
   "UNCHANGED_SOURCE_REPEAT_REJECTED:",
@@ -122,6 +127,39 @@ export function completedRuntimeV2ProviderToolCallIdentities(
     identities.add(runtimeV2ProviderToolCallIdentity(call));
   }
   return identities;
+}
+
+/** A successful backend read whose whole body was omitted is not delivered evidence.
+ * Re-open only when this request actually offers a larger share of the same Run
+ * window and the exact frozen knowledge scope/version is unchanged. */
+export function runtimeV2ProviderOmittedKnowledgeCanReplay(
+  call: Pick<RuntimeV2NormalizedToolCall, "name" | "arguments">,
+  messages: readonly AgentMessage[],
+  references: readonly KnowledgeReference[],
+  windowChars: number,
+): boolean {
+  if (!["knowledge_search", "knowledge_get_excerpt"].includes(call.name) || !references.length) return false;
+  const identity = runtimeV2ProviderToolCallIdentity(call);
+  const matchingIds = new Set<string>();
+  let latest: string | null = null;
+  for (const message of messages) {
+    if (message.role === "assistant") for (const item of message.tool_calls || []) {
+      if (runtimeV2ProviderToolCallIdentity({ name: item.function.name, arguments: parsedToolCallArguments(item.function.arguments) }) === identity) matchingIds.add(item.id);
+    }
+    if (message.role !== "tool" || !message.tool_call_id || !matchingIds.has(message.tool_call_id)) continue;
+    const text = typeof message.content === "string" ? message.content : "";
+    // A soft duplicate reflection cannot replace the original delivery fact.
+    if (RUNTIME_V2_REJECTED_ACTION_RESULT_PREFIXES.some(prefix => text.startsWith(prefix))) continue;
+    latest = text;
+  }
+  if (!latest) return false;
+  try {
+    const result = JSON.parse(latest);
+    return result?.type === "knowledge.result_window" && result.truncated === true &&
+      result.scopeHash === knowledgeReferenceScopeHash(references) && Array.isArray(result.hits) && result.hits.length === 0 &&
+      Number.isSafeInteger(result.omittedHits) && result.omittedHits > 0 && Number.isFinite(result.windowChars) && result.windowChars > 0 &&
+      Number.isFinite(windowChars) && windowChars > result.windowChars;
+  } catch { return false; }
 }
 
 function normalizedReadPath(value: unknown): string {
@@ -461,6 +499,7 @@ export function runtimeV2ProviderExactReadReceipt(
       continue;
     }
     if (message.role !== "tool" || !message.tool_call_id) continue;
+    if (effects?.unexecutedToolCallIds?.has(message.tool_call_id) || effects?.failedToolCallIds?.has(message.tool_call_id)) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
     if (

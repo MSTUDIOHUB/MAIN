@@ -4,10 +4,12 @@ import type {
   RuntimeV2WorkPlanReference,
 } from "../../lib/runtime-v2/contracts";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2/aggregate";
+import type { RuntimeV2Event } from "../../lib/runtime-v2/events";
 import {
   RUNTIME_V2_PLAN_ARTIFACT_PATH,
   RUNTIME_V2_PLAN_REVIEW_COMMIT_SCHEMA_VERSION,
   sealWorkPlanV1,
+  isWorkPlanArtifactProjectionBound,
   type RuntimeV2PlanArtifactProjection,
   type RuntimeV2PlanAuthority,
   type RuntimeV2PlanChatProjection,
@@ -16,6 +18,7 @@ import {
   type RuntimeV2PlanReviewCommit,
   type SealedWorkPlanV1,
 } from "../../lib/runtime-v2/workPlan";
+import type { PlanDocumentRef } from "../../lib/planDocuments";
 
 export {
   RUNTIME_V2_PLAN_ARTIFACT_PATH,
@@ -136,6 +139,7 @@ export function validateSealedWorkPlanV1Integrity(
       id: plan.id,
       createdAt: plan.createdAt,
       ...(plan.legacy ? { legacy: plan.legacy } : {}),
+      ...(plan.decisionJournal !== undefined ? { decisionJournal: plan.decisionJournal } : {}),
     });
   } catch {
     return { ok: false, reason: "work_plan_invalid" };
@@ -218,6 +222,7 @@ function buildPlanChatProjection(
 }
 
 function buildReviewCommitUnchecked(input: {
+  readonly documentRef?: PlanDocumentRef;
   readonly plan: SealedWorkPlanV1;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -229,7 +234,8 @@ function buildReviewCommitUnchecked(input: {
     schemaVersion: RUNTIME_V2_PLAN_REVIEW_COMMIT_SCHEMA_VERSION,
     authority,
     artifact: {
-      path: RUNTIME_V2_PLAN_ARTIFACT_PATH,
+      path: input.documentRef?.path || RUNTIME_V2_PLAN_ARTIFACT_PATH,
+      ...(input.documentRef ? { documentRef: input.documentRef } : {}),
       content: input.plan.markdown,
       projectionHash: authority.projectionHash,
     },
@@ -249,6 +255,7 @@ function buildReviewCommitUnchecked(input: {
 }
 
 export function createRuntimeV2PlanReviewCommit(input: {
+  readonly documentRef?: PlanDocumentRef;
   readonly plan: SealedWorkPlanV1;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -260,6 +267,7 @@ export function createRuntimeV2PlanReviewCommit(input: {
   if (input.plan.status !== "pending_review") {
     throw new Error("plan_not_pending_review");
   }
+  if (input.documentRef && !isWorkPlanArtifactProjectionBound({ path: input.documentRef.path, documentRef: input.documentRef, content: input.plan.markdown, projectionHash: input.plan.projectionHash }, input.plan, input.turn)) throw new Error("plan_artifact_projection_mismatch");
   requiredIdentity(input.turn.sessionKey, "turn.sessionKey");
   requiredIdentity(input.turn.sessionEpoch, "turn.sessionEpoch");
   requiredIdentity(input.turn.turnId, "turn.turnId");
@@ -302,13 +310,14 @@ function validateRuntimeV2PlanReviewCommitIntegrity(input: {
   }
 
   const expected = buildReviewCommitUnchecked({
+    ...(input.commit.artifact.documentRef ? { documentRef: input.commit.artifact.documentRef } : {}),
     plan: input.currentPlan,
     turn: input.turn,
     run: input.run,
     requestId: input.commit.review.requestId,
     createdAt: input.commit.review.createdAt,
   });
-  if (!sameJson(input.commit.artifact, expected.artifact)) {
+  if (!isWorkPlanArtifactProjectionBound(input.commit.artifact, input.currentPlan, input.turn) || !sameJson(input.commit.artifact, expected.artifact)) {
     return { ok: false, reason: "plan_artifact_projection_mismatch" };
   }
   if (!sameJson(input.commit.panel, expected.panel)) {
@@ -360,6 +369,29 @@ export function resolveRuntimeV2PlanReviewFromAggregate(
   const pending = aggregate.phase === "reviewing" &&
     aggregate.workPlan?.status === "pending_review";
   return { plan, commit, pending };
+}
+
+/** A historical source may be reviewed for continuation; it never becomes an
+ * active authority for the completed owner or another workspace/session. */
+export function resolveHistoricalRuntimeV2ApprovedWorkPlan(aggregate: TurnAggregateV1 | null | undefined):
+  (RuntimeV2ResolvedApprovedWorkPlan & { approvalEvent: Extract<RuntimeV2Event, { type: "work_plan.approved" }> }) | null {
+  if (!aggregate || aggregate.workPlan?.status !== "approved" || aggregate.run?.status !== "completed" ||
+    !aggregate.events.some(event => event.type === "turn.completed")) return null;
+  const run = aggregate.run.identity;
+  const result = aggregate.terminalOutcome?.resultKind;
+  const blockedByDrift = result === "blocked" && aggregate.planContinuation && aggregate.events.some(event =>
+    event.type === "observation.recorded" && event.run.runId === run.runId && event.run.attemptId === run.attemptId &&
+    event.evidence.kind === "tool" && /^approved-plan-drift:\d+$/.test(event.evidence.id) && !!event.evidence.target.trim());
+  if (result !== "canceled" && result !== "partial" && !blockedByDrift) return null;
+  const review = resolveRuntimeV2PlanReviewFromAggregate(aggregate);
+  if (!review || !sameAuthority(aggregate.workPlan, review.commit.authority)) return null;
+  const approvalEvent = [...aggregate.events].reverse().find(
+    (event): event is Extract<RuntimeV2Event, { type: "work_plan.approved" }> =>
+      event.type === "work_plan.approved" && event.workPlan.status === "approved" &&
+      sameAuthority(event.workPlan, review.commit.authority) && sameOwner(review.commit.review, aggregate.turn, event.run) &&
+      event.run.attemptId === run.attemptId,
+  );
+  return approvalEvent ? { plan: review.plan, commit: review.commit, approvalEvent } : null;
 }
 
 /**

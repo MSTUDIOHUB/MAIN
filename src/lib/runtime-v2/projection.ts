@@ -8,6 +8,8 @@ import type {
 import type { RuntimeV2Event } from "./events";
 import { countDistinctRuntimeV2EvidenceFacts } from "./evidenceFacts";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
+import { runtimeV2DirectExecuteMutationTargets } from "./validationReceipt";
+import { deriveUnityCompilation, deriveUnityShaderImport } from "./unityCompilation";
 
 function markdownCode(value: unknown): string {
   const text = String(value || "").trim().replace(/`/g, "");
@@ -49,38 +51,8 @@ export function runtimeV2StructuredActionMarkdown(
   switch (command.kind) {
     case "collect_observation":
       return "正在收集与当前目标相关的上下文与证据。";
-    case "request_model": {
-      const mode = String(command.payload.mode || "");
-      const recoveryPressure =
-        command.payload.recoveryPressure &&
-          typeof command.payload.recoveryPressure === "object" &&
-          !Array.isArray(command.payload.recoveryPressure)
-          ? command.payload.recoveryPressure as Record<string, unknown>
-          : null;
-      if (recoveryPressure) {
-        const occurrence = Math.max(
-          1,
-          Math.floor(Number(recoveryPressure.occurrence) || 1),
-        );
-        return `上一个模型动作没有形成可执行进展，正在切换恢复策略（第 ${occurrence} 次）。`;
-      }
-      const labels: Record<string, string> = {
-        chat: "正在理解当前问题，并结合本轮对话上下文组织完整回复。",
-        analyze: "正在结合实际只读证据形成完整答复。",
-        observe: "正在根据已读证据判断根本原因。",
-        plan: "正在把已确认的事实整理成可审核的修复计划。",
-        execute: context?.strategy === "plan"
-          ? "正在依据已批准的计划选择下一项安全修改。"
-          : command.payload.executePolicy === "mutation_required"
-            ? "正在把已确认的证据转化为下一项执行修改。"
-            : command.payload.executePolicy ===
-                "source_reorientation_required"
-              ? "上一次修改目标不属于当前工作区，正在重新定位目标文件。"
-            : "正在确认实施方案所需的关键细节。",
-        validate: "正在根据验收条件检查当前实现。",
-      };
-      return labels[mode] || "正在根据当前证据决定下一步。";
-    }
+    case "request_model":
+      return "正在准备模型请求。";
     case "execute_tool": {
       const tool = String(command.payload.toolName || "").trim();
       const target = readTarget(command, context?.turn.workspaceKey);
@@ -105,21 +77,6 @@ export function runtimeV2StructuredActionMarkdown(
         ? "正在整理本轮对话的完整回复。"
         : "正在整理已验证的结果与仍需说明的边界。";
   }
-}
-
-function publicProviderCommentaryForCommand(
-  aggregate: TurnAggregateV1,
-  command: RuntimeV2Command | undefined,
-): string {
-  if (!command) return "";
-  const toolCallId = String(command.payload.toolCallId || "").trim();
-  if (!toolCallId) return "";
-  const response = [...aggregate.events].reverse().find((event) =>
-    event.type === "provider.responded" &&
-    event.result.toolCalls.some((call) => call.id === toolCallId)
-  );
-  if (!response || response.type !== "provider.responded") return "";
-  return visibleProviderCommentary(response.result);
 }
 
 function visibleProviderCommentary(
@@ -154,20 +111,6 @@ function visibleProviderCommentary(
   // no concise complete public sentence exists, the structured action below
   // is more truthful than a clipped fragment.
   return selected.trim();
-}
-
-function currentProviderCommentary(aggregate: TurnAggregateV1): string {
-  const response = [...aggregate.events].reverse().find((event) =>
-    event.type === "provider.responded"
-  );
-  if (!response || response.type !== "provider.responded") return "";
-  const commentary = visibleProviderCommentary(response.result);
-  if (!commentary) return "";
-  if (response.result.toolCalls.length === 0) return commentary;
-  const pendingCallIds = new Set(aggregate.pendingToolCalls.map((call) => call.id));
-  return response.result.toolCalls.some((call) => pendingCallIds.has(call.id))
-    ? commentary
-    : "";
 }
 
 function phaseTitle(phase: TurnAggregateV1["phase"]): string {
@@ -212,27 +155,16 @@ function projection(
   };
 }
 
-/** Capsule shows one complete public sentence plus the current structured
- * action. Provider monologues and tool-envelope internals stay out of this
- * live surface; durable results remain in ChatArea and the timeline. */
+/** Durable phase projection for older consumers. The live UI reads the
+ * actual request and tool activity, while public commentary goes to ChatArea. */
 export function buildRuntimeV2CapsuleProjection(
   aggregate: TurnAggregateV1,
   id: string,
 ): RuntimeV2Projection {
   const current = aggregate.scheduledCommands[0];
-  const providerCommentary = currentProviderCommentary(aggregate);
-  const action = current
+  const markdown = current
     ? runtimeV2StructuredActionMarkdown(current, aggregate)
-    : providerCommentary
-      ? providerCommentary
-      : `正在${phaseTitle(aggregate.phase)}。`;
-  const commandCommentary = publicProviderCommentaryForCommand(
-    aggregate,
-    current,
-  );
-  const markdown = commandCommentary && commandCommentary !== action
-    ? `${commandCommentary}\n\n${action}`
-    : action;
+    : `正在${phaseTitle(aggregate.phase)}。`;
   return projection(
     aggregate,
     "capsule_live",
@@ -300,10 +232,7 @@ export function buildRuntimeV2FinalProjection(
       `final:${resultKind}:${reason}`,
     );
   }
-  const mutationTargets = [...new Set(aggregate.evidence
-    .filter((evidence) => evidence.kind === "mutation")
-    .map((evidence) => evidence.target)
-    .filter(Boolean))];
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(aggregate);
   const validations = aggregate.events.filter(
     isRuntimeV2ValidationAttempt,
   );
@@ -321,6 +250,9 @@ export function buildRuntimeV2FinalProjection(
   const validationLine = validations.length > 0
     ? `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
     : "- 本轮没有完成可确认的验证。";
+  const editorChecks = [["C# 编译", deriveUnityCompilation(aggregate)?.receipt], ["Shader 导入", deriveUnityShaderImport(aggregate)?.receipt]] as const;
+  const editorLines = editorChecks.flatMap(([name, receipt]) => receipt && receipt.result.status !== "not_unity_project" ?
+    [`- ${name}${receipt.result.status === "passed" ? "通过" : receipt.result.status === "failed" ? "仍有错误" : "待验证"}。`] : []);
   return projection(
     aggregate,
     "final",
@@ -329,7 +261,8 @@ export function buildRuntimeV2FinalProjection(
       `### ${terminalTitle(resultKind)}`,
       finalMarkdown?.trim(),
       mutationLine,
-      validationLine,
+      ...(validations.length > 0 || editorLines.length === 0 ? [validationLine] : []),
+      ...editorLines,
       evidenceLine,
       /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
     ].filter(Boolean).join("\n\n"),

@@ -28,10 +28,7 @@ export function buildRuntimeV2PlanExecutionPrompt(
     `Revision: ${resolved.commit.authority.revision}`,
     `Digest: ${resolved.commit.authority.digest}`,
     `Projection: ${resolved.commit.authority.projectionHash}`,
-    "",
-    resolved.plan.markdown,
-    "",
-    "Execute this sealed WorkPlan now. Preserve its step dependencies and perform the declared finite validation. The checkpoint object, not this Markdown projection, remains approval authority.",
+    "Execute the WorkPlan bound to this approval. Use the sealed plan and validation in the runtime context.",
   ].join("\n");
 }
 

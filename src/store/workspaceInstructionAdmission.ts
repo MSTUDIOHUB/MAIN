@@ -5,6 +5,7 @@ import type {
   WorkspaceJsonObject,
 } from "../lib/workspaceInstruction";
 import { buildUserContextItems } from "../lib/userContextItems";
+import type { KnowledgeReference } from "../lib/knowledgeReferences";
 
 /**
  * Keeps the workspace admission projection independent from the legacy
@@ -17,6 +18,7 @@ export function buildWorkspaceInstructionUserContext(input: {
   images: string[];
   workspace: string;
   language: "zh" | "en";
+  knowledgeReferences?: readonly KnowledgeReference[];
 }): NonNullable<Extract<TaskBlock, { type: "user" }>["contextItems"]> {
   return buildUserContextItems(input);
 }
@@ -26,6 +28,7 @@ export function buildWorkspaceInstructionPayloadIdentity(input: {
   images: string[];
   contextMentions: string[];
   attachedFiles: AttachedFile[];
+  knowledgeReferences?: readonly KnowledgeReference[];
   source: WorkspaceInstructionSource;
   dispatchHints?: WorkspaceJsonObject;
   remoteContext?: unknown;
@@ -55,6 +58,7 @@ export function buildWorkspaceInstructionPayloadIdentity(input: {
       workspace: file.workspace || null,
       readable: file.readable === true,
     })),
+    knowledgeReferences: input.knowledgeReferences || [],
     dispatchHints: input.dispatchHints || null,
     remoteContext: input.remoteContext || null,
   }));

@@ -7,10 +7,6 @@ import {
   type SubmitSendGateDecision,
 } from "../lib/submit/turnSubmission";
 import type { ResolvedRunIntent } from "../lib/runIntent";
-import type {
-  GoalContinuationAuthorization,
-  GoalCreationAuthorization,
-} from "../lib/submit/turnSubmission";
 
 export interface SubmitSendGateEffectsState {
   isGenerating: boolean;
@@ -42,12 +38,11 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
   state: TState;
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
+  knowledgeReferencesSnapshot?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
   queuedRunContext?: {
     runtimeIntentOverride?: ResolvedRunIntent;
-    goalSourceContextSnapshot?: string;
-    goalCreationAuthorization?: GoalCreationAuthorization;
-    goalContinuationAuthorization?: GoalContinuationAuthorization;
-    goalContinuationGuidance?: string;
+
+
   };
   queueUserMessage: (
     text: string,
@@ -55,11 +50,10 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
     options?: {
       contextMentions?: string[];
       attachedFiles?: AttachedFile[];
+      knowledgeReferences?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
       runtimeIntentOverride?: ResolvedRunIntent;
-      goalSourceContextSnapshot?: string;
-      goalCreationAuthorization?: GoalCreationAuthorization;
-      goalContinuationAuthorization?: GoalContinuationAuthorization;
-      goalContinuationGuidance?: string;
+
+
     },
   ) => void;
   approvePendingReviewOnce: () => void;
@@ -145,6 +139,7 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
     input.queueUserMessage(input.text, input.images, {
       contextMentions: input.mentionSnapshot,
       attachedFiles: input.attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
+      knowledgeReferences: input.knowledgeReferencesSnapshot || [],
       ...input.queuedRunContext,
     });
     input.logStoreEvent("send_queued", {
