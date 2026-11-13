@@ -1,4 +1,5 @@
 import { runtimeV2ProviderOmittedKnowledgeCanReplay } from "./providerReadReceipts";
+import { runtimeV2BoundEditorObservation } from "./executionAuthorizationContext";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
@@ -42,18 +43,14 @@ import {
   executeRuntimeV2ProviderWithDeadline,
   isRuntimeV2ExecutionProviderTimeout,
 } from "./executionProviderDeadline";
-import {
-  requestRuntimeV2ProviderWithEmptySurface,
-} from "./executionProviderEmptySurface";
+import { requestRuntimeV2ProviderWithEmptySurface } from "./executionProviderEmptySurface";
 import {
   requestRuntimeV2ProviderOnce,
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ProviderProtocolError,
 } from "./executionProviderRequest";
 import { runtimeV2ExecutionProviderDeadlineAt } from "./executionProviderRequestPolicy";
-import {
-  normalizeRuntimeV2ProviderToolCalls,
-} from "./executionProviderTools";
+import { normalizeRuntimeV2ProviderToolCalls } from "./executionProviderTools";
 import {
   buildRuntimeV2RepeatedActionReceipts,
   runtimeV2DeferredToolReceipts,
@@ -73,6 +70,13 @@ export function createRuntimeV2ProviderPort(
 ): ProviderPort {
   return {
     async request({ command, signal }) {
+      input.logStoreEvent("runtime_v2_provider_request_timing", {
+        turnId: command.run.turnId,
+        runId: command.run.runId,
+        commandKey: command.idempotencyKey,
+        phase: command.phase,
+        stage: "provider_entered",
+      });
       const state = input.get();
       if (!input.live.providerLaneProfile) {
         input.live.providerLaneProfile = baseProviderProfile(state);
@@ -134,7 +138,7 @@ export function createRuntimeV2ProviderPort(
         // Therefore the current supported transport is never interrupted by a
         // shorter adapter retry timer.
         try {
-          let result = await executeRuntimeV2ProviderWithDeadline({
+          const { reasoningActionScope, ...providerResult } = await executeRuntimeV2ProviderWithDeadline({
             ports: input,
             command,
             requestDeadlineAt,
@@ -144,6 +148,7 @@ export function createRuntimeV2ProviderPort(
               input.logStoreEvent("runtime_v2_provider_request_opened", {
                 turnId: command.run.turnId,
                 runId: command.run.runId,
+                commandKey: command.idempotencyKey,
                 phase: command.phase,
                 transport: attempt.variant,
                 allowedToolNames,
@@ -168,10 +173,10 @@ export function createRuntimeV2ProviderPort(
               });
             },
           });
-          result = {
-            ...result,
+          let result = {
+            ...providerResult,
             toolCalls: normalizeRuntimeV2ProviderToolCalls(
-              result.toolCalls,
+              providerResult.toolCalls,
               tools,
               input.context.runWorkspace,
             ).map((call) => isReadOnlyContext(input) && call.name === "web_search"
@@ -276,7 +281,9 @@ export function createRuntimeV2ProviderPort(
                 : [];
             }),
           );
-          const schedulingCalls = result.toolCalls;
+          const schedulingCalls = result.toolCalls.map(call => runtimeV2BoundEditorObservation(input, call.name, call.arguments)
+            ? { ...call, boundEditorObservation: true as const } : call);
+          result = { ...result, toolCalls: schedulingCalls };
           const completedIdentities = new Set(
             completedRuntimeV2ProviderToolCallIdentities(
               input.live.messages,
@@ -440,6 +447,9 @@ export function createRuntimeV2ProviderPort(
             selectedCalls,
             () => input.nextId("provider-tool-call"),
           );
+          if (!signal.aborted && scopedCalls.length > 0 && reasoningActionScope) {
+            input.live.approvedActionReasoningScope = reasoningActionScope;
+          }
           const parallelReadCount =
             runtimeV2ParallelReadCount(scopedCalls);
           scopedCalls.forEach((call) => {
@@ -463,6 +473,7 @@ export function createRuntimeV2ProviderPort(
           input.logStoreEvent("runtime_v2_provider_result", {
             turnId: command.run.turnId,
             runId: command.run.runId,
+            commandKey: command.idempotencyKey,
             transport: attempt.variant,
             toolNames: result.toolCalls.map((call) => call.name),
             visibleChars: input.live.latestVisibleText.length,
@@ -506,6 +517,7 @@ export function createRuntimeV2ProviderPort(
             {
               turnId: command.run.turnId,
               runId: command.run.runId,
+              commandKey: command.idempotencyKey,
               transport: attempt.variant,
               error: lastError instanceof Error
                 ? lastError.message

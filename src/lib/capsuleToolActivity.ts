@@ -47,6 +47,7 @@ const TOOL_ACTIVITY_COPY: Readonly<Record<string, ToolActivityCopy>> = {
   web_search: { zh: "搜索网页", en: "Search web", enLive: "Searching the web" },
   web_fetch: { zh: "读取网页", en: "Read web page", enLive: "Reading web page", target: "host" },
   run_command: RUN_COMMAND,
+  unity_compile_project: { zh: "检查引擎编译", en: "Check Editor compilation", enLive: "Checking Editor compilation" },
   execute_command: RUN_COMMAND,
   browser_evaluate: { zh: "操作浏览器", en: "Use browser", enLive: "Using the browser", target: "host" },
   computer_use: { zh: "操作桌面应用", en: "Use desktop app", enLive: "Using a desktop app" },

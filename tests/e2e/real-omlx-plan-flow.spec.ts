@@ -1720,7 +1720,8 @@ test.beforeEach(async ({ page }, testInfo) => {
     prunedDirectories: initialWorkspaceInventory.prunedDirectories,
     skippedEntries: initialWorkspaceInventory.skippedEntries,
   })}`);
-  const fixtureMutationBaseline = realOmlxFixture === "unity" ? {} : await readFixtureMutationContents(workspace);
+  const fixtureMutationBaseline = realOmlxFixture === "unity" || process.env.REAL_OMLX_BOUND_EDITOR_MCP_URL
+    ? {} : await readFixtureMutationContents(workspace);
   await page.exposeFunction("__MAIN_E2E_INSPECT_FIXTURE_MUTATION", async () =>
     await inspectFixtureMutation(workspace, fixtureMutationBaseline)
   );
@@ -2004,8 +2005,12 @@ test.beforeEach(async ({ page }, testInfo) => {
       responseFormat: responseFormat?.type, responseSchema: responseFormat?.json_schema?.name,
       toolChoice: parsedBody?.tool_choice, template: parsedBody?.chat_template_kwargs, maxTokens: parsedBody?.max_tokens,
       messageDigest: createHash("sha256").update(JSON.stringify(parsedBody?.messages)).digest("hex"),
+      engineVersionFacts: (parsedBody?.messages as any[] || []).flatMap(message =>
+        typeof message.content === "string" && message.content.includes("[PROJECT BASELINE FACTS]")
+          ? message.content.split("\n").filter(line => /^(runtime|package)=/.test(line)).slice(0, 16)
+          : []),
       selectedKnowledgeAnchors: (parsedBody?.messages as any[] || []).map(message => message.content)
-        .filter(content => typeof content === "string" && content.includes("[SELECTED KNOWLEDGE REFERENCE DATA]")),
+        .filter(content => typeof content === "string" && (content.includes("[SELECTED KNOWLEDGE REFERENCE DATA]") || content.includes("[ACTIVE ENGINE MANUAL KNOWLEDGE BASE]"))),
       roles: (parsedBody?.messages as any[] || []).map(message => message.role),
       tools: toolNames });
     const protocolEvidenceDirectory = String(process.env.REAL_OMLX_PROTOCOL_EVIDENCE_DIR || "").trim();
@@ -2401,7 +2406,7 @@ test.beforeEach(async ({ page }, testInfo) => {
       }
       if (cmd === "list_all_session_snapshots" || cmd === "list_legacy_session_files") return [];
       if (cmd === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
-      if (["save_plan_document", "read_plan_document", "list_plan_documents", "inspect_project_init_target", "commit_project_init", "knowledge_list_bases", "knowledge_list_sources", "knowledge_create_base", "knowledge_import_source", "knowledge_search", "knowledge_get_excerpt"].includes(cmd)) {
+      if (["save_plan_document", "read_plan_document", "list_plan_documents", "inspect_project_init_target", "commit_project_init", "knowledge_list_bases", "knowledge_list_presets", "knowledge_bootstrap_preset", "knowledge_set_base_enabled", "knowledge_list_sources", "knowledge_create_base", "knowledge_import_source", "knowledge_search", "knowledge_get_excerpt"].includes(cmd)) {
         return await (window as any).__MAIN_E2E_NATIVE_TOOL(cmd, args || {});
       }
       if (["ingest_attachment_file", "get_chat_temp_root"].includes(cmd)) {
@@ -4863,6 +4868,57 @@ test(`real OMLX starts semantic collaboration after runtime admission with ${sub
   }, { timeout: 60_000 }).toBe(true);
 });
 
+test(`real OMLX ordinary Execute starts a proactive read-only subagent with ${subagentModel}`, async ({ page }, testInfo) => {
+  test.skip(realOmlxFixture !== "csv");
+  test.skip(!!process.env.REAL_OMLX_WORKSPACE, "Proactive collaboration regression uses its own disposable project.");
+  test.setTimeout(150_000);
+  const workspace = (page as any).__realOmlxWorkspace as string;
+  const editorVersionPath = "ProjectSettings/ProjectVersion.txt";
+  const lockPath = "Packages/packages-lock.json";
+  const packageName = "com.unity.render-pipelines.universal";
+  await fs.mkdir(path.join(workspace, "ProjectSettings"), { recursive: true });
+  await fs.mkdir(path.join(workspace, "Packages"), { recursive: true });
+  await fs.writeFile(path.join(workspace, editorVersionPath), "m_EditorVersion: 2022.3.62t16\nm_TuanjieEditorVersion: 1.10.4\n");
+  await fs.writeFile(path.join(workspace, lockPath), JSON.stringify({ dependencies: { [packageName]: { version: "14.2.0-t1" } } }));
+  await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(subagentModel)}`);
+  await page.evaluate(() => {
+    const bridge = (window as any).__CODELY_E2E__;
+    bridge.setPreferSubagents(true);
+    void bridge.sendRealMessage(
+      "直接修复 CSV creatorName 映射。先读取 src/hooks/useCsvParser.ts 确认现有字段映射，再修改解析器并运行 npm test。只改解析器，不生成计划。",
+      { resolvedIntent: "execute", runtimeIntentOverride: "execute", skipIntentResolution: true },
+    );
+  });
+  let runtime: any;
+  try {
+    await expect.poll(async () => {
+      runtime = (await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot())).runtimeV2;
+      const jobs = runtime?.events.flatMap((event: any) => event.jobs || []) || [];
+      const proactive = jobs.find((job: any) => job.scopeKey?.startsWith("proactive:"));
+      return !!(proactive && runtime.subagents.some((job: any) => job.id === proactive.id && job.firstTokenAt))
+        || !!runtime?.terminalOutcome;
+    }, { timeout: 100_000, intervals: [500] }).toBe(true);
+    expect(runtime.strategy).toBe("execute");
+    expect(runtime.workPlan).toBeNull();
+    const proactive = runtime.events.flatMap((event: any) => event.jobs || [])
+      .find((job: any) => job.scopeKey?.startsWith("proactive:"));
+    expect(proactive).toMatchObject({ accessMode: "read", allowedPaths: expect.arrayContaining([editorVersionPath, lockPath]) });
+    expect(runtime.subagents.find((job: any) => job.id === proactive.id)?.firstTokenAt).toBeGreaterThan(0);
+    const scheduled = runtime.events.find((event: any) => event.jobs?.some((job: any) => job.id === proactive.id));
+    const completed = runtime.events.find((event: any) => event.type === "subagent.completed" && event.jobId === proactive.id);
+    const parentReadsBeforeSchedule = runtime.commands.filter((command: any) => command.sequence < scheduled.sequence &&
+      command.toolName === "read_file" && command.status === "succeeded").map((command: any) => command.target);
+    expect(parentReadsBeforeSchedule).toContain("src/hooks/useCsvParser.ts");
+    expect(parentReadsBeforeSchedule).not.toContain(editorVersionPath);
+    expect(parentReadsBeforeSchedule).not.toContain(lockPath);
+    expect(runtime.events.some((event: any) => event.type === "command.scheduled" && event.commandKind === "request_model" &&
+      event.sequence > scheduled.sequence && (!completed || event.sequence < completed.sequence))).toBe(true);
+  } finally {
+    await fs.writeFile(testInfo.outputPath("proactive-execute-v2.json"), JSON.stringify(runtime || {}, null, 2));
+    await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+  }
+});
+
 test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }, testInfo) => {
   test.skip(realOmlxFixture !== "csv");
   await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
@@ -4921,6 +4977,7 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
     )).toBe(true);
   }
   expect(maxInFlight).toBeGreaterThanOrEqual(2);
+  expect(runtime.subagentConcurrency.observedWithParent).toBeGreaterThanOrEqual(2);
   expect(runtime.subagentConcurrency.peakInFlight).toBeLessThanOrEqual(3);
   const candidateEvidenceTargets = new Set(runtime.sealedWorkPlan.evidence.map((entry: any) => entry.target));
   for (const target of ["src/hooks/useCsvParser.ts", "src/hooks/useChartData.ts", "src/store/dashboardStore.ts", "src/types/order.ts"]) {
@@ -5374,6 +5431,229 @@ for (const model of models) {
     expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
   });
 
+  test(`real OMLX first runtime request carries exact engine and locked package versions with ${model}`, async ({ page }, testInfo) => {
+    test.setTimeout(240_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await fs.mkdir(path.join(workspace, "ProjectSettings"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "Packages"), { recursive: true });
+    await fs.writeFile(path.join(workspace, "ProjectSettings/ProjectVersion.txt"),
+      "m_EditorVersion: 2022.3.62t16\nm_TuanjieEditorVersion: 1.10.4\n");
+    const packageName = "com.unity.render-pipelines.universal";
+    await fs.writeFile(path.join(workspace, "Packages/manifest.json"), JSON.stringify({ dependencies: { [packageName]: "14.2.0-t1" } }));
+    await fs.writeFile(path.join(workspace, "Packages/packages-lock.json"), JSON.stringify({ dependencies: { [packageName]: { version: "14.2.0-t1" } } }));
+    const before = await fingerprintPlanOnlyWorkspace(workspace);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.evaluate(() => {
+      void (window as any).__CODELY_E2E__.sendDirectEditMessage(
+        "只读核对当前项目的团结引擎、编辑器和 URP 版本，并按三行回答。不要修改工程或运行命令。",
+      );
+    });
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "engine-versions-wire");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    const firstRuntime = ((page as any).__realOmlxProviderWire as any[]).find(request => request.tools.length > 0);
+    expect(firstRuntime?.engineVersionFacts).toEqual(expect.arrayContaining([
+      expect.stringContaining('runtime="tuanjie"@"1.10.4"'),
+      expect.stringContaining('runtime="unity"@"2022.3.62t16"'),
+      expect.stringContaining('package="com.unity.render-pipelines.universal"@"14.2.0-t1"'),
+    ]));
+    const answer = snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown || "";
+    for (const version of ["1.10.4", "2022.3.62t16", "14.2.0-t1"]) expect(answer).toContain(version);
+    expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+  });
+
+  for (const [request, strategy] of [
+    ["修复console窗口里的报错", "execute"],
+    ["查看console窗口的报错", "analyze"],
+  ] as const) {
+    test(`real OMLX Console intent routes ${strategy} with ${model}`, async ({ page }, testInfo) => {
+      const boundEditorUrl = String(process.env.REAL_OMLX_BOUND_EDITOR_MCP_URL || "").trim();
+      test.skip(!!process.env.REAL_OMLX_WORKSPACE && (!boundEditorUrl || strategy !== "execute"), "The live repair requires an explicitly marked disposable Editor workspace.");
+      test.setTimeout(300_000);
+      const workspace = (page as any).__realOmlxWorkspace as string;
+      const sourcePath = "Assets/ConsoleFixture.cs";
+      const sourceFile = path.join(workspace, sourcePath);
+      const brokenSource = "public static class ConsoleFixture\n{\n    public static int Read() => 42\n}\n";
+      const editorVersion = "2022.3.62t16";
+      const projectHash = createHash("sha1").update(`${workspace}/Assets`).digest("hex").slice(0, 16);
+      const instanceId = `ConsoleFixture@${projectHash}`;
+      const diagnostic = `${sourcePath}(3,35): error CS1002: ; expected`;
+      const repairedMethod = /\b(?:Read\(\)\s*=>|return)\s*42\s*;/;
+      const shaderPath = "Assets/ConsoleProbe.shader";
+      const shaderFile = path.join(workspace, shaderPath);
+      const missingInclude = "MAIN_MissingShaderFixture.hlsl";
+      const shaderIsFixed = async (source: string) => source.includes("ENDCG") && (!source.includes(missingInclude) ||
+        (await fs.stat(path.join(workspace, "Assets", missingInclude)).catch(() => null))?.isFile() === true);
+      if (boundEditorUrl) {
+        expect(process.env.REAL_OMLX_WORKSPACE).toBeTruthy();
+        expect(new URL(boundEditorUrl).hostname).toBe("127.0.0.1");
+        expect((await fs.readFile(path.join(workspace, ".main-unity-disposable"), "utf8")).trim()).toBe("isolated test workspace");
+        const originalScript = await fs.readFile(sourceFile, "utf8");
+        expect(originalScript).not.toMatch(repairedMethod);
+        expect(await shaderIsFixed(await fs.readFile(shaderFile, "utf8"))).toBe(false);
+        await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+        expect(await page.evaluate(async ({ request, url }) => {
+          const host = window as any;
+          const invoke = host.__TAURI_INTERNALS__.invoke;
+          // The disposable Tuanjie project uses the bound MCP Editor route.
+          host.__TAURI_INTERNALS__.invoke = (command: string, args: unknown) => command === "unity_compile_project"
+            ? Promise.resolve({ status: "unavailable", message: "UNITY_CLI_UNAVAILABLE: the disposable Editor uses MCP." }) : invoke(command, args);
+          if (!(await host.__CODELY_E2E__.setRealMcpFixture(url, true))) return false;
+          return host.__CODELY_E2E__.sendDirectEditMessage(request);
+        }, { request, url: boundEditorUrl })).toBe(true);
+        const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "console-live-editor");
+        expect(snapshot.runtimeV2.strategy).toBe("execute");
+        expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+        const firstConsole = snapshot.runtimeV2.events.find((event: any) => event.editorConsole);
+        expect(firstConsole.editorConsole.complete).toBe(true);
+        expect(firstConsole.editorConsole.diagnostics.map((item: any) => item.kind)).toEqual(expect.arrayContaining(["csharp", "shader_import"]));
+        const ledger = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+        const checks = ledger.events.filter((event: any) => event.type === "tool.completed" && event.modelContent &&
+          event.presentation?.toolName && ["unity_compile_project", "unity_import_shader"].includes(event.presentation.toolName))
+          .map((event: any) => JSON.parse(event.modelContent)).filter((result: any) => result.status === "passed");
+        for (const kind of ["csharp", "shader_import"]) {
+          const receipt = checks.find((result: any) => result.kind === kind);
+          expect(receipt).toMatchObject({ editor: "connected", editorVersion, editorInstanceId: firstConsole.editorConsole.instanceId });
+          for (const file of receipt.targets) {
+            expect(file.version).toBe(`sha256-${createHash("sha256").update(await fs.readFile(path.join(workspace, file.path))).digest("hex")}`);
+          }
+        }
+        expect(await fs.readFile(sourceFile, "utf8")).toMatch(repairedMethod);
+        expect(await shaderIsFixed(await fs.readFile(shaderFile, "utf8"))).toBe(true);
+        return;
+      }
+      const shader = `Shader "Fixture/ConsoleProbe" {
+  SubShader { Pass {
+    CGPROGRAM
+    #pragma vertex vert
+    #pragma fragment frag
+    #include "${missingInclude}"
+    float4 vert(float4 position : POSITION) : SV_POSITION { return position; }
+    float4 frag() : SV_Target { return float4(1, 0, 0, 1); }
+    ENDCG
+  } }
+}`;
+      await fs.mkdir(path.dirname(sourceFile));
+      await fs.writeFile(sourceFile, brokenSource);
+      if (strategy === "execute") await fs.writeFile(shaderFile, shader);
+      await fs.mkdir(path.join(workspace, "ProjectSettings"));
+      await fs.writeFile(path.join(workspace, "ProjectSettings/ProjectVersion.txt"),
+        `m_EditorVersion: ${editorVersion}\nm_TuanjieEditorVersion: 1.10.4\n`);
+      await fs.mkdir(path.join(workspace, "Packages"), { recursive: true });
+      await fs.writeFile(path.join(workspace, "Packages/packages-lock.json"), JSON.stringify({ dependencies: {
+        "com.unity.render-pipelines.universal": { version: "14.2.0-t1" },
+      } }));
+      await fs.writeFile(path.join(workspace, "package.json"), JSON.stringify({ name: "console-intent-fixture", private: true }));
+      const before = await fingerprintPlanOnlyWorkspace(workspace);
+
+      let consoleReads = 0;
+      let selectedInstance: string | undefined;
+      const server = createServer(async (incoming, response) => {
+        let body = "";
+        for await (const chunk of incoming) body += chunk;
+        const rpc = JSON.parse(body || "{}");
+        response.setHeader("content-type", "application/json");
+        response.setHeader("mcp-session-id", "console-fixture-session");
+        if (rpc.id == null) { response.writeHead(202); response.end(); return; }
+        let result: object;
+        if (rpc.method === "initialize") {
+          result = { protocolVersion: "2025-03-26", capabilities: { tools: {}, resources: {} }, serverInfo: { name: "mcp-for-unity-server", version: "1" } };
+        } else if (rpc.method === "tools/list") {
+          result = { tools: ["read_console", "set_active_instance"].map(name => ({ name, inputSchema: { type: "object", properties: {} } })) };
+        } else if (rpc.method === "resources/read" && rpc.params?.uri === "mcpforunity://instances") {
+          result = { contents: [{ text: JSON.stringify({ success: true, instances: [{ id: instanceId, hash: projectHash, unity_version: editorVersion }] }) }] };
+        } else if (rpc.method === "tools/call" && rpc.params?.name === "set_active_instance") {
+          selectedInstance = rpc.params.arguments?.instance;
+          result = { structuredContent: { success: selectedInstance === instanceId, data: { instance: selectedInstance } } };
+        } else if (rpc.method === "tools/call" && rpc.params?.name === "read_console" && selectedInstance === instanceId &&
+          rpc.params.arguments?.action === "get" && rpc.params.arguments?.format === "json") {
+          consoleReads++;
+          const source = await fs.readFile(sourceFile, "utf8");
+          const entries = repairedMethod.test(source) ? [] : [{ type: "Error", file: sourcePath, line: 3, message: diagnostic }];
+          if (strategy === "execute" && !(await shaderIsFixed(await fs.readFile(shaderFile, "utf8")))) {
+            entries.push({ type: "Error", file: shaderPath, line: 6,
+              message: `Shader error in 'Fixture/ConsoleProbe': Couldn't open include file '${missingInclude}' at ${shaderPath}(6)` });
+          }
+          const data = rpc.params.arguments?.page_size
+            ? { items: entries, cursor: 0, total: entries.length, truncated: false } : entries;
+          const log = { success: true, message: `Retrieved ${entries.length} log entries.`, data };
+          result = { content: [{ type: "text", text: JSON.stringify(log) }], structuredContent: log };
+        } else {
+          response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: "Unsupported fixture request" } }));
+          return;
+        }
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }));
+      });
+      await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const compileChecks: Array<{ workspace: string; checkKind: string; targets: string[]; expectedVersions: Record<string, string>; shaderImportTargets?: string[] }> = [];
+        await page.exposeFunction("__MAIN_E2E_CONSOLE_FIXTURE_COMPILE", async (args: typeof compileChecks[number]) => {
+          compileChecks.push(args);
+          const isShader = args.checkKind === "shader_import";
+          const source = await fs.readFile(isShader ? shaderFile : sourceFile, "utf8");
+          const versions = await Promise.all(args.targets.map(async target => ({ path: target,
+            version: `sha256-${createHash("sha256").update(await fs.readFile(path.join(workspace, target))).digest("hex")}`,
+          })));
+          const fixed = isShader ? args.shaderImportTargets?.includes(shaderPath) && await shaderIsFixed(source) : repairedMethod.test(source);
+          return { status: fixed ? "passed" : "failed", editor: "connected", editorPid: 4312, editorVersion,
+            editorInstanceId: instanceId, kind: args.checkKind, targets: versions, importedPaths: args.shaderImportTargets,
+            errorCount: fixed ? 0 : 1, diagnostics: fixed ? [] : [{ file: isShader ? shaderPath : sourcePath,
+              line: isShader ? 6 : 3, column: 0, code: isShader ? "SHADER_IMPORT" : "CS1002", message: isShader ? missingInclude : diagnostic }] };
+        });
+        const { port } = server.address() as { port: number };
+        await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+        expect(await page.evaluate(async ({ request, url }) => {
+          const host = window as any;
+          const bridge = host.__CODELY_E2E__;
+          const invoke = host.__TAURI_INTERNALS__.invoke;
+          host.__TAURI_INTERNALS__.invoke = (cmd: string, args?: { command?: string }) => {
+            if (cmd === "unity_compile_project") return host.__MAIN_E2E_CONSOLE_FIXTURE_COMPILE(args);
+            return invoke(cmd, args);
+          };
+          await bridge.setRealMcpFixture(url);
+          return await bridge.sendDirectEditMessage(request);
+        }, { request, url: `http://127.0.0.1:${port}/mcp` })).toBe(true);
+
+        const readStrategy = () => page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot().runtimeV2?.strategy ?? null);
+        await expect.poll(readStrategy, { timeout: 30_000 }).not.toBeNull();
+        expect(await readStrategy()).toBe(strategy);
+        const snapshot = await expectRealWorkspaceTerminal(page, testInfo, `console-${strategy}`);
+        expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+        expect(consoleReads).toBeGreaterThan(0);
+        expect(realWorkspaceToolSucceeded(snapshot, "unity_mcp_console")).toBe(true);
+        const { commands, events, evidence, projections } = snapshot.runtimeV2;
+        const mutations = events.filter((event: any) => event.type === "tool.completed" &&
+          event.evidence?.some((item: any) => item.kind === "mutation"));
+        if (strategy === "execute") {
+          const consoleKey = commands.find((command: any) => command.toolName === "unity_mcp_console").idempotencyKey;
+          const consoleReceipt = events.find((event: any) => event.type === "tool.completed" && event.idempotencyKey === consoleKey);
+          expect(mutations[0]?.sequence).toBeGreaterThan(consoleReceipt.sequence);
+          const version = `sha256-${createHash("sha256").update(await fs.readFile(sourceFile)).digest("hex")}`;
+          const shaderVersion = `sha256-${createHash("sha256").update(await fs.readFile(shaderFile)).digest("hex")}`;
+          expect(compileChecks).toEqual(expect.arrayContaining([
+            expect.objectContaining({ workspace, checkKind: "csharp", targets: [sourcePath], expectedVersions: { [sourcePath]: version } }),
+            expect.objectContaining({ workspace, checkKind: "shader_import", targets: expect.arrayContaining([shaderPath]),
+              shaderImportTargets: [shaderPath], expectedVersions: expect.objectContaining({ [shaderPath]: shaderVersion }) }),
+          ]));
+          expect(realWorkspaceToolSucceeded(snapshot, "unity_compile_project")).toBe(true);
+          expect(consoleReceipt.effectKind).toBe("observation");
+          expect(events.filter((event: any) => event.type === "turn.completed")).toHaveLength(1);
+          expect(projections.find((item: any) => item.audience === "final")?.markdown).toContain("Shader 导入通过");
+        } else {
+          expect(projections.find((item: any) => item.audience === "final")?.markdown).toContain("CS1002");
+          const isEffect = (name: string) => isWorkspaceMutationToolName(name) || name === "run_command";
+          expect(commands.some((command: any) => isEffect(command.toolName))).toBe(false);
+          expect(((page as any).__realOmlxProviderWire as Array<{ tools: string[] }>).some(wire => wire.tools.some(isEffect))).toBe(false);
+          expect(evidence.some((item: any) => item.kind === "mutation")).toBe(false);
+          expect(compileChecks).toHaveLength(0);
+          expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+        }
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    });
+  }
+
   test(`real OMLX Small-model XML fallback reads actual workspace source with ${model}`, async ({ page }, testInfo) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
     const before = await fingerprintPlanOnlyWorkspace(workspace);
@@ -5451,7 +5731,7 @@ for (const model of models) {
       await page.evaluate(async (url) => {
         const bridge = (window as any).__CODELY_E2E__;
         await bridge.setRealMcpFixture(url);
-        void bridge.sendDirectEditMessage("请通过 fixture MCP 服务的 read_fixture_fact 工具读取并返回测试 token。如果工具未显示，先用 tool_search 查找。只返回服务实际给出的 token。");
+        void bridge.sendDirectEditMessage("请先调用 tool_search 查询 read_fixture_fact，再调用 fixture MCP 的这个工具。只返回服务实际给出的 token。");
       }, `http://127.0.0.1:${address.port}/mcp`);
       const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "small-model-mcp", true);
       expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
@@ -6177,5 +6457,120 @@ for (const model of models) {
       await fs.writeFile(testInfo.outputPath("workspace-fifo-sidebar-restore.json"), JSON.stringify(restoration || null, null, 2));
       await fs.writeFile(testInfo.outputPath("workspace-fifo-rust-snapshot.json"), JSON.stringify({ admission, final, roundtrip, restoration }, null, 2));
     }
+  });
+
+  test(`real OMLX Tuanjie Engine manual preset auto-binding, zero pre-injection standby, navigator Skill, and 3-tier knowledge_search with ${model}`, async ({ page }, testInfo) => {
+    test.setTimeout(240_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const projectSettingsDir = path.join(workspace, "ProjectSettings");
+    const packagesDir = path.join(workspace, "Packages");
+    await fs.mkdir(projectSettingsDir, { recursive: true });
+    await fs.mkdir(packagesDir, { recursive: true });
+    const versionFile = "m_EditorVersion: 2022.3.62t16\nm_TuanjieEditorVersion: 1.10.4\n";
+    await fs.writeFile(path.join(projectSettingsDir, "ProjectVersion.txt"), versionFile);
+    await fs.writeFile(path.join(packagesDir, "manifest.json"), JSON.stringify({
+      dependencies: { "com.unity.render-pipelines.universal": "14.2.0-t1" },
+    }));
+
+    // 1. Bootstrap BOTH Unity 6 and Tuanjie Engine official manuals and enable both to verify workspace-aware mutual exclusion
+    const unity6Base = await invokeRuntimeToolBridge(workspace, "knowledge_bootstrap_preset", { presetId: "unity6" });
+    const tuanjieBase = await invokeRuntimeToolBridge(workspace, "knowledge_bootstrap_preset", { presetId: "tuanjie" });
+    await invokeRuntimeToolBridge(workspace, "knowledge_set_base_enabled", { kbId: unity6Base.id, enabled: true });
+    const enabledTuanjieBase = await invokeRuntimeToolBridge(workspace, "knowledge_set_base_enabled", { kbId: tuanjieBase.id, enabled: true });
+
+    expect(enabledTuanjieBase.presetId).toBe("tuanjie");
+    expect(enabledTuanjieBase.enabled).toBe(true);
+    expect(enabledTuanjieBase.sourceCount).toBeGreaterThanOrEqual(1);
+    expect(enabledTuanjieBase.tocEntryCount).toBeGreaterThanOrEqual(8);
+
+    // 2. Open workspace conversation without manually selecting # in composer
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+
+    // 2b. Verify KnowledgeModal UI & Preset Cards across Light, Dark, and Black themes
+    await page.getByRole("button", { name: /^知识库$|^Knowledge$/i }).click();
+    await expect(page.getByText(/官方引擎代码手册|Official Engine Code Manuals/i)).toBeVisible();
+    for (const theme of ["light", "dark", "black"] as const) {
+      await page.evaluate(async (nextTheme) => {
+        const { useAppStore } = await import("/src/store/useAppStore.ts");
+        const state = useAppStore.getState();
+        state.setConfig({ ...state.config, themeMode: nextTheme });
+        document.documentElement.setAttribute("data-theme", nextTheme);
+      }, theme);
+      await page.waitForTimeout(150);
+      await page.screenshot({ path: testInfo.outputPath(`knowledge-modal-${theme}.png`) });
+    }
+    await page.getByRole("button", { name: /^完成$|^Done$/i }).click();
+
+    const prompt =
+      "当前是一个团结引擎 (Tuanjie Engine) 工程。请务必先调用 knowledge_search 工具检索已绑定的团结引擎官方代码手册（例如查询 WeChatWASM OpenHarmony Awaitable），然后依据手册回答团结与 Unity 6 的 Awaitable 差异，以及微信小游戏和 OpenHarmony 的版本或平台注意事项。明确资料与项目版本的差异。只读回答，不修改文件。";
+    const input = page.getByTestId("composer-textarea");
+    await input.fill(prompt);
+    await input.press("Enter");
+
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "tuanjie-engine-manual-simulation");
+    const observed = await page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const { normalizeRuntimeV2Checkpoint } = await import("/src/lib/runtime-v2/index.ts");
+      const state = useAppStore.getState();
+      const aggregate = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[state.currentTurnId!])?.aggregate;
+      return { aggregate };
+    });
+
+    const aggregate = observed.aggregate!;
+    expect(aggregate).toBeTruthy();
+    expect(aggregate.terminalOutcome?.resultKind).toBe("success");
+
+    // 3. Verify Workspace Engine Auto-Detection, Mutual Exclusion & Zero Pre-Turn Injection (state: "standby")
+    const admittedEvent = aggregate.events.find((event: any) => event.type === "turn.admitted");
+    const packet = admittedEvent?.knowledgeContext;
+    expect(packet).toBeTruthy();
+    expect(packet.state).toBe("standby");
+    expect(packet.hits).toHaveLength(0);
+    expect(packet.references).toHaveLength(1);
+    expect(packet.references[0]).toMatchObject({
+      kind: "base",
+      kbId: enabledTuanjieBase.id,
+      presetId: "tuanjie",
+      activationMode: "workspace_active",
+    });
+
+    // 4. Verify First Provider Request Wire: 1-line standby anchor + knowledge_search tool unlocked + Companion Navigator Skill mounted
+    const wire = (page as any).__realOmlxProviderWire as any[];
+    const admittedAt = admittedEvent.at;
+    const firstRuntimeRequest = wire.find((entry) => Date.parse(entry.at) >= admittedAt);
+    expect(firstRuntimeRequest).toBeTruthy();
+    expect(JSON.stringify(firstRuntimeRequest.selectedKnowledgeAnchors)).toContain("[ACTIVE ENGINE MANUAL KNOWLEDGE BASE]");
+    expect(JSON.stringify(firstRuntimeRequest.selectedKnowledgeAnchors)).toContain("tuanjie");
+    expect(firstRuntimeRequest.tools).toContain("knowledge_search");
+    expect(firstRuntimeRequest.tools).toContain("knowledge_get_excerpt");
+
+    // 5. Verify the model called knowledge_search on demand and produced a grounded Tuanjie Engine response
+    expect(realWorkspaceToolSucceeded(snapshot, "knowledge_search")).toBe(true);
+    const finalAnswer =
+      snapshot.runtimeV2.projections.find((projection: any) => projection.audience === "final")?.markdown || "";
+    expect(finalAnswer).toMatch(/2022|Awaitable/i);
+    expect(finalAnswer).toMatch(/MINIGAME_SUBPLATFORM_WEIXIN|WeChatWASM|微信小游戏/i);
+    expect(finalAnswer).not.toMatch(/\bTUANJIE_WEIXINMINIGAME\b/);
+    expect(finalAnswer).toMatch(/TUANJIE_OPENHARMONY|OpenHarmonyJSClass|OpenHarmonyJSObject/i);
+
+    await fs.writeFile(
+      testInfo.outputPath("tuanjie-simulation-report.json"),
+      JSON.stringify(
+        {
+          model,
+          versionFile: versionFile.trim(),
+          unity6Base,
+          enabledTuanjieBase,
+          admittedKnowledgeContext: packet,
+          firstRuntimeRequestTools: firstRuntimeRequest.tools,
+          firstRuntimeRequestKnowledgeAnchors: firstRuntimeRequest.selectedKnowledgeAnchors,
+          knowledgeSearchSucceeded: realWorkspaceToolSucceeded(snapshot, "knowledge_search"),
+          finalAnswer,
+        },
+        null,
+        2,
+      ),
+    );
   });
 }

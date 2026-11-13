@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
-import { IconCheck, IconSave } from "./Icons";
+import { IconCheck, IconChevronDown, IconChevronRight, IconSave } from "./Icons";
 import { buildPlanTaskEvidenceAudit, extractPlanTasks, isPlanConversationTurn, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask } from "../lib/workflowModels";
 import {
   resolvePlanPresentationBehavior,
@@ -9,10 +9,12 @@ import {
 } from "../lib/turnPresentation";
 import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import type { RuntimeV2PlanPanelProjection } from "../lib/runtime-v2";
+import type { RuntimeV2PlanProgressPresentation } from "../lib/runtime-v2/planProgressPresentation";
 
 interface PlanPanelProps {
   presentation?: TurnPresentationModel;
   runtimeV2Review?: RuntimeV2PlanPanelProjection | null;
+  runtimeV2Progress?: RuntimeV2PlanProgressPresentation | null;
   artifacts: PlanArtifact[];
   tasks: PlanTask[];
   evidenceLedger?: PlanExecutionEvidenceEntry[];
@@ -35,6 +37,10 @@ interface PlanPanelProps {
   onContinuePlanning?: () => void;
   onRequestAdjustment?: (text: string) => void;
   onResumeExecution?: () => void;
+  onContinueApprovedWorkPlan?: () => Promise<boolean>;
+  onReviseApprovedWorkPlan?: () => Promise<boolean>;
+  continuationIssues?: readonly string[];
+  executionRepair?: import("../lib/runtime-v2/unityCompilation").ApprovedPlanExecutionRepair;
   onSaveDocument?: (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => Promise<boolean> | boolean;
   onApprove: () => void;
   onReject: () => void;
@@ -55,6 +61,26 @@ const COPY = {
     stopped: "未执行",
     failed: "失败",
     taskProgress: "任务进度",
+    changeProgress: "修改进度",
+    requiredValidations: "必需验证",
+    runtimeStep: {
+      applied: "已实施",
+      ready: "待执行",
+      dependency_blocked: "等待前置步骤",
+      preserve: "保留项",
+    },
+    runtimeValidation: { passed: "通过", pending: "待验证", failed: "失败" },
+    runtimeStage: {
+      executing: "执行中",
+      validating: "验证中",
+      paused: "已暂停",
+      success: "已完成",
+      partial: "部分完成",
+      blocked: "已受阻",
+      error: "失败",
+      canceled: "已取消",
+    },
+    runtimeExecutionHint: "修改进度与必需验证结果分别显示，并在执行结束后保留。",
     retained: "保留记录",
     completed: "完成",
     inProgress: "进行中",
@@ -71,6 +97,13 @@ const COPY = {
     submitAdjustment: "提交意见",
     continuePlanning: "继续生成正式计划",
     resumeExecution: "继续执行剩余任务",
+    continueApprovedPlan: "继续完成",
+    continuingApprovedPlan: "正在继续执行…",
+    continueApprovedPlanFailed: "无法继续执行当前计划，请重试。",
+    reviseApprovedPlan: "复核并修订",
+    revisingApprovedPlan: "正在开启计划复核…",
+    reviseApprovedPlanFailed: "无法开启计划复核，请重试。",
+    continuationIssueHeading: "以下路径与已批准计划的记录不一致，请先复核。",
     saveDocument: "保存当前文档",
     savingDocument: "保存中...",
     savedDocument: "已保存",
@@ -118,6 +151,26 @@ const COPY = {
     stopped: "No Action",
     failed: "Failed",
     taskProgress: "Task Progress",
+    changeProgress: "Change Progress",
+    requiredValidations: "Required Validation",
+    runtimeStep: {
+      applied: "Applied",
+      ready: "Pending",
+      dependency_blocked: "Waiting for Dependencies",
+      preserve: "Preserve",
+    },
+    runtimeValidation: { passed: "Passed", pending: "Pending", failed: "Failed" },
+    runtimeStage: {
+      executing: "Executing",
+      validating: "Validating",
+      paused: "Paused",
+      success: "Completed",
+      partial: "Partially Completed",
+      blocked: "Blocked",
+      error: "Failed",
+      canceled: "Canceled",
+    },
+    runtimeExecutionHint: "Applied changes and required validation results are shown separately and retained when execution ends.",
     retained: "Retained",
     completed: "Done",
     inProgress: "In Progress",
@@ -134,6 +187,13 @@ const COPY = {
     submitAdjustment: "Submit Feedback",
     continuePlanning: "Continue Planning",
     resumeExecution: "Resume Execution",
+    continueApprovedPlan: "Continue Plan",
+    continuingApprovedPlan: "Continuing…",
+    continueApprovedPlanFailed: "Could not continue this plan. Try again.",
+    reviseApprovedPlan: "Review and Revise",
+    revisingApprovedPlan: "Opening Plan Review…",
+    reviseApprovedPlanFailed: "Could not open plan review. Try again.",
+    continuationIssueHeading: "These paths differ from the approved plan. Review them before continuing.",
     saveDocument: "Save Current Doc",
     savingDocument: "Saving...",
     savedDocument: "Saved",
@@ -185,9 +245,21 @@ function getStageTone(stage: PlanStage): string {
   }
 }
 
+const RUNTIME_V2_STAGE_TONE = {
+  executing: "executing",
+  validating: "executing",
+  paused: "ready_to_execute",
+  success: "completed",
+  partial: "ready_to_execute",
+  blocked: "ready_to_execute",
+  error: "bugfix",
+  canceled: "design",
+} as const;
+
 export default function PlanPanel({
   presentation,
   runtimeV2Review = null,
+  runtimeV2Progress = null,
   artifacts,
   tasks,
   evidenceLedger = [],
@@ -210,6 +282,10 @@ export default function PlanPanel({
   onContinuePlanning,
   onRequestAdjustment,
   onResumeExecution,
+  onContinueApprovedWorkPlan,
+  onReviseApprovedWorkPlan,
+  continuationIssues = [],
+  executionRepair,
   onSaveDocument,
   onApprove,
   onReject,
@@ -230,6 +306,11 @@ export default function PlanPanel({
     runtimeV2Artifact?.path || artifacts[artifacts.length - 1]?.path || "",
   );
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [expandedProgressKey, setExpandedProgressKey] = useState<string | null>(null);
+  const [planAction, setPlanAction] = useState<{
+    key: string; kind: "continue" | "revise"; status: "pending" | "error";
+  } | null>(null);
+  const progressDetailsId = useId();
   const [isApproving, setIsApproving] = useState(false);
   const [adjustmentText, setAdjustmentText] = useState("");
   const approvingRef = useRef(false);
@@ -276,34 +357,71 @@ export default function PlanPanel({
   const activeArtifact = displayArtifacts.find((artifact) => artifact.path === activeArtifactPath) || displayArtifacts[displayArtifacts.length - 1];
   const isCandidateOnly = !hasReviewablePlanArtifact && previewMarkdown.length > 0;
   const displayTasks = useMemo(
-    () => tasks.length > 0
-      ? tasks
-      : runtimeV2Review
-        ? runtimeV2Review.steps.map((step) => ({
-            id: step.id,
-            text: step.title,
-            status: "pending" as const,
-            executionKind: step.operation === "preserve" ? "observation" as const : "mutation" as const,
-            requirementRef: step.id,
-          }))
-        : previewMarkdown
-          ? extractPlanTasks(previewMarkdown)
-          : [],
+    () => runtimeV2Review ? [] : tasks.length > 0 ? tasks : extractPlanTasks(previewMarkdown),
     [tasks, previewMarkdown, runtimeV2Review],
   );
   const taskAudit = useMemo(
     () => buildPlanTaskEvidenceAudit({ tasks: displayTasks, evidenceLedger }),
     [displayTasks, evidenceLedger],
   );
-  const auditedTasks = taskAudit.tasks;
-  const doneCount = taskAudit.completedCount;
-  const progressPct = taskAudit.totalCount > 0 ? Math.round((doneCount / taskAudit.totalCount) * 100) : 0;
+  const progressRows = runtimeV2Progress
+    ? runtimeV2Progress.steps.map((step) => ({
+      id: step.id,
+      text: step.title,
+      label: copy.runtimeStep[step.status],
+      requirementRef: step.id,
+      retained: false,
+      complete: step.status === "applied",
+      active: false,
+    }))
+    : taskAudit.tasks.map((task) => {
+      const complete = isPlanTaskTrustedComplete(task);
+      const active = task.status === "in_progress";
+      return {
+        id: task.id,
+        text: task.text,
+        requirementRef: task.requirementRef,
+        retained: task.retained,
+        complete,
+        active,
+        label: complete ? copy.completed
+          : isPlanTaskAwaitingExternalValidation(task) ? copy.userValidation
+          : isPlanTaskAwaitingBrowserValidation(task) ? copy.autoValidation
+          : task.claimedStatus === "completed" && task.evidenceStatus !== "satisfied" ? copy.missingEvidence
+          : active ? copy.inProgress : copy.pending,
+      };
+    });
+  const totalCount = runtimeV2Progress?.totalCount ?? taskAudit.totalCount;
+  const doneCount = runtimeV2Progress?.completedCount ?? taskAudit.completedCount;
+  const progressPct = totalCount > 0 ? Math.round((doneCount / totalCount) * 100) : 0;
   const activeTurn = (
     presentation?.turnId
       ? turns.find((turn) => turn.id === presentation.turnId)
       : null
   ) || [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
-  const showTaskProgress = (isApproved || stage === "executing" || stage === "completed") && auditedTasks.length > 0;
+  const showTaskProgress = !!runtimeV2Progress ||
+    ((isApproved || stage === "executing" || stage === "completed") && progressRows.length > 0);
+  const progressKey = JSON.stringify([
+    activeTurn?.id, runtimeV2Review?.authority ?? [activeArtifact?.path, activeArtifact?.revision],
+  ]);
+  const progressExpanded = expandedProgressKey === progressKey;
+  const currentPlanAction = planAction?.key === progressKey ? planAction : null;
+  const validationRows = runtimeV2Progress?.requiredValidations ?? [];
+  const passedValidationCount = validationRows.filter((validation) => validation.status === "passed").length;
+  const hasFailedValidation = validationRows.some((validation) => validation.status === "failed");
+  const handleApprovedPlanAction = async (kind: "continue" | "revise", action: () => Promise<boolean>) => {
+    if (currentPlanAction?.status === "pending") return;
+    setPlanAction({ key: progressKey, kind, status: "pending" });
+    let accepted = false;
+    try {
+      accepted = await action();
+    } catch (error) {
+      console.error("[PlanPanel] approved plan action failed", error);
+    }
+    setPlanAction((current) => current?.key !== progressKey
+      ? current
+      : accepted ? null : { key: progressKey, kind, status: "error" });
+  };
   const legacyLifecycle = resolveTurnPresentationLifecycle(
     isAwaitingApproval
       ? "awaiting_approval"
@@ -330,7 +448,9 @@ export default function PlanPanel({
     canContinuePlanning,
     canResumeExecution,
   });
-  const stageLabel = presentationBehavior.mode === "review"
+  const stageLabel = runtimeV2Progress
+    ? copy.runtimeStage[runtimeV2Progress.status]
+    : presentationBehavior.mode === "review"
     ? copy.pendingApproval
     : presentationBehavior.mode === "choice"
     ? copy.awaitingChoice
@@ -347,7 +467,9 @@ export default function PlanPanel({
     : presentationBehavior.mode === "failed"
     ? copy.failed
     : copy.stage[stage];
-  const stageTone = presentationBehavior.mode === "failed"
+  const stageTone = runtimeV2Progress
+    ? getStageTone(RUNTIME_V2_STAGE_TONE[runtimeV2Progress.status])
+    : presentationBehavior.mode === "failed"
     ? getStageTone("bugfix")
     : presentationBehavior.mode === "success"
     ? getStageTone("completed")
@@ -361,6 +483,7 @@ export default function PlanPanel({
     : getStageTone(stage);
 
   const helperText = useMemo(() => {
+    if (runtimeV2Progress) return copy.runtimeExecutionHint;
     if (presentationBehavior.mode === "review") {
       return copy.helperApproval;
     }
@@ -383,7 +506,7 @@ export default function PlanPanel({
       return copy.helperCompleted;
     }
     return copy.helperDefault;
-  }, [copy, isCandidateOnly, presentationBehavior.mode, stage]);
+  }, [copy, isCandidateOnly, presentationBehavior.mode, runtimeV2Progress, stage]);
 
   const currentDocument = activeArtifact
     ? {
@@ -464,67 +587,158 @@ export default function PlanPanel({
 
         {showTaskProgress && (
           <div data-testid="plan-task-progress" className="mt-4 rounded-xl border border-[#1f1f23] bg-[#0d0d11] p-3">
-            <div className="flex items-center justify-between text-[11px] text-[#a1a1aa]">
-              <span>{copy.taskProgress}</span>
-              <span>{doneCount}/{taskAudit.totalCount}</span>
-            </div>
-            <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#18181b]">
+            <button
+              type="button"
+              data-testid="plan-task-progress-toggle"
+              aria-expanded={progressExpanded}
+              aria-controls={progressDetailsId}
+              onClick={() => setExpandedProgressKey(progressExpanded ? null : progressKey)}
+              className="flex w-full min-w-0 items-center gap-1.5 rounded text-left text-[11px] text-[var(--surface-text-muted)] hover:text-[var(--surface-text-strong)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
+            >
+              {progressExpanded
+                ? <IconChevronDown aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+                : <IconChevronRight aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />}
+              <span className="min-w-0 flex-1 truncate">{runtimeV2Progress ? copy.changeProgress : copy.taskProgress}</span>
+              {totalCount > 0 && <span className="shrink-0 tabular-nums">{doneCount}/{totalCount}</span>}
+              {validationRows.length > 0 && (
+                <span className="shrink-0 tabular-nums">
+                  {copy.requiredValidations} {passedValidationCount}/{validationRows.length}
+                  {hasFailedValidation ? ` · ${copy.runtimeValidation.failed}` : ""}
+                </span>
+              )}
+            </button>
+            {runtimeV2Progress?.compilation && (
+              <div data-testid="plan-compilation-status" className="mt-1 text-[11px] text-[var(--surface-text-muted)]">
+                {language === "zh" ? "引擎编译" : "Editor compilation"} · {runtimeV2Progress.compilation === "unavailable"
+                  ? language === "zh" ? "未取得结果" : "Unavailable"
+                  : copy.runtimeValidation[runtimeV2Progress.compilation]}
+              </div>
+            )}
+            {totalCount > 0 && (
               <div
-                className="theme-plan-progress h-full rounded-full transition-all duration-300"
-                style={{ width: `${progressPct}%` }}
-              />
-            </div>
-            <div className="mt-3 space-y-2">
-              {auditedTasks.map((task) => (
+                role="progressbar"
+                aria-label={runtimeV2Progress ? copy.changeProgress : copy.taskProgress}
+                aria-valuemin={0}
+                aria-valuemax={totalCount}
+                aria-valuenow={doneCount}
+                className="mt-2 h-2 overflow-hidden rounded-full bg-[#18181b]"
+              >
                 <div
-                  key={task.id}
-                  data-testid="plan-task-row"
-                  className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2"
-                >
-                  <span
-                    className={`mt-[2px] h-4 w-4 shrink-0 rounded-full border flex items-center justify-center ${
-                      isPlanTaskTrustedComplete(task)
-                        ? "border-[#34d399] bg-[#34d399] text-[#050507]"
-                        : task.status === "in_progress"
-                        ? "border-[#60a5fa] bg-[#60a5fa]"
-                        : "border-[#3f3f46] bg-transparent"
-                    }`}
+                  className="theme-plan-progress h-full rounded-full transition-all duration-300"
+                  style={{ width: `${progressPct}%` }}
+                />
+              </div>
+            )}
+            <div id={progressDetailsId} hidden={!progressExpanded} data-testid="plan-task-progress-details">
+              {progressExpanded && <div className="mt-3 space-y-2">
+                {progressRows.map((task) => (
+                  <div
+                    key={task.id}
+                    data-testid="plan-task-row"
+                    className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2"
                   >
-                    {isPlanTaskTrustedComplete(task) && (
-                      <svg className="h-2.5 w-2.5" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M2.5 6L5 8.5L9.5 3.5" />
-                      </svg>
-                    )}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[12px] leading-relaxed text-[#e4e4e7]">{task.text}</div>
-                    {(task.requirementRef || task.retained) && (
-                      <div className="mt-1 flex flex-wrap items-center gap-2">
-                        {task.requirementRef && (
-                          <span className="text-[10px] tracking-wide text-[#71717a]">{task.requirementRef}</span>
-                        )}
-                        {task.retained && (
-                          <span className="rounded-full border border-[rgba(251,191,36,0.24)] bg-[rgba(251,191,36,0.1)] px-2 py-0.5 text-[10px] text-[#fcd34d]">
-                            {copy.retained}
-                          </span>
-                        )}
-                      </div>
-                    )}
+                    <span
+                      className={`mt-[2px] h-4 w-4 shrink-0 rounded-full border flex items-center justify-center ${
+                        task.complete
+                          ? "border-[#34d399] bg-[#34d399] text-[#050507]"
+                          : task.active
+                          ? "border-[#60a5fa] bg-[#60a5fa]"
+                          : "border-[#3f3f46] bg-transparent"
+                      }`}
+                    >
+                      {task.complete && (
+                        <svg className="h-2.5 w-2.5" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M2.5 6L5 8.5L9.5 3.5" />
+                        </svg>
+                      )}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[12px] leading-relaxed text-[#e4e4e7]">{task.text}</div>
+                      {(task.requirementRef || task.retained) && (
+                        <div className="mt-1 flex flex-wrap items-center gap-2">
+                          {task.requirementRef && (
+                            <span className="text-[10px] tracking-wide text-[#71717a]">{task.requirementRef}</span>
+                          )}
+                          {task.retained && (
+                            <span className="rounded-full border border-[rgba(251,191,36,0.24)] bg-[rgba(251,191,36,0.1)] px-2 py-0.5 text-[10px] text-[#fcd34d]">
+                              {copy.retained}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <div data-testid="plan-task-status" className="shrink-0 max-w-[40%] break-words text-right text-[10px] text-[#a1a1aa]">
+                      {task.label}
+                    </div>
                   </div>
-                  <div data-testid="plan-task-status" className="text-[10px] text-[#71717a] whitespace-nowrap">
-                    {isPlanTaskTrustedComplete(task)
-                      ? copy.completed
-                      : isPlanTaskAwaitingExternalValidation(task)
-                      ? copy.userValidation
-                      : isPlanTaskAwaitingBrowserValidation(task)
-                      ? copy.autoValidation
-                      : task.claimedStatus === "completed" && task.evidenceStatus !== "satisfied"
-                      ? copy.missingEvidence
-                      : task.status === "in_progress" ? copy.inProgress : copy.pending}
-                  </div>
+                ))}
+              </div>}
+              {progressExpanded && validationRows.length > 0 && (
+                <div data-testid="plan-required-validations" className="mt-3 space-y-2">
+                  <div className="text-[11px] text-[#a1a1aa]">{copy.requiredValidations}</div>
+                  {validationRows.map((validation) => (
+                    <div key={validation.id} data-testid="plan-validation-row" className="flex items-start gap-2 rounded-lg border border-[#18181b] bg-[#09090b] px-3 py-2">
+                      <span className="shrink-0 text-[10px] text-[#71717a]">{validation.id}</span>
+                      <span className="min-w-0 flex-1 break-words text-[12px] text-[#e4e4e7]">{validation.description}</span>
+                      <span className="shrink-0 text-[10px] text-[#a1a1aa]">{copy.runtimeValidation[validation.status]}</span>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
+          </div>
+        )}
+        {continuationIssues.length > 0 && (
+          <div data-testid="approved-work-plan-issues" className="mt-3 rounded-lg border border-[var(--surface-border)] px-3 py-2 text-[11px] text-[var(--surface-text)]">
+            <p>{copy.continuationIssueHeading}</p>
+            <ul className="mt-1 list-disc space-y-0.5 pl-4">
+              {continuationIssues.map((path) => (
+                <li key={path}><code className="[overflow-wrap:anywhere]">{path}</code></li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {executionRepair && (
+          <div data-testid="approved-work-plan-repair" className="mt-3 rounded-lg border border-[var(--surface-border)] px-3 py-2 text-[11px] text-[var(--surface-text)]">
+            <p>{executionRepair.kind === "compiler_scope"
+              ? language === "zh" ? "编译修复需要复核文件操作。" : "Review the file operation needed to fix compilation."
+              : language === "zh" ? "当前工程已打开，请复核在线 PlayMode 验收方式。" : "The project is open. Review the connected Editor PlayMode route."}</p>
+            <code className="mt-1 block [overflow-wrap:anywhere]">{executionRepair.target}</code>
+          </div>
+        )}
+        {(onContinueApprovedWorkPlan || onReviseApprovedWorkPlan || currentPlanAction?.status === "error") && (
+          <div className="mt-3 space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              {onContinueApprovedWorkPlan && (
+                <button
+                  type="button"
+                  data-testid="continue-approved-work-plan"
+                  disabled={currentPlanAction?.status === "pending"}
+                  onClick={() => void handleApprovedPlanAction("continue", onContinueApprovedWorkPlan)}
+                  className="theme-plan-button rounded-lg border px-3 py-1.5 text-[12px] font-medium disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
+                >
+                  {currentPlanAction?.status === "pending" && currentPlanAction.kind === "continue"
+                    ? copy.continuingApprovedPlan : copy.continueApprovedPlan}
+                </button>
+              )}
+              {onReviseApprovedWorkPlan && (
+                <button
+                  type="button"
+                  data-testid="revise-approved-work-plan"
+                  disabled={currentPlanAction?.status === "pending"}
+                  onClick={() => void handleApprovedPlanAction("revise", onReviseApprovedWorkPlan)}
+                  className="theme-plan-button rounded-lg border px-3 py-1.5 text-[12px] font-medium disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
+                >
+                  {currentPlanAction?.status === "pending" && currentPlanAction.kind === "revise"
+                    ? copy.revisingApprovedPlan : copy.reviseApprovedPlan}
+                </button>
+              )}
+            </div>
+            {currentPlanAction?.status === "error" && (
+              <div role="status" className="text-[11px] text-[var(--surface-text-muted)]">
+                {currentPlanAction.kind === "continue" ? copy.continueApprovedPlanFailed : copy.reviseApprovedPlanFailed}
+              </div>
+            )}
           </div>
         )}
 

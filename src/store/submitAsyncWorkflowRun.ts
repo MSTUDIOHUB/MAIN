@@ -42,6 +42,7 @@ import { resolveRuntimeV2SessionEpoch } from "./runtimeV2/sessionIdentity";
 import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2/checkpoint";
 import { resolveBoundPlanDraftCheckpoint } from "./runtimeV2/planDraftSource";
 import { hasExecutablePlanChoice } from "./runtimeV2/planQuestionTool";
+import { resolveApprovedWorkPlanContinuation } from "./runtimeV2/approvedPlanContinuation";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
 import {
   createSubmitHarnessRunId,
@@ -1720,7 +1721,13 @@ export async function runSubmitAsyncWorkflowRun<
   if (checkpointCandidate !== undefined && !checkpoint) throw new Error("SUBMIT_BOOTSTRAP_CHECKPOINT_INVALID");
   const planOptions = input.options as { planPurpose?: unknown; sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord } | undefined;
   const sourceDraft = admissionTurn?.sourcePlanDraft || planOptions?.sourcePlanDraft;
-  const reusePlanContext = input.runtimeRunIntent === "plan" && planOptions?.planPurpose !== "rules" && (
+  const approvedPlanContinuation = admissionTurn?.approvedPlanContinuation;
+  const sourcePlan = approvedPlanContinuation && resolveApprovedWorkPlanContinuation(admissionState, approvedPlanContinuation, {
+    workspaceKey: input.runScopeKey, sessionKey: input.runSessionKey, sessionEpoch: runSessionEpoch,
+    turnId: input.turnId, clientSubmissionId: admissionTurn?.clientSubmissionId || input.turnId,
+  });
+  const reusePlanContext = (!!approvedPlanContinuation && (!approvedPlanContinuation.revise || input.runtimeRunIntent === "plan")) ||
+    (input.runtimeRunIntent === "plan" && planOptions?.planPurpose !== "rules" && (
     checkpoint
       ? checkpoint.aggregate.strategy === "plan" && checkpoint.aggregate.phase === "planning" &&
         checkpoint.aggregate.run?.identity.runId === submissionRunId && hasExecutablePlanChoice(checkpoint.aggregate)
@@ -1730,11 +1737,15 @@ export async function runSubmitAsyncWorkflowRun<
         { workspaceKey: input.runScopeKey, sessionKey: input.runSessionKey, sessionEpoch: runSessionEpoch,
           clientSubmissionId: admissionTurn?.clientSubmissionId || input.turnId, turnId: input.turnId },
       )
-  );
+  ));
   // A restored Turn's immutable objective wins over a missing or looser
   // resubmission context. Legacy objective fields stay absent, never borrowed.
-  const capabilityRestrictions = checkpoint ? checkpoint.aggregate.objective.capabilityRestrictions : input.semanticIntent?.forbiddenCapabilities;
-  const approvalRequiredCapabilities = checkpoint ? checkpoint.aggregate.objective.approvalRequiredCapabilities : input.semanticIntent?.approvalRequiredCapabilities;
+  const capabilityRestrictions = checkpoint ? checkpoint.aggregate.objective.capabilityRestrictions : approvedPlanContinuation
+    ? [...new Set([...(sourcePlan?.aggregate.objective.capabilityRestrictions || []), ...(input.semanticIntent?.forbiddenCapabilities || [])])]
+    : input.semanticIntent?.forbiddenCapabilities;
+  const approvalRequiredCapabilities = checkpoint ? checkpoint.aggregate.objective.approvalRequiredCapabilities : approvedPlanContinuation
+    ? [...new Set([...(sourcePlan?.aggregate.objective.approvalRequiredCapabilities || []), ...(input.semanticIntent?.approvalRequiredCapabilities || [])])]
+    : input.semanticIntent?.approvalRequiredCapabilities;
   // Bootstrap reads have no exact-call approval resolver. Defer project and
   // attachment content to ordinary authorized tools when this Turn requires it.
   const deferWorkspaceReads = normalizeTurnCapabilityRestrictions(capabilityRestrictions).includes("workspace_read") ||
@@ -1817,8 +1828,8 @@ export async function runSubmitAsyncWorkflowRun<
   const originalPlanPrompt = input.runtimeRunIntent === "plan" && checkpoint?.aggregate.strategy === "plan" &&
     checkpoint.aggregate.run?.identity.runId === submissionRunId
     ? admissionTurn?.userPrompt : undefined;
-  const instructionPrompt = originalPlanPrompt && originalPlanPrompt !== input.text
-    ? [originalPlanPrompt, input.text].filter(Boolean).join("\n") : input.text;
+  const instructionPrompt = [sourcePlan?.aggregate.objective.text || originalPlanPrompt, input.text]
+    .filter((part, index, parts) => part && parts.indexOf(part) === index).join("\n");
   if (deferWorkspaceReads) input.logStoreEvent("workspace_read_bootstrap_deferred", {
     turnId: input.turnId,
     referenceCount: deferredReferences.length,
@@ -2095,6 +2106,7 @@ export async function runSubmitAsyncWorkflowRun<
     capabilityRestrictions,
     approvalRequiredCapabilities,
     requiredCapabilities: input.semanticIntent?.requiredCapabilities,
+    semanticWorkType: input.semanticIntent?.workType,
     intentClarification: input.semanticIntent?.clarification,
 
 
@@ -2110,6 +2122,7 @@ export async function runSubmitAsyncWorkflowRun<
     planPurpose: (input.options as { planPurpose?: unknown } | undefined)?.planPurpose === "rules" ? "rules" : undefined,
     sourcePlanDraft: input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.sourcePlanDraft ||
       (input.options as { sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord } | undefined)?.sourcePlanDraft,
+    approvedPlanContinuation,
     projectBaselineContext: projectBaselineSnapshot,
     skillCatalog: resolvedInstructionSnapshot?.skillCatalog || null,
     workspaceMcpSnapshot,

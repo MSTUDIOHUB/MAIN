@@ -385,7 +385,12 @@ export function boundRuntimeMessageGroupsToInputBudget(
     groups.push(group);
   }
   const protectedGroups = new Set(groups.filter((group) => group[0]?.role === "system"));
-  for (const group of groups.filter((item) => item[0]?.role === "user").slice(-2)) protectedGroups.add(group);
+  const userGroups = groups.filter((item) => item[0]?.role === "user");
+  for (const group of userGroups.slice(-2)) protectedGroups.add(group);
+  if (userGroups.some(group => group[0]?.runtimeGuidanceId)) {
+    const objectiveGroup = [...userGroups].reverse().find(group => !group[0]?.runtimeGuidanceId);
+    if (objectiveGroup) protectedGroups.add(objectiveGroup);
+  }
   const latestToolGroup = [...groups].reverse().find((group) => group[0]?.tool_calls?.length);
   if (latestToolGroup) protectedGroups.add(latestToolGroup);
   const latestContentGroup = [...groups].reverse().find((group) => group[0]?.role !== "system");

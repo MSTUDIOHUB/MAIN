@@ -1,14 +1,22 @@
 import { expect, test } from "@playwright/test";
+import { installCapsuleFixtureStartup } from "./capsuleFixtureStartup";
+
+test.beforeEach(({ page }) => installCapsuleFixtureStartup(page));
 
 for (const theme of ["light", "dark", "black"]) {
   test(`canonical tool outcomes restore readable steps and disclosed diagnostics in ${theme}`, async ({ page }, testInfo) => {
     await page.goto("/?e2eScenario=awaiting-choice");
     await expect.poll(() => page.evaluate(async () => {
-      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const storeUrl = performance.getEntriesByType("resource")
+        .filter((entry) => new URL(entry.name).pathname === "/src/store/useAppStore.ts").at(-1)?.name;
+      if (!storeUrl) return undefined;
+      const { useAppStore } = await import(storeUrl);
       return useAppStore.getState().harnessRunMarker?.runId;
     })).toBe("run-e2e-awaiting-choice");
     await page.evaluate(async appearance => {
-      const store = await import("/src/store/useAppStore.ts");
+      const storeUrl = performance.getEntriesByType("resource")
+        .filter((entry) => new URL(entry.name).pathname === "/src/store/useAppStore.ts").at(-1)!.name;
+      const store = await import(storeUrl) as typeof import("/src/store/useAppStore.ts");
       const runtime = await import("/src/lib/runtime-v2/index.ts");
       const { formatReadFileWindowForModel } = await import("/src/lib/readFileWindow.ts");
       window.history.replaceState(null, "", "/?e2eScenario=runtime-tool-outcomes");
@@ -64,6 +72,11 @@ for (const theme of ["light", "dark", "black"]) {
     }, theme);
 
     await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    const activity = page.getByTestId("live-turn-process-toggle");
+    await expect(activity).toHaveAttribute("aria-expanded", "false");
+    await expect(activity.getByTestId("turn-activity-issues")).toHaveText("失败 1 · 受阻 1 · 未执行 1");
+    await activity.screenshot({ path: testInfo.outputPath(`tool-activity-${theme}.png`) });
+    await activity.click();
     const steps = page.getByTestId("live-turn-step");
     await expect(steps).toHaveCount(5);
     await expect(steps.nth(0)).toHaveAttribute("data-status", "not_executed");

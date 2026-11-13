@@ -1199,7 +1199,7 @@ test("provider mutation facts come only from committed ledger evidence", () => {
           version: "editor-v2",
         }],
       },
-      scheduled("committed-command", "committed-mutation"),
+      scheduled("committed-command", "committed-mutation", "replace_in_file"),
       completed("committed-command", "succeeded", [{
         id: "mutation",
         kind: "mutation",
@@ -1405,10 +1405,10 @@ test("equivalent failed validations converge across command wrapper churn", () =
       stderr: "src/editor.js:192: a different acceptance failure",
     })),
   );
-  const durableCompletion = evidence.toolCompletionFor(
+  const completion = (idempotencyKey, output) => evidence.toolCompletionFor(
     { live: executionTypes.createRuntimeV2LiveExecutionState() },
     {
-      idempotencyKey: "build-versioned",
+      idempotencyKey,
       kind: "execute_tool",
       phase: "acting",
       run: {},
@@ -1417,13 +1417,19 @@ test("equivalent failed validations converge across command wrapper churn", () =
     "run_command",
     { command: "npm run build" },
     "npm run build",
-    firstOutput,
-    "succeeded",
+    output,
+    "failed",
+    "execution_failed",
+    undefined,
+    undefined,
+    "command_exit_nonzero",
   );
+  const durableCompletion = completion("build-a", firstOutput);
+  assert.deepEqual(durableCompletion.evidence, []);
   assert.equal(
-    durableCompletion.evidence[0]?.version,
+    durableCompletion.diagnosticVersion,
     firstVersion,
-    "successful tool completion records a durable result-semantic version",
+    "a real command failure keeps a stable fingerprint without success evidence",
   );
 
   const command = (id, callId, commandText) => ({
@@ -1439,28 +1445,12 @@ test("equivalent failed validations converge across command wrapper churn", () =
       },
     },
   });
-  const completion = (id, version) => ({
-    type: "tool.completed",
-    idempotencyKey: id,
-    status: "succeeded",
-    evidence: [{
-      id: `${id}-tool`,
-      kind: "tool",
-      target: "build",
-      version,
-    }],
-    presentation: {
-      toolName: "run_command",
-      target: "build",
-      observationSummary: diagnostic,
-    },
-  });
   const facts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({
     events: [
       command("build-a", "build-call-a", "npm run build 2>&1 | head -100"),
-      completion("build-a", firstVersion),
+      durableCompletion,
       command("build-b", "build-call-b", "npx vite build"),
-      completion("build-b", secondVersion),
+      completion("build-b", secondOutput),
     ],
   });
   assert.deepEqual(
@@ -6937,7 +6927,9 @@ test("source-only pressure asks for an effect while keeping concrete reads avail
 
 test("a fresh source frontier after a committed mutation never denies the historical effect", () => {
   const aggregate = { events: [
-    { type: "tool.completed", status: "succeeded", sequence: 11, evidence: [{ id: "E3", kind: "mutation", target: "src/main.js" }] },
+    { type: "command.scheduled", sequence: 10, command: { idempotencyKey: "write", kind: "execute_tool",
+      payload: { toolName: "replace_in_file", arguments: { path: "src/main.js" } } } },
+    { type: "tool.completed", idempotencyKey: "write", status: "succeeded", sequence: 11, evidence: [{ id: "E3", kind: "mutation", target: "src/main.js" }] },
     { type: "validation.completed", passed: false, sequence: 14, evidence: [] },
     { type: "tool.completed", status: "succeeded", sequence: 17, evidence: [{ id: "E6", kind: "source", target: "src/main.js", version: "post-mutation-v1" }] },
   ] };
@@ -11272,7 +11264,10 @@ test("mixed observation shell provider admission replays only the pre-command re
   authorization.authorizeToolForCurrentTurn = async () => ({ allowed: true, reason: null });
   toolExecutor.executeTool = async (name) => {
     executions.push(name);
-    if (name === "run_command") { refreshed = true; return "exitCode: 0\nrefreshed"; }
+    if (name === "run_command") {
+      refreshed = true;
+      return { exitCode: 0, stdout: "refreshed", stderr: "", timedOut: false };
+    }
     assert.equal(refreshed, true, "the post-command observation executes after the command");
     return newContent;
   };

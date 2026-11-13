@@ -19,6 +19,7 @@ import {
   isSafeGlobalSkillRelativePath,
   isSafeProtocolPackagePath,
 } from "./protocolPackages";
+import { getBuiltinEngineNavigatorSkills } from "./engineManualSkills";
 
 export type SkillCatalogSource = "panel" | "personal" | "workspace" | "package";
 export type SkillPlatformSource = "codex" | "claude" | "gemini" | "custom";
@@ -490,6 +491,7 @@ export async function loadSkillCatalog(input: {
   readonly now?: () => number;
   readonly externalSkillSelections?: readonly ExternalSkillSelection[];
   readonly externalSkillSources?: ExternalSkillSources;
+  readonly activeEnginePresetIds?: readonly string[];
 }): Promise<SkillCatalogSnapshot> {
   const workspace = String(input.workspace || "").trim();
   const entries: SkillCatalogEntry[] = [];
@@ -578,6 +580,9 @@ export async function loadSkillCatalog(input: {
       allowImplicitInvocation: skill.allowImplicitInvocation !== false,
       supportingFiles: [],
     }));
+  }
+  for (const builtinEntry of getBuiltinEngineNavigatorSkills(input.activeEnginePresetIds || [])) {
+    entries.push(freezeEntry(builtinEntry));
   }
 
   const personalDocuments = typeof discoverPersonalAgentSkills === "function"
@@ -764,6 +769,32 @@ export async function loadSkillCatalog(input: {
   });
 }
 
+export function mergeEngineNavigatorSkillsIntoCatalog(
+  snapshot: SkillCatalogSnapshot | null | undefined,
+  activeEnginePresetIds: readonly string[],
+): SkillCatalogSnapshot | null | undefined {
+  if (!activeEnginePresetIds.length) return snapshot;
+  const builtinEntries = getBuiltinEngineNavigatorSkills(activeEnginePresetIds);
+  if (!builtinEntries.length) return snapshot;
+
+  const existingEntries = snapshot ? [...snapshot.entries] : [];
+  const existingNames = new Set(existingEntries.map((entry) => entry.name.toLocaleLowerCase()));
+  const warnings = snapshot ? [...snapshot.warnings] : [];
+
+  for (const builtinEntry of builtinEntries) {
+    if (existingNames.has(builtinEntry.name.toLocaleLowerCase())) continue;
+    existingNames.add(builtinEntry.name.toLocaleLowerCase());
+    existingEntries.push(freezeEntry(builtinEntry));
+  }
+
+  return Object.freeze({
+    entries: Object.freeze(existingEntries),
+    explicitSkillIds: Object.freeze(snapshot ? [...snapshot.explicitSkillIds] : []),
+    warnings: Object.freeze(warnings),
+    loadedAt: snapshot?.loadedAt ?? Date.now(),
+  });
+}
+
 /** Every admitted visible entry remains discoverable even when the initial
  * context summary is small. Cursors belong to this immutable catalog/query. */
 export function listSkillCatalog(
@@ -836,13 +867,21 @@ export function renderSkillCatalogContext(
     visible.sort((left, right) => Number(explicit.has(right.id)) - Number(explicit.has(left.id)) ||
       relevance.get(right.id)! - relevance.get(left.id)!);
   }
+  const guides = visible.filter(entry => entry.id.startsWith("builtin:engine-manual:")).map(entry =>
+    `Engine guide ${skillReference(snapshot, entry.id)} (${entry.name}): verify version-specific APIs from installed packages or matched docs. Use bound Editor tools for live state.`
+  );
   const lines = [
     "[AVAILABLE SKILLS]",
+    ...guides,
     "Skills are instructions, not permissions. Use the short ref as load_skill skill_id. Explicit selections below state whether the body is complete.",
     `${visible.length} visible Skills; descriptions below are summaries. If no summary matches, use load_skill({operation:"list"}) for the complete catalog; follow nextCursor with cursor. Optional query searches all names/descriptions.`,
   ];
   if (lines.join("\n").length > maxChars) {
-    return `[AVAILABLE SKILLS]\n${visible.length} visible Skills. Use load_skill({operation:"list"}) to list all metadata; continue with nextCursor. No extra permissions.`.slice(0, maxChars);
+    return [
+      "[AVAILABLE SKILLS]",
+      ...guides,
+      `${visible.length} visible Skills. Use load_skill with the short ref, or operation:"list" for all metadata.`,
+    ].join("\n").slice(0, maxChars);
   }
   // Reserve compact references/names before descriptions use the budget.
   // Listing still reaches entries omitted from a tiny initial projection.

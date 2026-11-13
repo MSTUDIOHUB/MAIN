@@ -103,10 +103,8 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
   const processDisclosure = page.getByTestId("live-turn-process-toggle");
-  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
-  await expect(processDisclosure).toContainText("3 步");
-  await processDisclosure.click();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
+  await expect(processDisclosure).toContainText("本轮活动");
   await expect(timeline).toBeVisible();
   await expect(page.getByTestId("live-turn-process-details")).toHaveCount(0);
   await expect(capsule.getByTestId("capsule-status-label")).toHaveCount(0);
@@ -114,7 +112,8 @@ test("ChatArea checkpoints stay durable while Capsule shows only live guidance",
   await expect(firstUpdate).toHaveCount(1);
   await expect(secondUpdate).toHaveCount(1);
 
-  await processDisclosure.click();
+  await processDisclosure.focus();
+  await processDisclosure.press("Enter");
   await expect(timeline).toBeVisible();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
   await expect(timeline.getByTestId("tool-status-label")).toHaveCount(1);
@@ -207,6 +206,7 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
+  await page.getByTestId("live-turn-process-toggle").click();
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
 
   const overflowing = await page.evaluate(() => {

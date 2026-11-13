@@ -9,6 +9,7 @@ export type { PlanDocumentOwner, PlanDocumentRef, PlanDocumentScope, SavePlanDoc
 import type { GithubSkillSource } from "./githubSkillSource";
 import type { WebSearchProvider } from "./networkRead";
 import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
+import { mergeRuntimeV2CheckpointMaps } from "./runtime-v2/checkpointMerge";
 import {
   createProjectSessionMutationCoordinator,
   isProjectSessionAdmissionProjectionOwned,
@@ -17,6 +18,7 @@ import {
 
 const projectSessionMutations = createProjectSessionMutationCoordinator();
 const projectSessionRevisionByOwner = new Map<string, number>();
+const projectSessionLedgerByOwner = new Map<string, { revision: number; checkpoints: unknown }>();
 
 function projectSessionOwnerKey(workspace: string, sessionId: number | string): string {
   return `${workspace}\u0000${String(sessionId)}`;
@@ -42,6 +44,18 @@ function rememberProjectSessionRevision(ownerKey: string, session: unknown): voi
   }
 }
 
+function rememberProjectSessionLedger(ownerKey: string, session: any): void {
+  const revision = normalizeProjectSessionStorageRevision(session?.storageRevision);
+  if (revision === null || revision !== projectSessionRevisionByOwner.get(ownerKey) ||
+      !isProjectSessionObject(session?.runtimeSnapshot)) return;
+  projectSessionLedgerByOwner.delete(ownerKey);
+  projectSessionLedgerByOwner.set(ownerKey, { revision, checkpoints: session.runtimeSnapshot.runtimeV2Checkpoints });
+  if (projectSessionLedgerByOwner.size > 8) {
+    const oldest = projectSessionLedgerByOwner.keys().next().value;
+    if (oldest !== undefined) projectSessionLedgerByOwner.delete(oldest);
+  }
+}
+
 function rememberProjectSessionList(workspace: string, sessions: unknown): void {
   if (!Array.isArray(sessions)) return;
   sessions.forEach((session) => {
@@ -53,13 +67,14 @@ function rememberProjectSessionList(workspace: string, sessions: unknown): void 
 
 function clearProjectSessionRevision(ownerKey: string): void {
   projectSessionRevisionByOwner.delete(ownerKey);
+  projectSessionLedgerByOwner.delete(ownerKey);
 }
 
 function clearWorkspaceProjectSessionRevisions(workspace: string): void {
   const ownerPrefix = `${workspace}\u0000`;
   for (const ownerKey of projectSessionRevisionByOwner.keys()) {
     if (ownerKey.startsWith(ownerPrefix)) {
-      projectSessionRevisionByOwner.delete(ownerKey);
+      clearProjectSessionRevision(ownerKey);
     }
   }
 }
@@ -154,7 +169,9 @@ export function prepareProjectSessionSnapshotForSave(session: any, existing: unk
     conversationTurns: turns,
   };
   if ("runtimeV2Checkpoints" in runtimeSnapshot) {
-    runtimeSnapshot.runtimeV2Checkpoints = serializeRuntimeV2CheckpointMap(runtimeSnapshot.runtimeV2Checkpoints);
+    runtimeSnapshot.runtimeV2Checkpoints = serializeRuntimeV2CheckpointMap(mergeRuntimeV2CheckpointMaps(
+      currentRuntime?.runtimeV2Checkpoints, incomingRuntime?.runtimeV2Checkpoints,
+    ));
   }
   return {
     ...current,
@@ -466,6 +483,23 @@ export interface KnowledgeBase {
   indexRevision: string;
   createdAtMs: number;
   updatedAtMs: number;
+  presetId?: string | null;
+  tocEntryCount?: number;
+  tocIndexedSourceCount?: number;
+  presetSyncStatus?: "done" | "partial";
+}
+
+export interface EngineManualPreset {
+  presetId: string;
+  name: string;
+  description: string;
+  engineFamily: string;
+  entryUrl: string;
+  tocUrls: string[];
+  seedUrls: string[];
+  officialDomains: string[];
+  searchSiteFilter: string;
+  documentationVersion: string;
 }
 
 export interface KnowledgeSource {
@@ -481,6 +515,7 @@ export interface KnowledgeSource {
   metadata: Record<string, unknown> | null;
   lastIndexedAtMs: number;
   sourceRevision: string;
+  provenance?: "official_document" | "builtin_summary" | "unverified_legacy";
 }
 
 export interface KnowledgeCitation {
@@ -493,7 +528,11 @@ export interface KnowledgeCitation {
   block?: string | null;
   score: number;
   indexRevision: string;
+  admittedIndexRevision?: string;
   sourceRevision: string;
+  sourceKind?: "official_document" | "builtin_summary";
+  documentationVersion?: string;
+  documentationCoverage?: string;
   sourceUrl?: string | null;
 }
 
@@ -513,6 +552,8 @@ export interface KnowledgeSearchResult {
   searchedKnowledgeBaseIds: string[];
   hits: KnowledgeSearchHit[];
   note: string;
+  attemptedTiers?: string[];
+  hydratedCount?: number;
 }
 
 export interface KnowledgeImportResult {
@@ -1306,18 +1347,24 @@ export function saveProjectSession(
       // enqueue-time fence above deliberately excludes already-stale callers.
       let existingSession: any = null;
       let reconciledStorageRevision: number | null = null;
+      const cachedLedger = projectSessionLedgerByOwner.get(ownerKey);
+      const knownRevision = projectSessionRevisionByOwner.get(ownerKey) ?? capturedStorageRevision;
+      const ledgerMayBePresent = isProjectSessionObject(session?.runtimeSnapshot) &&
+        "runtimeV2Checkpoints" in session.runtimeSnapshot || cachedLedger?.checkpoints !== undefined;
       if (projectSessionSaveNeedsTranscriptBase(session)) {
         existingSession = await invoke<any>("load_project_session", {
           workspace,
           sessionId,
         });
         rememberProjectSessionRevision(ownerKey, existingSession);
+        rememberProjectSessionLedger(ownerKey, existingSession);
         if (lease.revisionReconciliationRequired) {
           reconciledStorageRevision = normalizeProjectSessionStorageRevision(
             existingSession?.storageRevision,
           ) ?? 0;
         }
-      } else if (lease.revisionReconciliationRequired) {
+      } else if (lease.revisionReconciliationRequired ||
+          (ledgerMayBePresent && knownRevision > 0 && cachedLedger?.revision !== knownRevision)) {
         // A previous invoke crossed the JavaScript settlement boundary. It
         // may have committed before its response was lost, so refresh Rust's
         // authoritative CAS revision before this writer selects its base.
@@ -1326,9 +1373,13 @@ export function saveProjectSession(
           sessionId,
         });
         rememberProjectSessionRevision(ownerKey, meta);
+        rememberProjectSessionLedger(ownerKey, meta);
+        existingSession = meta;
         reconciledStorageRevision = normalizeProjectSessionStorageRevision(
           meta?.storageRevision,
         ) ?? 0;
+      } else if (cachedLedger?.revision === knownRevision && cachedLedger.checkpoints !== undefined) {
+        existingSession = { runtimeSnapshot: { runtimeV2Checkpoints: cachedLedger.checkpoints } };
       }
       const storageRevision = mayAdvanceQueuedRevision
         ? reconciledStorageRevision ??
@@ -1345,6 +1396,7 @@ export function saveProjectSession(
         mutationDeadlineMs: lease.mutationDeadlineMs,
       });
       rememberProjectSessionRevision(ownerKey, saved);
+      rememberProjectSessionLedger(ownerKey, { ...queuedSession, storageRevision: saved?.storageRevision });
       return saved;
     },
     {
@@ -1356,7 +1408,9 @@ export function saveProjectSession(
 
 export async function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
   const session = await invoke<any>("load_project_session", { workspace, sessionId });
-  rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  const ownerKey = projectSessionOwnerKey(workspace, sessionId);
+  rememberProjectSessionRevision(ownerKey, session);
+  rememberProjectSessionLedger(ownerKey, session);
   return session;
 }
 
@@ -1373,7 +1427,9 @@ export interface ProjectSessionPage {
 
 export async function loadProjectSessionMeta(workspace: string, sessionId: number | string): Promise<any> {
   const session = await invoke<any>("load_project_session_meta", { workspace, sessionId });
-  rememberProjectSessionRevision(projectSessionOwnerKey(workspace, sessionId), session);
+  const ownerKey = projectSessionOwnerKey(workspace, sessionId);
+  rememberProjectSessionRevision(ownerKey, session);
+  rememberProjectSessionLedger(ownerKey, session);
   return session;
 }
 
@@ -1529,6 +1585,14 @@ export function knowledgeListBases(): Promise<KnowledgeBase[]> {
   return invoke<KnowledgeBase[]>("knowledge_list_bases");
 }
 
+export function knowledgeListPresets(): Promise<EngineManualPreset[]> {
+  return invoke<EngineManualPreset[]>("knowledge_list_presets");
+}
+
+export function knowledgeBootstrapPreset(presetId: string): Promise<KnowledgeBase> {
+  return invoke<KnowledgeBase>("knowledge_bootstrap_preset", { presetId });
+}
+
 export function knowledgeCreateBase(name: string, description?: string): Promise<KnowledgeBase> {
   return invoke<KnowledgeBase>("knowledge_create_base", { name, description });
 }
@@ -1557,13 +1621,24 @@ export function knowledgeRebuildBase(kbId: string): Promise<KnowledgeBase> {
   return invoke<KnowledgeBase>("knowledge_rebuild_base", { kbId });
 }
 
-/** Only frozen selections from this message may authorize a search. */
-export function knowledgeSearch(
+/** Only frozen selections from this message or workspace-active engine manual bindings may authorize a search. */
+export async function knowledgeSearch(
   query: string,
   references: readonly KnowledgeReference[],
   limit?: number,
+  policy: import("./knowledgeReferences").KnowledgeLookupPolicy = { mode: "local" },
+  signal?: AbortSignal,
 ): Promise<KnowledgeSearchResult> {
-  return invoke<KnowledgeSearchResult>("knowledge_search", { query, references, limit });
+  signal?.throwIfAborted();
+  const requestId = `knowledge-${globalThis.crypto.randomUUID()}`;
+  const cancel = () => { void invoke("cancel_proxy_request", { requestId }).catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    signal?.throwIfAborted();
+    return await invoke<KnowledgeSearchResult>("knowledge_search", { query, references, limit, policy, requestId });
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+  }
 }
 
 export function knowledgeGetExcerpt(
@@ -1612,6 +1687,25 @@ export function runHookCommand(
     input,
     timeoutMs,
   });
+}
+
+export async function runUnityEditorOperation(
+  command: "unity_create_scene" | "unity_compile_project" | "unity_probe_editor" | "unity_test_project",
+  args: Record<string, unknown>,
+  signal: AbortSignal,
+  deadlineAt: number,
+): Promise<unknown> {
+  signal.throwIfAborted();
+  const operationId = crypto.randomUUID();
+  const cancel = () => { void invoke("cancel_unity_editor_operation", { operationId }).catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    const result = await invoke(command, { ...args, operationId, deadlineAt });
+    signal.throwIfAborted();
+    return result;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
 }
 
 export function runCommand(
@@ -1698,10 +1792,14 @@ export function codeAstQuery(input: {
 export function checkSourceSyntax(
   path: string,
   content: string,
+  workspace?: string,
+  patchPaths?: Readonly<Record<string, boolean>>,
 ): Promise<SourceSyntaxCheckResult> {
+  const shader = /\.(shader|hlsl|cginc|compute)$/i.test(path);
   return invoke<SourceSyntaxCheckResult>("check_source_syntax", {
     path,
     content,
+    ...(shader && workspace ? { workspace, patchPaths } : {}),
   });
 }
 

@@ -59,6 +59,80 @@ function candidate(overrides = {}) {
   };
 }
 
+const planContinuationCandidates = [
+  { id: "brick-breaker:v3", title: "Unity brick breaker", objective: "Build a playable Unity 6 brick breaker", status: "canceled" },
+  { id: "collector:v1", title: "Unity collector", objective: "Prototype a collectible game", status: "review" },
+];
+
+test("one tool-free semantic request distinguishes continuing, revising and discussing a scoped plan", async () => {
+  for (const [input, kind, expectedIntent, language] of [
+    ["继续完成计划方案", "continue", "respond", "zh"],
+    ["Revise the brick breaker plan for touch controls.", "revise", "plan", "en"],
+    ["Explain the proposed brick breaker verification.", "discuss", "respond", "en"],
+    ["Explain how an unrelated browser API works.", "new", "respond", "en"],
+  ]) {
+    const relation = kind === "new" ? { kind } : { kind, candidateId: planContinuationCandidates[0].id };
+    const wire = { ...candidate({ forbiddenCapabilities: ["command"] }), planContinuation: relation, approved: true };
+    let requests = 0;
+    const preflight = loadPreflight(null, async (messages, _settings, _callbacks, _signal, tools) => {
+      requests += 1;
+      assert.deepEqual(tools, []);
+      assert.deepEqual(JSON.parse(messages[1].content), {
+        currentRequest: input, previousRequest: "Pause the previous run.", planContinuationCandidates,
+      });
+      return { content: JSON.stringify(wire), finishReason: "stop", toolCalls: [] };
+    });
+    const result = await preflight({ ...params, input, language, hasWorkspace: true,
+      previousRequest: "Pause the previous run.", planContinuationCandidates });
+    assert.equal(requests, 1);
+    assert.equal(result.intent, expectedIntent);
+    assert.deepEqual(result.planContinuation, kind === "new" ? undefined : relation);
+    assert.deepEqual(result.semantic.forbiddenCapabilities, ["command"]);
+    assert.equal(result.approved, undefined);
+  }
+});
+
+test("continuation candidates cannot be guessed, repeated, or invented by the classifier", async () => {
+  const invalid = [
+    { kind: "continue", candidateId: "other-session:v3" },
+    { kind: "approve", candidateId: planContinuationCandidates[0].id },
+    { kind: "ambiguous", candidateIds: [planContinuationCandidates[0].id, planContinuationCandidates[0].id] },
+  ];
+  for (const planContinuation of invalid) {
+    const diagnostics = [];
+    const result = await loadPreflight({ ...candidate(), planContinuation })({
+      ...params, hasWorkspace: true, planContinuationCandidates, onDiagnostic: value => diagnostics.push(value),
+    });
+    assert.equal(result, null);
+    assert.equal(diagnostics[0].field, "planContinuation");
+  }
+  const operation = { ...candidate({ workType: "implement", requiredCapabilities: ["workspace_write"], forbiddenCapabilities: [] }),
+    planContinuation: { kind: "discuss", candidateId: planContinuationCandidates[0].id } };
+  assert.equal(await loadPreflight(operation)({ ...params, hasWorkspace: true, planContinuationCandidates }), null);
+  const unbound = { ...candidate(), planContinuation: { kind: "continue", candidateId: planContinuationCandidates[0].id } };
+  assert.equal(await loadPreflight(unbound)({ ...params, hasWorkspace: true }), null);
+});
+
+test("a missing continuation decision can retain read-only semantics or explicit Plan, while autonomous effects and planning fail closed", async () => {
+  for (const [workType, requiredCapabilities, explicitIntent, expected] of [
+    ["answer", [], undefined, "respond"],
+    ["investigate", ["workspace_read"], undefined, "analyze"],
+    ["plan", ["workspace_read"], "plan", "plan"],
+    ["plan", ["workspace_read"], undefined, null],
+    ["implement", ["workspace_write"], undefined, null],
+    ["operate", ["command"], undefined, null],
+  ]) {
+    const diagnostics = [];
+    const result = await loadPreflight(candidate({ workType, requiredCapabilities, forbiddenCapabilities: [] }))({
+      ...params, hasWorkspace: true, explicitIntent, planContinuationCandidates,
+      onDiagnostic: value => diagnostics.push(value),
+    });
+    assert.equal(result?.intent ?? null, expected);
+    assert.equal(result?.planContinuation, undefined);
+    assert.equal(diagnostics[0]?.field, expected === null ? "planContinuation" : undefined);
+  }
+});
+
 test("public web research uses network capability without becoming an interactive operation", async () => {
   for (const [workType, intent] of [["answer", "respond"], ["investigate", "analyze"], ["operate", "respond"]]) {
     const wire = candidate({

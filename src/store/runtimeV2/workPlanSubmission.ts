@@ -1,4 +1,4 @@
-import { analyzeValidationCommand, finiteValidationRepairHint, type ValidationCommandRejectionReason } from "../../lib/validationContract";
+import { analyzeValidationCommand, finiteValidationRepairHint, normalizeValidationWorkspaceCwd, type ValidationCommandRejectionReason } from "../../lib/validationContract";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   WORK_PLAN_V1_SCHEMA_VERSION,
@@ -270,6 +270,7 @@ function compileValidations(input: {
   readonly steps: WorkPlanDraftV1["steps"];
   readonly normalizationReasons: string[];
   readonly knownCriterionIds: ReadonlySet<string>;
+  readonly workspace?: string;
 }): { validations: WorkPlanDraftV1["validations"]; origins: readonly WorkPlanValidationOrigin[] } {
   const executableStepIndexes = input.steps
     .map((step, index) => (step.operation !== "preserve" ? index : -1))
@@ -300,7 +301,7 @@ function compileValidations(input: {
   });
 
   const origins: WorkPlanValidationOrigin[] = [];
-  const compiled = normalizedRaw.map((validation) => {
+  const compiled = normalizedRaw.map((validation, index) => {
     const requestedCommand = typeof validation?.command === "string"
       ? validation.command.trim()
       : "";
@@ -311,6 +312,9 @@ function compileValidations(input: {
       requestedCommand ? "finite_command" : "assertion"
     );
     const command = kind === "finite_command" ? requestedCommand : "";
+    const rawCwd = typeof validation?.cwd === "string" ? validation.cwd.trim() : "";
+    const cwd = rawCwd ? normalizeValidationWorkspaceCwd(rawCwd, input.workspace) : undefined;
+    if (cwd === null) throw new Error(`validations[${index}].cwd: Use a directory inside the workspace (use . for the root).`);
     const stepIndexes = normalizeStepIndexesList(
       validation,
       defaultStepIndexes,
@@ -319,9 +323,9 @@ function compileValidations(input: {
       stepIndexes,
       kind,
       ...(command ? { command } : {}),
-      ...(typeof validation?.cwd === "string" && validation.cwd.trim()
-        ? { cwd: validation.cwd.trim() }
-        : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(validation?.expectedTestCases !== undefined ? { expectedTestCases: validation.expectedTestCases } : {}),
+      ...(validation?.useProjectEditor === true ? { useProjectEditor: true as const } : {}),
       expectedOutcome: String(
         validation?.expectedOutcome ||
         validation?.outcome ||
@@ -378,6 +382,7 @@ export function workPlanDraftFromSubmission(
   evidence: readonly WorkPlanRuntimeEvidence[],
   objective: string,
   criterionIds: readonly string[] = [],
+  workspace?: string,
 ): {
   readonly draft: WorkPlanDraftV1;
   readonly normalized: boolean;
@@ -458,6 +463,7 @@ export function workPlanDraftFromSubmission(
     steps,
     normalizationReasons,
     knownCriterionIds,
+    workspace,
   });
   const draft: WorkPlanDraftV1 = {
     schemaVersion: WORK_PLAN_V1_SCHEMA_VERSION,

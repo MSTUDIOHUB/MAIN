@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import { acquireModelLane } from "../../lib/modelLaneCoordinator";
+import { acquireModelLane, ModelLaneResourceInterruption } from "../../lib/modelLaneCoordinator";
+import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
 import { boundRuntimeMessagesToContext } from "../../lib/runtimeContextBudget";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
@@ -120,6 +121,7 @@ export async function requestRuntimeV2ChildStep(input: {
         ) + maxOutputTokens,
       );
       const requestController = new AbortController();
+      const activity = beginCapsuleModelActivity(input.job.run, input.job.id, requestController.signal);
       const abortRequestFromParent = () =>
         requestController.abort(input.signal.reason);
       if (input.signal.aborted) abortRequestFromParent();
@@ -131,6 +133,7 @@ export async function requestRuntimeV2ChildStep(input: {
         );
       }
       let lane: Awaited<ReturnType<typeof acquireModelLane>> | null = null;
+      let memoryWait = false;
       const releaseLane = () => {
         const activeLane = lane;
         if (!activeLane) return;
@@ -149,22 +152,29 @@ export async function requestRuntimeV2ChildStep(input: {
             releaseLane();
           },
           task: async () => {
+            activity.acquiringLane();
             lane = await acquireModelLane({
               config: state.config,
               contextLimit: budget?.contextLimit,
               requestTokenBudget,
               agentKind: "subagent",
               subagentId: input.job.id,
+              parentRunId: input.job.parentRunId,
+              ...(input.job.proactiveKey ? { optionalOverlap: true as const } : {}),
               signal: requestController.signal,
-              onDebugEvent: (event, data) =>
+              onDebugEvent: (event, data) => {
+                if (event === "model_lane_admission") memoryWait = data.decision === "queued" &&
+                  (data.queueReason === "memory_reserve" || data.queueReason === "memory_probe_unavailable");
                 input.ports.logStoreEvent(event, {
                   turnId: input.job.run.turnId,
                   runId: input.job.run.runId,
                   jobId: input.job.id,
                   ...data,
-                }),
+                });
+              },
             });
             const activeLane = lane;
+            activity.preparing();
             activeLane.setPressureHandler((error) =>
               requestController.abort(error)
             );
@@ -191,6 +201,7 @@ export async function requestRuntimeV2ChildStep(input: {
                   },
                   onDone: () => undefined,
                   onError: () => undefined,
+                  onRequestDispatched: activity.requestDispatched,
                   onLifecycle: (event) => {
                     if (event.phase !== "model_progress") return;
                     activeLane.markFirstToken();
@@ -213,11 +224,14 @@ export async function requestRuntimeV2ChildStep(input: {
                 },
               );
             } catch (error) {
+              if (requestController.signal.reason instanceof ModelLaneResourceInterruption) throw requestController.signal.reason;
               activeLane.reportFailure(error);
+              if (requestController.signal.reason instanceof ModelLaneResourceInterruption) throw requestController.signal.reason;
               throw error;
             }
           },
         });
+        requestController.signal.throwIfAborted();
 
         // An output limit is capacity evidence, not evidence that the
         // transport cannot express tools. Never parse or execute an action
@@ -354,7 +368,13 @@ export async function requestRuntimeV2ChildStep(input: {
             () => input.ports.nextId("subagent-tool-call"),
           ),
         };
+      } catch (error) {
+        if (memoryWait && (error instanceof Error ? error.message : String(error)) === RUNTIME_V2_SUBAGENT_PROVIDER_TIMEOUT_ERROR) {
+          throw new ModelLaneResourceInterruption("memory", "memory reserve did not recover before the child deadline");
+        }
+        throw error;
       } finally {
+        activity.finish();
         input.signal.removeEventListener(
           "abort",
           abortRequestFromParent,
@@ -362,6 +382,13 @@ export async function requestRuntimeV2ChildStep(input: {
         releaseLane();
       }
     } catch (error) {
+      if (error instanceof ModelLaneResourceInterruption) {
+        input.ports.logStoreEvent("runtime_v2_subagent_resource_interrupted", {
+          sessionKey: input.job.run.sessionKey, turnId: input.job.run.turnId, runId: input.job.run.runId,
+          jobId: input.job.id, cause: error.causeKind, reason: error.message,
+        });
+        throw error;
+      }
       const errorMessage = error instanceof Error
         ? error.message
         : String(error);

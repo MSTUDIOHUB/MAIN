@@ -202,6 +202,7 @@ export interface StreamResult {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
+    cachedInputTokens?: number;
   };
   streamDiagnostics?: StreamSemanticDiagnostics;
   /** Receipt for the exact accepted request that produced this response. */
@@ -394,7 +395,15 @@ function extractProviderTokenUsage(payload: unknown): StreamResult["usage"] | un
     inputTokens + outputTokens,
   );
   if (inputTokens === 0 && outputTokens === 0 && totalTokens === 0) return undefined;
-  return { inputTokens, outputTokens, totalTokens: totalTokens || inputTokens + outputTokens };
+  const inputDetails = usage.prompt_tokens_details ?? usage.input_tokens_details;
+  const cacheCount = inputDetails && typeof inputDetails === "object"
+    ? (inputDetails as Record<string, unknown>).cached_tokens
+    : usage.cachedContentTokenCount;
+  return {
+    inputTokens, outputTokens, totalTokens: totalTokens || inputTokens + outputTokens,
+    ...(typeof cacheCount === "number" && Number.isInteger(cacheCount) && cacheCount >= 0 && cacheCount <= inputTokens
+      ? { cachedInputTokens: cacheCount } : {}),
+  };
 }
 
 const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;

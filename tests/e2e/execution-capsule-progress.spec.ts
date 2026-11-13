@@ -245,9 +245,16 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   await expect(capsule).not.toContainText("阶段：tool_start");
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
+  const progressToggle = page.getByTestId("plan-task-progress-toggle");
+  await expect(progressToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("plan-task-row")).toHaveCount(0);
+  await progressToggle.click();
   await expect(page.getByTestId("plan-task-progress")).toContainText("T1: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T8: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
+  await progressToggle.click();
+  await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
+  await expect(page.getByTestId("plan-task-row")).toHaveCount(0);
 });
 
 test("approved child-run activity excludes its parent review pause", async ({ page }) => {
@@ -305,6 +312,7 @@ test("PlanPanel counts only trusted evidence, not claimed completed checkboxes",
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("1/8");
+  await page.getByTestId("plan-task-progress-toggle").click();
   await expect(page.getByTestId("plan-task-progress")).toContainText("1.1 修复 useTrendData 回退逻辑");
   await expect(page.getByTestId("plan-task-status").nth(1)).toContainText("待验证");
   await expect(page.getByTestId("plan-task-progress")).not.toContainText("缺少真实执行证据");

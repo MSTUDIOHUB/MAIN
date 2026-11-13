@@ -1,4 +1,5 @@
 // @ts-nocheck
+import { isQueuedWorkspaceGuidanceEligible } from "../store/workspaceGuidance";
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconGlobe, IconShield, IconSubagent } from "./Icons";
 import MainOnboardingPanel from "./MainOnboardingPanel";
@@ -207,6 +208,9 @@ export default function Composer({
   isRunActive,
   turnIngressMode,
   guidanceTarget,
+  runtimeV2Guidance = false,
+  guidancePending = false,
+  restoreDraftRef,
   onStopGeneration,
   autoApproveTools,
   onToggleAutoApprove,
@@ -360,10 +364,10 @@ export default function Composer({
     : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
   const subagentPreferenceTitle = language === "en"
     ? preferSubagents
-      ? "Collaboration is preferred. For complex work with independent scopes, MAIN should use available child capacity in parallel at any useful stage while the parent keeps progressing; simple or linear work stays direct."
+      ? "Proactive collaboration is on. MAIN launches subagents for independent work when the model lane allows it. The parent keeps progressing, and simple or linear work stays direct."
       : "Allow adaptive collaboration for the next turn, including scoped investigation and planned non-overlapping implementation when useful."
     : preferSubagents
-      ? "已选择优先协作：复杂任务存在独立范围时，MAIN 应在任一合适阶段优先并行使用可用子智能体容量，同时父线程继续推进；简单或线性任务仍直接执行。"
+      ? "已开启主动协作：有独立工作且模型通道允许时，MAIN 会启动子智能体，父线程继续推进。简单或线性任务直接执行。"
       : "允许下一轮自适应协作，包括范围明确的调查及方案明确、互不重叠的实现任务。";
   const subagentPreferenceLockedTitle = language === "en"
     ? "Subagent collaboration is captured for the current run and can be changed after it stops."
@@ -386,9 +390,13 @@ export default function Composer({
   const workspaceComposer = Boolean(String(currentWorkspace || "").trim());
   const visibleLegacyQueuedMessage = workspaceComposer ? null : queuedUserMessage;
   const queuedTurnCount = queuedWorkspaceEntries.length + (visibleLegacyQueuedMessage ? 1 : 0);
-  const queuedTurnPreview = String(
-    queuedWorkspaceEntries[0]?.instruction?.payload?.text || visibleLegacyQueuedMessage?.text || "",
-  ).trim() || (language === "en" ? "Turn with attachments or images" : "包含附件或图片的回合");
+  const queuedGuidanceAvailable = composerGuidanceAvailable && runtimeV2Guidance && !guidancePending && !activeGuidance;
+  const queuedRows = queuedWorkspaceEntries.map(entry => ({
+    id: entry.receipt.receiptId,
+    text: entry.instruction.payload.text,
+    guide: isQueuedWorkspaceGuidanceEligible(entry),
+  }));
+  if (visibleLegacyQueuedMessage) queuedRows.push({ id: visibleLegacyQueuedMessage.id, text: visibleLegacyQueuedMessage.text, guide: false });
   const activeGuidancePreview = String(activeGuidance?.text || "").trim();
   const hasGuidanceUnsupportedPayload =
     contextMentions.length > 0 || attachedFiles.length > 0 || pendingImages.length > 0;
@@ -404,7 +412,8 @@ export default function Composer({
     !hasGuidanceUnsupportedPayload &&
     knowledgeReferences.length === 0 &&
     !draftHasExplicitTurnIntent &&
-    !activeGuidance,
+    !activeGuidance &&
+    !guidancePending,
   );
   const guidanceButtonTitle = language === "en"
     ? activeGuidance
@@ -502,6 +511,19 @@ export default function Composer({
     if (composerRunActive) return;
     setDraftInput(storeInput || "");
   }, [composerRunActive, storeInput]);
+
+  useEffect(() => {
+    if (!restoreDraftRef) return;
+    restoreDraftRef.current = (text: string) => {
+      if (draftInput !== text && !draftInput.endsWith(`\n\n${text}`)) {
+        const next = [draftInput, text].filter(Boolean).join("\n\n");
+        setDraftInput(next);
+        setStoreInput(next, { preserveLockedComposerIntent: true });
+      }
+      textareaRef.current?.focus();
+    };
+    return () => { restoreDraftRef.current = null; };
+  }, [draftInput, restoreDraftRef, setStoreInput]);
 
   useEffect(() => {
     return () => {
@@ -1257,19 +1279,23 @@ export default function Composer({
     }
   }, [attachedFiles, closeSlashMenu, closeSkillMenu, contextMentions, currentWorkspace, draftInput, knowledgeReferences, knowledgeOwnerKey, language, lockedComposerIntent, onSendMessage, pendingImages, preferSubagents, setLockedComposerIntent, setStoreInput]);
 
-  const handleGuideCurrentRun = useCallback(() => {
+  const handleGuideCurrentRun = useCallback(async () => {
     const guidanceText = draftInput.trim();
     if (!guidanceEligible || !guidanceText) return;
 
     const latest = useAppStore.getState();
-    if (!guidanceTarget || !latest.setActiveGuidance(guidanceText, guidanceTarget)) return;
+    if (!guidanceTarget) return;
+    const accepted = runtimeV2Guidance
+      ? await latest.guideWorkspaceRun({ text: guidanceText, target: guidanceTarget })
+      : latest.setActiveGuidance(guidanceText, guidanceTarget);
+    if (!accepted) return;
     closeMentionMenu();
     closeSlashMenu();
     setDraftInput((currentDraft) => currentDraft === draftInput ? "" : currentDraft);
-    if (latest.input === draftInput) {
+    if (useAppStore.getState().input === draftInput) {
       setStoreInput("", { preserveLockedComposerIntent: true });
     }
-  }, [closeMentionMenu, closeSlashMenu, draftInput, guidanceEligible, guidanceTarget, setStoreInput]);
+  }, [closeMentionMenu, closeSlashMenu, draftInput, guidanceEligible, guidanceTarget, runtimeV2Guidance, setStoreInput]);
 
   // ── Handle textarea change (detect @ typing) ──
   const resizeTextarea = useCallback(() => {
@@ -2028,7 +2054,32 @@ export default function Composer({
                     <div className={`text-[10px] font-semibold uppercase tracking-[0.14em] ${isLightTheme ? "text-blue-700" : "text-[#93c5fd]"}`}>
                       {language === "en" ? `Queued · ${queuedTurnCount} turn${queuedTurnCount === 1 ? "" : "s"}` : `已排队 · ${queuedTurnCount} 个回合`}
                     </div>
-                    <div className="mt-0.5 truncate text-[12px] leading-snug">{queuedTurnPreview}</div>
+                    <div className="max-h-28 overflow-y-auto">
+                      {queuedRows.map(row => (
+                        <div key={row.id} className="mt-0.5 flex items-center gap-2">
+                          <div className="min-w-0 flex-1 truncate text-[12px] leading-snug">
+                            {row.text.trim() || (language === "en" ? "Turn with attachments or images" : "包含附件或图片的回合")}
+                          </div>
+                          {queuedGuidanceAvailable && row.guide && (
+                            <button
+                              type="button"
+                              data-testid="composer-guide-queued-message"
+                              onClick={async () => {
+                                if (guidanceTarget && !await useAppStore.getState().guideWorkspaceRun({
+                                  receiptId: row.id, target: guidanceTarget,
+                                })) {
+                                  setAttachmentNotice(language === "en" ? "Guidance could not be confirmed. Check the current turn and queue." : "引导未能确认，请查看当前回合和队列。");
+                                }
+                              }}
+                              className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-emerald-600/40 px-2 transition-colors hover:bg-emerald-600/10"
+                            >
+                              <IconZap className="h-3.5 w-3.5" />
+                              {language === "en" ? "Guide current turn" : "引导当前回合"}
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

@@ -1,4 +1,6 @@
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
+import { unityMcpObservationTools, UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
+import { UNITY_CREATE_SCENE_TOOL } from "../../lib/workspaceMutationTools";
 import {
   buildLoadSkillToolDefinition,
   LOAD_SKILL_TOOL_NAME,
@@ -39,7 +41,25 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "record_execution_contract",
   "load_skill",
   "tool_search",
+  UNITY_CREATE_SCENE_TOOL,
 ]);
+
+const UNITY_SCENE_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: UNITY_CREATE_SCENE_TOOL,
+    description: "Create the exact approved Unity 6 scene with one root and the named project MonoBehaviour. The connected Editor refreshes and recompiles first, saves once, and verifies the saved asset. Unity generates .meta files.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Approved new workspace-relative Assets/... .unity path." },
+        root_name: { type: "string", description: "Name of the scene's single GameObject." },
+        script_path: { type: "string", description: "Workspace-relative Assets/... .cs path from the approved Plan, already committed or preserved." },
+      },
+      required: ["path", "root_name", "script_path"],
+    },
+  },
+};
 
 export function runtimeV2ToolDefinitions(
   state?: any,
@@ -50,11 +70,13 @@ export function runtimeV2ToolDefinitions(
   const loadSkillDefinition = buildLoadSkillToolDefinition(skillCatalog);
   const builtIns = [
     ...TOOL_DEFINITIONS,
+    ...unityMcpObservationTools(state),
+    UNITY_SCENE_DEFINITION,
     RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
     ...(loadSkillDefinition ? [loadSkillDefinition] : []),
   ].filter((definition) => {
     const name = definition.function.name;
-    return RUNTIME_V2_CORE_TOOL_NAMES.has(name) ||
+    return RUNTIME_V2_CORE_TOOL_NAMES.has(name) || UNITY_MCP_OBSERVATION_NAMES.has(name) ||
       (!!knowledgeContext?.references.length && knowledgeContext.state !== "stale" && knowledgeContext.state !== "error" && ["knowledge_search", "knowledge_get_excerpt"].includes(name)) ||
       (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
   }).map((definition) => {
@@ -149,9 +171,12 @@ export function logRuntimeV2SkillLoad(input: {
   readonly skillId: string;
   readonly turnId: string;
   readonly runId: string;
+  readonly sessionKey: string;
+  readonly commandKey: string;
   readonly logStoreEvent: (type: string, payload: Record<string, unknown>) => void;
 }): void {
   if (input.toolName !== LOAD_SKILL_TOOL_NAME || !input.succeeded) return;
+  const trace = { sessionKey: input.sessionKey, turnId: input.turnId, runId: input.runId, commandKey: input.commandKey };
   let revision: string | null = null;
   let skillId = input.skillId;
   let complete = true;
@@ -161,8 +186,7 @@ export function logRuntimeV2SkillLoad(input: {
     const result = JSON.parse(String(input.rawOutput || ""));
     if (result.type === "skill.catalog") {
       input.logStoreEvent("runtime_v2_skill_catalog_listed", {
-        turnId: input.turnId,
-        runId: input.runId,
+        ...trace,
         total: result.total,
         returned: Array.isArray(result.entries) ? result.entries.length : 0,
         hasNextPage: !!result.nextCursor,
@@ -172,7 +196,7 @@ export function logRuntimeV2SkillLoad(input: {
     }
     if (result.type === "skill.resource") {
       input.logStoreEvent("runtime_v2_skill_resource_read", {
-        turnId: input.turnId, runId: input.runId, skillId: String(result.id || input.skillId),
+        ...trace, skillId: String(result.id || input.skillId),
         resource: result.resource, revision: result.version, complete: result.complete !== false,
         disclosure: result.disclosure, returnedRange: result.returnedRange,
         effect: "resource_guidance_only",
@@ -188,8 +212,7 @@ export function logRuntimeV2SkillLoad(input: {
     revision = null;
   }
   input.logStoreEvent(complete ? "runtime_v2_skill_loaded" : "runtime_v2_skill_disclosed", {
-    turnId: input.turnId,
-    runId: input.runId,
+    ...trace,
     skillId,
     revision,
     complete,

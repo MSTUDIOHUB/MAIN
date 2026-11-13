@@ -21,6 +21,7 @@ export function runtimeV2SubagentStartHasRunway(input: {
 
 export interface RuntimeV2SubagentScopeCandidate {
   readonly scopeKey: string;
+  readonly proactiveKey?: string;
   readonly taskKind?: "explore" | "review" | "validate" | "implement";
   readonly accessMode?: "read" | "write";
   readonly implementationOperation?: "create" | "modify" | "delete";
@@ -64,6 +65,7 @@ export function runtimeV2SubagentModelHandle(
 }
 
 export function runtimeV2SubagentSemanticIdentity(input: {
+  readonly proactiveKey?: string;
   readonly taskKind?: "explore" | "review" | "validate" | "implement";
   readonly accessMode?: "read" | "write";
   readonly implementationOperation?: "create" | "modify" | "delete";
@@ -74,6 +76,7 @@ export function runtimeV2SubagentSemanticIdentity(input: {
   readonly successCriteria?: string;
   readonly allowedPaths: readonly string[];
 }): string {
+  if (input.proactiveKey) return `proactive:${input.proactiveKey}`;
   return JSON.stringify([
     input.taskKind || "explore",
     input.accessMode || "read",
@@ -123,6 +126,7 @@ export function runtimeV2SubagentFailureSummary(input: {
   readonly canceled: boolean;
   readonly deadlineExceeded: boolean;
   readonly recoveryStalled?: boolean;
+  readonly resource?: "memory" | "provider_capacity";
   readonly evidence: readonly { readonly target: string }[];
 }): string {
   const targets = [...new Set(
@@ -134,6 +138,9 @@ export function runtimeV2SubagentFailureSummary(input: {
         targets.length > 0 ? `（${targets.join("、")}）` : ""
       }。`
     : "没有形成可交接的证据。";
+  if (input.resource) {
+    return `${input.resource === "memory" ? "子任务因模型内存压力暂停并交回主体。" : "子任务因模型服务并发容量不足交回主体。"}${retained}`;
+  }
   if (input.canceled) {
     return `子任务已因父任务取消而停止；未形成带来源的可核验结论。${retained}`;
   }
@@ -268,6 +275,7 @@ export function scheduleRuntimeV2Subagents(input: {
         attemptId: `${input.parentRun.attemptId}:child:${id}`,
       },
       parentRunId: input.parentRun.runId,
+      ...(candidate.proactiveKey ? { proactiveKey: candidate.proactiveKey } : {}),
       ...(text(candidate.sourceToolCallId, 256)
         ? { sourceToolCallId: text(candidate.sourceToolCallId, 256) }
         : {}),

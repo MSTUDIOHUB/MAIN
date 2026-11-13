@@ -6,14 +6,16 @@ import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 const load = createTsModuleLoader();
 const runtime = load("src/lib/runtime-v2/index.ts");
 const { runtimeV2ExecuteTerminalDecision } = load("src/store/runtimeV2/executionOutcome.ts");
+const { requestedRuntimeV2NetworkRead } = load("src/lib/runtime-v2/completionRequirement.ts");
 const outcome = aggregate => runtimeV2ExecuteTerminalDecision({ aggregate, signal: new AbortController().signal });
 const turn = { workspaceKey: "__MAIN_GLOBAL_CHAT__", sessionKey: "session", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn" };
 const run = { sessionKey: "session", sessionEpoch: "epoch", turnId: "turn", runId: "run", parentRunId: null, attemptId: "attempt" };
 let id = 0;
 const apply = (state, type, fields) => runtime.transition(state, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type, eventId: `web-completion-${++id}`, at: (state?.updatedAt || 0) + 1, sequence: state?.nextSequence || 0, ...fields });
-function base(requirement = null) {
-  const admitted = apply(null, "turn.admitted", { turn, strategy: "execute", objective: "Inspect the requested remote source.",
+const web = toolName => ({ kind: "requested_operation", channel: "network", toolName });
+function base(requirement = null, completionRequirement = web("web_fetch")) {
+  const admitted = apply(null, "turn.admitted", { turn, strategy: "execute", objective: "Inspect the requested remote source.", completionRequirement,
     networkRead: { enabled: true, provider: "bing" }, acceptanceCriteria: ["Answer from the actual result."],
     acceptanceCriterionIds: ["goal"], acceptanceEvidenceRequirements: [requirement], constraints: [] });
   return apply(admitted, "run.started", { run, phase: "observing" });
@@ -25,12 +27,12 @@ function provider(state, result) {
   return apply(state, "provider.responded", { run, idempotencyKey: request.idempotencyKey,
     result: { toolCalls: [], diagnostics: [], ...result } });
 }
-function tool(state, name, { status = "succeeded", evidence = [{ id: `E${++id}`, kind: "tool", target: "remote-source", version: "v1" }], receiptOrigin, args } = {}) {
+function tool(state, name, { status = "succeeded", evidence = [{ id: `E${++id}`, kind: "tool", target: "remote-source", version: "v1" }], receiptOrigin, args, effectKind } = {}) {
   state = provider(state, { toolCalls: [{ id: `call-${++id}`, name, arguments: args ||
     (name === "web_search" ? { query: "source" } : name === "web_fetch" ? { url: "https://example.test/source" } : { path: "source.txt" }) }] });
   const command = runtime.decideNextCommands(state)[0];
   state = apply(state, "command.scheduled", { run, command });
-  return apply(state, "tool.completed", { run, idempotencyKey: command.idempotencyKey, status, evidence, ...(receiptOrigin ? { receiptOrigin } : {}) });
+  return apply(state, "tool.completed", { run, idempotencyKey: command.idempotencyKey, status, evidence, ...(receiptOrigin ? { receiptOrigin } : {}), ...(effectKind ? { effectKind } : {}) });
 }
 const answer = state => provider(state, { visibleText: "The requested source has been read; this is the complete answer." });
 
@@ -80,7 +82,7 @@ test("the exact real MDN ledger reaches one natural final through the production
 
 test("both successful web reads support an optional later natural answer but do not force finalization", () => {
   for (const name of ["web_search", "web_fetch"]) {
-    const observed = tool(base(), name);
+    const observed = tool(base(null, web(name)), name);
     assert.equal(outcome(observed), null, "a receipt alone cannot finish a task");
     assert.equal(runtime.decideNextCommands(observed)[0].payload.mode, "execute");
     const settled = answer(observed);
@@ -100,7 +102,7 @@ test("failed, blocked, empty or replayed web receipts cannot support success", (
     for (const options of [{ status: "failed" }, { status: "blocked" }, { evidence: [] }, { receiptOrigin: "replayed" },
       { evidence: [{ id: "not-tool", kind: "source", target: "file.txt", version: "v1" }] },
       { evidence: [{ id: "not-tool", kind: "validation", target: "test", version: "pass" }] }]) {
-      assert.equal(outcome(answer(tool(base(), name, options))), null, `${name} ${JSON.stringify(options)}`);
+      assert.equal(outcome(answer(tool(base(null, web(name)), name, options))), null, `${name} ${JSON.stringify(options)}`);
     }
   }
 });
@@ -141,7 +143,22 @@ test("explicit typed acceptance, file mutation and implementation contract debts
 });
 
 test("ordinary command and MCP operation receipts retain their existing natural completion path", () => {
-  for (const name of ["run_command", "mcp__service__inspect"]) {
-    assert.equal(outcome(answer(tool(base(), name, { args: { command: "service status", cwd: "." } })))?.resultKind, "success", name);
-  }
+  const command = { kind: "requested_operation", channel: "command", exactCommand: "service status" };
+  const mcp = { kind: "requested_operation", channel: "external", toolName: "mcp__service__apply", action: "apply" };
+  assert.equal(outcome(answer(tool(base(null, command), "run_command", { args: { command: "service status", cwd: "." } })))?.resultKind, "success");
+  const actual = { args: { action: "apply" }, effectKind: "external_operation" };
+  assert.equal(outcome(answer(tool(base(null, mcp), mcp.toolName, actual)))?.resultKind, "success");
+  assert.equal(outcome(answer(tool(base(null, mcp), mcp.toolName, { ...actual, effectKind: "observation" }))), null);
+});
+
+test("an Execute web lookup requires results for the explicitly requested URLs", () => {
+  const first = "https://example.test/first";
+  const second = "https://example.test/second";
+  const requirement = requestedRuntimeV2NetworkRead(`Open ${first} and ${second}.`);
+  const fetched = (state, url) => tool(state, "web_fetch", { args: { url } });
+  assert.deepEqual(requirement.targetUrls, [first, second]);
+  const one = fetched(base(null, requirement), first);
+  assert.equal(outcome(answer(fetched(one, "https://example.test/other"))), null);
+  assert.equal(outcome(answer(fetched(one, second)))?.resultKind, "success");
+  assert.equal(outcome(answer(fetched(base(null, { kind: "unspecified" }), first))), null);
 });

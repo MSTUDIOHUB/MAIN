@@ -126,6 +126,16 @@ test("Unity batch acceptance uses the Editor test runner and lets tests finish",
   assert.equal(analyzeValidationCommand("unity test . --mode PlayMode --timeout 120 --format json").spec?.capability, "test");
 });
 
+test("Unity live PlayMode and compilation require a bounded and project-scoped invocation", () => {
+  const compile = "unity recompile --project-path . --timeout 90 --format json --non-interactive";
+  const test = "unity command test run --project-path . --caller plugin --skill unity-cli --mode playmode --filter BreakoutTests --async-tests --timeout 90 --format json --non-interactive";
+  assert.equal(analyzeValidationCommand(compile).spec?.capability, "typecheck");
+  assert.equal(analyzeValidationCommand(test).spec?.capability, "test");
+  for (const command of [compile.replace("--project-path .", "--project-path ../other"), test.replace("--timeout 90", "--timeout 300"), test.replace("--async-tests", ""), "unity command test status", "unity test . --shard 1/3"]) {
+    assert.equal(analyzeValidationCommand(command).spec, null, command);
+  }
+});
+
 test("inline commands require decidable failure semantics and reject resident runtimes", () => {
   for (const command of [
     "node -e \"const value = 1; if (value !== 1) process.exit(1)\"",

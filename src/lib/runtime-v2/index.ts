@@ -1,5 +1,6 @@
 export * from "./aggregate";
 export * from "./checkpoint";
+export * from "./collaborationDecision";
 export * from "./completion";
 export * from "./controller";
 export * from "./controllerRecovery";
@@ -11,6 +12,8 @@ export * from "./events";
 export * from "./evidenceVersion";
 export * from "./lifecycle";
 export * from "./phaseTransition";
+export * from "./planContinuation";
+export * from "./planContinuationBaseline";
 export * from "./planExecution";
 export * from "./ports";
 export * from "./projection";

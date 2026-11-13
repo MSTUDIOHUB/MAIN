@@ -24,6 +24,7 @@ export interface CreateSubmitRuntimeContextInput {
   capabilityRestrictions?: readonly import("../lib/turnCapabilities").TurnCapability[];
   approvalRequiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
+  semanticWorkType?: import("../lib/runIntent").SemanticTaskIntent["workType"];
   intentClarification?: import("../lib/turnClarification").TurnClarification;
 
 
@@ -36,6 +37,7 @@ export interface CreateSubmitRuntimeContextInput {
   workspaceInstructionContext?: string;
   planPurpose?: "rules";
   sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
+  approvedPlanContinuation?: import("../lib/runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   projectBaselineContext?: ProjectBaselineContext | null;
   skillCatalog?: SkillCatalogSnapshot | null;
   workspaceMcpSnapshot?: import("../lib/workspaceMcp").WorkspaceMcpSnapshot | null;
@@ -71,6 +73,7 @@ export function createSubmitRuntimeContext(
     capabilityRestrictions: input.capabilityRestrictions,
     approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     requiredCapabilities: input.requiredCapabilities,
+    semanticWorkType: input.semanticWorkType,
     intentClarification: input.intentClarification,
 
 
@@ -85,6 +88,7 @@ export function createSubmitRuntimeContext(
     ),
     planPurpose: input.planPurpose,
     sourcePlanDraft: input.sourcePlanDraft,
+    approvedPlanContinuation: input.approvedPlanContinuation,
     projectBaselineContext: input.projectBaselineContext || null,
     skillCatalog: input.skillCatalog || null,
     workspaceMcpSnapshot: input.workspaceMcpSnapshot || null,

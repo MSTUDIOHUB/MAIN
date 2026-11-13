@@ -1,3 +1,4 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { renderKnowledgeContextAnchor } from "../../lib/knowledgeReferences";
 import { runtimeV2ClarificationMessage } from "./clarificationHistory";
@@ -12,7 +13,10 @@ import {
   skillCatalogContextCharBudget,
 } from "../../lib/agentSkills";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
+import { extractExactReadFileWindow } from "../../lib/readFileWindow";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { approvedContinuationSkillHistory } from "./executionSkillHistory";
 import {
   buildSubagentDelegationGuidance,
 } from "../../lib/turnIntake";
@@ -32,14 +36,45 @@ export { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
 
 /** Restore actual receipts, never execute tools to reconstruct context. */
 export function restoreRuntimeV2ExecutionHistory(live: RuntimeV2LiveExecutionState, aggregate: TurnAggregateV1): void {
+  const plan = aggregate.workPlan?.status === "approved" ? aggregate.sealedWorkPlan : null;
+  const approval = plan ? [...aggregate.events].reverse().find(event =>
+    event.type === "work_plan.approved" && event.workPlan.id === plan.id &&
+    event.workPlan.revision === plan.revision && event.workPlan.digest === plan.digest
+  ) : null;
+  const planTargets = plan?.draft.steps.flatMap(step => step.targets) || [];
+  const planBasis = new Set(plan?.draft.steps.flatMap(step => step.basis));
   const commands = new Map(aggregate.events.flatMap(event => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
   const results = new Map(aggregate.events.flatMap(event => {
     if (event.type !== "tool.completed" && event.type !== "validation.completed") return [];
-    const id = String(commands.get(event.idempotencyKey)?.payload.toolCallId || "");
+    const command = commands.get(event.idempotencyKey);
+    const id = String(command?.payload.toolCallId || "");
+    if (!id) return [];
+    // The Skill-specific restorer validates the exact typed body and unwraps
+    // Plan's evidence prefix. A generic result would shadow that pair.
+    if (command?.payload.toolName === "load_skill") return [];
     const content = event.type === "tool.completed" ? event.modelContent : undefined;
-    return id ? [[id, content || event.presentation?.message || "Tool completed without a model receipt."] as const] : [];
+    if (!approval || event.sequence >= approval.sequence) {
+      return [[id, content || event.presentation?.message || "Tool completed without a model receipt."] as const];
+    }
+    if (event.type !== "tool.completed" || event.status !== "succeeded" || !content) return [];
+    if (command?.payload.toolName !== "read_file") return [];
+    const source = event.evidence.find(item => item.kind === "source" && item.version && (
+      planBasis.has(item.id) || planTargets.some(path => workspacePathsReferToSameFile(path, item.target))
+    ));
+    if (!source) return [];
+    // Old Plan receipts wrap the exact read in a display heading. Strip only
+    // the heading bound to this committed source and validate the inner window.
+    const header = `[${source.id}] ${source.target}\n`;
+    const body = content.startsWith(header) ? content.slice(header.length) : content;
+    const exact = extractExactReadFileWindow(body);
+    return exact?.metadata.contentVersion === source.version &&
+      workspacePathsReferToSameFile(exact.metadata.path, source.target) ? [[id, body] as const] : [];
   }));
+  const hasGuidance = aggregate.events.some(event => event.type === "guidance.admitted");
   for (const event of aggregate.events) {
+    if (hasGuidance && event.type === "command.scheduled" && event.command.kind === "request_model") {
+      appendRuntimeV2GuidanceHistory(live.messages, aggregate, event.run, event.command.idempotencyKey);
+    }
     const reply = runtimeV2ClarificationMessage(event);
     if (reply) live.messages.push(reply);
     if (event.type !== "provider.responded") continue;
@@ -48,7 +83,9 @@ export function restoreRuntimeV2ExecutionHistory(live: RuntimeV2LiveExecutionSta
       appendRuntimeV2AssistantToolCallHistory(live, { ...event.result, toolCalls: calls });
       for (const call of calls) appendRuntimeV2ToolResultHistory(live, call.id, results.get(call.id)!);
     }
-    appendRuntimeV2RejectedToolCallBatchHistory(live, event.result.actionReceipts || []);
+    if (!approval || event.sequence >= approval.sequence) {
+      appendRuntimeV2RejectedToolCallBatchHistory(live, event.result.actionReceipts || []);
+    }
   }
   live.evidenceCounter = Math.max(0, ...aggregate.evidence.map(evidence => Number(/^E(\d+)$/.exec(evidence.id)?.[1]) || 0));
 }
@@ -90,7 +127,7 @@ export function restoreRuntimeV2ProviderRecoveryHistory(
       return;
     }
     if (event.type === "command.completed" && event.status === "succeeded") continue;
-    if (event.type === "soft_signal.observed" || event.type === "projection.published") continue;
+    if (event.type === "soft_signal.observed" || event.type === "projection.published" || event.type === "guidance.admitted") continue;
     // Tool, validation, source, child, phase and Run boundaries all supersede
     // this reply, including failed work. Recovery pressure is not freshness.
     return;
@@ -507,6 +544,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
         ].join("\n")
       : "",
     projectBaseline,
+    projectBaseline && "Use the live project baseline for engine and dependency versions. Before using an unfamiliar engine API or shader include, check the installed package, project code, or a version-matched reference. Verify the result in the current project.",
     renderKnowledgeContextAnchor(input.context.knowledgeContext),
     skillCatalog,
     explicitSkills,
@@ -570,6 +608,7 @@ function currentTurnUserMessage(
 function baseProviderHistory(
   live: RuntimeV2LiveExecutionState,
   input: RuntimeV2ExecutionPortsInput,
+  approvedAggregate?: TurnAggregateV1 | null,
 ): AgentMessage[] {
   if (live.messages.some((message) =>
     message.role === "system" &&
@@ -590,8 +629,9 @@ function baseProviderHistory(
     (candidate: any) => candidate.id === input.context.turnId,
   );
   const turn = turnIndex >= 0 ? turns[turnIndex] : null;
+  const continuation = approvedAggregate?.planContinuation && !isReadOnlyContext(input) ? approvedAggregate : null;
   const history: AgentMessage[] = [];
-  const priorTurns = (turnIndex >= 0 ? turns.slice(0, turnIndex) : turns)
+  const priorTurns = (continuation ? [] : turnIndex >= 0 ? turns.slice(0, turnIndex) : turns)
     .filter((candidate: any) => candidate?.uiVisibility !== "internal");
   for (const prior of priorTurns) {
     const user = conversationText(prior?.userPrompt);
@@ -628,6 +668,7 @@ function baseProviderHistory(
       input.context.turnId,
       String(turn?.userPrompt || ""),
     ),
+    ...(continuation ? approvedContinuationSkillHistory(continuation, state.runtimeV2Checkpoints || {}, preloadedContext) : []),
     ...preloadedContext,
   );
   return live.messages;
@@ -636,13 +677,14 @@ function baseProviderHistory(
 export function providerHistory(
   live: RuntimeV2LiveExecutionState,
   input: RuntimeV2ExecutionPortsInput,
+  approvedAggregate?: TurnAggregateV1 | null,
 ): {
   readonly messages: AgentMessage[];
   readonly chars: number;
   readonly historyMessages: number;
   readonly priorTurns: number;
 } {
-  const base = baseProviderHistory(live, input);
+  const base = baseProviderHistory(live, input, approvedAggregate);
   const userMessages = base.filter((message) => message.role === "user").length;
   return {
     messages: [...base],

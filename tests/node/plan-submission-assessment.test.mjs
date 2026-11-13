@@ -164,6 +164,33 @@ test("an advisory extra does not prevent required executable coverage from remai
   assert.equal(result.sealedPlan.draft.validations[1].required, false);
 });
 
+test("required Plan validation resolves its cwd against the exact workspace", () => {
+  const submission = candidate();
+  const aggregate = { turn: { workspaceKey: "/work/TestCli" }, subagents: [], events: [] };
+  submission.validations[0].cwd = "/work/TestCli";
+  const accepted = assess(submission, { aggregate });
+  assert.equal(accepted.kind, "reviewable");
+  assert.equal(accepted.sealedPlan.draft.validations[0].cwd, ".");
+  submission.validations[0].cwd = "/work/TestCli-other";
+  const rejected = assess(submission, { aggregate });
+  assert.equal(rejected.kind, "draft");
+  assert.match(rejected.diagnostics[0].message, /validations\[0\]\.cwd/);
+});
+
+test("Unity Plan seals and displays a typed expected case count only with a test runner", () => {
+  const submission = candidate();
+  submission.validations[0].command = "unity test . --mode PlayMode --filter CollectorTests";
+  submission.validations[0].expectedTestCases = 5;
+  const accepted = assess(submission);
+  assert.equal(accepted.kind, "reviewable");
+  assert.equal(accepted.sealedPlan.draft.validations[0].expectedTestCases, 5);
+  assert.match(accepted.sealedPlan.markdown, /必须通过的测试用例数：5/);
+  submission.validations[0].command = "npm test";
+  const rejected = assess(submission);
+  assert.equal(rejected.kind, "draft");
+  assert.equal(rejected.diagnostics[0].fieldPath, "validations[0].expectedTestCases");
+});
+
 test("a behavioral implementation cannot enter review on build and manual checks alone", () => {
   const submission = candidate();
   submission.validations = [

@@ -91,3 +91,29 @@ test('durable JSON omits optional request fields without invalidating the checkp
   assert.equal(runtime.normalizeRuntimeV2Checkpoint(corrupted, turn, diagnostic => diagnostics.push(diagnostic)), null);
   assert.equal(diagnostics[0].code, 'aggregate_digest_mismatch');
 });
+
+test('async live appends preserve the replay digest and reject stale writes', async () => {
+  const { createAsyncRuntimeV2CheckpointAppender } = load('src/lib/runtime-v2/checkpoint.ts');
+  const appendLive = createAsyncRuntimeV2CheckpointAppender();
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId,
+    runId: 'run', parentRunId: null, attemptId: 'attempt' };
+  let base = checkpoint();
+  const makeEvent = (type, fields) => ({ type, run, schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+    sequence: base.aggregate.nextSequence, eventId: `async-${base.revision}`, at: base.updatedAt + 1, ...fields });
+  for (let index = 0; index < 10; index++) {
+    const event = index === 0 ? makeEvent('run.started', { phase: 'planning' }) : makeEvent('observation.recorded', {
+      evidence: { id: `E${index}`, kind: 'tool', target: `Assets/代码-${index}.cs`, version: null },
+      modelContent: 'Structured compiler data 🧪\n'.repeat(300),
+    });
+    const args = { checkpoint: base, owner: turn, expectedRevision: base.revision, event };
+    const expected = runtime.appendRuntimeV2Checkpoint(args);
+    const live = await appendLive(args);
+    assert.equal(live.disposition, 'committed');
+    assert.equal(live.checkpoint.aggregateDigest, expected.checkpoint.aggregateDigest);
+    assert.equal((await appendLive({ ...args, checkpoint: live.checkpoint })).disposition, 'idempotent');
+    assert.equal((await appendLive({ ...args, checkpoint: live.checkpoint, event: { ...event, eventId: 'other-writer' } })).disposition, 'conflict');
+    base = live.checkpoint;
+  }
+  const encoded = runtime.serializeRuntimeV2CheckpointMap({ turn: base }).turn;
+  assert.equal(runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(encoded)), turn).aggregateDigest, base.aggregateDigest);
+});

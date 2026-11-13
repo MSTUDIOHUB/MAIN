@@ -12,6 +12,7 @@ import { normalizePlanDraftRecord } from "../planDrafts";
 import { resolveSessionWorkspaceKey } from "../sessionTypes";
 import { sha256Hex } from "../sha256";
 import { isWorkPlanArtifactProjectionBound } from "./workPlan";
+import { isValidRuntimeV2PlanContinuation } from "./planContinuation";
 
 export function appendNovelRuntimeV2Evidence(
   existing: readonly RuntimeV2EvidenceReference[],
@@ -72,6 +73,7 @@ export function isValidRuntimeV2SubagentCompletion(input: {
       item.target === path || item.target.startsWith(`${path.replace(/\/$/, "")}/`)
     )
   );
+  const interrupted = input.event.resourceInterruption === "memory" || input.event.resourceInterruption === "provider_capacity";
   return eventEvidenceIdsAreUnique &&
     childEvidenceIdsKeepExistingMeaning &&
     inheritedIsKnown &&
@@ -90,7 +92,8 @@ export function isValidRuntimeV2SubagentCompletion(input: {
         inheritedEvidence,
       })
     ) &&
-    (input.event.status !== "degraded" || input.event.evidence.length > 0);
+    (!input.event.resourceInterruption || interrupted && input.event.status === "degraded") &&
+    (input.event.status !== "degraded" || input.event.evidence.length > 0 || interrupted);
 }
 
 export function isValidRuntimeV2SubagentJob(
@@ -106,6 +109,7 @@ export function isValidRuntimeV2SubagentJob(
     !!job.scopeKey &&
     !!job.objective &&
     job.allowedPaths.length > 0 &&
+    (!job.proactiveKey || (!job.sourceToolCallId && job.accessMode === "read" && job.taskKind !== "implement")) &&
     (
       job.taskKind === "implement"
         ? job.accessMode === "write" &&
@@ -179,7 +183,10 @@ export function hasMatchingRuntimeV2SealedPlanAuthority(input: {
   const journal = buildPlanDecisionJournal(state);
   const journalMatches = derivedFrom ? plan.decisionJournal === journal :
     plan.decisionJournal === undefined && state.planPurpose === undefined || typeof plan.decisionJournal === "string" && plan.decisionJournal === journal;
-  return interviewed && journalMatches && savedDocument && plan.status === "pending_review" &&
+  const ready = event.continuation !== undefined
+    ? isValidRuntimeV2PlanContinuation(state, event)
+    : interviewed && journalMatches && savedDocument;
+  return ready && plan.status === "pending_review" &&
     event.workPlan.id === plan.id &&
     event.workPlan.revision === plan.revision &&
     event.workPlan.digest === plan.digest &&

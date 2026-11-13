@@ -49,6 +49,9 @@ function loadTsWithMocks(sourcePath, mocks, cache = new Map()) {
 const { isStreamOutputLimited } = loadTsWithMocks(
   path.join(workspaceRoot, "src/lib/streaming.ts"), new Map(),
 );
+const { ModelLaneResourceInterruption } = loadTsWithMocks(
+  path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"), new Map(),
+);
 
 function fixtureChildReportTool(evidenceIds) {
   return {
@@ -184,6 +187,7 @@ async function runChildFixture({ finalKind = "cited", readSource = true, sourceT
       boundRuntimeMessagesToContext: (messages) => [...messages],
     }],
     ["../../lib/modelLaneCoordinator", {
+      ModelLaneResourceInterruption,
       acquireModelLane: async () => ({
         markFirstToken() { modelProgressMarks += 1; },
         reportFailure() {},
@@ -477,6 +481,7 @@ test("a legacy report request uses the admitted child budget and preserves lengt
     ),
     new Map([
       ["../../lib/modelLaneCoordinator", {
+        ModelLaneResourceInterruption,
         acquireModelLane: async () => ({
           markFirstToken() {},
           reportFailure() {},
@@ -746,6 +751,7 @@ test("a missing native child report falls back to a required text envelope", asy
     ),
     new Map([
       ["../../lib/modelLaneCoordinator", {
+        ModelLaneResourceInterruption,
         acquireModelLane: async () => ({
           markFirstToken() {},
           reportFailure() {},
@@ -948,6 +954,7 @@ test("a required tool_choice compatibility rejection falls directly back to the 
     ),
     new Map([
       ["../../lib/modelLaneCoordinator", {
+        ModelLaneResourceInterruption,
         acquireModelLane: async () => ({
           markFirstToken() {},
           reportFailure() {},
@@ -1141,6 +1148,7 @@ test("a child provider request hard-stops when the transport ignores abort", asy
     ),
     new Map([
       ["../../lib/modelLaneCoordinator", {
+        ModelLaneResourceInterruption,
         acquireModelLane: async ({ signal }) => ({
           markFirstToken() {},
           reportFailure() {},
@@ -1249,4 +1257,101 @@ test("a child provider request hard-stops when the transport ignores abort", asy
   assert.ok(Date.now() - startedAt < 500);
   assert.equal(observedAbort, true);
   assert.equal(released, 1);
+});
+
+for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strategy} commits and starts a scoped job without a provider spawn call`, async () => {
+  const revision = strategy === "revision";
+  const direct = strategy === "execute";
+  const owner = {
+    workspaceKey: "/fixture", sessionKey: "session", sessionEpoch: "epoch",
+    clientSubmissionId: "submission", turnId: "turn",
+  };
+  const run = {
+    sessionKey: owner.sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId,
+    runId: "run", parentRunId: null, attemptId: "attempt",
+  };
+  const runtime = loadTsWithMocks("src/lib/runtime-v2/index.ts", new Map());
+  const { deriveProactiveCollaboration } = loadTsWithMocks("src/store/runtimeV2/proactiveSubagents.ts", new Map());
+  let state = null;
+  const apply = (draft) => {
+    const sequence = state?.nextSequence ?? 0;
+    state = runtime.transition(state, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence, eventId: `event-${sequence}`, at: sequence + 1, ...draft });
+  };
+  apply({ type: "turn.admitted", turn: owner, strategy: direct ? "execute" : "plan", objective: "Build a new scene and verify it",
+    constraints: [], acceptanceCriteria: ["Run behavior checks"], ...(revision ? {} : { acceptanceEvidenceRequirements: ["behavioral"] }) });
+  apply({ type: "run.started", run, phase: direct ? "observing" : "planning" });
+  const target = revision ? "Assets/Scripts/Breakout/Ball.cs" : "Packages/manifest.json";
+  const versionPath = "ProjectSettings/ProjectVersion.txt";
+  const lockPath = "Packages/packages-lock.json";
+  const reads = revision ? [target] : direct ? ["Assets/Scripts/Breakout/Ball.cs"] : [target, "Assets/Scenes/Existing.unity"];
+  const delegated = direct ? [lockPath, versionPath] : [target];
+  for (const [index, path] of reads.entries()) {
+    apply({ type: "observation.recorded", run, evidence: { id: `E${index + 1}`, kind: "source", target: path, version: `v${index + 1}` } });
+  }
+  const baseline = revision ? null : { kind: "project_baseline_context", workspace: { canonicalPath: "/fixture" },
+    anchors: direct ? [
+      { kind: "config", path: versionPath, contentHash: "editor-hash", provenance: "workspace_file" },
+      { kind: "lockfile", path: lockPath, contentHash: "lock-hash", provenance: "workspace_file" },
+      { kind: "config", path: ".gitignore", contentHash: "ignore-hash", provenance: "workspace_file" },
+    ] : [{ kind: "manifest", path: target }],
+    facts: { runtimes: [{ name: "tuanjie", version: "1.10.4", provenance: { path: versionPath, contentHash: "editor-hash" } }],
+      packages: [{ name: "com.unity.render-pipelines.universal", version: "14.2.0-t1", provenance: { path: lockPath, contentHash: "lock-hash" } }],
+      packageManagers: [], scripts: [] } };
+  const facts = { state, preference: "preferred", capacity: 1, requestMode: "parallel", baseline, workspace: "/fixture", now: 5,
+    ...(revision ? { revisionTargetPaths: [target, "Assets/Scripts/Breakout/Missing.cs"] } : {}) };
+  assert.equal(deriveProactiveCollaboration({ ...facts, preference: "unspecified" }), undefined);
+  assert.deepEqual(deriveProactiveCollaboration({ ...facts, requestMode: "serialized" }), { reason: "no_parallel_capacity" });
+  assert.deepEqual(deriveProactiveCollaboration({ ...facts, revisionTargetPaths: [], state: { ...state, evidence: state.evidence.slice(0, direct ? 0 : 1) } }), { reason: "no_independent_scope" });
+  if (direct) assert.deepEqual(deriveProactiveCollaboration({ ...facts, baseline: { ...baseline, workspace: { canonicalPath: "/foreign" } } }), { reason: "no_independent_scope" });
+  if (revision) assert.deepEqual(deriveProactiveCollaboration({ ...facts, state: { ...state, evidence: [] } }), { reason: "no_independent_scope" });
+  assert.deepEqual(deriveProactiveCollaboration({ ...facts, lifecycleDeadlineAt: 1000 }), { reason: "insufficient_runway" });
+  for (const key of ["capabilityRestrictions", "approvalRequiredCapabilities"]) {
+    const restricted = { ...state, objective: { ...state.objective, [key]: ["workspace_read"] } };
+    assert.deepEqual(deriveProactiveCollaboration({ ...facts, state: restricted }), { reason: "workspace_read_restricted" });
+  }
+  assert.equal(deriveProactiveCollaboration({ ...facts, state: { ...state, run: { ...state.run, status: "completed" } } }), undefined);
+  const decision = { subagentPreference: "preferred", subagentCapacity: 1, subagentRequestMode: "parallel",
+    proactiveCollaboration: deriveProactiveCollaboration(facts) };
+  const [command] = runtime.decideNextCommands(state, decision);
+  assert.equal(command.kind, "schedule_subagents");
+  assert.equal(command.payload.toolCallId, undefined);
+  assert.equal(command.payload.arguments.allowed_paths, delegated.join("\n"));
+  assert.equal(command.payload.arguments.task_kind, revision ? "review" : "explore");
+  assert.equal(command.payload.arguments.access_mode, "read");
+
+  const started = [];
+  const { createRuntimeV2SchedulerPort } = loadTsWithMocks("src/store/runtimeV2/executionSchedulerPort.ts", new Map([
+    ["./executionAggregate", { aggregateForCurrentTurn: () => state }],
+    ["./executionSubagentRunner", {
+      startRuntimeV2Child(_ports, job) {
+        assert.ok(state.subagents.some(entry => entry.id === job.id), "job is durable before dispatch");
+        started.push(job.id);
+        return new Promise(() => {});
+      },
+    }],
+  ]));
+  const live = { messages: [], childRuns: new Map(), childTelemetry: new Map() };
+  const scheduler = createRuntimeV2SchedulerPort({ live, nextId: () => "child", now: () => 7, logStoreEvent() {} });
+  apply({ type: "command.scheduled", run, command });
+  const events = await runtime.executeRuntimeV2SchedulerLifecycle({ command, scheduler, signal: new AbortController().signal,
+    getScheduledSubagents: () => state.subagents, commitPrepared: async (draft) => apply(draft) });
+  events.forEach(apply);
+  assert.deepEqual(started, ["child"]);
+  assert.deepEqual(state.subagents[0].allowedPaths, delegated);
+  assert.equal(state.subagents[0].sourceToolCallId, undefined);
+  assert.equal(state.subagents[0].proactiveKey, command.payload.proactiveKey);
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
+  const persisted = JSON.parse(JSON.stringify(runtime.serializeRuntimeV2CheckpointMap({ [owner.turnId]: checkpoint })));
+  const restored = runtime.normalizeRuntimeV2Checkpoint(persisted[owner.turnId], owner).aggregate;
+  assert.equal(runtime.runtimeV2ProactiveSchedulesToRestore(restored)[0].idempotencyKey, command.idempotencyKey);
+  assert.equal(runtime.runtimeV2JobMatchesSchedule(state.subagents[0], { ...command, payload: { proactiveKey: "other" } }), false);
+  await scheduler.execute({ command, run, scheduledSubagents: state.subagents, signal: new AbortController().signal });
+  assert.deepEqual(started, ["child"], "retry with the same live owner does not launch twice");
+  const nextDecision = { ...decision, proactiveCollaboration: deriveProactiveCollaboration({ ...facts, state }) };
+  const [parent] = runtime.decideNextCommands(state, nextDecision);
+  assert.equal(parent.kind, "request_model");
+  assert.equal(parent.payload.proactiveSkipReason, "slots_in_use");
+  const completed = { ...state, subagents: state.subagents.map(job => ({ ...job, status: "completed" })) };
+  assert.deepEqual(deriveProactiveCollaboration({ ...facts, state: completed }), { reason: "no_independent_scope" });
 });

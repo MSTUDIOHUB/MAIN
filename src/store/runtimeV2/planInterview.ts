@@ -20,7 +20,7 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
   const existing = getRuntimeV2Checkpoint(state, identity.turn);
   // Executable draft continuations and interrupted draft saves are owned by
   // the WorkPlan runner. A saved draft must never become document success.
-  if (input.context.sourcePlanDraft || existing?.aggregate.events.some(event =>
+  if (input.context.sourcePlanDraft || input.context.approvedPlanContinuation || turn.approvedPlanContinuation || existing?.aggregate.events.some(event =>
     (event.type === "turn.admitted" && event.sourcePlanDraft) ||
     (event.type === "command.scheduled" && event.command.payload.planDraftMetadata))) return null;
   if (existing?.aggregate.sealedWorkPlan) return null;
@@ -29,7 +29,7 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
   if (existing && !existing.aggregate.planPurpose && !questions.length) return null;
   input = { ...input, context: { ...input.context, planPurpose: existing ? existing.aggregate.planPurpose || "plan" : input.context.planPurpose || "plan", workspaceInstructionContext: existing?.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext, knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext } };
   const ledger = new PlanLedger(identity.turn, createRuntimeV2CheckpointPort({ ...input, scopeKey: input.context.runScopeKey, sessionId: input.context.runSessionId }),
-    createRuntimeV2ProjectionPort({ ...input, language: input.context.phaseLanguage, nextTaskId: () => input.get()._nextTaskId() }), existing || null);
+    createRuntimeV2ProjectionPort({ ...input, language: input.context.phaseLanguage, nextTaskId: () => input.get()._nextTaskId() }), existing || null, input.logStoreEvent);
   try {
   if (!existing) {
     const admission = resolveRuntimeV2ObjectiveAdmission(input.context, turn.userPrompt);

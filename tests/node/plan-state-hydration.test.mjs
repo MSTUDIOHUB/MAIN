@@ -115,7 +115,7 @@ test("ChatArea omits the duplicated effective progress ledger", () => {
   assert.doesNotMatch(source, /progressItems=\{effectiveProgressLedger\}/);
   assert.match(source, /<CapsuleActivityPopover/);
   assert.match(popover, /data-testid="effective-progress-popover"/);
-  assert.match(source, /archived-phase-analysis[\s\S]*archivedAfterChoice: false/);
+  assert.match(source, /shouldArchiveCompletedProcess && hasProposalCheckpoint && proposalCheckpointBlock[\s\S]*?<TurnPhaseDivider label=\{phaseLabels\.analysis\} \/>[\s\S]*?archivedAfterChoice: false/);
 });
 
 test("plan panel gives a lease-bound paused execution priority over planning continuation", () => {
@@ -135,7 +135,7 @@ test("plan panel gives a lease-bound paused execution priority over planning con
   assert.match(resumeGate, /!activeActionRequest/);
   assert.match(resumeGate, /!isGenerating/);
   assert.match(resumeGate, /!abortController/);
-  assert.match(resumeGate, /const canContinuePlanning = !canResumeExecution && canOfferPlanContinuation/);
+  assert.match(resumeGate, /const canContinuePlanning = [^;]*!canResumeExecution && canOfferPlanContinuation/);
   assert.doesNotMatch(resumeGate, /isPlanApproved &&/);
   assert.doesNotMatch(resumeGate, /planStage === "executing"/);
   assert.doesNotMatch(resumeGate, /allTrustedComplete/);

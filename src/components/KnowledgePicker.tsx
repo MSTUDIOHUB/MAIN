@@ -41,7 +41,7 @@ const KnowledgePicker = forwardRef<KnowledgePickerHandle, {
           reference: { kind: "base", kbId: base.id, indexRevision: base.indexRevision, label: base.name } });
         const result = sources[index]!;
         if (result.status === "rejected") { setError(zh ? "部分资料列表加载失败，请关闭后重试。" : "Some source lists could not be loaded. Close and retry."); continue; }
-        for (const source of result.value) next.push({ id: `source:${base.id}:${source.id}`, kind: "source", label: source.title, description: `${base.name} · ${source.status}`, ready: source.status === "indexed" && !!source.sourceRevision,
+        for (const source of result.value) next.push({ id: `source:${base.id}:${source.id}`, kind: "source", label: source.title, description: `${base.name} · ${source.provenance === "unverified_legacy" ? (language === "en" ? "Reverification needed" : "等待重新核验") : source.status}`, ready: source.status === "indexed" && source.provenance !== "unverified_legacy" && !!source.sourceRevision,
           reference: { kind: "source", kbId: base.id, sourceId: source.id, sourceRevision: source.sourceRevision, label: source.title } });
       }
       settledOwner.current = ownerKey;

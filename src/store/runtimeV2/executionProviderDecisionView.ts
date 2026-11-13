@@ -434,6 +434,8 @@ function runtimeDecisionAnchorIndices(
     messageText(message).includes("[MAIN RUNTIME V2]")
   );
   if (runtimeSystemIndex >= 0) selected.add(runtimeSystemIndex);
+  const latestGuidance = messages.map(message => !!message.runtimeGuidanceId).lastIndexOf(true);
+  if (latestGuidance >= 0) selected.add(latestGuidance);
 
   let currentUserIndex = -1;
   let latestFeedbackSelected = false;
@@ -450,7 +452,7 @@ function runtimeDecisionAnchorIndices(
   if (currentUserIndex < 0) {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index]!;
-      if (message.role === "user") {
+      if (message.role === "user" && !message.runtimeGuidanceId) {
         currentUserIndex = index;
         break;
       }

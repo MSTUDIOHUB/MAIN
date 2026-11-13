@@ -1,9 +1,11 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { runtimeV2TerminalProjection } from "./terminal";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../turnCapabilities";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
+  type RuntimeV2CompletionRequirement,
   type RuntimeV2Projection,
   type RuntimeV2ResultKind,
   type RuntimeV2RunIdentity,
@@ -13,6 +15,7 @@ import {
 } from "./contracts";
 import { decideNextCommands, type RuntimeV2DecisionInput } from "./decision";
 import type { RuntimeV2Event, RuntimeV2EventDraft } from "./events";
+import { RuntimeV2GuidancePendingError, runtimeV2PendingGuidance } from "./guidance";
 import type { RuntimeV2Ports } from "./ports";
 import {
   buildRuntimeV2CapsuleProjection,
@@ -28,18 +31,13 @@ import {
   repeatsRuntimeV2ProjectionInCurrentPhase,
   shouldRecordRuntimeV2SoftSignal,
 } from "./controllerRecovery";
-import {
-  runtimeV2SubagentHandoffApplicationDrafts,
-} from "./subagentHandoff";
-import { executeRuntimeV2SchedulerLifecycle } from "./schedulerLifecycle";
+import { runtimeV2SubagentHandoffApplicationDrafts } from "./subagentHandoff";
+import { executeRuntimeV2SchedulerLifecycle, restoreRuntimeV2ProactiveSchedules } from "./schedulerLifecycle";
 export interface RuntimeV2ControllerSnapshot {
   readonly aggregate: TurnAggregateV1 | null;
   readonly revision: number;
 }
-type RuntimeV2SoftSignal = Extract<
-  RuntimeV2Event,
-  { readonly type: "soft_signal.observed" }
->["signal"];
+type RuntimeV2SoftSignal = Extract<RuntimeV2Event, { readonly type: "soft_signal.observed" }>["signal"];
 export interface RuntimeV2Admission {
   readonly workspaceInstructionContext?: string;
   readonly knowledgeContext?: import("../knowledgeReferences").KnowledgeContextPacket;
@@ -48,6 +46,7 @@ export interface RuntimeV2Admission {
   readonly run: RuntimeV2RunIdentity;
   readonly strategy: RuntimeV2Strategy;
   readonly objective: string;
+  readonly completionRequirement?: RuntimeV2CompletionRequirement;
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
   readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly constraints?: readonly string[];
@@ -69,7 +68,7 @@ export class RuntimeV2Controller {
   constructor(
     private readonly ports: RuntimeV2Ports,
     initial?: RuntimeV2ControllerSnapshot,
-    options?: { readonly abortSignal?: AbortSignal },
+    private readonly options?: { readonly abortSignal?: AbortSignal; readonly logEvent?: (event: string, data: Record<string, unknown>) => void },
   ) {
     this.aggregate = initial?.aggregate || null;
     this.revision = initial?.revision || 0;
@@ -97,17 +96,14 @@ export class RuntimeV2Controller {
 
   private async apply(event: RuntimeV2Event): Promise<TurnAggregateV1> {
     const next = transition(this.aggregate, event);
-    const checkpoint = await this.ports.checkpoint.append({
-      owner: next.turn,
-      expectedRevision: this.revision,
-      event,
-    });
+    const checkpoint = await this.ports.checkpoint.append({ owner: next.turn, expectedRevision: this.revision, event });
     if (checkpoint.disposition === "conflict" || !checkpoint.checkpoint) {
       throw new Error("Runtime v2 checkpoint ownership or revision conflict.");
     }
-    this.aggregate = next;
+    // The durable append may include user guidance admitted during the request.
+    this.aggregate = checkpoint.checkpoint.aggregate ?? next;
     this.revision = checkpoint.checkpoint.revision;
-    return next;
+    return this.aggregate;
   }
 
   private requireAggregate(): TurnAggregateV1 {
@@ -126,6 +122,7 @@ export class RuntimeV2Controller {
       turn: input.turn,
       strategy: input.strategy,
       objective: input.objective,
+      ...(input.completionRequirement ? { completionRequirement: input.completionRequirement } : {}),
       ...(input.capabilityRestrictions !== undefined ? {
         capabilityRestrictions: normalizeTurnCapabilityRestrictions(input.capabilityRestrictions),
       } : {}),
@@ -149,7 +146,6 @@ export class RuntimeV2Controller {
       input.initialPhase || (input.strategy === "plan" ? "planning" : "preparing"),
     );
   }
-
   /** Complete an admitted Turn's Run boundary after an interrupted admission.
    * This is the same primitive used by fresh admission; it grants no effect
    * authority and cannot create a second Run for an active aggregate. */
@@ -166,6 +162,10 @@ export class RuntimeV2Controller {
     }));
   }
 
+  async commitPlanContinuationEvent(event: Extract<RuntimeV2EventDraft, { type: "work_plan.sealed" | "work_plan.approved" }>): Promise<void> {
+    this.abortSignal?.throwIfAborted();
+    await this.apply(this.rebasePortEvent(event));
+  }
   async changePhase(
     phase: Exclude<TurnAggregateV1["phase"], "completed">,
     reason: string,
@@ -183,9 +183,7 @@ export class RuntimeV2Controller {
     return next;
   }
 
-  /** Record a non-terminal pressure signal in the ordered ledger. Soft
-   * signals may trigger compaction or a strategy pivot, but never decide the
-   * Turn outcome by themselves. */
+  /** Record pressure in the ledger without deciding a Turn outcome. */
   async recordSoftSignal(
     signal: RuntimeV2SoftSignal,
   ): Promise<TurnAggregateV1> {
@@ -316,10 +314,13 @@ export class RuntimeV2Controller {
       command,
     });
     await this.apply(scheduledEvent);
+    const modelRequest = command.kind === "request_model" ? { turnId: command.run.turnId, runId: command.run.runId, commandKey: command.idempotencyKey } : null;
+    if (modelRequest) this.options?.logEvent?.("runtime_v2_model_schedule_committed", modelRequest);
     await this.recordAppliedSubagentHandoffs(scheduledEvent);
     const next = this.requireAggregate();
     await this.publish(buildRuntimeV2CapsuleProjection(next, this.ports.clockId.nextId("capsule")));
     await this.publish(buildRuntimeV2TimelineProjection(next, command, this.ports.clockId.nextId("timeline")));
+    if (modelRequest) this.options?.logEvent?.("runtime_v2_model_schedule_projection_returned", modelRequest);
     return this.requireAggregate();
   }
 
@@ -351,6 +352,13 @@ export class RuntimeV2Controller {
     try {
       await this.schedule(next);
     } catch (error) {
+      if (error instanceof RuntimeV2GuidancePendingError) {
+        const latest = await this.ports.checkpoint.load({ owner: state.turn });
+        if (!latest || latest.revision <= this.revision || !runtimeV2PendingGuidance(latest.aggregate)) throw error;
+        this.aggregate = latest.aggregate;
+        this.revision = latest.revision;
+        return this.driveOnce(input);
+      }
       // Recovery owns only commands that crossed the durable scheduling
       // boundary. A rejected transition/CAS is an infrastructure failure;
       // treating it as a provider failure can retry an uncommitted identity
@@ -508,6 +516,11 @@ export class RuntimeV2Controller {
     if (!command || state.terminalOutcome) return false;
     await this.execute(command);
     return true;
+  }
+
+  async restoreProactiveSubagents(): Promise<void> {
+    await restoreRuntimeV2ProactiveSchedules({ state: this.requireAggregate(), scheduler: this.ports.scheduler,
+      signal: this.abortSignal || new AbortController().signal, commit: event => this.apply(this.rebasePortEvent(event)) });
   }
 
   /** v3 migration fence: discard an unresumable scheduled effect without
@@ -767,13 +780,8 @@ export class RuntimeV2Controller {
         String(pending.command.payload.resultReason || ""), String(pending.command.payload.finalMarkdown || ""));
       return true;
     }
-    const completed = state.events.find((event) => event.type === "run.completed");
     const published = state.events.find((event) => event.type === "projection.published" && event.projectionId === outcome.finalProjectionId);
-    const finalize = [...state.events].reverse().find((event) => event.type === "command.scheduled" && event.command.kind === "finalize_turn");
-    const finalProjection = completed?.type === "run.completed" && completed.finalProjection ||
-      (published?.type === "projection.published" && published.projection) ||
-      buildRuntimeV2FinalProjection(state, outcome.finalProjectionId, outcome.resultKind, outcome.reason,
-        finalize?.type === "command.scheduled" ? String(finalize.command.payload.finalMarkdown || "") : undefined);
+    const finalProjection = runtimeV2TerminalProjection(state)!;
     if (published?.type === "projection.published") {
       await this.ports.projection.publish({ aggregate: state, audience: finalProjection.audience, projection: finalProjection, event: published });
     } else await this.publish(finalProjection);

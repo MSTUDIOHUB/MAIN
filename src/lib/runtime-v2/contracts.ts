@@ -101,8 +101,19 @@ export interface RuntimeV2RunIdentity {
   readonly attemptId: string;
 }
 
+export type RuntimeV2CompletionRequirement =
+  | { readonly kind: "workspace_change"; readonly editorDiagnostics?: true }
+  | { readonly kind: "requested_operation"; readonly channel: "command" | "external";
+      readonly exactCommand?: string; readonly toolName?: string; readonly action?: string }
+  | { readonly kind: "requested_operation"; readonly channel: "network";
+      readonly toolName: "web_search" | "web_fetch"; readonly targetUrls?: readonly string[] }
+  | { readonly kind: "unspecified" };
+
+export type RuntimeV2ToolEffectKind = "observation" | "workspace_change" | "external_operation";
+
 export interface RuntimeV2Objective {
   readonly text: string;
+  readonly completionRequirement?: RuntimeV2CompletionRequirement;
   /** Immutable current-request restrictions; never tool approval or scope. */
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
   readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
@@ -125,6 +136,14 @@ export interface RuntimeV2EvidenceReference {
   readonly version: string | null;
 }
 
+/** The evidence id and sequence identify the exact write covered by a validator. */
+export interface RuntimeV2ValidatedMutationVersion {
+  readonly target: string;
+  readonly mutationEvidenceId: string;
+  readonly mutationSequence: number;
+  readonly version: string | null;
+}
+
 export interface RuntimeV2ExecutionValidationAuthority {
   readonly kind: "direct_execute" | "work_plan";
   readonly id: string;
@@ -133,6 +152,8 @@ export interface RuntimeV2ExecutionValidationAuthority {
   readonly validationId: string;
   readonly criterionIds: readonly string[];
   readonly targetPaths: readonly string[];
+  readonly expectedTestCases?: number;
+  readonly useProjectEditor?: true;
 }
 
 /**
@@ -161,6 +182,34 @@ export interface RuntimeV2WorkPlanReference {
   readonly digest: string;
   readonly projectionHash: string;
   readonly status: "draft" | "sealed" | "pending_review" | "approved" | "invalidated";
+}
+
+/** Exact historical approval selected by a new submission. */
+export interface ApprovedWorkPlanContinuationReference {
+  readonly turn: RuntimeV2TurnIdentity;
+  readonly approvalEventId: string;
+  readonly authority: import("./workPlan").RuntimeV2PlanAuthority;
+  readonly revise?: true;
+}
+
+/** The newly admitted owner's verified baseline, with historical receipt provenance. */
+export interface RuntimeV2PlanContinuation {
+  readonly source: {
+    readonly turn: RuntimeV2TurnIdentity;
+    readonly run: RuntimeV2RunIdentity;
+    readonly approvalEventId: string;
+    readonly workPlan: RuntimeV2WorkPlanReference;
+    readonly documentRef?: import("../planDocuments").PlanDocumentRef;
+    /** The original document owner when the immediate source is itself a continuation. */
+    readonly documentTurn?: RuntimeV2TurnIdentity;
+  };
+  readonly completedStepIndexes: readonly number[];
+  readonly carriedTargets: readonly {
+    readonly target: string;
+    /** A trusted hash of the current bytes, or a verified absence after delete. */
+    readonly version: string | null;
+    readonly receiptId: string;
+  }[];
 }
 
 export interface RuntimeV2RecoveryBudget {
@@ -200,11 +249,13 @@ export interface RuntimeV2NormalizedToolCall {
   readonly id: string;
   readonly name: string;
   readonly arguments: Readonly<Record<string, unknown>>;
+  /** Assigned by the workspace catalog after provider arguments are validated. */
+  readonly boundEditorObservation?: true;
 }
 
 export interface RuntimeV2ExecutionBlocker {
   readonly requestId: string;
-  readonly reasonCode: "rejected_action_cycle" | "recovery_stalled" | "external_state_required" | "intent_clarification" | "user_questionnaire" | "document_save_failed";
+  readonly reasonCode: "rejected_action_cycle" | "recovery_stalled" | "external_state_required" | "intent_clarification" | "user_questionnaire" | "document_save_failed" | "unity_editor_verification_pending";
   readonly evidenceSequence: number;
   readonly message: string;
   readonly actionIdentity?: string;
@@ -213,6 +264,7 @@ export interface RuntimeV2ExecutionBlocker {
   readonly decision?: "recheck" | "continue" | "stop";
   readonly clarification?: import("../turnClarification").TurnClarification;
   readonly decisionReply?: string;
+  readonly decisionSource?: "editor_reconnected";
   readonly questionnaire?: import("../userQuestions").UserQuestionnaire;
   readonly decisionAnswer?: import("../userQuestions").UserChoiceAnswer;
 }
@@ -270,6 +322,8 @@ export interface RuntimeV2SubagentJob {
   readonly parentRunId: string;
   /** Exact provider tool call that created this one-shot job. */
   readonly sourceToolCallId?: string;
+  /** Exact runtime-owned dispatch identity; never a provider tool call. */
+  readonly proactiveKey?: string;
   readonly scopeKey: string;
   readonly taskKind?: "explore" | "review" | "validate" | "implement";
   readonly accessMode?: "read" | "write";

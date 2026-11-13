@@ -1,3 +1,5 @@
+import { normalizeRuntimeV2Checkpoint } from "./runtime-v2/checkpoint";
+import { runtimeV2PendingGuidance } from "./runtime-v2/guidance";
 import {
   decideTurnIngress,
   type CanonicalRunIdentity,
@@ -16,6 +18,8 @@ export interface TurnIngressAvailability {
   mode: TurnIngressMode;
   activeTurn: CanonicalTurnRuntimeState | null;
   guidanceTarget: CanonicalRunIdentity | null;
+  runtimeV2Guidance?: true;
+  guidancePending?: boolean;
   submitDecision: TurnIngressDecision;
   queueDecision: TurnIngressDecision;
   guidanceDecision: TurnIngressDecision;
@@ -40,6 +44,7 @@ export function resolveTurnStrategyFromIntent(
  */
 export function selectTurnIngressAvailability(input: {
   checkpoint: unknown;
+  runtimeV2Checkpoint?: unknown;
   expectedOwner: TurnRuntimeCheckpointExpectedOwner | null;
   strategy: TurnStrategy;
   runtimeOwnerObserved: boolean;
@@ -64,6 +69,32 @@ export function selectTurnIngressAvailability(input: {
     mode: "guidance",
     activeTurn,
   });
+
+  const runtimeV2 = input.expectedOwner && input.runtimeV2Checkpoint
+    ? normalizeRuntimeV2Checkpoint(input.runtimeV2Checkpoint, {
+        workspaceKey: input.expectedOwner.workspaceKey ?? undefined,
+        sessionKey: input.expectedOwner.sessionKey ?? undefined,
+        sessionEpoch: input.expectedOwner.sessionEpoch ?? undefined,
+        turnId: input.expectedOwner.turnId ?? undefined,
+      })?.aggregate
+    : null;
+  if (runtimeV2 && !runtimeV2.terminalOutcome) {
+    const run = runtimeV2.run;
+    const target = input.runtimeOwnerObserved && run?.status === "running" &&
+      run.phase !== "reviewing" && run.phase !== "finalizing" ? run.identity : null;
+    return {
+      mode: target ? "guidance_or_queue" : "queue_only",
+      activeTurn: null,
+      guidanceTarget: target,
+      runtimeV2Guidance: true,
+      guidancePending: !!runtimeV2PendingGuidance(runtimeV2),
+      submitDecision: { kind: "reject", createsTurn: false, reason: "active_run_requires_explicit_ingress" },
+      queueDecision,
+      guidanceDecision: target
+        ? { kind: "attach_guidance", createsTurn: false, admission: "active_run", target }
+        : { kind: "reject", createsTurn: false, reason: "active_run_not_guidable" },
+    };
+  }
 
   if (submitDecision.kind === "reject") {
     if (guidanceDecision.kind === "attach_guidance") {

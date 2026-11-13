@@ -1,4 +1,4 @@
-import { canonicalJson as stableJson } from "../canonicalJson";
+import { canonicalJson as stableJson, canonicalJsonWithEncodedObjects } from "../canonicalJson";
 import { sha256Hex } from "../sha256";
 import {
   RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
@@ -163,6 +163,7 @@ export interface CreateRuntimeV2CheckpointInput {
  * the incremental CAS path without replaying the whole ledger on every event.
  */
 const trustedRuntimeV2Checkpoints = new WeakSet<object>();
+const serializedRuntimeV2Checkpoints = new WeakMap<object, RuntimeV2CheckpointV3>();
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -179,6 +180,8 @@ function sameOwner(left: RuntimeV2TurnIdentity, right: RuntimeV2TurnIdentity): b
     left.clientSubmissionId === right.clientSubmissionId &&
     left.turnId === right.turnId;
 }
+
+export { sameOwner as sameRuntimeV2CheckpointOwner };
 
 function isFinitePositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) > 0;
@@ -222,6 +225,11 @@ export function replayRuntimeV2Events(events: readonly RuntimeV2Event[]): TurnAg
 export function createRuntimeV2Checkpoint(
   input: CreateRuntimeV2CheckpointInput,
 ): RuntimeV2CheckpointV3 {
+  assertCheckpointInput(input);
+  return checkpointWithDigest(input, runtimeV2AggregateDigest(input.aggregate));
+}
+
+function assertCheckpointInput(input: CreateRuntimeV2CheckpointInput): void {
   const revision = Math.floor(Number(input.revision));
   const updatedAt = Number(input.updatedAt);
   if (!isFinitePositiveInteger(revision) || !isFiniteTimestamp(updatedAt)) {
@@ -232,20 +240,22 @@ export function createRuntimeV2Checkpoint(
       "checkpoint_event_budget_exceeded",
     );
   }
-  const digest = runtimeV2AggregateDigest(input.aggregate);
+}
+
+function checkpointWithDigest(input: CreateRuntimeV2CheckpointInput, digest: string): RuntimeV2CheckpointV3 {
   if (input.aggregateDigest && input.aggregateDigest !== digest) {
     throw new Error("Runtime v2 checkpoint aggregate digest mismatch.");
   }
   const checkpoint: RuntimeV2CheckpointV3 = {
     schemaVersion: RUNTIME_V2_CHECKPOINT_SCHEMA_VERSION,
     engineVersion: RUNTIME_V2_ENGINE_VERSION,
-    revision,
+    revision: Math.floor(Number(input.revision)),
     owner: input.aggregate.turn,
     aggregate: input.aggregate,
     events: input.aggregate.events,
     scheduledCommands: input.aggregate.scheduledCommands,
     aggregateDigest: digest,
-    updatedAt,
+    updatedAt: Number(input.updatedAt),
   };
   assertRuntimeV2CheckpointPersistable(checkpoint);
   trustedRuntimeV2Checkpoints.add(checkpoint);
@@ -509,6 +519,8 @@ export function normalizeRuntimeV2Checkpoint(
   if (trustedRuntimeV2Checkpoints.has(value)) {
     return value as unknown as RuntimeV2CheckpointV3;
   }
+  const cached = serializedRuntimeV2Checkpoints.get(value);
+  if (cached) return cached;
   try {
     const serializedChars = JSON.stringify(value).length;
     if (serializedChars > MAX_RUNTIME_V2_CHECKPOINT_CHARS) return reject("size_budget_exceeded", serializedChars);
@@ -626,6 +638,7 @@ export function serializeRuntimeV2CheckpointMap(
       saved.aggregateDigest !== checkpoint.aggregateDigest || !sameOwner(saved.owner, checkpoint.owner)) {
       throw new RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed");
     }
+    serializedRuntimeV2Checkpoints.set(saved, checkpoint);
   }
   return persisted;
 }
@@ -635,13 +648,14 @@ export type AppendRuntimeV2CheckpointResult =
   | { readonly disposition: "idempotent"; readonly checkpoint: RuntimeV2CheckpointV3 }
   | { readonly disposition: "conflict"; readonly checkpoint: null };
 
-/** Pure CAS append used by the Store port and deterministic tests. */
-export function appendRuntimeV2Checkpoint(input: {
+type RuntimeV2CheckpointAppendInput = {
   readonly checkpoint: RuntimeV2CheckpointV3 | null;
   readonly owner: RuntimeV2TurnIdentity;
   readonly expectedRevision: number;
   readonly event: RuntimeV2Event;
-}): AppendRuntimeV2CheckpointResult {
+};
+
+function prepareCheckpointAppend(input: RuntimeV2CheckpointAppendInput): AppendRuntimeV2CheckpointResult | CreateRuntimeV2CheckpointInput {
   const current = input.checkpoint;
   if (current && !sameOwner(current.owner, input.owner)) {
     return { disposition: "conflict", checkpoint: null };
@@ -657,13 +671,39 @@ export function appendRuntimeV2Checkpoint(input: {
   const previous = current?.aggregate || null;
   const transition = tryTransition(previous, input.event);
   if (transition.disposition === "rejected") return { disposition: "conflict", checkpoint: null };
-  return {
-    disposition: "committed",
-    checkpoint: createRuntimeV2Checkpoint({
-      revision: revision + 1,
-      aggregate: transition.state,
-      updatedAt: input.event.at,
-    }),
+  return { revision: revision + 1, aggregate: transition.state, updatedAt: input.event.at };
+}
+
+/** Pure CAS append for sync replay and callers outside the live Store port. */
+export function appendRuntimeV2Checkpoint(input: RuntimeV2CheckpointAppendInput): AppendRuntimeV2CheckpointResult {
+  const prepared = prepareCheckpointAppend(input);
+  return "disposition" in prepared ? prepared : {
+    disposition: "committed", checkpoint: createRuntimeV2Checkpoint(prepared),
+  };
+}
+
+/** The live port owns this cache for one Run. Canonical event objects are
+ * immutable after the reducer admits them. The digest and schema are identical
+ * to sync replay, while hashing the serialized ledger no longer blocks input. */
+export function createAsyncRuntimeV2CheckpointAppender() {
+  const encodedEvents = new WeakMap<object, string>();
+  return async (input: RuntimeV2CheckpointAppendInput): Promise<AppendRuntimeV2CheckpointResult> => {
+    const prepared = prepareCheckpointAppend(input);
+    if ("disposition" in prepared) return prepared;
+    assertCheckpointInput(prepared);
+    for (const event of prepared.aggregate.events) {
+      if (!encodedEvents.has(event)) encodedEvents.set(event, stableJson(event));
+    }
+    const body = canonicalJsonWithEncodedObjects(prepared.aggregate, encodedEvents);
+    const subtle = globalThis.crypto?.subtle;
+    let hex: string;
+    if (subtle) {
+      const hash = await subtle.digest("SHA-256", new TextEncoder().encode(body));
+      hex = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+    } else {
+      hex = sha256Hex(body);
+    }
+    return { disposition: "committed", checkpoint: checkpointWithDigest(prepared, `runtime-v2-aggregate-sha256-${hex}`) };
   };
 }
 

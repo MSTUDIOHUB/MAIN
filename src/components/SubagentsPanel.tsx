@@ -1,4 +1,6 @@
-import { Fragment, useMemo } from "react";
+import { Fragment, useMemo, useSyncExternalStore } from "react";
+import { getCapsuleLiveActivitySnapshot, subscribeCapsuleLiveActivity } from "../lib/capsuleLiveActivity";
+import type { RuntimeV2ProactiveSkipReason } from "../lib/runtime-v2";
 import {
   IconCheck,
   IconClose,
@@ -19,6 +21,7 @@ interface SubagentsPanelProps {
   runs: SubagentRunRecord[];
   selectedId: string | null;
   capacityPolicy: SubagentCapacityPolicy;
+  proactiveSkipReason?: RuntimeV2ProactiveSkipReason;
   language: "zh" | "en";
   themeMode: ThemeMode;
   onSelect: (id: string) => void;
@@ -101,6 +104,7 @@ export default function SubagentsPanel({
   runs,
   selectedId,
   capacityPolicy,
+  proactiveSkipReason,
   language,
   themeMode,
   onSelect,
@@ -108,6 +112,24 @@ export default function SubagentsPanel({
   onStopAll,
   onClearEnded,
 }: SubagentsPanelProps) {
+  const live = useSyncExternalStore(subscribeCapsuleLiveActivity, getCapsuleLiveActivitySnapshot);
+  const requestFor = (run: SubagentRunRecord) => live.find(item => item.kind === "model" && item.run.runId === run.runId &&
+    item.run.sessionKey === run.threadId && item.run.parentRunId === run.parentRunId && item.run.turnId === run.parentTurnId);
+  const liveStatus = (run: SubagentRunRecord) => {
+    if (!isSubagentActiveStatus(run.status)) return statusLabel(run.status, language);
+    const request = requestFor(run);
+    if (request?.kind !== "model") return statusLabel(run.status, language);
+    if (request.stage === "waiting") return language === "zh" ? "已发出请求，等待首包" : "Request sent, waiting for first chunk";
+    if (request.stage === "receiving") return statusLabel("running", language);
+    return statusLabel("queued", language);
+  };
+  const skipReasons: Record<RuntimeV2ProactiveSkipReason, readonly [string, string]> = {
+    no_independent_scope: ["当前没有可独立委派的范围", "No independent scope is available"],
+    no_parallel_capacity: ["模型通道当前无并发容量", "The model lane has no parallel capacity"],
+    slots_in_use: ["子请求槽位已占用", "Child request slots are occupied"],
+    workspace_read_restricted: ["当前工作区读取受限", "Workspace reads are restricted"],
+    insufficient_runway: ["剩余运行时间不足", "The remaining run time is too short"],
+  };
   const isLight = themeMode === "light";
   const selected = useMemo(
     () => runs.find((run) => run.id === selectedId) || [...runs].reverse()[0] || null,
@@ -116,6 +138,12 @@ export default function SubagentsPanel({
   const activeCount = runs.filter((run) => isSubagentActiveStatus(run.status)).length;
   const endedCount = runs.length - activeCount;
   const activeRuns = runs.filter((run) => isSubagentActiveStatus(run.status));
+  const liveModelRequests = activeRuns.map(requestFor);
+  const receiving = liveModelRequests.filter(request => request?.kind === "model" && request.stage === "receiving").length;
+  const waiting = activeRuns.filter((run, index) => {
+    const request = liveModelRequests[index];
+    return request?.kind === "model" ? request.stage !== "receiving" : run.status === "queued" || run.status === "starting";
+  }).length;
   const doneRuns = runs.filter((run) => !isSubagentActiveStatus(run.status));
   const projectedRuns = [
     ...[...activeRuns].reverse().map((run) => ({ run, section: "active" as const })),
@@ -125,19 +153,22 @@ export default function SubagentsPanel({
   return (
     <div data-testid="subagents-panel" className={`flex h-full min-h-0 flex-col ${isLight ? "bg-[#ffffff] text-[#202124]" : "bg-[#050505] text-[#e4e4e7]"}`}>
       <div className={`shrink-0 border-b px-4 py-3 ${isLight ? "border-[#e4e4e7] bg-[#fafafa]" : "border-[#18181b] bg-[#09090b]"}`}>
+        {proactiveSkipReason && <div data-testid="subagent-proactive-disposition" className="mb-2 text-xs">
+          {language === "zh" ? "最近一次协作调度 · " : "Latest delegation decision · "}{skipReasons[proactiveSkipReason][language === "zh" ? 0 : 1]}
+        </div>}
         <div className="flex items-start gap-3">
           <div className="grid min-w-0 flex-1 grid-cols-3 gap-3 text-[11px]">
           <div>
-            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "活跃" : "Active"}</div>
-            <div className="mt-0.5 text-[14px] font-semibold">{activeCount} / {capacityPolicy.maxActiveRequests}</div>
+            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "等待中的子任务" : "Waiting children"}</div>
+            <div className="mt-0.5 text-[14px] font-semibold">{waiting}</div>
           </div>
           <div>
-            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "已结束" : "Ended"}</div>
-            <div className="mt-0.5 text-[14px] font-semibold">{endedCount}</div>
+            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "正在输出的子流" : "Streaming children"}</div>
+            <div className="mt-0.5 text-[14px] font-semibold">{receiving} / {capacityPolicy.maxActiveRequests}</div>
           </div>
           <div>
-            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "本轮总数" : "Total"}</div>
-            <div className="mt-0.5 text-[14px] font-semibold">{runs.length}</div>
+            <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "实测与主体并发" : "Observed with parent"}</div>
+            <div className="mt-0.5 text-[14px] font-semibold">{capacityPolicy.confirmedOverlappingChildren}</div>
           </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
@@ -233,7 +264,7 @@ export default function SubagentsPanel({
                 <span className="flex min-w-0 items-center gap-2">
                   <span className="truncate text-[12px] font-semibold">{run.name}</span>
                   <span className={`shrink-0 rounded-full border px-1.5 py-0.5 text-[9px] ${statusTone(run.status, isLight)}`}>
-                    {statusLabel(run.status, language)}
+                    {liveStatus(run)}
                   </span>
                 </span>
                 <span className={`mt-0.5 block truncate text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#8f8f98]"}`}>
@@ -254,7 +285,7 @@ export default function SubagentsPanel({
                 <IconSubagent className="h-4 w-4 shrink-0 text-[#7c3aed]" />
                 <h3 className="truncate text-[14px] font-semibold">{selected.name}</h3>
                 <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusTone(selected.status, isLight)}`}>
-                  {statusLabel(selected.status, language)}
+                  {liveStatus(selected)}
                 </span>
               </div>
               <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>

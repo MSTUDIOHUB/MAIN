@@ -978,13 +978,14 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
   return (
     <>
       <div
-        className="w-1 cursor-col-resize hover:bg-[#3f3f46] active:bg-[#555] z-20 transition-colors"
+        className="w-1 cursor-col-resize hover:bg-[#3f3f46] active:bg-[#555] z-20 transition-colors max-[1119px]:hidden"
         onMouseDown={onStartResizing}
       />
       <aside
         data-testid="file-panel"
-        className="bg-[#000000] flex min-w-0 shrink-0 flex-col border-l border-r border-[#27272a] z-10"
-        style={{ width: `${width}px`, display: window.innerWidth < 1120 ? "none" : "flex" }}
+        data-workbench-panel="files"
+        className="bg-[#000000] flex min-w-0 shrink-0 flex-col border-l border-r border-[#27272a] z-10 max-[1119px]:hidden"
+        style={{ width: `var(--panel-drag-width, ${width}px)` }}
       >
         <div className="min-h-[56px] shrink-0 border-b border-[#27272a] bg-[#09090b] px-3 py-2 flex items-center justify-between gap-3">
           <div className="min-w-0 flex items-center gap-3">

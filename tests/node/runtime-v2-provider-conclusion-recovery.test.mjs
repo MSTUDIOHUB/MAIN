@@ -503,6 +503,74 @@ test(`complete ${mode} replies retain causal feedback on the actual wire without
 });
 }
 
+test("direct validation recovery points to finite commands from the admitted project", async () => {
+  const { buildProjectBaselineContext } = loadTs("src/lib/projectBaseline.ts");
+  const baseline = await buildProjectBaselineContext({ workspace: "/fixture", io: {
+    canonicalizeWorkspace: async workspace => workspace,
+    listDirectory: async () => [],
+    readFile: async ({ path }) => {
+      if (path !== "package.json") throw new Error("Missing fixture file");
+      return JSON.stringify({ packageManager: "npm@11.0.0", scripts: { test: "node --test", dev: "vite" } });
+    },
+  } });
+  const runCommand = { type: "function", function: { name: "run_command", description: "Run a command", parameters: { type: "object", properties: {} } } };
+  await withStreamFixture("omlx", completedStream, async (fixture, calls) => {
+    fixture.context.runtimeRunIntent = "execute";
+    fixture.context.runWorkspace = "/fixture";
+    fixture.context.projectBaselineContext = baseline;
+    const next = command("validate", { recoveryPressure: { reason: "non_actionable_response" } });
+    const input = { live: fixture.live, ports: fixture, command: next, tools: [runCommand], textEnvelope: false,
+      toolChoice: null, signal: new AbortController().signal };
+    await request.requestRuntimeV2ProviderOnce(input);
+    fixture.context.runWorkspace = "/other-project";
+    await request.requestRuntimeV2ProviderOnce(input);
+    const guidance = calls[0].messages.at(-1).content;
+    assert.match(guidance, /Project validation commands from package\.json: "npm run test"/);
+    assert.doesNotMatch(guidance, /npm run dev/);
+    assert.equal(calls[0].options.toolChoice, undefined);
+    assert.doesNotMatch(calls[1].messages.at(-1).content, /Project validation commands/);
+
+    // An actual compiler receipt and an outstanding validation let the
+    // scheduler recover using the workspace's exact, versioned test entry.
+    let aggregate = executeReplyAggregate({}, "validating");
+    const run = aggregate.run.identity;
+    const append = (type, fields) => { aggregate = runtime.transition(aggregate, {
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, type, run,
+      eventId: `validation-${aggregate.nextSequence}`, sequence: aggregate.nextSequence, at: aggregate.updatedAt + 1, ...fields,
+    }); };
+    const target = "Assets/Fixture.cs";
+    const version = `sha256-${"e".repeat(64)}`;
+    append("command.scheduled", { command: { run, kind: "execute_tool", phase: "validating", idempotencyKey: "repair-source",
+      payload: { toolName: "replace_in_file", arguments: { path: target } } } });
+    const mutationSequence = aggregate.nextSequence;
+    append("tool.completed", { idempotencyKey: "repair-source", status: "succeeded",
+      evidence: [{ id: "repair-version", kind: "mutation", target, version }] });
+    append("command.scheduled", { command: { run, kind: "execute_tool", phase: "validating", idempotencyKey: "editor-check",
+      payload: { toolName: "unity_compile_project", runtimeOwnedUnityCompile: true, mutationSequence } } });
+    append("tool.completed", { idempotencyKey: "editor-check", status: "succeeded", evidence: [],
+      modelContent: JSON.stringify({ status: "passed", kind: "csharp", editor: "connected", editorPid: 42, targets: [{ path: target, version }] }) });
+    const ordinaryDecision = runtime.decideNextCommands(aggregate)[0];
+    append("command.scheduled", { command: ordinaryDecision });
+    append("provider.responded", { idempotencyKey: ordinaryDecision.idempotencyKey,
+      result: { visibleText: "The compiler passed.", toolCalls: [], diagnostics: [] } });
+    fixture.context.runWorkspace = "/fixture";
+    const { projectFiniteValidationCommands, projectValidationRecoveryReceipt } = loadTs("src/store/runtimeV2/executionProviderContext.ts");
+    const [option] = projectFiniteValidationCommands(fixture);
+    const recovered = runtime.decideNextCommands(aggregate, { projectValidationRecovery: option })[0];
+    assert.equal(recovered.kind, "execute_validation");
+    assert.equal(recovered.payload.toolName, "run_command");
+    assert.equal(recovered.payload.arguments.command, "npm run test");
+    assert.equal(recovered.payload.projectValidationManifestVersion, option.manifestVersion);
+    assert.deepEqual(recovered.payload.validationAuthority.targetPaths, [target]);
+    append("command.scheduled", { command: recovered });
+    append("validation.completed", { idempotencyKey: recovered.idempotencyKey, passed: false, evidence: [],
+      failureKind: "not_executed", failureReasonCode: "not_authorized", mutationBoundarySequence: mutationSequence,
+      presentation: { target: "npm run test" } });
+    assert.match(projectValidationRecoveryReceipt(aggregate), /not executed \(not_authorized\)/);
+    assert.equal(runtime.decideNextCommands(aggregate, { projectValidationRecovery: option })[0].kind, "request_model");
+  });
+});
+
 test("empty or malformed action recovery keeps its explicit protocol feedback and required tool decoding", () => {
   assert.equal(request.runtimeV2RecoveryRequiresStructuredAction({ reason: "empty_response" }), true);
   assert.equal(request.runtimeV2RecoveryRequiresStructuredAction({ reason: "provider_response_rejected" }), true);

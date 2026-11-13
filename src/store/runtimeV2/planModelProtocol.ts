@@ -22,6 +22,7 @@ import { normalizeKnowledgeReferences, renderKnowledgeContextAnchor } from "../.
 import { containsProviderTextEnvelopePrompt } from "./executionProviderContext";
 import { buildRuntimeV2TextEnvelopeCatalog } from "./executionProviderTools";
 import { renderPlanSkillContext } from "./planSkillContext";
+import { unityMcpObservationTools, UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
 
 export const SUBMIT_WORK_PLAN_TOOL_NAME = "submit_runtime_v2_work_plan";
 export const PLAN_MODEL_REQUEST_TIMEOUT_MS = 90_000;
@@ -47,6 +48,7 @@ export const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "tool_search",
   "knowledge_search",
   "knowledge_get_excerpt",
+  ...UNITY_MCP_OBSERVATION_NAMES,
 ]);
 
 export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
@@ -121,7 +123,9 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
                 type: "string",
                 description: "可选，用于验证的构建/测试/检查命令（如 npm run build）",
               },
-              cwd: { type: "string" },
+              cwd: { type: "string", description: "工作区相对目录，根目录用 ." },
+              expectedTestCases: { type: "integer", description: "为 Unity 测试定义了确定的用例集时填正整数用例数。运行时要求该数量全部通过。" },
+              useProjectEditor: { type: "boolean", description: "Unity 或团结 PlayMode 验收设置为 true。命令用 unity test . --mode PlayMode --filter SuiteName，填写确定的正整数用例数。审批涵盖同一工程版本和测试筛选的在线与批处理方式。" },
               expectedOutcome: {
                 type: "string",
                 description: "预期的验证通过结果说明",
@@ -130,6 +134,7 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
               stepIndexes: {
                 type: "array",
                 items: { type: "integer" },
+                description: "该检查覆盖的 changes[] 零基下标。Unity PlayMode 测试覆盖场景时也应引用创建场景和引导脚本的步骤。",
               },
               criterionIds: {
                 type: "array",
@@ -173,6 +178,7 @@ export function planModelToolCandidates(
   });
   return [
     ...baseTools,
+    ...(context.workspaceMcpSnapshot?.planObservationsAllowed ? unityMcpObservationTools(context.workspaceMcpSnapshot) : []),
     ...(loadSkill ? [loadSkill] : []),
   ];
 }
@@ -181,7 +187,9 @@ export function planModelTools(context: RuntimeV2SubmissionContext): ToolDefinit
   const canAskPlanQuestions = !!(context.planPurpose || context.sourcePlanDraft);
   return filterToCoreAndUnlockedTools([...planModelToolCandidates(context), ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL] : []), SUBMIT_WORK_PLAN_TOOL], {
     sessionKey: context.runSessionKey,
-    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL.function.name] : [])],
+    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...UNITY_MCP_OBSERVATION_NAMES,
+      ...(context.knowledgeContext?.references.length ? ["knowledge_search", "knowledge_get_excerpt"] : []),
+      ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL.function.name] : [])],
   });
 }
 
@@ -380,6 +388,9 @@ export function providerPlanMessages(input: {
         "You are in Plan Mode: inspect relevant files with read-only tools and then submit a clear plan via submit_runtime_v2_work_plan.",
         "Do not invent file paths or modify project files during planning.",
         "Use prior read receipts as evidence. Inspect the smallest missing fact about a test entry point, fixture, or interaction capability. Use a relevant admitted Skill when it can identify the check. If adding a test is in scope and the project has a suitable runner, plan that test as a change and bind the runnable check to it. Design the check yourself; ask only for a consequential scope, constraint, or acceptance decision that safe inspection cannot resolve.",
+        ...(input.context.projectBaselineContext?.facts.runtimes.some(runtime => ["unity", "tuanjie"].includes(runtime.name)) ? [
+          "For Unity or Tuanjie tests, check the project's existing test and runtime assembly definitions and references. Include each necessary .asmdef in the reviewed changes, with dependencies. A PlayMode test using yield must return IEnumerator. Bind PlayMode to a named suite with useProjectEditor and expectedTestCases so the same reviewed check can use the exact Editor or batch mode.",
+        ] : []),
         "When ready, call submit_runtime_v2_work_plan with planMarkdown, changes, and validations. Record each runnable check as a structured validation with its working directory where needed and its concrete expected outcome. Keep manual checks as supplemental assertions.",
         "Implementation acceptance normally needs a runnable behavioral test, executable assertion, or supported interaction that observes the user's outcome. Build, lint and typecheck are supplemental unless the admitted criterion explicitly asks for static verification.",
         `[ADMITTED CRITERIA]\n${criteria.map((criterion) => `${criterion.id}: ${criterion.text}`).join("\n")}`,

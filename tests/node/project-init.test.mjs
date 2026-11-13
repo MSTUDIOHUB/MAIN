@@ -107,6 +107,26 @@ function createIo(options = {}) {
   };
 }
 
+test("automatic rules refresh preserves human bytes and requires review after a hand edit", async () => {
+  const original = projectInit.renderProjectInitManagedBlock(makeBaseline());
+  const human = "# Human rules\n\nKeep this.\n\n";
+  const preference = { blockDigest: projectInit.projectInitManagedBlockDigest(original), locale: "en" };
+  const same = createIo({ exists: true, content: human + original });
+  const refresh = (io, isCurrent = () => true) =>
+    projectInit.refreshApprovedProjectInitBlock({ workspace: "/fixture/repo", preference, io, isCurrent });
+  assert.equal(await refresh(same), null);
+  assert.equal(same.calls.commit.length, 0);
+  const changed = createIo({ exists: true, content: human + original, baseline: makeBaseline({ fingerprint: "project-baseline-sha256-two" }) });
+  const updated = await refresh(changed);
+  assert.notEqual(updated.blockDigest, preference.blockDigest);
+  assert.ok(changed.calls.commit[0].proposedContent.startsWith(human));
+  const edited = createIo({ exists: true, content: human + original.replace("Runtimes", "Edited runtimes") });
+  assert.equal(await refresh(edited), "needs_review");
+  assert.equal(edited.calls.commit.length, 0);
+  assert.equal(await refresh(changed, () => false), null);
+  assert.equal(changed.calls.commit.length, 1);
+});
+
 test("rules command accepts a request and keeps init as a hidden alias", () => {
   for (const command of ["/规则", "/rules", "/init", "/INIT"]) {
     assert.deepEqual(projectInit.parseProjectInitCommand(command), { kind: "project_init", refresh: false });

@@ -57,6 +57,7 @@ pub mod session_store;
 pub mod skill_packages;
 pub mod task_graph;
 pub mod trusted_execution;
+mod unity_editor;
 pub mod web_search;
 
 // region: 全局常量与状态
@@ -379,6 +380,8 @@ pub struct TerminalCommandOutput {
     success: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unity_test_reports: Option<Value>,
 }
 
 struct GitProcessOutput {
@@ -2537,8 +2540,40 @@ pub fn run_workspace_shell_command(
             .map_err(|error| format!("TRUSTED_EXECUTION_REJECTED: {error}"))?;
 
     let mut process = build_workspace_shell_command(trimmed);
+    process.current_dir(prepared.working_directory());
+    if let Some(filter) = unity_editor::live_playmode_filter(prepared.inspection()) {
+        return unity_editor::run_live_playmode(workspace, prepared.working_directory(), filter, timeout, None,
+            |remaining| capture_command_output(process, trimmed, input, remaining));
+    }
+    let report_checks = unity_editor::batch_report_expectations(workspace, prepared.working_directory(), prepared.inspection());
+    let mut output = capture_command_output(process, trimmed, input, timeout)?;
+    if output.success {
+        output.unity_test_reports = unity_editor::verify_batch_reports(workspace, report_checks);
+    }
+    Ok(output)
+}
+
+fn capture_command_output(
+    process: ProcessCommand,
+    command: &str,
+    input: Option<String>,
+    timeout: Duration,
+) -> Result<TerminalCommandOutput, String> {
+    capture_command_output_with_cancel(process, command, input, timeout, None)
+}
+
+fn capture_command_output_with_cancel(
+    mut process: ProcessCommand,
+    command: &str,
+    input: Option<String>,
+    timeout: Duration,
+    canceled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<TerminalCommandOutput, String> {
+    let is_canceled = || canceled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    if is_canceled() {
+        return Err("COMMAND_CANCELED".to_string());
+    }
     process
-        .current_dir(prepared.working_directory())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2569,6 +2604,10 @@ pub fn run_workspace_shell_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if is_canceled() {
+                    terminate_timed_out_child(&mut child)?;
+                    return Err("COMMAND_CANCELED".to_string());
+                }
                 if started_at.elapsed() >= timeout {
                     timed_out = true;
                     break terminate_timed_out_child(&mut child)?;
@@ -2584,7 +2623,7 @@ pub fn run_workspace_shell_command(
     let exit_code = status.code().unwrap_or(if timed_out { -1 } else { 1 });
 
     Ok(TerminalCommandOutput {
-        command: trimmed.to_string(),
+        command: command.to_string(),
         stdout: stdout.text,
         stderr: stderr.text,
         exit_code,
@@ -2593,6 +2632,7 @@ pub fn run_workspace_shell_command(
         success: !timed_out && status.success(),
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
+        unity_test_reports: None,
     })
 }
 
@@ -2780,9 +2820,20 @@ fn code_ast_query(
 
 #[tauri::command]
 fn check_source_syntax(
+    state: State<WorkspaceState>,
     path: String,
     content: String,
+    workspace: Option<String>,
+    patch_paths: Option<std::collections::HashMap<String, bool>>,
 ) -> Result<code_ast::SourceSyntaxCheckResult, String> {
+    if let Some(workspace) = workspace.filter(|workspace| !workspace.trim().is_empty()) {
+        let project = resolve_workspace_root(&state, Some(workspace))?;
+        if let Some(result) = unity_editor::check_shader_includes(
+            &project, Path::new(&path), &content, patch_paths.as_ref(),
+        ) {
+            return Ok(result);
+        }
+    }
     code_ast::check_source_syntax(Path::new(&path), content.as_bytes())
 }
 
@@ -8956,8 +9007,15 @@ async fn send_guarded_proxy_request(
     identity_encoding: bool,
     user_configured_endpoint: bool,
     request_lease: Option<GuardedRequestLease<'_>>,
+    url_scope: Option<&(dyn Fn(&url::Url) -> bool + Sync)>,
 ) -> Result<reqwest::Response, String> {
     validate_proxy_request_headers(headers)?;
+    if let Some(allows_url) = url_scope {
+        let initial_url = url::Url::parse(url).map_err(|error| error.to_string())?;
+        if !allows_url(&initial_url) {
+            return Err("NETWORK_GUARD_DENIED: URL outside the granted documentation scope".into());
+        }
+    }
     let mut grant = proxy_network_grant(url, headers, user_configured_endpoint)?;
     let mut resolved = resolve_proxy_target(&grant, url, request_lease).await?;
     let mut current_method = method.to_uppercase();
@@ -9050,6 +9108,9 @@ async fn send_guarded_proxy_request(
             .url
             .join(location)
             .map_err(|error| format!("NETWORK_GUARD_DENIED: invalid redirect URL: {error}"))?;
+        if url_scope.is_some_and(|allows_url| !allows_url(&redirect_url)) {
+            return Err("NETWORK_GUARD_DENIED: redirect outside the granted documentation scope".into());
+        }
         let redirect =
             authorize_proxy_redirect_hop(&grant, &resolved.target, redirect_url.as_str())?;
         forward_sensitive_headers = redirect.forward_sensitive_headers;
@@ -9079,6 +9140,15 @@ pub(crate) async fn send_guarded_public_get(
     user_agent: &str,
     timeout_duration: Duration,
 ) -> Result<reqwest::Response, String> {
+    send_guarded_public_get_scoped(url, user_agent, timeout_duration, None).await
+}
+
+pub(crate) async fn send_guarded_public_get_scoped(
+    url: &str,
+    user_agent: &str,
+    timeout_duration: Duration,
+    url_scope: Option<&(dyn Fn(&url::Url) -> bool + Sync)>,
+) -> Result<reqwest::Response, String> {
     let headers = HashMap::from([
         ("User-Agent".to_string(), user_agent.to_string()),
         (
@@ -9103,6 +9173,7 @@ pub(crate) async fn send_guarded_public_get(
         false,
         false,
         None,
+        url_scope,
     )
     .await
 }
@@ -9261,6 +9332,7 @@ async fn proxy_request(
         is_model_request,
         true,
         Some(GuardedRequestLease::Proxy(&request_lease)),
+        None,
     )
     .await;
 
@@ -9595,6 +9667,7 @@ async fn proxy_request_detailed(
         meth == "POST",
         false,
         true,
+        None,
         None,
     )
     .await?;
@@ -10126,6 +10199,7 @@ async fn run_chat_stream_worker(
         is_model_request,
         true,
         Some(GuardedRequestLease::Stream(&stream_lease)),
+        None,
     )
     .await
     {
@@ -12093,10 +12167,17 @@ fn knowledge_rebuild_base(
         let expected_root=knowledge::source_storage_dir(&app_data_dir,&kb_id).canonicalize().map_err(|e|e.to_string())?;
         let actual=stored.storage_path.canonicalize().map_err(|e|e.to_string())?;
         if !actual.starts_with(&expected_root) { return Err("KNOWLEDGE_UNTRUSTED_SOURCE_PATH".into()); }
-        let extracted = match extract_document_for_knowledge(&actual) {
+        let mut extracted = match extract_document_for_knowledge(&actual) {
             Ok(extracted)=>extracted,
             Err(error)=>{knowledge::mark_source_failure(&app_data_dir,&kb_id,&stored.source.id,&error)?;return Err(error);}
         };
+        if knowledge::file_hash(&actual)? == stored.source.hash {
+            if let Some(previous) = stored.source.metadata.get("metadata") {
+                if let Some(metadata) = extracted.as_object_mut() {
+                    metadata.insert("metadata".into(), previous.clone());
+                }
+            }
+        }
         let original_path = PathBuf::from(&stored.source.original_path);
         let _ = knowledge::index_extracted_source(
             &app_data_dir,
@@ -12114,18 +12195,447 @@ fn knowledge_rebuild_base(
 }
 
 #[tauri::command]
-fn knowledge_search(
+fn knowledge_list_presets() -> Vec<knowledge::presets::EngineManualPreset> {
+    knowledge::presets::list_engine_manual_presets()
+}
+
+fn emit_preset_progress(
+    app: Option<&AppHandle>,
+    base: &knowledge::KnowledgeBase,
+    status: &str,
+    url: &str,
+    current: usize,
+    total: usize,
+) {
+    if let Some(app) = app {
+        let _ = app.emit(
+            "knowledge-import-progress",
+            json!({
+                "kbId": base.id, "presetId": base.preset_id, "status": status,
+                "url": url, "current": current, "total": total,
+            }),
+        );
+    }
+}
+
+pub async fn bootstrap_preset_in_app_data(
+    app_data_dir: &Path,
+    preset_id: &str,
+    app: Option<&AppHandle>,
+) -> Result<knowledge::KnowledgeBase, String> {
+    let preset = knowledge::presets::find_engine_manual_preset(preset_id)
+        .ok_or_else(|| format!("未知的引擎手册预设: {preset_id}"))?;
+    let base = knowledge::ensure_preset_knowledge_base(app_data_dir, &preset)?;
+    set_import_cancelled(&base.id, false);
+    let cancelled = || is_import_cancelled(&base.id);
+    let total = 1 + preset.toc_urls.len() + preset.seed_urls.len();
+    let mut current = 1;
+    let transport = PublicKnowledgeTransport { lease: None };
+
+    for doc in &preset.builtin_docs {
+        knowledge::append_preset_document(
+            app_data_dir,
+            &base,
+            &preset,
+            knowledge::PresetDocument {
+                title: &doc.title,
+                content: &doc.content,
+                source_url: &doc.source_url,
+                builtin_summary: true,
+                truncated: false,
+            },
+            None,
+            cancelled,
+        )?;
+    }
+    knowledge::replace_toc_snapshot(app_data_dir, &base, "builtin", &preset.builtin_toc_entries)?;
+    emit_preset_progress(
+        app,
+        &base,
+        "toc_indexing",
+        &preset.entry_url,
+        current,
+        total,
+    );
+
+    let mut incomplete = false;
+    for toc_url in &preset.toc_urls {
+        if cancelled() {
+            break;
+        }
+        current += 1;
+        emit_preset_progress(app, &base, "toc_indexing", toc_url, current, total);
+        let result = match transport.fetch(&preset, toc_url, true).await {
+            Ok(fetched)
+                if !fetched.truncated
+                    && !cancelled()
+                    && (toc_url.ends_with("/docdata/toc.json")
+                        == url::Url::parse(&fetched.final_url)
+                            .is_ok_and(|url| url.path().ends_with("/docdata/toc.json"))) =>
+            {
+                knowledge::presets::parse_toc_payload(&preset, &fetched.final_url, &fetched.content)
+                    .and_then(|entries| {
+                        knowledge::replace_toc_snapshot(app_data_dir, &base, toc_url, &entries)
+                    })
+            }
+            _ => Err("KNOWLEDGE_TOC_FETCH_INCOMPLETE".into()),
+        };
+        if result.is_err() {
+            incomplete = true;
+        }
+    }
+
+    for seed_url in &preset.seed_urls {
+        if cancelled() {
+            break;
+        }
+        current += 1;
+        emit_preset_progress(app, &base, "fetching", seed_url, current, total);
+        let result = match transport.fetch(&preset, seed_url, false).await {
+            Ok(fetched) => knowledge::append_preset_document(
+                app_data_dir,
+                &base,
+                &preset,
+                preset_document_from_fetch(&fetched, &preset.name),
+                None,
+                cancelled,
+            ),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            incomplete = true;
+        }
+    }
+
+    let status = if cancelled() {
+        "cancelled"
+    } else if incomplete {
+        "partial"
+    } else {
+        "done"
+    };
+    emit_preset_progress(app, &base, status, &preset.entry_url, current, total);
+    if cancelled() {
+        return Err("知识库预设获取已取消".into());
+    }
+    let mut updated = knowledge::get_knowledge_base(app_data_dir, &base.id)?;
+    updated.preset_sync_status = Some(status.into());
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn knowledge_bootstrap_preset(
+    app: AppHandle,
+    state: State<'_, WorkspaceState>,
+    preset_id: String,
+) -> Result<knowledge::KnowledgeBase, String> {
+    let app_data_dir = knowledge_app_data_dir(&app, &state)?;
+    bootstrap_preset_in_app_data(&app_data_dir, &preset_id, Some(&app)).await
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum KnowledgeLookupPolicy {
+    #[default]
+    Local,
+    OfficialToc,
+    OfficialSearch {
+        provider: String,
+    },
+}
+
+trait KnowledgeTransport {
+    fn fetch(
+        &self,
+        preset: &knowledge::presets::EngineManualPreset,
+        url: &str,
+        preserve_markup: bool,
+    ) -> impl std::future::Future<Output = Result<web_search::WebFetchResponse, String>> + Send;
+
+    fn search(
+        &self,
+        query: String,
+        provider: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<web_search::WebSearchResultItem>, String>> + Send;
+
+    fn cancelled(&self) -> bool;
+}
+
+struct PublicKnowledgeTransport<'a> {
+    lease: Option<GuardedRequestLease<'a>>,
+}
+
+impl PublicKnowledgeTransport<'_> {
+    async fn request<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, String>> + Send,
+    ) -> Result<T, String> {
+        let deadline = Duration::from_secs(16);
+        match self.lease {
+            Some(lease) => await_guarded_abortable_phase(lease, deadline, future)
+                .await
+                .map_err(|error| match error {
+                    ProxyPhaseError::Aborted => "Aborted".into(),
+                    ProxyPhaseError::TimedOut => "KNOWLEDGE_NETWORK_TIMEOUT".into(),
+                    ProxyPhaseError::Inner(error) => error,
+                }),
+            None => tokio::time::timeout(deadline, future)
+                .await
+                .map_err(|_| "KNOWLEDGE_NETWORK_TIMEOUT".to_string())?,
+        }
+    }
+}
+
+impl KnowledgeTransport for PublicKnowledgeTransport<'_> {
+    async fn fetch(
+        &self,
+        preset: &knowledge::presets::EngineManualPreset,
+        url: &str,
+        preserve_markup: bool,
+    ) -> Result<web_search::WebFetchResponse, String> {
+        let allows_url = |target: &url::Url| preset.allows_document_url(target);
+        self.request(web_search::fetch_official_document(
+            url,
+            preserve_markup,
+            &allows_url,
+        ))
+        .await
+    }
+
+    async fn search(
+        &self,
+        query: String,
+        provider: &str,
+    ) -> Result<Vec<web_search::WebSearchResultItem>, String> {
+        self.request(web_search::web_search(
+            query,
+            Some(provider.to_owned()),
+            Some(8),
+            Some(false),
+        ))
+        .await
+        .map(|response| response.results)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.lease.is_some_and(GuardedRequestLease::is_cancelled)
+    }
+}
+
+fn preset_document_from_fetch<'a>(
+    fetched: &'a web_search::WebFetchResponse,
+    fallback_title: &'a str,
+) -> knowledge::PresetDocument<'a> {
+    knowledge::PresetDocument {
+        title: if fetched.title.trim().is_empty() {
+            fallback_title
+        } else {
+            &fetched.title
+        },
+        content: &fetched.content,
+        source_url: &fetched.final_url,
+        builtin_summary: false,
+        truncated: fetched.truncated,
+    }
+}
+
+async fn search_knowledge_with_transport(
+    app_data_dir: &Path,
+    query: &str,
+    references: &[knowledge::KnowledgeReference],
+    limit: Option<usize>,
+    policy: KnowledgeLookupPolicy,
+    transport: &impl KnowledgeTransport,
+) -> Result<knowledge::KnowledgeSearchResult, String> {
+    let resolved_limit = limit.unwrap_or(8);
+    let mut result = knowledge::search(app_data_dir, query, references, resolved_limit)?;
+    if !result.hits.is_empty()
+        || matches!(policy, KnowledgeLookupPolicy::Local)
+        || references.is_empty()
+    {
+        return Ok(result);
+    }
+
+    let mut active = references.iter().filter_map(|reference| match reference {
+        knowledge::KnowledgeReference::Base {
+            kb_id,
+            index_revision,
+            activation_mode,
+            preset_id,
+            ..
+        } if activation_mode.as_deref() == Some("workspace_active") => {
+            Some((kb_id, index_revision, preset_id.as_deref()?))
+        }
+        _ => None,
+    });
+    let Some((kb_id, admitted_revision, preset_id)) = active.next() else {
+        return Ok(result);
+    };
+    // There is only one automatically bound engine manual per Turn.
+    if active.next().is_some() {
+        return Err("KNOWLEDGE_MULTIPLE_ACTIVE_PRESETS".into());
+    }
+    let base = knowledge::get_knowledge_base(app_data_dir, kb_id)?;
+    let Some(preset) = knowledge::presets::find_engine_manual_preset(preset_id).filter(|preset| {
+        base.enabled && base.preset_id.as_deref() == Some(preset.preset_id.as_str())
+    }) else {
+        return Ok(result);
+    };
+
+    let mut attempted_tiers = vec!["local".into(), "official_toc".into()];
+    let mut hydrated_count = 0;
+    let mut failures = 0;
+    let candidates = knowledge::search_unhydrated_toc_entries(app_data_dir, kb_id, query, 2)?;
+    for (entry_id, title, url) in candidates {
+        if transport.cancelled() {
+            return Err("Aborted".into());
+        }
+        let outcome = match transport.fetch(&preset, &url, false).await {
+            Ok(fetched) => knowledge::append_preset_document(
+                app_data_dir,
+                &base,
+                &preset,
+                preset_document_from_fetch(&fetched, &title),
+                Some(knowledge::HydrationScope {
+                    admitted_revision,
+                    toc_entry: Some((&entry_id, &url)),
+                }),
+                || transport.cancelled(),
+            ),
+            Err(error) => Err(error),
+        };
+        tally_hydration(outcome, &mut hydrated_count, &mut failures)?;
+    }
+    // A concurrent Turn may have hydrated the matching page while this one was fetching.
+    result = knowledge::search(app_data_dir, query, references, resolved_limit)?;
+
+    if result.hits.is_empty() {
+        if let KnowledgeLookupPolicy::OfficialSearch { provider } = policy {
+            if !matches!(
+                provider.as_str(),
+                "yahoo" | "quark" | "duckduckgo" | "bing" | "baidu"
+            ) {
+                return Err("KNOWLEDGE_UNSUPPORTED_SEARCH_PROVIDER".into());
+            }
+            if transport.cancelled() {
+                return Err("Aborted".into());
+            }
+            attempted_tiers.push("official_search".into());
+            let scoped_query = format!("{} {}", query.trim(), preset.search_site_filter);
+            match transport.search(scoped_query, &provider).await {
+                Ok(items) => {
+                    let mut seen = std::collections::HashSet::new();
+                    let candidates = items
+                        .into_iter()
+                        .filter_map(|item| {
+                            let url = preset.document_url(url::Url::parse(&item.url).ok()?)?;
+                            seen.insert(url.clone()).then_some((item.title, url))
+                        })
+                        .take(2);
+                    for (title, url) in candidates {
+                        if transport.cancelled() {
+                            return Err("Aborted".into());
+                        }
+                        let outcome = match transport.fetch(&preset, url.as_str(), false).await {
+                            Ok(fetched) => knowledge::append_preset_document(
+                                app_data_dir,
+                                &base,
+                                &preset,
+                                preset_document_from_fetch(&fetched, &title),
+                                Some(knowledge::HydrationScope {
+                                    admitted_revision,
+                                    toc_entry: None,
+                                }),
+                                || transport.cancelled(),
+                            ),
+                            Err(error) => Err(error),
+                        };
+                        tally_hydration(outcome, &mut hydrated_count, &mut failures)?;
+                    }
+                }
+                Err(error) => tally_hydration(Err(error), &mut hydrated_count, &mut failures)?,
+            }
+            result = knowledge::search(app_data_dir, query, references, resolved_limit)?;
+        }
+    }
+    if transport.cancelled() {
+        return Err("Aborted".into());
+    }
+    result.attempted_tiers = attempted_tiers;
+    result.hydrated_count = hydrated_count;
+    if failures > 0 {
+        result
+            .note
+            .push_str(" Some official document requests or cache commits failed.");
+    }
+    Ok(result)
+}
+
+fn tally_hydration(
+    outcome: Result<bool, String>,
+    hydrated_count: &mut usize,
+    failures: &mut usize,
+) -> Result<(), String> {
+    match outcome {
+        Ok(true) => *hydrated_count += 1,
+        Ok(false) => {}
+        Err(error) if error == "Aborted" || error.starts_with("STALE_KNOWLEDGE_REFERENCE") => {
+            return Err(error)
+        }
+        Err(_) => *failures += 1,
+    }
+    Ok(())
+}
+
+pub async fn search_with_tier_penetration_in_app_data(
+    app_data_dir: &Path,
+    query: &str,
+    references: &[knowledge::KnowledgeReference],
+    limit: Option<usize>,
+    policy: KnowledgeLookupPolicy,
+) -> Result<knowledge::KnowledgeSearchResult, String> {
+    search_knowledge_with_transport(
+        app_data_dir,
+        query,
+        references,
+        limit,
+        policy,
+        &PublicKnowledgeTransport { lease: None },
+    )
+    .await
+}
+
+#[tauri::command]
+async fn knowledge_search(
     app: AppHandle,
     state: State<'_, WorkspaceState>,
     query: String,
     references: Vec<knowledge::KnowledgeReference>,
     limit: Option<usize>,
+    policy: Option<KnowledgeLookupPolicy>,
+    request_id: Option<String>,
 ) -> Result<knowledge::KnowledgeSearchResult, String> {
     if references.is_empty() {
         return knowledge::search(Path::new(""), &query, &references, limit.unwrap_or(8));
     }
     let app_data_dir = knowledge_app_data_dir(&app, &state)?;
-    knowledge::search(&app_data_dir, &query, &references, limit.unwrap_or(8))
+    let lease = ProxyRequestLease::acquire(normalize_proxy_request_id(request_id))?;
+    let transport = PublicKnowledgeTransport {
+        lease: Some(GuardedRequestLease::Proxy(&lease)),
+    };
+    let result = search_knowledge_with_transport(
+        &app_data_dir,
+        &query,
+        &references,
+        limit,
+        policy.unwrap_or_default(),
+        &transport,
+    )
+    .await?;
+    if !lease.try_settle_success() {
+        return Err("Aborted".into());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -12141,6 +12651,198 @@ fn knowledge_get_excerpt(
     }
     let app_data_dir = knowledge_app_data_dir(&app, &state)?;
     knowledge::get_excerpt(&app_data_dir, &source_id, &chunk_id, &references)
+}
+
+#[cfg(test)]
+mod knowledge_tier_tests {
+    use super::*;
+
+    const TOC_PAGE: &str =
+        "https://docs.unity3d.com/6000.0/Documentation/ScriptReference/FixtureToc.html";
+    const SEARCH_PAGE: &str =
+        "https://docs.unity3d.com/6000.0/Documentation/ScriptReference/FixtureSearch.html";
+
+    #[derive(Default)]
+    struct FakeKnowledgeTransport {
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl KnowledgeTransport for FakeKnowledgeTransport {
+        async fn fetch(
+            &self,
+            _preset: &knowledge::presets::EngineManualPreset,
+            url: &str,
+            _markup: bool,
+        ) -> Result<web_search::WebFetchResponse, String> {
+            self.requests.lock().unwrap().push(url.into());
+            let content = match url {
+                TOC_PAGE => "FixtureToc is the authoritative fixture for this indexed method.",
+                SEARCH_PAGE => {
+                    "FixtureSearch is the authoritative fixture for the other indexed method."
+                }
+                _ => panic!("Unexpected fixture fetch: {url}"),
+            };
+            Ok(web_search::WebFetchResponse {
+                url: url.into(),
+                final_url: url.into(),
+                title: "Fixture documentation".into(),
+                content: content.into(),
+                content_type: "text/plain".into(),
+                char_count: content.chars().count(),
+                truncated: false,
+                source: "fixture".into(),
+                retrieval: None,
+            })
+        }
+
+        async fn search(
+            &self,
+            query: String,
+            provider: &str,
+        ) -> Result<Vec<web_search::WebSearchResultItem>, String> {
+            assert_eq!(provider, "bing");
+            assert!(query.starts_with("FixtureSearch site:docs.unity3d.com/6000.0/"));
+            self.requests.lock().unwrap().push("search".into());
+            Ok([
+                "https://example.org/6000.0/Documentation/ScriptReference/FixtureSearch.html",
+                "https://docs.unity3d.com/2022.3/Documentation/ScriptReference/FixtureSearch.html",
+                SEARCH_PAGE,
+            ]
+            .into_iter()
+            .map(|url| web_search::WebSearchResultItem {
+                url: url.into(),
+                title: "Fixture documentation".into(),
+                snippet: String::new(),
+                source: "fixture".into(),
+            })
+            .collect())
+        }
+
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn local_toc_and_search_tiers_are_strictly_ordered_and_scoped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let preset = knowledge::presets::find_engine_manual_preset("unity6").unwrap();
+            let base = knowledge::ensure_preset_knowledge_base(root.path(), &preset).unwrap();
+            knowledge::replace_toc_snapshot(
+                root.path(),
+                &base,
+                "fixture",
+                &[knowledge::presets::TocSeedEntry {
+                    symbol: "FixtureToc".into(),
+                    title: "FixtureToc".into(),
+                    url: TOC_PAGE.into(),
+                }],
+            )
+            .unwrap();
+            let make_ref = |activation_mode| knowledge::KnowledgeReference::Base {
+                kb_id: base.id.clone(),
+                index_revision: base.index_revision.clone(),
+                activation_mode,
+                preset_id: base.preset_id.clone(),
+            };
+            let exact = [make_ref(None)];
+            let active = [make_ref(Some("workspace_active".into()))];
+            let transport = FakeKnowledgeTransport::default();
+            let search_policy = || KnowledgeLookupPolicy::OfficialSearch {
+                provider: "bing".into(),
+            };
+            let result = search_knowledge_with_transport(
+                root.path(),
+                "FixtureToc",
+                &active,
+                None,
+                KnowledgeLookupPolicy::Local,
+                &transport,
+            )
+            .await
+            .unwrap();
+            assert!(result.hits.is_empty());
+            let result = search_knowledge_with_transport(
+                root.path(),
+                "FixtureToc",
+                &exact,
+                None,
+                search_policy(),
+                &transport,
+            )
+            .await
+            .unwrap();
+            assert!(result.hits.is_empty());
+            assert!(transport.requests.lock().unwrap().is_empty());
+            let result = search_knowledge_with_transport(
+                root.path(),
+                "FixtureToc",
+                &active,
+                None,
+                search_policy(),
+                &transport,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.attempted_tiers, ["local", "official_toc"]);
+            assert_eq!(result.hydrated_count, 1);
+            assert_eq!(
+                result.hits[0].citation.source_url.as_deref(),
+                Some(TOC_PAGE)
+            );
+            let result = search_knowledge_with_transport(
+                root.path(),
+                "FixtureToc",
+                &active,
+                None,
+                search_policy(),
+                &transport,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.attempted_tiers, ["local"]);
+            let result = search_knowledge_with_transport(
+                root.path(),
+                "FixtureSearch",
+                &active,
+                None,
+                KnowledgeLookupPolicy::OfficialToc,
+                &transport,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.attempted_tiers, ["local", "official_toc"]);
+            assert!(result.hits.is_empty());
+            let result = search_knowledge_with_transport(
+                root.path(),
+                "FixtureSearch",
+                &active,
+                None,
+                search_policy(),
+                &transport,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.attempted_tiers,
+                ["local", "official_toc", "official_search"]
+            );
+            assert_eq!(result.hydrated_count, 1);
+            assert_eq!(
+                result.hits[0].citation.source_url.as_deref(),
+                Some(SEARCH_PAGE)
+            );
+            assert_eq!(
+                *transport.requests.lock().unwrap(),
+                [TOC_PAGE, "search", SEARCH_PAGE]
+            );
+        });
+    }
 }
 
 /// Delete a protocol package folder without trusting persisted relative paths.
@@ -13021,6 +13723,11 @@ pub fn run() {
             clear_pty_buffer,
             get_pty_status,
             run_command,
+            unity_editor::unity_create_scene,
+            unity_editor::unity_compile_project,
+            unity_editor::unity_probe_editor,
+            unity_editor::unity_test_project,
+            unity_editor::cancel_unity_editor_operation,
             browser_evaluate,
             computer_use,
             shell_permission_preflight,
@@ -13071,6 +13778,8 @@ pub fn run() {
             compare_and_swap_legacy_session_file,
             cleanup_legacy_image_studio_outputs,
             knowledge_list_bases,
+            knowledge_list_presets,
+            knowledge_bootstrap_preset,
             knowledge_create_base,
             knowledge_set_base_enabled,
             knowledge_delete_base,

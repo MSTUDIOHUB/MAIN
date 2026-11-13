@@ -50,7 +50,7 @@ export const SUBMIT_PLAN_CANDIDATE_TOOL_NAME = "submit_plan_candidate";
 export const RUN_COMMAND_SHELL_CONTRACT = [
   "This tool uses a restricted shell parser. Use literal arguments and the cwd field instead of cd.",
   "Shell variable expansion, command substitution, nested shells, and unquoted line breaks are rejected; quoted multiline code or data may be passed as one literal argument.",
-  "For batches, submit separate tool calls with literal paths and arguments.",
+  'Use glob_search, grep_search, or a quoted pattern with find -name instead of shell-expanded paths. Submit independent checks separately so a no-match exit cannot skip them.',
 ].join(" ");
 
 const PLAN_EXPECTED_SCALAR_SCHEMA = {
@@ -863,12 +863,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "knowledge_search",
-      description: "在用户本条消息用 # 选定的资料范围内检索，返回正文片段和来源引用。不能访问未选择的资料。",
+      description: "在用户本条消息用 # 选定的资料范围或当前工作区已启用的官方引擎代码手册（Unity 6 / 团结引擎 / UE6 Verse）内检索，返回正文片段和来源引用。支持本地索引、TOC 目录按需水合与受控官方站点联网兜底。",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "用户问题或要检索的关键词/概念" },
+          query: { type: "string", description: "用户问题或要检索的 API 类名/函数签名/概念" },
           limit: { type: "number", description: "最多返回多少个片段，默认 8，最多 16" },
+          allow_web_fallback: { type: "boolean", description: "仅当前轮已启用联网搜索时生效。设为 true 且本地与官方目录均未命中时，可使用搜索服务查找官方文档。" },
         },
         required: ["query"],
       },

@@ -21,20 +21,34 @@ export async function prepareKnowledgeContext(input: {
   if (!references) throw new Error("INVALID_KNOWLEDGE_REFERENCES");
   if (!references.length) return undefined;
   input.signal.throwIfAborted();
-  const query = input.query.trim() || references.map(ref => ref.label || "").filter(Boolean).join(" ") || "资料概览";
+  const remainingTokens = input.budget
+    ? Math.max(0, input.budget.inputBudget - input.reservedInputTokens)
+    : 8_192;
+  const maxChars = Math.max(0, Math.min(input.budget?.readWindowChars ?? 12_000, remainingTokens));
+  const explicitRefs = references.filter(
+    (ref) => !(ref.kind === "base" && ref.activationMode === "workspace_active"),
+  );
+  if (explicitRefs.length === 0) {
+    return freezeKnowledgeData({
+      modelContextCharBudget: maxChars,
+      state: "standby",
+      query: "",
+      references,
+      hits: Object.freeze([]),
+      omittedHits: 0,
+      note: "Active engine manual knowledge base is in standby (zero pre-turn token injection). Call knowledge_search on demand.",
+    });
+  }
+  const query = input.query.trim() || explicitRefs.map(ref => ref.label || "").filter(Boolean).join(" ") || "资料概览";
   try {
     const search = dependencies.search || (async (text, scope, limit) => {
       const { knowledgeSearch } = await import("../lib/ipc");
-      return knowledgeSearch(text, [...scope], limit);
+      return knowledgeSearch(text, scope, limit, { mode: "local" }, input.signal);
     });
-    const result = await search(query, references, 6);
+    const result = await search(query, explicitRefs, 6);
     input.signal.throwIfAborted();
-    const remainingTokens = input.budget
-      ? Math.max(0, input.budget.inputBudget - input.reservedInputTokens)
-      : 8_192;
     // The final decision-view budget still accounts for complete prompts and schemas.
     // RAG uses at most half the currently available input and one shared read window.
-    const maxChars = Math.max(0, Math.min(input.budget?.readWindowChars ?? 12_000, remainingTokens));
     const hits: KnowledgeContextHit[] = [];
     let used = query.length + 1_024;
     for (const hit of result.hits) {

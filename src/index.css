@@ -50,7 +50,7 @@
 
 .right-panel-shell {
   display: flex;
-  width: var(--right-panel-width, 450px);
+  width: var(--panel-drag-width, var(--right-panel-width, 450px));
 }
 
 .right-panel-resizer {
@@ -508,6 +508,10 @@ html[data-theme="light"] #root {
 [data-theme="light"] .bg-\[\#2b2b2d\] { background-color: #e4e4e7 !important; }
 [data-theme="light"] .bg-\[\#173522\] { background-color: #dcfce7 !important; }
 [data-theme="light"] .bg-\[\#3a1d1f\] { background-color: #fee2e2 !important; }
+[data-theme="light"] .bg-red-950\/30 { background-color: #fef2f2 !important; }
+[data-theme="light"] .hover\:bg-red-950\/40:hover { background-color: #fee2e2 !important; }
+[data-theme="light"] .bg-emerald-950\/60 { background-color: #dcfce7 !important; }
+[data-theme="light"] .bg-\[\#0d1322\]\/60 { background-color: #eff6ff !important; }
 [data-theme="light"] .bg-\[\#1b1f26\] { background-color: #eef2ff !important; }
 [data-theme="light"] .bg-\[\#181111\] { background-color: #fff1f2 !important; }
 [data-theme="light"] .bg-\[\#2e1f0f\] { background-color: #ffedd5 !important; }
@@ -544,6 +548,9 @@ html[data-theme="light"] #root {
 [data-theme="light"] .border-\[\#2f2f32\] { border-color: #d4d4d8 !important; }
 [data-theme="light"] .border-\[\#7f1d1d\] { border-color: #fca5a5 !important; }
 [data-theme="light"] .border-\[\#991b1b\] { border-color: #fca5a5 !important; }
+[data-theme="light"] .border-red-900\/60 { border-color: #fca5a5 !important; }
+[data-theme="light"] .border-red-950 { border-color: #fca5a5 !important; }
+[data-theme="light"] .border-emerald-800\/60 { border-color: #86efac !important; }
 [data-theme="light"] .border-\[\#292524\] { border-color: #fed7aa !important; }
 [data-theme="light"] .border-\[\#3f1f1f\] { border-color: #fecaca !important; }
 [data-theme="light"] .border-\[\#1d4ed8\]\/18 { border-color: rgba(37, 99, 235, 0.22) !important; }
@@ -574,6 +581,8 @@ html[data-theme="light"] #root {
 [data-theme="light"] .text-\[\#f48771\] { color: #dc2626 !important; }
 [data-theme="light"] .text-\[\#fb7185\] { color: #e11d48 !important; }
 [data-theme="light"] .text-\[\#f87171\] { color: #dc2626 !important; }
+[data-theme="light"] .text-red-300 { color: #b91c1c !important; }
+[data-theme="light"] .text-emerald-300 { color: #047857 !important; }
 [data-theme="light"] .text-\[\#fb923c\] { color: #c2410c !important; }
 [data-theme="light"] .text-\[\#fbbf24\] { color: #92400e !important; }
 [data-theme="light"] .text-\[\#fcd34d\] { color: #92400e !important; }

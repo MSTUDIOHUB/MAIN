@@ -48,6 +48,7 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
       task: (request) => {
         input.ports.logStoreEvent("runtime_v2_provider_request_opened", {
           turnId: input.command.run.turnId, runId: input.command.run.runId,
+          commandKey: input.command.idempotencyKey,
           phase: input.command.phase, mode: input.command.payload.mode,
           transport: null, allowedToolNames: [], hasFallback: false,
           timeoutMs: request.timeoutMs ?? null,

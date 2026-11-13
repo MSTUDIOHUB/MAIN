@@ -17,6 +17,7 @@ const WORKSPACE_REQUIRED_TOOL_NAMES: ReadonlySet<string> = new Set([
   "replace_in_file",
   "write_file",
   "apply_patch",
+  "unity_create_scene",
   "git_status",
   "git_diff",
   "delete_workspace_path",

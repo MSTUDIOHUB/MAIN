@@ -71,6 +71,9 @@ export type WorkspaceTurnQueueCommand =
       readonly terminalOwner: WorkspaceTurnTerminalOwner;
     })
   | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueEntryIdentity & {
+      readonly type: "promote_to_guidance";
+    })
+  | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueEntryIdentity & {
       /** Persistence failed; discard only the exact still-persisting entry. */
       readonly type: "rollback";
     });
@@ -662,11 +665,12 @@ export function reduceWorkspaceTurnQueue(
       ) return rejected(state, "terminal_owner_mismatch", head);
       return applied(state, command.at, Object.freeze(state.entries.slice(1)), head);
     }
+    case "promote_to_guidance":
     case "rollback": {
       const index = state.entries.findIndex((entry) => entryIdentityMatches(entry, command));
       if (index < 0) return rejected(state, "entry_not_found");
       const entry = state.entries[index];
-      if (entry.status !== "persisting") {
+      if (entry.status !== (command.type === "promote_to_guidance" ? "queued" : "persisting")) {
         return rejected(state, "entry_state_conflict", entry);
       }
       return applied(

@@ -1,7 +1,7 @@
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions, type TurnCapability } from "../../lib/turnCapabilities";
 import { classifyKnownBuiltInTool, type ToolRiskLevel } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
-import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES, RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 
@@ -30,12 +30,13 @@ export function runtimeV2ForbiddenToolCapability(input: {
   readonly toolName: string;
   readonly risk: ToolRiskLevel | null;
   readonly source?: "built_in" | "mcp" | "skill" | null;
+  readonly editorObservation?: boolean;
 }): TurnCapability | null {
   const mutation = isWorkspaceMutationToolName(input.toolName);
   const opaque = !mutation && ["shell", "external_write", "browser_control", "desktop_control", "destructive"].includes(input.risk || "");
   for (const restriction of input.restrictions) {
     if (restriction === "workspace_read" && (
-      RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(input.toolName) ||
+      RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(input.toolName) || RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(input.toolName) || input.editorObservation ||
       input.risk === "local_file_read" || opaque
     )) return restriction;
     if (restriction === "workspace_write" && (
@@ -55,4 +56,13 @@ export function runtimeV2BuiltinCapabilityRestriction(
   restrictions: readonly TurnCapability[], toolName: string,
 ): TurnCapability | null {
   return runtimeV2ForbiddenToolCapability({ restrictions, toolName, risk: classifyKnownBuiltInTool(toolName), source: "built_in" });
+}
+
+
+export function runtimeV2KnowledgeMayFetch(
+  restrictions: readonly TurnCapability[],
+  approvalRequired: readonly TurnCapability[],
+): boolean {
+  return !runtimeV2BuiltinCapabilityRestriction(restrictions, "web_fetch") &&
+    !runtimeV2BuiltinCapabilityRestriction(approvalRequired, "web_fetch");
 }

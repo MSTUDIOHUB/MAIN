@@ -18,6 +18,8 @@ interface LaneEntry {
   id: string;
   agentKind: ModelLaneAgentKind;
   subagentId?: string;
+  parentRunId?: string;
+  optionalOverlap?: true;
   admittedAt: number;
   firstTokenSeen: boolean;
   pressureHandler?: (error: Error) => void;
@@ -42,6 +44,7 @@ interface ModelLaneState {
   requestLimitCeiling: number;
   requestLimitConfigured: boolean;
   maxConfirmedActiveRequests: number;
+  maxConfirmedOverlappingChildren: number;
   active: LaneEntry[];
   queue: LaneWaiter[];
   degradedUntil: number;
@@ -57,7 +60,7 @@ interface ModelLaneState {
   drainRequested: boolean;
   safeSubagentOverlapSamples: number;
   lastSafeSubagentOverlapAt: number;
-  lastQueueReason: "lane_full" | "cold_start_first_token" | "memory_reserve" | "memory_probe_unavailable" | null;
+  lastQueueReason: "lane_full" | "waiting_for_parent" | "cold_start_first_token" | "memory_reserve" | "memory_probe_unavailable" | null;
 }
 
 export interface ModelLaneBurstAdmission {
@@ -81,6 +84,7 @@ export interface ModelLaneCapacityObservation {
   readonly configured: boolean;
   readonly requestLimitCeiling: number;
   readonly maxConfirmedActiveRequests: number;
+  readonly maxConfirmedOverlappingChildren: number;
   /** Current provider-request admission limit, including the parent. */
   readonly maxActiveRequests: number;
   /** Whether provider calls can overlap or must take turns on this lane. */
@@ -99,8 +103,10 @@ function abortError(): Error {
   return error;
 }
 
-function pressureError(reason: string): Error {
-  return new Error(`SUBAGENT_MEMORY_PRESSURE_DEGRADED: ${reason}`);
+export class ModelLaneResourceInterruption extends Error {
+  constructor(readonly causeKind: "memory" | "provider_capacity", reason: string) {
+    super(`SUBAGENT_MEMORY_PRESSURE_DEGRADED: ${reason}`);
+  }
 }
 
 function isCapacityFailure(error: unknown): boolean {
@@ -150,13 +156,15 @@ function laneLimit(state: ModelLaneState): number {
 }
 
 function recordConfirmedOverlap(state: ModelLaneState): void {
-  const confirmed = state.active.filter(
-    (entry) => entry.firstTokenSeen,
-  ).length;
+  const confirmed = state.active.filter(entry => entry.firstTokenSeen);
   state.maxConfirmedActiveRequests = Math.max(
     state.maxConfirmedActiveRequests,
-    confirmed,
+    confirmed.length,
   );
+  for (const parent of confirmed.filter(entry => entry.agentKind === "parent")) {
+    state.maxConfirmedOverlappingChildren = Math.max(state.maxConfirmedOverlappingChildren,
+      confirmed.filter(entry => entry.agentKind === "subagent" && entry.parentRunId === parent.parentRunId).length);
+  }
 }
 
 function newestSubagent(state: ModelLaneState): LaneEntry | null {
@@ -165,7 +173,7 @@ function newestSubagent(state: ModelLaneState): LaneEntry | null {
     .sort((a, b) => b.admittedAt - a.admittedAt)[0] || null;
 }
 
-function degradeLane(state: ModelLaneState, reason: string): boolean {
+function degradeLane(state: ModelLaneState, reason: string, causeKind: "memory" | "provider_capacity" = "memory"): boolean {
   state.degradedUntil = Date.now() + DEGRADE_DURATION_MS;
   state.safeSubagentOverlapSamples = 0;
   state.lastSafeSubagentOverlapAt = 0;
@@ -177,7 +185,7 @@ function degradeLane(state: ModelLaneState, reason: string): boolean {
     subagentId: child.subagentId || null,
     agentKind: child.agentKind,
   });
-  child?.pressureHandler?.(pressureError(reason));
+  child?.pressureHandler?.(new ModelLaneResourceInterruption(causeKind, reason));
   return !!child;
 }
 
@@ -185,6 +193,7 @@ async function sampleLaneMemory(
   state: ModelLaneState,
   requestTokenBudget: number,
   phase: "admission" | "overlap",
+  candidate?: LaneEntry,
 ): Promise<boolean> {
   try {
     const memory = await memoryReader();
@@ -203,8 +212,9 @@ async function sampleLaneMemory(
       observedOverlapDropBytes,
     );
     const belowReserve = memory.available_bytes < reserve;
-    state.lowMemorySamples = belowReserve ? state.lowMemorySamples + 1 : 0;
-    const action = memory.available_bytes < critical || state.lowMemorySamples >= 2
+    if (phase === "overlap") state.lowMemorySamples = belowReserve && state.active.length > 1 ? state.lowMemorySamples + 1 : 0;
+    const criticalPressure = memory.available_bytes < critical;
+    const action = (criticalPressure || state.lowMemorySamples >= 2) && !(phase === "admission" && candidate?.optionalOverlap)
       ? "degrade"
       : belowReserve ? "hold" : "sample";
     recordConfirmedOverlap(state);
@@ -221,7 +231,7 @@ async function sampleLaneMemory(
     const shouldLog = phase === "admission" || action !== "sample" ||
       state.overlapSampleCount === 1 || state.overlapSampleCount % 15 === 0;
     if (shouldLog) {
-      const owner = state.active[0];
+      const owner = candidate || state.active[0];
       owner?.onDebugEvent?.("memory_pressure_sample", {
         laneKey: state.laneKey,
         phase,
@@ -248,7 +258,7 @@ async function sampleLaneMemory(
       });
     }
     if (action === "degrade") {
-      degradeLane(state, memory.available_bytes < critical ? "critical memory threshold" : "sustained low memory");
+      degradeLane(state, criticalPressure ? "critical memory threshold" : "sustained low memory");
       return false;
     }
     return !belowReserve;
@@ -256,7 +266,7 @@ async function sampleLaneMemory(
     state.memoryUnavailable = true;
     state.safeSubagentOverlapSamples = 0;
     state.lastSafeSubagentOverlapAt = 0;
-    for (const entry of state.active) {
+    for (const entry of candidate ? [candidate] : state.active) {
       entry.onDebugEvent?.("memory_pressure_sample", {
         laneKey: state.laneKey,
         action: "hold",
@@ -296,26 +306,37 @@ function startMonitor(state: ModelLaneState, requestTokenBudget: number): void {
 }
 
 async function canAdmit(state: ModelLaneState, waiter: LaneWaiter): Promise<boolean> {
+  const activeParent = () => state.active.some(entry => entry.agentKind === "parent" &&
+    (!waiter.entry.parentRunId || entry.parentRunId === waiter.entry.parentRunId));
   if (state.active.length >= laneLimit(state)) {
     state.lastQueueReason = "lane_full";
+    return false;
+  }
+  if (waiter.entry.optionalOverlap && !activeParent()) {
+    state.lastQueueReason = "waiting_for_parent";
     return false;
   }
   if (!state.local || state.active.length === 0) {
     state.lastQueueReason = null;
     return true;
   }
-  if (!state.active.every((entry) => entry.firstTokenSeen)) {
+  const usingParentReserve = waiter.entry.agentKind === "parent" && state.active.every(entry => entry.optionalOverlap);
+  if (!usingParentReserve && !state.active.every((entry) => entry.firstTokenSeen)) {
     state.lastQueueReason = "cold_start_first_token";
     return false;
   }
-  const memoryAvailable = await sampleLaneMemory(state, waiter.requestTokenBudget, "admission");
-  if (!memoryAvailable && state.degradedUntil > Date.now() && waiter.entry.agentKind === "subagent") {
-    throw pressureError("model lane admission degraded after memory pressure");
+  const memoryAvailable = await sampleLaneMemory(state, waiter.requestTokenBudget, "admission", waiter.entry);
+  if (!memoryAvailable && state.degradedUntil > Date.now() && waiter.entry.agentKind === "subagent" && !waiter.entry.optionalOverlap) {
+    throw new ModelLaneResourceInterruption("memory", "model lane admission degraded after memory pressure");
+  }
+  if (waiter.entry.optionalOverlap && (!activeParent() || state.active.length >= laneLimit(state))) {
+    state.lastQueueReason = activeParent() ? "lane_full" : "waiting_for_parent";
+    return false;
   }
   state.lastQueueReason = memoryAvailable
     ? null
     : state.memoryUnavailable ? "memory_probe_unavailable" : "memory_reserve";
-  return memoryAvailable;
+  return memoryAvailable || usingParentReserve && state.degradedUntil <= Date.now() && !state.memoryUnavailable;
 }
 
 function scheduleAdmissionRetry(state: ModelLaneState): void {
@@ -336,20 +357,27 @@ async function drainLane(state: ModelLaneState): Promise<void> {
     do {
       state.drainRequested = false;
       while (state.queue.length > 0) {
-        const waiter = state.queue[0];
+        // Optional exploration must never be ahead of work that owns the
+        // parent's request slot. A blocked child keeps its place among peers.
+        const waiter = state.queue.find(item => !item.entry.optionalOverlap) || state.queue[0]!;
         let allowed = false;
         try {
           allowed = await canAdmit(state, waiter);
         } catch (error) {
-          state.queue.shift();
+          const index = state.queue.indexOf(waiter);
+          if (index < 0) continue;
+          state.queue.splice(index, 1);
           if (waiter.signal && waiter.onAbort) {
             waiter.signal.removeEventListener("abort", waiter.onAbort);
           }
-          waiter.reject(error instanceof Error ? error : pressureError(String(error || "admission failed")));
+          waiter.reject(error instanceof Error ? error : new Error(String(error || "Model lane admission failed")));
           continue;
         }
+        const index = state.queue.indexOf(waiter);
+        if (index < 0) continue;
+        if (waiter.entry.optionalOverlap && state.queue.some(item => !item.entry.optionalOverlap)) continue;
         if (!allowed) {
-          if (!waiter.queueLogged) {
+          if (!waiter.queueLogged || waiter.queueReason !== state.lastQueueReason) {
             waiter.queueLogged = true;
             waiter.queueReason = state.lastQueueReason;
             waiter.entry.onDebugEvent?.("model_lane_admission", {
@@ -372,7 +400,7 @@ async function drainLane(state: ModelLaneState): Promise<void> {
           if (state.active[0]?.firstTokenSeen) scheduleAdmissionRetry(state);
           break;
         }
-        state.queue.shift();
+        state.queue.splice(index, 1);
         if (waiter.signal && waiter.onAbort) {
           waiter.signal.removeEventListener("abort", waiter.onAbort);
         }
@@ -396,6 +424,8 @@ export async function acquireModelLane(input: {
   requestTokenBudget?: number;
   agentKind: ModelLaneAgentKind;
   subagentId?: string;
+  parentRunId?: string;
+  optionalOverlap?: true;
   signal?: AbortSignal;
   onDebugEvent?: (event: string, data: Record<string, unknown>) => void;
 }): Promise<ModelLaneLease> {
@@ -411,6 +441,7 @@ export async function acquireModelLane(input: {
     requestLimitCeiling,
     requestLimitConfigured: configuredLimit !== null,
     maxConfirmedActiveRequests: 0,
+    maxConfirmedOverlappingChildren: 0,
     active: [],
     queue: [],
     degradedUntil: 0,
@@ -436,6 +467,8 @@ export async function acquireModelLane(input: {
     id: `model-lane-${++sequence}`,
     agentKind: input.agentKind,
     subagentId: input.subagentId,
+    parentRunId: input.parentRunId,
+    ...(input.agentKind === "subagent" && input.optionalOverlap ? { optionalOverlap: true as const } : {}),
     admittedAt: Date.now(),
     firstTokenSeen: false,
     onDebugEvent: input.onDebugEvent,
@@ -461,6 +494,7 @@ export async function acquireModelLane(input: {
       const index = state.queue.indexOf(waiter);
       if (index >= 0) state.queue.splice(index, 1);
       reject(abortError());
+      void drainLane(state);
     };
     input.signal?.addEventListener("abort", waiter.onAbort, { once: true });
     state.queue.push(waiter);
@@ -500,7 +534,8 @@ export async function acquireModelLane(input: {
     setPressureHandler: (handler) => { entry.pressureHandler = handler; },
     reportFailure: (error) => {
       if (!isCapacityFailure(error)) return false;
-      return degradeLane(state, error instanceof Error ? error.message : String(error || "model request failure"));
+      const memory = /\b(?:oom|out of memory|memory allocation)\b/i.test(error instanceof Error ? error.message : String(error));
+      return degradeLane(state, memory ? "provider memory allocation failed" : "provider concurrency limit", memory ? "memory" : "provider_capacity");
     },
     release: () => {
       if (released) return;
@@ -533,6 +568,7 @@ export function getModelLaneCapacityObservation(
     configured: configuredLimit !== null,
     requestLimitCeiling,
     maxConfirmedActiveRequests,
+    maxConfirmedOverlappingChildren: state?.maxConfirmedOverlappingChildren || 0,
     maxActiveRequests,
     requestMode: maxActiveRequests > 1 ? "parallel" : "serialized",
     maxActiveSubagents: Math.max(0, maxActiveRequests - 1),

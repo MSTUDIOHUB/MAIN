@@ -1,3 +1,4 @@
+import { normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
 import type {
   SubmissionRuntimeContext,
   SubmissionRuntimeStorePorts,
@@ -17,6 +18,9 @@ import { withRuntimeV2ContextBudget } from "./runtimeV2/submissionContext";
 import { handleRuntimeV2IntentClarification } from "./runtimeV2/intentClarification";
 import { prepareKnowledgeContext } from "./prepareKnowledgeContext";
 import { estimateMessagesTokens } from "../lib/contextTrim";
+import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
+import { resolveActiveEngineKnowledgeReferences } from "../lib/engineManualBinding";
+import { mergeEngineNavigatorSkillsIntoCatalog } from "../lib/agentSkills";
 
 type SubmitRuntimeStoreGet = () => any;
 type SubmitRuntimeStoreSet = any;
@@ -68,14 +72,30 @@ export async function runSubmitRuntime(
     input.context,
     runtimeContextBudget,
   );
+  const rawExplicitReferences =
+    input.context.knowledgeReferences || input.context.options?.knowledgeReferencesSnapshot || [];
+  const explicitReferences = normalizeKnowledgeReferences(rawExplicitReferences);
+  const resolvedEngineManuals = explicitReferences
+    ? await resolveActiveEngineKnowledgeReferences({
+        workspace: normalizeTurnCapabilityRestrictions(input.context.capabilityRestrictions).includes("workspace_read")
+          ? undefined
+          : input.context.runWorkspace,
+        knowledgeBases: Array.isArray(input.get().knowledgeBases) ? input.get().knowledgeBases : [],
+        explicitReferences,
+      })
+    : null;
+  const effectiveReferences = resolvedEngineManuals ? resolvedEngineManuals.references : rawExplicitReferences;
   const knowledgeContext = await prepareKnowledgeContext({
-    references: input.context.knowledgeReferences || input.context.options?.knowledgeReferencesSnapshot || [],
+    references: effectiveReferences,
     query: turn?.userPrompt || "",
     budget: runtimeContextBudget,
     reservedInputTokens: estimateMessagesTokens(input.get().agentMessages || []),
     signal: input.context.abortCtrl.signal,
   });
-  const runtimeContext = { ...budgetedContext, knowledgeContext };
+  const skillCatalog = resolvedEngineManuals?.activePresetIds.length
+    ? mergeEngineNavigatorSkillsIntoCatalog(budgetedContext.skillCatalog, resolvedEngineManuals.activePresetIds)
+    : budgetedContext.skillCatalog;
+  const runtimeContext = { ...budgetedContext, knowledgeContext, skillCatalog };
   input.logStoreEvent("runtime_v2_context_budget_resolved", {
     turnId: input.context.turnId,
     runId: input.context.harnessRunId,

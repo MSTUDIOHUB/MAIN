@@ -20,6 +20,7 @@ export interface ProjectInitReviewModalProps {
   onCancel: () => void;
   onRegenerate: () => void | Promise<void>;
   onEditDraft?: (content: string) => void;
+  confirmLabel?: string;
 }
 
 type PreviewStatus = ProjectInitPreview["status"];
@@ -158,6 +159,7 @@ export default function ProjectInitReviewModal({
   onConfirm,
   onCancel,
   onRegenerate,
+  confirmLabel,
   onEditDraft,
 }: ProjectInitReviewModalProps) {
   const cancelButtonRef = useRef<HTMLButtonElement>(null);
@@ -166,7 +168,8 @@ export default function ProjectInitReviewModal({
   const isLight = themeMode === "light";
   const isBlack = themeMode === "black";
   const status = preview?.status ?? null;
-  const isReady = phase === "review" && !!preview?.proposed.trim() && (status === "ready_create" || status === "ready_update");
+  const isReady = phase === "review" && !!preview?.proposed.trim() &&
+    (status === "ready_create" || status === "ready_update" || (!!confirmLabel && status === "no_changes"));
   const isNoChange = status === "already_initialized" || status === "no_changes";
   const isCommitting = phase === "committing";
   const isTerminal = phase === "success" || (phase === "review" && isNoChange);
@@ -593,7 +596,7 @@ export default function ProjectInitReviewModal({
                   className="theme-bg theme-bg-hover rounded-lg px-4 py-2 text-[12px] font-semibold outline-none transition-opacity focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                   style={{ color: "var(--accent-contrast, #ffffff)" }}
                 >
-                  {isCommitting ? copy.committing : copy.confirm}
+                  {isCommitting ? copy.committing : confirmLabel || copy.confirm}
                 </button>
               )}
             </>

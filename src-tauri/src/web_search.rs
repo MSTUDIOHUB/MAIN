@@ -389,6 +389,10 @@ async fn fetch_text(url: &str, max_bytes: usize) -> Result<FetchedBody, String> 
     let response = crate::send_guarded_public_get(url, USER_AGENT, Duration::from_secs(15))
         .await
         .map_err(|error| format!("Network request failed: {error}"))?;
+    read_fetched_body(response, max_bytes).await
+}
+
+async fn read_fetched_body(response: Response, max_bytes: usize) -> Result<FetchedBody, String> {
     let status = response.status();
     if !status.is_success() {
         return Err(format!("HTTP request failed with status {status}"));
@@ -998,6 +1002,32 @@ fn github_title_from_url(url: &Url) -> String {
     url.path_segments()
         .and_then(|segments| segments.last().map(|s| s.to_string()))
         .unwrap_or_default()
+}
+
+pub(crate) async fn fetch_official_document(
+    url: &str,
+    preserve_markup: bool,
+    allows_url: &(dyn Fn(&Url) -> bool + Sync),
+) -> Result<WebFetchResponse, String> {
+    let response = crate::send_guarded_public_get_scoped(
+        url, USER_AGENT, Duration::from_secs(15), Some(allows_url),
+    )
+    .await?;
+    let body = read_fetched_body(response, MAX_RESPONSE_BYTES).await?;
+    let html = looks_like_html(&body.content_type, &body.text);
+    let title = if html { extract_html_title(&body.text) } else { String::new() };
+    let content = if preserve_markup || !html { body.text } else { html_to_text(&body.text) };
+    Ok(WebFetchResponse {
+        url: url.to_string(),
+        final_url: body.final_url,
+        title,
+        char_count: content.chars().count(),
+        content,
+        content_type: body.content_type,
+        truncated: body.truncated,
+        source: "official_document".into(),
+        retrieval: None,
+    })
 }
 
 pub async fn fetch_page_raw(url: &str) -> Result<WebFetchResponse, String> {

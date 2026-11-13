@@ -1,13 +1,7 @@
 import { expect, test } from "@playwright/test";
+import { installCapsuleFixtureStartup } from "./capsuleFixtureStartup";
 
-test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => {
-    if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
-      window.localStorage.clear();
-      window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
-    }
-  });
-});
+test.beforeEach(({ page }) => installCapsuleFixtureStartup(page));
 
 test("completed read tools stay grouped inside the continuous process timeline", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-collapse");
@@ -19,7 +13,10 @@ test("completed read tools stay grouped inside the continuous process timeline",
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
-  await expect(page.getByTestId("live-turn-process-toggle")).toHaveAttribute("aria-expanded", "true");
+  const toggle = page.getByTestId("live-turn-process-toggle");
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle.getByTestId("turn-activity-issues")).toContainText("失败 1");
+  await toggle.click();
   const steps = page.getByTestId("live-turn-step");
   // Successful reads, the failed read, the mutation and the later read retain
   // separate evidence/status groups rather than folding failure into success.

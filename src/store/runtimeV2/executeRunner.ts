@@ -1,3 +1,4 @@
+import { latestRuntimeV2Answer } from "../../lib/runtime-v2/providerAnswer";
 import {
   abortedAgentLoopOutcome,
 } from "../../lib/runOutcome";
@@ -18,9 +19,11 @@ import {
   runtimeV2ProviderRecoveryStallExpired,
   runtimeV2CheckpointWriteFailureReason,
   summarizeRuntimeV2ExecuteEvidence,
+  runtimeV2WorkspaceChangeReceipts,
   type RuntimeV2ProviderRecoveryStallLease,
 } from "../../lib/runtime-v2";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import { approvedPlanExecutionRepair, retryableUnityEditorCheck, unresolvedUnityEditorCheck } from "../../lib/runtime-v2/unityCompilation";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
@@ -51,10 +54,14 @@ import {
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
 import { restoreRuntimeV2SkillHistory } from "./executionSkillHistory";
 import { restoreRuntimeV2ExecutionHistory } from "./executionProviderHistory";
+import { projectFiniteValidationCommands } from "./executionProviderContext";
 import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import { pausedAgentLoopOutcome } from "../../lib/runOutcome";
 import { projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
-import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
+import { createRuntimeV2PlanReviewCommit, resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
+import { deriveProactiveCollaboration } from "./proactiveSubagents";
+import { isRuntimeV2EditorDiagnosticRepair } from "../../lib/runtime-v2/editorConsoleEvidence";
+import { checkApprovedPlanArtifact, checkCarriedWorkPlanTargets, resolveApprovedWorkPlanContinuation, verifyApprovedWorkPlanContinuation } from "./approvedPlanContinuation";
 import {
   resolveRuntimeV2ObjectiveAdmission,
   type RuntimeV2SubmissionContext,
@@ -118,6 +125,9 @@ export async function runSubmitRuntimeV2Execute(
     logStoreEvent: input.logStoreEvent,
   });
   const existing = getRuntimeV2Checkpoint(initialState, identity.turn);
+  const requestedContinuation = input.context.approvedPlanContinuation || turn.approvedPlanContinuation;
+  const continuationReference = requestedContinuation?.revise ? undefined : requestedContinuation;
+  const continuationSource = continuationReference && resolveApprovedWorkPlanContinuation(initialState, continuationReference, identity.turn);
   input = { ...input, context: { ...input.context,
     networkRead: normalizeNetworkRead(existing ? existing.aggregate.networkRead : turn.networkRead),
     ...(existing ? { knowledgeContext: existing.aggregate.knowledgeContext,
@@ -190,6 +200,7 @@ export async function runSubmitRuntimeV2Execute(
     },
   }, existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined, {
     abortSignal: input.context.abortCtrl.signal,
+    logEvent: input.logStoreEvent,
   });
   let providerRecoveryLease: RuntimeV2ProviderRecoveryStallLease | null = null;
   recordUserWait = (commandKey, requestId, waiting) => controller.recordUserWait(commandKey, requestId, waiting);
@@ -203,34 +214,38 @@ export async function runSubmitRuntimeV2Execute(
       input.logStoreEvent("runtime_v2_execute_admitted", {
         turnId: identity.turn.turnId,
         runId: identity.run.runId,
+        sessionKey: identity.turn.sessionKey,
         workspaceKey: identity.turn.workspaceKey,
-        strategy: "execute",
+        strategy: continuationReference ? "plan" : "execute",
+        completionRequirement: continuationReference ? null : admission.completionRequirement?.kind || null,
       });
       await controller.admit({
         turn: identity.turn,
         run: identity.run,
-        strategy: "execute",
-        objective: admission.objective,
+        strategy: continuationReference ? "plan" : "execute",
+        objective: continuationSource ? continuationSource.aggregate.objective.text : admission.objective,
+        completionRequirement: continuationSource ? undefined : admission.completionRequirement,
         networkRead: input.context.networkRead,
         knowledgeContext: input.context.knowledgeContext,
         workspaceInstructionContext: input.context.workspaceInstructionContext,
         capabilityRestrictions: admission.capabilityRestrictions,
         approvalRequiredCapabilities: admission.approvalRequiredCapabilities,
-        constraints: admission.constraints,
-        acceptanceCriteria: admission.acceptanceCriteria.map(
+        constraints: continuationSource ? continuationSource.aggregate.objective.constraints : admission.constraints,
+        acceptanceCriteria: continuationSource ? continuationSource.aggregate.objective.acceptanceCriteria : admission.acceptanceCriteria.map(
           (criterion) => criterion.text,
         ),
-        acceptanceCriterionIds: admission.acceptanceCriteria.map(
+        acceptanceCriterionIds: continuationSource ? continuationSource.aggregate.objective.acceptanceCriterionIds : admission.acceptanceCriteria.map(
           (criterion) => criterion.id,
         ),
         acceptanceEvidenceRequirements:
-          runtimeV2ExecuteAcceptanceEvidenceRequirements(
+          continuationSource ? continuationSource.aggregate.objective.acceptanceEvidenceRequirements : runtimeV2ExecuteAcceptanceEvidenceRequirements(
             admission.acceptanceCriteria,
           ),
-        initialPhase: isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "") || admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
+        initialPhase: continuationReference ? "planning" : isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "") || admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
       });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
+      await controller.resumeTerminalProjection();
       return createRuntimeV2RunnerSettlement(
         input.context,
         runtimeV2TerminalOutcomeToLegacy(terminal.resultKind, terminal.reason),
@@ -263,7 +278,72 @@ export async function runSubmitRuntimeV2Execute(
         },
       );
       await controller.reobserveAfterLegacyMigration();
-    } else {
+    }
+
+    if (continuationReference && !controller.snapshot().aggregate?.terminalOutcome) {
+      const current = controller.snapshot().aggregate!;
+      const signal = input.context.abortCtrl.signal;
+      const workspace = input.context.runWorkspace || "";
+      const en = input.context.phaseLanguage === "en";
+      const checkingStarted = Date.now();
+      if (!continuationSource || !workspace ||
+          current.objective.capabilityRestrictions?.includes("workspace_read") ||
+          current.objective.approvalRequiredCapabilities?.includes("workspace_read")) {
+        await controller.finishTerminal("blocked", en ? "The approved plan or permission for its file checks is no longer valid."
+          : "原计划的批准记录或文件核对权限已失效，请在 Plan 面板复核。");
+      } else if (approvedPlanExecutionRepair(continuationSource.aggregate)) {
+        await controller.finishTerminal("blocked", en ? "Review the pending repair in the Plan panel before continuing."
+          : "请先在 Plan 面板复核待批准的修复，再继续执行。");
+      } else {
+        const verified = current.workPlan?.status === "approved"
+          ? { changed: [
+              ...await checkApprovedPlanArtifact(continuationSource, signal),
+              ...await checkCarriedWorkPlanTargets(current, workspace, signal),
+            ] }
+          : await verifyApprovedWorkPlanContinuation(continuationSource, workspace, signal);
+        signal.throwIfAborted();
+        if ("changed" in verified && verified.changed.length) {
+          for (const [index, target] of verified.changed.entries()) {
+            await controller.recordObservation({ id: `approved-plan-drift:${index}`, kind: "tool", target });
+          }
+          const heading = en ? "Review these changes before continuing the approved plan."
+            : "继续执行前，请在 Plan 面板复核以下文件。";
+          await controller.finishTerminal("blocked", heading, [heading, "", ...verified.changed.map(target => `- ${target}`)].join("\n"));
+        } else if ("continuation" in verified &&
+            !resolveApprovedWorkPlanContinuation(input.get(), continuationReference, identity.turn)) {
+          await controller.finishTerminal("blocked", en ? "The approved plan changed during continuation checks."
+            : "核对期间原计划的批准状态已变化，请在 Plan 面板复核。");
+        } else if ("continuation" in verified) {
+          const commit = current.planReviewCommit || createRuntimeV2PlanReviewCommit({
+            plan: continuationSource.plan, turn: identity.turn, run: identity.run,
+            requestId: `runtime-v2-plan-continuation:${identity.run.runId}`, createdAt: Date.now(),
+          });
+          if (!current.workPlan) await controller.commitPlanContinuationEvent({
+            type: "work_plan.sealed", run: identity.run,
+            workPlan: { ...commit.authority, status: "pending_review" },
+            sealedPlan: continuationSource.plan, reviewCommit: commit, continuation: verified.continuation,
+          });
+          await controller.commitPlanContinuationEvent({
+            type: "work_plan.approved", run: identity.run,
+            workPlan: { ...commit.authority, status: "approved" },
+            continuationApprovalId: verified.continuation.source.approvalEventId,
+          });
+        }
+        const bound = controller.snapshot().aggregate;
+        if (bound?.planContinuation && bound.phase === "preparing" && !bound.terminalOutcome) {
+          await controller.changePhase("observing", "Approved WorkPlan continuation verified against current file versions.");
+        }
+      }
+      input.logStoreEvent("approved_work_plan_continuation_checked", {
+        turnId: identity.turn.turnId, runId: identity.run.runId,
+        sourceTurnId: continuationReference.turn?.turnId ?? null, elapsedMs: Date.now() - checkingStarted,
+        outcome: controller.snapshot().aggregate?.terminalOutcome?.resultKind ?? "verified",
+      });
+    }
+
+    if (existing && !controller.snapshot().aggregate?.terminalOutcome &&
+        existing.migrationDisposition !== "active_uncontracted_mutation" &&
+        existing.migrationDisposition !== "active_unmodified") {
       restoreRuntimeV2SkillHistory(live, existing.aggregate, identity.run);
       input.logStoreEvent("runtime_v2_execute_resuming_scheduled", {
         turnId: identity.turn.turnId,
@@ -271,6 +351,7 @@ export async function runSubmitRuntimeV2Execute(
         checkpointRevision: existing.revision,
         scheduledKind: existing.aggregate.scheduledCommands[0]?.kind || null,
       });
+      await controller.restoreProactiveSubagents();
       await controller.resumeScheduled();
     }
 
@@ -280,7 +361,9 @@ export async function runSubmitRuntimeV2Execute(
       if (before.run?.status === "paused") {
         if (before.run.blocker?.decision && before.run.blocker.decision !== "stop") {
           await controller.resumeRun(before.run.blocker.requestId);
-          live.messages.push({ role: "system", content: "The user requested a recheck of the paused prerequisite. Re-observe the exact prerequisite before retrying; no extra permissions or acceptance were granted." });
+          live.messages.push({ role: "system", content: before.run.blocker.decisionSource === "editor_reconnected"
+            ? "The exact project Editor became available. Recheck the committed files under the existing authority."
+            : "The user requested a recheck of the paused prerequisite. Re-observe the exact prerequisite before retrying; no extra permissions or acceptance were granted." });
           input.set((state: any) => ({ activeActionRequest: null, conversationTurns: state.conversationTurns.map((turn: any) => turn.id === before.turn.turnId ? { ...turn, status: "executing", runtimeOutcome: undefined } : turn) }));
           continue;
         }
@@ -298,11 +381,23 @@ export async function runSubmitRuntimeV2Execute(
         now: Date.now(),
       });
       if (live.permissionRejection) {
+        for (const [index, target] of (live.permissionRejection.continuationDriftTargets || []).entries()) {
+          await controller.recordObservation({ id: `approved-plan-drift:${index}`, kind: "tool", target });
+        }
         await controller.driveOnce({
           resultKind: "blocked",
           resultReason: live.permissionRejection.reason,
           finalMarkdown: live.permissionRejection.finalMarkdown,
         });
+        continue;
+      }
+      const repair = approvedPlanExecutionRepair(before);
+      if (repair) {
+        const heading = input.context.phaseLanguage === "en"
+          ? "The next fix requires a scoped Plan revision. Review it in the Plan panel."
+          : "下一步需要修订已批准的范围，请在 Plan 面板复核。";
+        await controller.driveOnce({ resultKind: "blocked", resultReason: heading,
+          finalMarkdown: [heading, `\`${repair.target.replace(/\x60/g, "")}\``, repair.diagnostic].filter(Boolean).join("\n\n") });
         continue;
       }
       if (
@@ -332,7 +427,7 @@ export async function runSubmitRuntimeV2Execute(
       if (
         before.strategy === "plan" &&
         before.workPlan?.status === "approved" &&
-        !before.evidence.some((evidence) => evidence.kind === "mutation")
+        runtimeV2WorkspaceChangeReceipts(before).length === 0
       ) {
         const freshness = deriveRuntimeV2PlanSourceFreshness(before);
         const invalidTargets = freshness
@@ -349,6 +444,32 @@ export async function runSubmitRuntimeV2Execute(
           if (controller.snapshot().aggregate?.terminalOutcome) break;
           continue;
         }
+      }
+      // Persist the compiler operation after the successful write receipt,
+      // before the next provider decision or any pending test call.
+      if (!before.recovery.exhausted && await controller.driveOnce({ checkUnityCompilation: true })) continue;
+      const editorCheck = retryableUnityEditorCheck(before);
+      const finishedProviderWork = editorCheck && latestRuntimeV2Answer(before);
+      if (editorCheck && finishedProviderWork && !input.context.abortCtrl.signal.aborted && !before.recovery.exhausted) {
+        const en = input.context.phaseLanguage === "en";
+        const pending = before.run?.blocker;
+        if (pending?.reasonCode === "unity_editor_verification_pending" &&
+            pending.evidenceSequence === editorCheck.sequence && pending.decision === "continue") {
+          const reason = en ? "Changes retained. Editor verification is pending." : "修改已保留，等待 Editor 验证。";
+          await controller.driveOnce({ resultKind: "partial", resultReason: reason,
+            finalMarkdown: [reason, editorCheck.result.message].filter(Boolean).join("\n\n") });
+        } else {
+          await controller.pauseRun({
+            requestId: nextId("editor-verification"),
+            reasonCode: "unity_editor_verification_pending",
+            evidenceSequence: editorCheck.sequence,
+            message: en ? "The current Editor did not return a verified result. Recheck when the exact project Editor is ready, or finish with the changes retained."
+              : "当前 Editor 未返回可核验结果。对应项目的 Editor 就绪后可重新检查，也可以保留修改并结束本轮。",
+            options: ["recheck", "continue", "stop"],
+            independentWork: ["report_pending_editor_verification"],
+          });
+        }
+        continue;
       }
       const terminal = runtimeV2ExecuteTerminalDecision({
         aggregate: before,
@@ -419,11 +540,19 @@ export async function runSubmitRuntimeV2Execute(
       const subagentPolicy = resolveSubagentCapacityPolicy(
         input.get().config,
       );
+      const subagentPreference = input.context.turnInputContextSignals.subagentPreference;
+      const projectValidators = before.phase === "validating" && !isRuntimeV2EditorDiagnosticRepair(before) && providerRecoveryPressure?.reason === "non_actionable_response"
+        ? projectFiniteValidationCommands(input).filter(option => option.capability === "test") : [];
       const drove = await controller.driveOnce({
-        subagentPreference:
-          input.context.turnInputContextSignals.subagentPreference,
+        projectValidationRecovery: projectValidators.length === 1 ? projectValidators[0] : undefined,
+        subagentPreference,
         subagentCapacity: subagentPolicy.maxActiveRequests,
         subagentRequestMode: subagentPolicy.modelRequestMode,
+        proactiveCollaboration: deriveProactiveCollaboration({ state: before, preference: subagentPreference,
+          capacity: subagentPolicy.maxActiveRequests, requestMode: subagentPolicy.modelRequestMode,
+          baseline: input.context.projectBaselineContext, workspace: input.context.runWorkspace,
+          language: input.context.phaseLanguage, now: Date.now() }),
+        settledProactiveJobIds: [...live.childTelemetry].filter(([, telemetry]) => telemetry.closedAt !== null).map(([id]) => id),
       });
       if (!drove) {
         if (before.phase === "reviewing") {
@@ -470,12 +599,12 @@ export async function runSubmitRuntimeV2Execute(
       executionAuthorityKind: planCoverage ? "work_plan" : "direct_execute",
       executionAuthorityId:
         finalAggregate.sealedWorkPlan?.id || finalAggregate.turn.turnId,
-      verificationComplete: planCoverage
+      verificationComplete: !unresolvedUnityEditorCheck(finalAggregate) && (planCoverage
         ? planCoverage.allMutationTargetsCovered &&
           planCoverage.allRequiredValidationsPassed
         : executionEvidence.mutationCount > 0 &&
           runtimeV2DirectExecuteReadyForConclusion(finalAggregate) &&
-          executionEvidence.failedValidationCount === 0,
+          executionEvidence.failedValidationCount === 0),
       missingMutationTargets:
         planCoverage?.missingMutationTargets ||
         [],
@@ -536,9 +665,7 @@ export async function runSubmitRuntimeV2Execute(
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 1_000);
-      const hasMutation = aggregate.evidence.some(
-        (evidence) => evidence.kind === "mutation",
-      ) || live.hasExecutedMutationEffect;
+      const hasMutation = runtimeV2WorkspaceChangeReceipts(aggregate).length > 0 || live.hasExecutedMutationEffect;
       const resultKind = input.context.abortCtrl.signal.aborted
         ? "canceled"
         : hasMutation

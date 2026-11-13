@@ -51,6 +51,7 @@ import {
 } from "./turnEvents";
 import {
   projectSubagentRuns,
+  resolveSubagentCapacityPolicy,
   SUBAGENT_CLOSURE_SCHEMA_VERSION,
 } from "./subagents";
 import {
@@ -8748,12 +8749,13 @@ function seedRealOmlxPlanFlowScenario() {
     useAppStore.setState((state) => ({ config: {
       ...state.config, local: { ...state.config.local, toolProtocol },
     } }));
-  bridge.setRealMcpFixture = async (url: string) => {
+  bridge.setRealMcpFixture = async (url: string, allowFixtureEditorChecks = false) => {
     const servers = [{ name: "fixture", type: "http" as const, url, enabled: true }];
     useAppStore.getState().setMcpServers(servers);
     const { discoverAllMcpTools } = await import("./mcpClient");
     const discovered = await discoverAllMcpTools(servers, { forceRefresh: true });
     useAppStore.getState().setMcpDiscoveredTools(discovered.tools, discovered.toolServerMap);
+    if (allowFixtureEditorChecks) useAppStore.setState({ autoApproveTools: true, autoApproveToolScopes: ["workspace_write", "mcp_action"] });
     return discovered.tools.length;
   };
   bridge.rejectPendingTool = () => useAppStore.getState().resolveReview("reject");
@@ -9304,6 +9306,8 @@ function seedRealOmlxPlanFlowScenario() {
               status: event.status,
               evidence: event.evidence || [],
               receiptOrigin: event.receiptOrigin || null,
+              effectKind: event.effectKind || null,
+              ...(event.editorConsole ? { editorConsole: event.editorConsole } : {}),
             }
           : {}),
         ...(event.type === "validation.completed"
@@ -9408,6 +9412,7 @@ function seedRealOmlxPlanFlowScenario() {
         requestCount: runtimeV2SubagentIntervals.length,
         peakInFlight: runtimeV2SubagentPeakInFlight,
         hasRequestOverlap: runtimeV2SubagentPeakInFlight >= 2,
+        observedWithParent: resolveSubagentCapacityPolicy(state.config).confirmedOverlappingChildren,
       },
       terminal: {
         runCompletedCount: runtimeV2RunCompleted.length,

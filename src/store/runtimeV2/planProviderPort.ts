@@ -1,3 +1,4 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
@@ -41,10 +42,7 @@ import {
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { withRuntimeV2HardDeadline, withRuntimeV2ProgressDeadline } from "./hardDeadline";
-import {
-  normalizeRuntimeV2ProviderToolCalls,
-  runtimeV2ProviderToolArgumentViolation,
-} from "./executionProviderTools";
+import { normalizeRuntimeV2ProviderToolCalls, runtimeV2ProviderToolArgumentViolation } from "./executionProviderTools";
 import { PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE } from "./planCollaborationAcquisition";
 import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } from "../../lib/runtime-v2/lifecycle";
 import { planRequestMetrics } from "./planRequestMetrics";
@@ -78,18 +76,16 @@ export async function requestPlanModel(input: {
   readonly validationRepair?: { candidate: Record<string, unknown>; feedback: string; rejectedCommands: readonly string[] };
   readonly logStoreEvent: RuntimeV2PlanLog;
   readonly customTools?: readonly ToolDefinition[];
+  readonly focusedRevision?: boolean;
 }): Promise<RuntimeV2PlanProviderResult> {
-  const requiredCollaborationPending =
-    input.collaboration.collaborationRequired === true &&
-    input.collaboration.collaborationRequirementMet !== true;
+  const collaborationRequired = input.collaboration.collaborationRequired === true;
+  const collaborationRequirementMet = input.collaboration.collaborationRequirementMet === true;
+  const requiredCollaborationPending = collaborationRequired && !collaborationRequirementMet;
   const submissionStage = !requiredCollaborationPending && (
     input.submissionRepairPending || isPlanSubmissionStage(input.stage)
   );
   const budget = input.context.runtimeContextBudget;
-  const settings = deriveBudgetedStreamSettings(
-    input.get().config,
-    budget,
-  );
+  const settings = deriveBudgetedStreamSettings(input.get().config, budget);
   const requestedTransport = submissionStage && (!input.submissionRepairPending || input.explicitFallback)
     ? input.transport ?? "native_tool"
     : "native_tool";
@@ -109,19 +105,15 @@ export async function requestPlanModel(input: {
   const structuredResponse = transport === "structured_response";
   const responseFormat = structuredResponse ? input.validationRepair ? WORK_PLAN_VALIDATION_REPAIR_FORMAT : WORK_PLAN_STRUCTURED_RESPONSE_FORMAT : undefined;
   const textEnvelope = transport === "text_envelope";
-  const activeSubagents = Array.isArray(input.collaboration.activeSubagents)
-    ? input.collaboration.activeSubagents
-    : [];
+  const activeSubagents = Array.isArray(input.collaboration.activeSubagents) ? input.collaboration.activeSubagents : [];
   const remainingSubagentCapacity = Math.max(0, Math.floor(Number(input.collaboration.remainingSubagentCapacity) || 0));
   const collaborationAllowed = input.collaboration.collaborationAllowed === true;
   const planTools = selectPlanModelTools({
     submissionStage,
     submissionRepairPending: input.submissionRepairPending,
     collaborationAllowed,
-    collaborationRequired:
-      input.collaboration.collaborationRequired === true,
-    collaborationRequirementMet:
-      input.collaboration.collaborationRequirementMet === true,
+    collaborationRequired,
+    collaborationRequirementMet,
     remainingSubagentCapacity,
     activeSubagentCount: activeSubagents.length,
     baseTools: (input.customTools || planModelTools({
@@ -129,6 +121,7 @@ export async function requestPlanModel(input: {
       planPurpose: admittedPlanQuestionPurpose(input.ledger.snapshot()) ?? input.context.planPurpose,
       networkRead: normalizeNetworkRead(input.ledger.snapshot()?.networkRead),
     })).filter((tool) =>
+      (!input.focusedRevision || ["read_file", "load_skill", SUBMIT_WORK_PLAN_TOOL_NAME].includes(tool.function.name)) &&
       !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
         input.ledger.snapshot()?.objective.capabilityRestrictions,
       ), tool.function.name)
@@ -161,6 +154,7 @@ export async function requestPlanModel(input: {
     ...(input.repetitionFallback ? { planRepetitionFallback: true } : {}),
     ...(input.validationRepair ? { planValidationOnlyRepair: true } : {}),
   });
+  const requestTrace = { turnId: input.run.turnId, runId: input.run.runId, commandKey: command.idempotencyKey };
   let streamedText = "";
   const requestAbort = new AbortController();
   let requestTimedOut = false;
@@ -178,6 +172,7 @@ export async function requestPlanModel(input: {
   const reasoningOnlyTimeoutMs = input.customTools ? undefined : PLAN_REASONING_ONLY_TIMEOUT_MS;
   const activity = beginCapsuleModelActivity(input.run, command.idempotencyKey, requestAbort.signal);
   try {
+    appendRuntimeV2GuidanceHistory(input.messages, input.ledger.snapshot(), input.run, command.idempotencyKey);
     const planRequestMessages = input.validationRepair
       ? validationRepairTranscript({ ...input.validationRepair, objective: input.ledger.snapshot()?.objective, decisionJournal: buildPlanDecisionJournal(input.ledger.snapshot()) })
       : submissionStage
@@ -189,6 +184,9 @@ export async function requestPlanModel(input: {
           canAskPlanQuestions,
         })
       : boundedPlanTranscript(input.messages);
+    if (input.validationRepair) {
+      appendRuntimeV2GuidanceHistory(planRequestMessages, input.ledger.snapshot(), input.run, command.idempotencyKey);
+    }
     const unboundedRequestMessages = textEnvelope
       ? planTextEnvelopeTranscript(planRequestMessages, planTools, input.context.phaseLanguage)
       : planRequestMessages;
@@ -198,30 +196,29 @@ export async function requestPlanModel(input: {
     const requestMessages = budget
       ? boundReadOnlyHistory(unboundedRequestMessages, {
           contextLimit: budget.contextLimit,
-          reservedOutputTokens:
-            maxOutputTokens || budget.outputBudget,
+          reservedOutputTokens: maxOutputTokens || budget.outputBudget,
           tools: offeredTools,
           preserveUserMessages: true,
           compactSkillGuidance: true,
         })
       : projectPlanSkillGuidance(unboundedRequestMessages);
-    const requestMetrics = planRequestMetrics({ messages: requestMessages, tools: offeredTools,
-      responseFormat });
+    const requestMetrics = planRequestMetrics({ messages: requestMessages, tools: offeredTools, responseFormat });
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
-      turnId: input.run.turnId,
-      runId: input.run.runId,
+      ...requestTrace,
+      sessionKey: input.run.sessionKey,
+      guidanceIds: requestMessages.flatMap(message => message.runtimeGuidanceId ? [message.runtimeGuidanceId] : []),
       evidenceCount: input.ledger.snapshot()?.evidence.length || 0,
       stage: input.stage,
       compactRecovery: !!input.compactRecovery,
       submissionRepairPending: input.submissionRepairPending,
       canAskPlanQuestions,
       collaborationPreferred: input.collaboration.collaborationPreferred === true,
+      focusedRevision: input.focusedRevision === true,
+      proactiveSkipReason: input.collaboration.proactiveSkipReason ?? null,
       collaborationAllowed,
       remainingSubagentCapacity,
-      collaborationRequired:
-        input.collaboration.collaborationRequired === true,
-      collaborationRequirementMet:
-        input.collaboration.collaborationRequirementMet === true,
+      collaborationRequired,
+      collaborationRequirementMet,
       requiredSpawn,
       requestedTransport,
       transport,
@@ -230,6 +227,8 @@ export async function requestPlanModel(input: {
       repairReasoningDisabled,
       offeredToolCount: offeredTools.length,
       offeredToolNames: offeredTools.map((tool) => tool.function.name),
+      editorObservationTools: offeredTools.map(tool => tool.function.name).filter(name => name.startsWith("unity_mcp_")),
+      projectBaselineFingerprint: input.context.projectBaselineContext?.fingerprints.overall || null,
       catalogToolNames: advertisedToolNames,
       promptMessageCount: requestMessages.length,
       ...requestMetrics,
@@ -254,10 +253,10 @@ export async function requestPlanModel(input: {
           contextLimit: budget?.contextLimit,
           requestTokenBudget,
           agentKind: "parent",
+          parentRunId: input.run.runId,
           signal: requestAbort.signal,
           onDebugEvent: (event, data) => input.logStoreEvent(event, {
-            turnId: input.run.turnId,
-            runId: input.run.runId,
+            ...requestTrace,
             ...data,
           }),
         });
@@ -288,6 +287,7 @@ export async function requestPlanModel(input: {
                 onError: () => undefined,
                 onRequestDispatched: activity.requestDispatched,
                 onLifecycle: (event) => {
+                  if (event.phase === "first_chunk") input.logStoreEvent("runtime_v2_provider_request_timing", { ...requestTrace, stage: "first_chunk", elapsedMs: event.elapsedMs });
                   if (
                     event.phase === "first_chunk" ||
                     event.phase === "chunk_progress"

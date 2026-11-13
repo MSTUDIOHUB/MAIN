@@ -1,7 +1,9 @@
+import { knowledgeSearchTraceFields } from "../../lib/knowledgeReferences";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { getFileMetadata } from "../../lib/ipc";
 import { beginCapsuleToolActivity } from "../../lib/capsuleLiveActivity";
-import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
+import { runtimeV2BuiltinCapabilityRestriction, runtimeV2KnowledgeMayFetch } from "./executionCapabilityRestrictions";
+import { UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { boundKnowledgeToolResult, normalizeKnowledgeReferences } from "../../lib/knowledgeReferences";
@@ -66,7 +68,7 @@ export async function settlePlanTool(input: {
     readonly target: string;
     readonly message?: string;
   };
-}): Promise<void> {
+}): Promise<string> {
   const command = await schedulePlanTool(input.ledger, input.run, input.call);
   await input.ledger.settleCommand({
     type: "tool.completed",
@@ -82,6 +84,7 @@ export async function settlePlanTool(input: {
       : {}),
     ...(input.presentation ? { presentation: input.presentation } : {}),
   });
+  return command.idempotencyKey;
 }
 
 /** Use an already-observed window while repairing validation. The metadata
@@ -150,7 +153,9 @@ export async function executeReadOnlyPlanTool(input: {
   const review = runtimeV2BuiltinCapabilityRestriction(
     normalizeTurnApprovalCapabilities(input.ledger.snapshot()?.objective.approvalRequiredCapabilities), input.call.name,
   );
-  if (restriction || review || (knowledgeTool && (!knowledgeReferences?.length || ["stale", "error"].includes(input.ledger.snapshot()?.knowledgeContext?.state || ""))) ||
+  if (restriction || review ||
+    (UNITY_MCP_OBSERVATION_NAMES.has(input.call.name) && !input.context.workspaceMcpSnapshot?.planObservationsAllowed) ||
+    (knowledgeTool && (!knowledgeReferences?.length || ["stale", "error"].includes(input.ledger.snapshot()?.knowledgeContext?.state || ""))) ||
     (!PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name) && !(networkTool && networkRead.enabled))) {
     const content = restriction ? `TURN_CAPABILITY_RESTRICTED: ${restriction}` : review
       ? `TURN_TOOL_REVIEW_REQUIRED: ${review}. This Plan read adapter cannot approve an invocation; use Execute for individually reviewed tools.`
@@ -214,8 +219,18 @@ export async function executeReadOnlyPlanTool(input: {
       input.context.runSessionKey,
       {
         skillCatalog: input.context.skillCatalog,
+        workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
         ...(knowledgeTool ? { knowledgeReferences: knowledgeReferences || [] } : {}),
-        ...(networkTool ? { networkRead } : {}),
+        ...(networkTool || knowledgeTool ? { networkRead } : {}),
+        ...(input.call.name === "knowledge_search" ? {
+          knowledgeLookup: {
+            allowOfficialDocuments: runtimeV2KnowledgeMayFetch(
+              normalizeTurnCapabilityRestrictions(input.ledger.snapshot()?.objective.capabilityRestrictions),
+              normalizeTurnApprovalCapabilities(input.ledger.snapshot()?.objective.approvalRequiredCapabilities),
+            ),
+            signal: input.context.abortCtrl?.signal,
+          },
+        } : {}),
         ...(input.call.name === "tool_search" ? { toolCatalog: buildToolCatalog({
           builtInDefinitions: planModelToolCandidates({ ...input.context, networkRead, knowledgeContext: input.ledger.snapshot()?.knowledgeContext }).filter((tool) =>
             !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
@@ -331,7 +346,7 @@ export async function executeReadOnlyPlanTool(input: {
       : existingEvidence && repeatedObservation && !skillRead
         ? `[${evidenceEntry.id}] ${evidenceTarget}\nRuntime v2 reused this unchanged source and observation.`
         : `[${evidenceEntry.id}] ${evidenceTarget}\n${content}`;
-    await settlePlanTool({
+    const commandKey = await settlePlanTool({
       ledger: input.ledger,
       run: input.run,
       call: input.call,
@@ -354,7 +369,8 @@ export async function executeReadOnlyPlanTool(input: {
       turnId: input.run.turnId,
       runId: input.run.runId,
       toolName: input.call.name,
-      target: evidenceTarget,
+      sessionKey: input.run.sessionKey, commandKey,
+      target: input.call.name === "knowledge_search" ? null : evidenceTarget,
       evidenceId: !existingEvidence && repeatedObservation ? null : evidenceEntry.id,
       sourceVersion: version,
       observationVersion: await resolveRuntimeV2SourceEvidenceVersion({
@@ -369,6 +385,11 @@ export async function executeReadOnlyPlanTool(input: {
         newSkillChars: skillObservation.newChars,
         reusedSkillChars: skillRead.content.length - skillObservation.newChars,
       } : {}),
+    });
+    const knowledgeTrace = input.call.name === "knowledge_search" && knowledgeSearchTraceFields(output);
+    if (knowledgeTrace) input.logStoreEvent("runtime_v2_knowledge_retrieved", {
+      sessionKey: input.run.sessionKey, turnId: input.run.turnId, runId: input.run.runId,
+      commandKey, toolCallId: input.call.id, ...knowledgeTrace,
     });
     return;
   } catch (error) {

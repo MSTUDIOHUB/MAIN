@@ -1,6 +1,14 @@
 import { resolvePlanDocumentFromAggregate, resolvePlanDraftFromAggregate, resolveSessionPlanDocument } from "../lib/planDocumentRecords";
 import { normalizePlanDraftRecord } from "../lib/planDrafts";
 import { resolvePlanDraftContinuationSource } from "./planDraftContinuation";
+import {
+  getContinuableApprovedWorkPlan,
+  getApprovedWorkPlanContinuationCandidates,
+  resolveApprovedWorkPlanContinuation,
+  sameWorkPlanAuthority,
+} from "./runtimeV2/approvedPlanContinuation";
+import type { ApprovedWorkPlanContinuationReference } from "../lib/runtime-v2/contracts";
+import type { RuntimeV2PlanAuthority } from "../lib/runtime-v2/workPlan";
 import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
 import { retireRemovedFeatures } from "../lib/retiredFeatureMigration";
 import { resolveSessionModeAffinity, normalizeSessionModeAffinity, buildStandardSessionDefaultTitle, type SessionModeAffinity, type SessionModeAffinityLike } from "../lib/mainModes";
@@ -14,7 +22,7 @@ import { buildOpenAiCompatibleReasoningRequestExtras } from "../lib/streaming";
 // Zustand global state for Local Agent IDE
 // All state that was previously scattered as useState in the monolith lives here.
 import { create, type StateCreator } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 import type { AgentMessage, ContentPart } from "../lib/agentMessages";
 import type { ToolReviewDecision } from "../lib/toolReviewDecision";
 import type {
@@ -60,12 +68,12 @@ import {
   type HarnessRunMarker,
 } from "../lib/harnessCrashTelemetry";
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
-import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
+import { discoverAllMcpTools, setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { inspectGlobalSkillPackage, promoteLegacySkillPackage } from "../lib/ipc";
 import { globalSkillPackageId, migrateLegacySkillRegistrations, upsertGlobalSkillRegistration } from "../lib/globalSkillPackages";
 import { applyGithubSkillPackageCandidate, type GithubSkillUpdateCandidate, type GithubSkillUpdateResult } from "../lib/githubSkillUpdates";
 import { normalizeGithubSkillSource } from "../lib/githubSkillSource";
-import { resolveWorkspaceMcpView } from "../lib/workspaceMcp";
+import { bindWorkspaceUnityMcpView, resolveWorkspaceMcpView } from "../lib/workspaceMcp";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
@@ -75,8 +83,14 @@ import {
   type ResolvedInstructionSet,
 } from "../lib/instructions";
 import { resolveWorkspaceAdmissionSnapshot } from "../lib/workspaceAdmission";
-import { workspaceAdmissionIpcIo } from "../lib/projectBaselineIpc";
-import { parseProjectInitCommand } from "../lib/projectInit";
+import { projectBaselineIpcIo, workspaceAdmissionIpcIo } from "../lib/projectBaselineIpc";
+import { buildProjectBaselineContext } from "../lib/projectBaseline";
+import {
+  parseProjectInitCommand,
+  refreshApprovedProjectInitBlock,
+  type ManagedProjectRulesPreference,
+} from "../lib/projectInit";
+import { projectInitIpcIo } from "../lib/projectInitIpc";
 import {
   loadHooksConfig,
   type HookDefinition,
@@ -141,6 +155,10 @@ import {
   type RuntimeV2EmergencyTerminalEnvelopeMap,
 } from "../lib/runtime-v2/emergencyTerminal";
 import { createRuntimeV2CheckpointPort } from "./runtimeV2/checkpointPort";
+import { RUNTIME_V2_EVENT_SCHEMA_VERSION } from "../lib/runtime-v2/contracts";
+import { recoverRuntimeV2TerminalCheckpoint, runtimeV2TerminalProjection } from "../lib/runtime-v2/terminal";
+import { localizedRuntimeV2FinalProjection } from "./runtimeV2/projectionTerminal";
+import { isQueuedWorkspaceGuidanceEligible, isWorkspaceGuidanceText } from "./workspaceGuidance";
 import { createRuntimeV2ProjectionPort } from "./runtimeV2/projectionPort";
 import {
   approveAndDispatchRuntimeV2Plan,
@@ -282,7 +300,7 @@ import {
 import { resolveSessionTranscriptPageMetadata } from "../lib/sessionTranscriptPaging";
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
-  buildPersistedAppState,
+  createPersistedAppStateSelector,
   normalizePersistedSkills,
   sanitizeHydratedLockedComposerIntent,
   stripLegacyConfigFields,
@@ -423,6 +441,7 @@ import {
   normalizeLocalFileReadPath,
   normalizeMcpRoutingConfig,
   normalizeToolPermissionPolicy,
+  isRiskAutoExecutable,
 } from "../lib/toolCapabilities";
 import type {
   AppConfig,
@@ -1296,6 +1315,11 @@ export interface AppState {
   addMcpServer: (server: MCPServer) => void;
   removeMcpServer: (name: string) => void;
   setMcpDiscoveredTools: (tools: MCPTool[], toolServerMap: Record<string, string>) => void;
+  refreshMcpDiscovery: () => Promise<void>;
+  managedProjectRulesByWorkspace: Record<string, ManagedProjectRulesPreference>;
+  managedProjectRulesReviewNeeded: Record<string, boolean>;
+  setManagedProjectRulesPreference: (workspace: string, preference: ManagedProjectRulesPreference | null) => void;
+  refreshManagedProjectRules: (workspace: string) => Promise<void>;
 
 
   // IM Adapters
@@ -1448,6 +1472,8 @@ export interface AppState {
   setNormalizedStreamState: (state: NormalizedStreamState) => void;
   approvePlan: (approvalChoice?: string, expected?: PlanReviewResolutionIdentity) => void;
   resumePlanExecution: (instruction: string) => boolean;
+  continueApprovedWorkPlan: (sourceTurnId: string, authority: RuntimeV2PlanAuthority) => Promise<boolean>;
+  reviseApprovedWorkPlan: (sourceTurnId: string, authority: RuntimeV2PlanAuthority) => Promise<boolean>;
   rejectPlan: (expected?: PlanReviewResolutionIdentity) => boolean;
   rejectPlanAndDeleteFiles: (expected?: PlanReviewResolutionIdentity) => Promise<void>;
   showWorkflowMenu: boolean;
@@ -1538,6 +1564,7 @@ export interface AppState {
     reason?: string;
   }) => boolean;
   setActiveGuidance: (text: string, target: CanonicalRunIdentity) => boolean;
+  guideWorkspaceRun: (input: { text?: string; receiptId?: string; target: CanonicalRunIdentity }) => Promise<boolean>;
   clearActiveGuidance: () => void;
   consumeActiveGuidance: (target: CanonicalRunIdentity) => ActiveGuidance | null;
   acceptWorkspaceInstruction: (
@@ -1586,6 +1613,7 @@ export interface AppState {
     knowledgeReferencesSnapshot?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
     planPurpose?: "rules";
     sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
+    approvedPlanContinuation?: ApprovedWorkPlanContinuationReference;
 
       /** Opaque one-shot capability captured before visible UI state is cleared. */
 
@@ -1601,6 +1629,7 @@ export interface AppState {
       /** Reserved child run identity for an approved Plan handoff. */
       runIdOverride?: string;
       executionResumeRequestId?: string;
+      editorVerificationReconnect?: UserChoiceResolutionIdentity;
       /** Exact one-shot Plan execution attempt consumed only after Run admission. */
       planExecutionLeaseId?: string;
       planExecutionInstructionHash?: string;
@@ -4030,6 +4059,33 @@ export function normalizeSessionRuntimeSnapshot(
   let restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents).filter(
     (event) => !expectedContainerSessionKey || event.threadId === expectedContainerSessionKey,
   );
+  const canonicalFinalText = new Map<string, string>();
+  if (options?.coldRestore) {
+    const loadedTurns = new Map((snapshot.conversationTurns || []).map(turn => [turn.id, turn]));
+    for (const [turnId, persisted] of Object.entries(restoredRuntimeV2Checkpoints)) {
+      if (!persisted.aggregate.terminalOutcome) continue;
+      let checkpoint = persisted;
+      try {
+        checkpoint = recoverRuntimeV2TerminalCheckpoint(persisted);
+        restoredRuntimeV2Checkpoints[turnId] = checkpoint;
+      } catch {
+        logStoreEvent("runtime_v2_terminal_restore_pending", { turnId, revision: persisted.revision });
+      }
+      const aggregate = checkpoint.aggregate;
+      const turn = loadedTurns.get(turnId);
+      const run = aggregate.run?.identity;
+      const outcome = aggregate.terminalOutcome;
+      const projection = runtimeV2TerminalProjection(aggregate);
+      if (!turn || !run || !outcome || !projection) continue;
+      const summary = localizedRuntimeV2FinalProjection(aggregate, projection, /[^\x00-\x7F]/.test(turn.userPrompt || "") ? "zh" : "en").markdown;
+      canonicalFinalText.set(turnId, summary);
+      restoredRuntimeEvents = insertRestoredRunConclusionBeforeTurnTerminal({ runtimeEvents: restoredRuntimeEvents,
+        sessionKey: run.sessionKey, turnId, runId: run.runId, parentRunId: run.parentRunId,
+        timestampMs: outcome.completedAt, resultKind: outcome.resultKind, summary });
+      restoredRuntimeEvents = appendRuntimeEvent(restoredRuntimeEvents, withEventSchema({ type: "turn.completed",
+        threadId: run.sessionKey, turnId, timestampMs: outcome.completedAt, resultKind: outcome.resultKind }));
+    }
+  }
   for (
     const [turnId, envelope] of Object.entries(
       candidateEmergencyTerminalEnvelopes,
@@ -4572,6 +4628,7 @@ export function normalizeSessionRuntimeSnapshot(
           : null
       ),
       runSummary: restoredRunConclusion?.summary,
+      finalText: canonicalFinalText.get(loadedTurn.id),
       markerError: terminalMarkerOwnsTurn ? sanitizedHarnessRunMarker?.lastStreamError : null,
       markerReason: restoredRunAbort?.reason || (
         terminalMarkerOwnsTurn ? sanitizedHarnessRunMarker?.closeReason : null
@@ -5376,6 +5433,7 @@ function selectCurrentTurnIngress(state: AppState) {
   );
   return selectTurnIngressAvailability({
     checkpoint: turnId ? state.turnRuntimeCheckpoints?.[turnId] : null,
+    runtimeV2Checkpoint: turnId ? state.runtimeV2Checkpoints?.[turnId] : null,
     expectedOwner,
     strategy: resolveTurnStrategyFromIntent(ownerTurn?.intent, ownerTurn?.mode),
     runtimeOwnerObserved,
@@ -8006,6 +8064,8 @@ const sessionSyncMiddleware =
 // later A/B/C snapshot from overtaking an earlier one while still allowing
 // unrelated Sessions to persist independently.
 const workspaceInstructionAdmissionPipelines = new Map<string, Promise<void>>();
+const managedProjectRulesRefreshes = new Map<string, Promise<void>>();
+let automaticMcpDiscovery: { key: string; finishedAt?: number; promise: Promise<void> } | null = null;
 const workspaceInstructionProjectionOwner =
   createWorkspaceInstructionProjectionOwner();
 const workspaceInstructionAdmissionsByIdentity = new Map<
@@ -8067,6 +8127,64 @@ function enqueueWorkspaceInstructionAdmission<T>(
 }
 
 // ── The Store ─────────────────────────────────────────────────────────
+
+const pendingApprovedPlanFollowups = new Set<string>();
+const pendingWorkspaceGuidance = new Set<string>();
+
+async function submitApprovedWorkPlanFollowup(
+  get: () => AppState,
+  sourceTurnId: string,
+  authority: RuntimeV2PlanAuthority,
+  intent: "execute" | "plan",
+): Promise<boolean> {
+  const state = get();
+  const source = getContinuableApprovedWorkPlan(state, sourceTurnId);
+  if (!source || !sameWorkPlanAuthority(source.reference.authority, authority) ||
+      state.isGenerating || state.abortController || state.activeActionRequest?.status === "pending" ||
+      state.workspaceTurnQueue?.entries.length || !["idle", "error"].includes(state.agentStatus)) return false;
+  const key = source.reference.approvalEventId;
+  if (pendingApprovedPlanFollowups.has(key)) return false;
+  const en = state.config.language === "en";
+  pendingApprovedPlanFollowups.add(key);
+  try {
+    const result = await state.acceptWorkspaceInstruction({
+      text: intent === "execute" ? (en ? "Continue the approved plan" : "继续完成计划方案")
+        : (en ? "Review and revise the approved plan" : "复核变化并修订原计划"),
+      source: "plan_adjustment",
+      dispatchHints: JSON.parse(JSON.stringify({
+        approvedPlanContinuation: { ...source.reference, ...(intent === "plan" ? { revise: true } : {}) },
+        resolvedIntent: intent,
+        runtimeIntentOverride: intent,
+        preservePlanState: true,
+        subagentPreference: state.preferSubagents ? "preferred" : "unspecified",
+        turnTitle: en ? (intent === "execute" ? "Continue approved plan" : "Review plan changes")
+          : (intent === "execute" ? "继续完成计划方案" : "复核计划变化"),
+      })),
+    });
+    return result.accepted;
+  } finally {
+    pendingApprovedPlanFollowups.delete(key);
+  }
+}
+
+const selectLocalPreferences = createPersistedAppStateSelector();
+const jsonPreferencesStorage = createJSONStorage<Partial<AppState>>(() => window.localStorage);
+let lastPreferencesWrite: StorageValue<Partial<AppState>> | undefined;
+const localPreferencesStorage: PersistStorage<Partial<AppState>> | undefined = jsonPreferencesStorage && {
+  getItem(name) {
+    lastPreferencesWrite = undefined;
+    return jsonPreferencesStorage.getItem(name);
+  },
+  setItem(name, value) {
+    if (lastPreferencesWrite?.state === value.state && lastPreferencesWrite.version === value.version) return;
+    jsonPreferencesStorage.setItem(name, value);
+    lastPreferencesWrite = value;
+  },
+  removeItem(name) {
+    lastPreferencesWrite = undefined;
+    return jsonPreferencesStorage.removeItem(name);
+  },
+};
 
 export const useAppStore = create<AppState>()(
   persist(
@@ -8949,7 +9067,7 @@ export const useAppStore = create<AppState>()(
   mcpServers: DEFAULT_MCP_SERVERS,
   mcpDiscoveredTools: [],
   mcpToolServerMap: {},
-  setMcpServers: (servers) =>
+  setMcpServers: (servers) => {
     set((s) => {
       const normalizedServers = normalizeMcpServers(servers);
       const filtered = filterMcpDiscoveryForServers(s.mcpDiscoveredTools, s.mcpToolServerMap, normalizedServers);
@@ -8959,13 +9077,79 @@ export const useAppStore = create<AppState>()(
         mcpDiscoveredTools: filtered.tools,
         mcpToolServerMap: filtered.toolServerMap,
       };
-    }),
+    });
+    void get().refreshMcpDiscovery();
+  },
   addMcpServer: (server) => get().setMcpServers([...get().mcpServers, server]),
   removeMcpServer: (name) => get().setMcpServers(get().mcpServers.filter((sv) => sv.name !== name)),
   setMcpDiscoveredTools: (tools, toolServerMap) => {
     const filtered = filterMcpDiscoveryForServers(tools, toolServerMap, get().mcpServers);
     setMcpToolServerMap(filtered.toolServerMap);
     set({ mcpDiscoveredTools: filtered.tools, mcpToolServerMap: filtered.toolServerMap });
+  },
+  refreshMcpDiscovery: () => {
+    const servers = get().mcpServers;
+    const key = JSON.stringify(servers);
+    if (automaticMcpDiscovery?.key === key &&
+      (!automaticMcpDiscovery.finishedAt || Date.now() - automaticMcpDiscovery.finishedAt < 60_000)) {
+      return automaticMcpDiscovery.promise;
+    }
+    const manualSnapshot = get().mcpDiscoveredTools;
+    const promise = discoverAllMcpTools(servers, { useFailureBackoff: true, logFailures: false })
+      .then(result => {
+        if (JSON.stringify(get().mcpServers) !== key) return;
+        if (get().mcpDiscoveredTools === manualSnapshot) get().setMcpDiscoveredTools(result.tools, result.toolServerMap);
+        logStoreEvent("mcp_discovery_refreshed", {
+          configured: servers.length, discovered: result.tools.length,
+          connections: result.serverStatuses.map(status => ({ status: status.status, category: status.category, toolCount: status.toolCount })),
+        });
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (automaticMcpDiscovery?.promise === promise) automaticMcpDiscovery.finishedAt = Date.now();
+      });
+    automaticMcpDiscovery = { key, promise };
+    return promise;
+  },
+  managedProjectRulesByWorkspace: {},
+  managedProjectRulesReviewNeeded: {},
+  setManagedProjectRulesPreference: (workspace, preference) => {
+    if (!workspace || get().currentWorkspace !== workspace) return;
+    set(state => {
+      const preferences = { ...state.managedProjectRulesByWorkspace };
+      if (preference) preferences[workspace] = preference;
+      else delete preferences[workspace];
+      return {
+        managedProjectRulesByWorkspace: preferences,
+        managedProjectRulesReviewNeeded: { ...state.managedProjectRulesReviewNeeded, [workspace]: false },
+      };
+    });
+  },
+  refreshManagedProjectRules: async (workspace) => {
+    const preference = get().managedProjectRulesByWorkspace[workspace];
+    if (!preference || get().currentWorkspace !== workspace) return;
+    const pending = managedProjectRulesRefreshes.get(workspace);
+    if (pending) return pending;
+    const isCurrent = () => get().currentWorkspace === workspace &&
+      get().managedProjectRulesByWorkspace[workspace] === preference;
+    const refresh = refreshApprovedProjectInitBlock({ workspace, preference, io: projectInitIpcIo, isCurrent })
+      .then(result => {
+        if (!isCurrent() || !result) return;
+        if (result === "needs_review") {
+          set(state => ({ managedProjectRulesReviewNeeded: { ...state.managedProjectRulesReviewNeeded, [workspace]: true } }));
+        } else {
+          get().setManagedProjectRulesPreference(workspace, result);
+          get().bumpWorkspaceContentVersion();
+        }
+      })
+      .catch(() => {
+        if (isCurrent()) set(state => ({
+          managedProjectRulesReviewNeeded: { ...state.managedProjectRulesReviewNeeded, [workspace]: true },
+        }));
+      })
+      .finally(() => managedProjectRulesRefreshes.delete(workspace));
+    managedProjectRulesRefreshes.set(workspace, refresh);
+    return refresh;
   },
   // IM adapters
   feishuAdapterStatus: createDefaultFeishuAdapterRuntimeStatus(),
@@ -9534,7 +9718,9 @@ export const useAppStore = create<AppState>()(
           },
         }));
         invalidateWorkspaceTreeCache();
-        return get().refreshInstructionAndHookState()
+        void get().refreshMcpDiscovery();
+        return get().refreshManagedProjectRules(stablePath)
+          .then(() => get().refreshInstructionAndHookState())
           .finally(() => {
             workspaceClearSubmissionReplayNotReady.delete(resolveSessionWorkspaceKey(normalizedPath));
             workspaceClearSubmissionReplayNotReady.delete(resolveSessionWorkspaceKey(stablePath));
@@ -11918,6 +12104,10 @@ export const useAppStore = create<AppState>()(
         });
       }
     })(),
+  continueApprovedWorkPlan: (sourceTurnId, authority) =>
+    submitApprovedWorkPlanFollowup(get, sourceTurnId, authority, "execute"),
+  reviseApprovedWorkPlan: (sourceTurnId, authority) =>
+    submitApprovedWorkPlanFollowup(get, sourceTurnId, authority, "plan"),
   resumePlanExecution: (instruction) => {
     const state = get();
     const lifecycle = state.planLifecycle;
@@ -12312,8 +12502,10 @@ export const useAppStore = create<AppState>()(
       persist: (projected, isCurrent) => persistSubmitRuntimeProjection({ state: projected, scopeKey, sessionId: state.currentSessionId,
         sanitizeTaskBlocksForPersist, buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState, persistSessionRecord: saveProjectSession, isCurrent }),
       dispatch: (turn, requestId) => {
-        const strategy = normalizeRuntimeV2Checkpoint(get().runtimeV2Checkpoints?.[turn.id])?.aggregate.strategy;
-        const intent = strategy === "chat" ? "respond" : strategy === "analyze" ? "analyze" : strategy === "plan" ? "plan" : "execute";
+        const aggregate = normalizeRuntimeV2Checkpoint(get().runtimeV2Checkpoints?.[turn.id])?.aggregate;
+        const strategy = aggregate?.strategy;
+        const intent = strategy === "chat" ? "respond" : strategy === "analyze" ? "analyze" :
+          strategy === "plan" && !aggregate?.planContinuation ? "plan" : "execute";
         get().sendMessage(turn.userPrompt, undefined, { hidden: true, reuseCurrentTurn: true, turnIdOverride: turn.id,
           runIdOverride: identity.runId, executionResumeRequestId: requestId, resolvedIntent: intent, runtimeIntentOverride: intent,
           skipIntentResolution: true, submissionOriginSessionKey: identity.sessionKey });
@@ -12429,6 +12621,103 @@ export const useAppStore = create<AppState>()(
     });
     return true;
   },
+  guideWorkspaceRun: async ({ text, receiptId, target }) => {
+    const initial = get();
+    const scopeKey = resolveSessionWorkspaceKey(initial.currentWorkspace);
+    const sessionId = initial.currentSessionId;
+    const sessionKey = resolveSessionRuntimeKey(scopeKey, sessionId);
+    if (!sessionKey || sessionKey !== target.sessionKey || pendingWorkspaceGuidance.has(sessionKey)) return false;
+    const ingress = selectCurrentTurnIngress(initial);
+    if (!ingress.runtimeV2Guidance || ingress.guidancePending || !ingress.guidanceTarget ||
+      !isSameCanonicalRunIdentity(ingress.guidanceTarget, target)) return false;
+    const checkpoint = normalizeRuntimeV2Checkpoint(initial.runtimeV2Checkpoints?.[target.turnId], {
+      workspaceKey: scopeKey, sessionKey, sessionEpoch: target.sessionEpoch, turnId: target.turnId,
+    });
+    if (!checkpoint) return false;
+
+    const queue = initial.workspaceTurnQueue;
+    const entry = receiptId ? queue?.entries.find(candidate => candidate.receipt.receiptId === receiptId) : null;
+    if (receiptId && (!entry || !isQueuedWorkspaceGuidanceEligible(entry))) return false;
+    const guidanceText = entry?.instruction.payload.text || text;
+    if (!guidanceText || !isWorkspaceGuidanceText(guidanceText)) return false;
+    const eventId = createWorkspaceRuntimeIdentity("guidance");
+    const blockId = entry?.receipt.userBlockId ?? initial._nextTaskId();
+    const { sessionGet, sessionSet, getSessionRevisionToken, hasSessionRuntimeOwnership,
+      publishOwnerScopedRuntimeProjection } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
+      get, set, runSessionKey: sessionKey, borrowExistingRuntimeOwnership: true,
+      createRuntimeFromState: createSessionRuntimeFromState, pickRuntimePatch: pickSessionRuntimePatch,
+      normalizePatch: (patch) => normalizeTaskFlowPatchForConsumedReplyOptions(patch as Record<string, unknown>),
+      derivePlanStageFromArtifacts, createDefaultCurrentTurnState, logStoreEvent,
+    });
+    const port = createRuntimeV2CheckpointPort({
+      get: sessionGet, set: sessionSet, scopeKey, sessionId, getSessionRevisionToken,
+      sanitizeTaskBlocksForPersist, buildSessionRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
+      persistSessionRecord: saveProjectSession, publishOwnerScopedRuntimeProjection, logStoreEvent,
+      projectGuidance: (candidate: AppState, stage) => {
+        if (!hasSessionRuntimeOwnership() || (stage === "persist" &&
+          (candidate.currentTurnId !== target.turnId || candidate.abortController?.signal.aborted ||
+            getPendingSessionCancellation(sessionKey)))) return null;
+        const owner = candidate.conversationTurns.find(turn => turn.id === target.turnId);
+        if (!owner || (stage === "persist" && owner.runtimeOutcome?.status === "completed")) return null;
+        const currentQueue = candidate.workspaceTurnQueue;
+        if (stage === "persist" && currentQueue?.version !== queue?.version) return null;
+        const currentEntry = entry && currentQueue?.entries.find(item => item.receipt.receiptId === entry.receipt.receiptId);
+        if (entry && (!currentQueue || !currentEntry || !isQueuedWorkspaceGuidanceEligible(currentEntry) ||
+          workspaceInstructionEnvelopeIdentity(currentEntry) !== workspaceInstructionEnvelopeIdentity(entry))) return null;
+        const promoted = currentQueue && currentEntry ? reduceWorkspaceTurnQueue(currentQueue, {
+          type: "promote_to_guidance", expectedVersion: currentQueue.version,
+          at: Math.max(Date.now(), currentQueue.updatedAt),
+          clientSubmissionId: currentEntry.receipt.clientSubmissionId,
+          receiptId: currentEntry.receipt.receiptId, sessionKey, sessionEpoch: target.sessionEpoch,
+        }) : null;
+        if (promoted && promoted.disposition !== "applied") return null;
+        const sourceTurnId = currentEntry?.receipt.turnId;
+        const guidanceBlock: TaskBlock = {
+          id: blockId, turnId: target.turnId, type: "user", content: guidanceText,
+          runtimeGuidance: { id: eventId },
+        };
+        const conversationTurns = candidate.conversationTurns
+          .filter(turn => turn.id !== sourceTurnId)
+          .map(turn => turn.id === target.turnId ? { ...turn, blockIds: [...turn.blockIds, blockId] } : turn);
+        return {
+          ...(promoted ? { workspaceTurnQueue: promoted.state } : {}),
+          taskFlow: [...candidate.taskFlow.filter(block => block.turnId !== sourceTurnId || !sourceTurnId), guidanceBlock],
+          conversationTurns,
+          ...resolveSessionTranscriptPageMetadata({
+            loadedTurns: conversationTurns.length,
+            totalTurns: Math.max(conversationTurns.length, candidate.transcriptTotalTurns - (sourceTurnId ? 1 : 0)),
+            hasMore: candidate.transcriptPartial === true,
+          }),
+        };
+      },
+    });
+    pendingWorkspaceGuidance.add(sessionKey);
+    try {
+      const result = await enqueueWorkspaceInstructionAdmission(sessionKey, () => port.append({
+        owner: checkpoint.owner, expectedRevision: checkpoint.revision,
+        event: {
+          schemaVersion: RUNTIME_V2_EVENT_SCHEMA_VERSION, type: "guidance.admitted",
+          sequence: checkpoint.aggregate.nextSequence, at: Math.max(Date.now(), checkpoint.aggregate.updatedAt),
+          eventId, run: target, text: guidanceText, ...(receiptId ? { sourceReceiptId: receiptId } : {}),
+        },
+      }));
+      if (result.disposition === "conflict") {
+        logStoreEvent("active_guidance_rejected", { turnId: target.turnId, runId: target.runId, reason: "ownership_conflict" });
+      }
+      if (result.disposition === "committed") logStoreEvent("runtime_v2_guidance_admitted", {
+        sessionKey, turnId: target.turnId, runId: target.runId, attemptId: target.attemptId, guidanceId: eventId,
+      });
+      return result.disposition !== "conflict" && !!result.checkpoint;
+    } catch (error) {
+      logStoreEvent("active_guidance_rejected", {
+        turnId: target.turnId, runId: target.runId, reason: error instanceof Error ? error.message : "persistence_failed",
+      });
+      return false;
+    } finally {
+      pendingWorkspaceGuidance.delete(sessionKey);
+      scheduleRuntimeTask(() => get().dispatchNextWorkspaceInstruction(sessionKey));
+    }
+  },
   clearActiveGuidance: () => {
     set({ activeGuidance: null });
     logStoreEvent("active_guidance_cleared");
@@ -12499,6 +12788,10 @@ export const useAppStore = create<AppState>()(
     }
 
     if (input.dispatchHints?.sourcePlanDraft !== undefined && !resolvePlanDraftContinuationSource(initial, input.dispatchHints.sourcePlanDraft)) {
+      return { accepted: false, reason: "admission_conflict", retryable: false };
+    }
+    const requestedWorkPlan = input.dispatchHints?.approvedPlanContinuation as unknown as ApprovedWorkPlanContinuationReference | undefined;
+    if (requestedWorkPlan !== undefined && !resolveApprovedWorkPlanContinuation(initial, requestedWorkPlan)) {
       return { accepted: false, reason: "admission_conflict", retryable: false };
     }
     const workspace = String(initial.currentWorkspace || "").trim();
@@ -13859,7 +14152,7 @@ export const useAppStore = create<AppState>()(
     }
 
     const head = queue.entries[0];
-    if (!head || head.status !== "queued") return false;
+    if (!head || head.status !== "queued" || pendingWorkspaceGuidance.has(sessionKey)) return false;
     // A cancel transaction owns the Session until its terminal projection is
     // durable. Keep the exact FIFO head queued; it must never become a second
     // owner or fall back to the legacy latest-wins message slot.
@@ -13939,6 +14232,12 @@ export const useAppStore = create<AppState>()(
     const sourcePlanDraft = hints.sourcePlanDraft === undefined ? undefined : resolvePlanDraftContinuationSource(state, hints.sourcePlanDraft)?.record;
     const sourcePlanDraftInvalid = hints.sourcePlanDraft !== undefined && !sourcePlanDraft;
     if (sourcePlanDraftInvalid) logStoreEvent("plan_draft_continuation_rejected", { sessionKey, turnId: head.receipt.turnId, reason: "source_owner_or_receipt_changed" });
+    const requestedWorkPlan = hints.approvedPlanContinuation as unknown as ApprovedWorkPlanContinuationReference | undefined;
+    const workPlanSource = requestedWorkPlan === undefined ? null : resolveApprovedWorkPlanContinuation(state, requestedWorkPlan);
+    const approvedPlanContinuation = workPlanSource ? {
+      ...workPlanSource.reference, ...(requestedWorkPlan?.revise === true ? { revise: true as const } : {}),
+    } : undefined;
+    const workPlanContinuationInvalid = requestedWorkPlan !== undefined && !approvedPlanContinuation;
     const pendingReviewActionDecision = state.agentStatus === "pending_review"
       ? resolveWorkspaceInstructionActionDecision({
           sessionKey,
@@ -14104,7 +14403,7 @@ export const useAppStore = create<AppState>()(
       }
     }
 
-    const started = projectionConflictReason || cancellationFailure || sourcePlanDraftInvalid
+    const started = projectionConflictReason || cancellationFailure || sourcePlanDraftInvalid || workPlanContinuationInvalid
       ? false
       : pendingReviewActionDecision.actionDecision
         ? pendingReviewActionApplied
@@ -14122,6 +14421,7 @@ export const useAppStore = create<AppState>()(
         submissionOriginSessionKey: sessionKey,
         ...(hints.planPurpose === "rules" ? { planPurpose: "rules" as const } : {}),
         ...(sourcePlanDraft ? { sourcePlanDraft } : {}),
+        ...(approvedPlanContinuation ? { approvedPlanContinuation } : {}),
         turnIdOverride: head.receipt.turnId,
         adoptExistingTurn: true,
         admittedUserBlockId: admittedUserBlock!.id,
@@ -14718,6 +15018,7 @@ export const useAppStore = create<AppState>()(
     knowledgeReferencesSnapshot?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
     planPurpose?: "rules";
     sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
+    approvedPlanContinuation?: ApprovedWorkPlanContinuationReference;
 
     remoteFeishu?: FeishuRemoteContext;
     skipAutoPlanHydration?: boolean;
@@ -14728,6 +15029,7 @@ export const useAppStore = create<AppState>()(
     parentRunIdOverride?: string;
     runIdOverride?: string;
     executionResumeRequestId?: string;
+    editorVerificationReconnect?: UserChoiceResolutionIdentity;
     planExecutionLeaseId?: string;
     planExecutionInstructionHash?: string;
 
@@ -14746,19 +15048,27 @@ export const useAppStore = create<AppState>()(
       logStoreEvent("plan_draft_continuation_rejected", { reason: "source_owner_or_receipt_changed" });
       return false;
     }
-    const executionChoice = options?.replyOptionRequestIdentity;
+    if (options?.approvedPlanContinuation &&
+        !resolveApprovedWorkPlanContinuation(state, options.approvedPlanContinuation)) {
+      logStoreEvent("approved_work_plan_continuation_rejected", { reason: "source_owner_or_approval_changed" });
+      return false;
+    }
+    const executionChoice = options?.editorVerificationReconnect || options?.replyOptionRequestIdentity;
     if (executionChoice && state.activeActionRequest?.kind === "user_choice" && state.activeActionRequest.executionBlocker) {
       const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
       const sessionKey = resolveSessionRuntimeKey(scopeKey, state.currentSessionId);
       if (sessionKey !== executionChoice.sessionKey) return false;
       void resolveRuntimeV2ExecutionBlocker({ get, set, identity: executionChoice,
         choice: options?.selectedReplyOptionText || text,
+        ...(options?.editorVerificationReconnect ? { source: "editor_reconnected" as const } : {}),
         sessionEpoch: resolveActiveSessionPlanLifecycleEpoch(state, sessionKey) || "",
         persist: (projected, isCurrent) => persistSubmitRuntimeProjection({ state: projected, scopeKey, sessionId: state.currentSessionId,
           sanitizeTaskBlocksForPersist, buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState, persistSessionRecord: saveProjectSession, isCurrent }),
         dispatch: (turn, requestId) => {
-          const resumedIntent = normalizeRuntimeV2Checkpoint(get().runtimeV2Checkpoints?.[turn.id])?.aggregate.strategy;
-          const intent = resumedIntent === "chat" ? "respond" : resumedIntent === "analyze" ? "analyze" : resumedIntent === "plan" ? "plan" : "execute";
+          const aggregate = normalizeRuntimeV2Checkpoint(get().runtimeV2Checkpoints?.[turn.id])?.aggregate;
+          const resumedIntent = aggregate?.strategy;
+          const intent = resumedIntent === "chat" ? "respond" : resumedIntent === "analyze" ? "analyze" :
+            resumedIntent === "plan" && !aggregate?.planContinuation ? "plan" : "execute";
           get().sendMessage(turn.userPrompt, undefined, { hidden: true, reuseCurrentTurn: true, turnIdOverride: turn.id,
             runIdOverride: executionChoice.runId, executionResumeRequestId: requestId, resolvedIntent: intent, runtimeIntentOverride: intent,
             skipIntentResolution: true, submissionOriginSessionKey: executionChoice.sessionKey });
@@ -14767,6 +15077,7 @@ export const useAppStore = create<AppState>()(
       }).catch(error => logStoreEvent("runtime_v2_blocker_resolution_failed", { requestId: executionChoice.requestId, error: String(error) }));
       return true;
     }
+    if (options?.editorVerificationReconnect) return false;
     if (options?.executionResumeRequestId) {
       const checkpoint = normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints?.[String(options.turnIdOverride)]);
       if (!checkpoint || checkpoint.aggregate.run?.blocker?.requestId !== options.executionResumeRequestId ||
@@ -15467,6 +15778,7 @@ export const useAppStore = create<AppState>()(
       currentTurn,
       currentTurnIntent,
       hasPlanArtifacts,
+      planContinuationCandidates: options?.skipIntentResolution ? [] : getApprovedWorkPlanContinuationCandidates(state),
       shouldContinuePlanIntent,
       shouldContinuePreviousTurnIntent,
       previousTurnContinuationTarget,
@@ -15630,7 +15942,25 @@ export const useAppStore = create<AppState>()(
             get().dispatchNextWorkspaceInstruction(sessionKey);
           },
           resumeSubmission: (nextText, nextImages, nextOptions) => {
-            return get().sendMessage(nextText, nextImages, nextOptions);
+            const current = get();
+            const decision = nextOptions.planContinuation;
+            const ceiling = blockingPreflightEffect.request.explicitIntent;
+            if (!nextOptions.semanticIntent?.clarification &&
+                ((decision?.kind === "continue" && (!ceiling || ceiling === "execute")) ||
+                  (decision?.kind === "revise" && (!ceiling || ceiling === "plan")))) {
+              const source = getContinuableApprovedWorkPlan(current, decision.candidateId);
+              if (!source) return false;
+              const intent = decision.kind === "continue" ? "execute" : "plan";
+              logStoreEvent("approved_work_plan_continuation_routed", {
+                turnId: nextOptions.turnIdOverride, sourceTurnId: source.reference.turn.turnId, intent,
+              });
+              return current.sendMessage(nextText, nextImages, {
+                ...nextOptions, resolvedIntent: intent, runtimeIntentOverride: intent,
+                approvedPlanContinuation: { ...source.reference, ...(intent === "plan" ? { revise: true } : {}) },
+                preservePlanState: true,
+              });
+            }
+            return current.sendMessage(nextText, nextImages, nextOptions);
           },
           onWorkspaceResumeAccepted: (nextOptions) => {
             const claim = nextOptions.workspaceInstructionClaim;
@@ -15713,6 +16043,7 @@ export const useAppStore = create<AppState>()(
       isPlanApprovalLeaseBoundToState(state.planLifecycle);
     const requestsPlanExecution =
       effectiveRunIntent === "execute" &&
+      !options?.approvedPlanContinuation &&
       (
         hasLivePlanApprovalCapability ||
         state.planLifecycle.status === "handoff_pending" ||
@@ -15902,6 +16233,7 @@ export const useAppStore = create<AppState>()(
       uiParentTurnId,
       parentPlanTurnId,
       sourcePlanDraft: options?.sourcePlanDraft,
+      approvedPlanContinuation: options?.approvedPlanContinuation,
       isInternalTurn,
       shouldExplicitlyReuseCurrentTurn,
       shouldAutoResumeChoiceTurn,
@@ -15919,7 +16251,12 @@ export const useAppStore = create<AppState>()(
       turnTitle,
       preferredLanguage,
       preservePlanState,
-      shouldGrantExecutionConsentForTurn,
+      preserveComposerMode: (!!options?.approvedPlanContinuation &&
+        sessionGet().workspaceTurnQueue?.entries[0]?.instruction.source === "plan_adjustment") ||
+        (isHidden && reuseCurrentTurn && !!existingTurn?.approvedPlanContinuation),
+      shouldGrantExecutionConsentForTurn: shouldGrantExecutionConsentForTurn &&
+        !options?.approvedPlanContinuation &&
+        !(reuseCurrentTurn && existingTurn?.approvedPlanContinuation && !existingTurn.approvedPlanContinuation.revise),
       requiresPlanExecutionAdmission,
     });
     if (visibleTurnSubmission.adoptionDecision.kind === "rejected") {
@@ -16070,12 +16407,16 @@ export const useAppStore = create<AppState>()(
       persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
       refreshWorkspaceAdmission: async (workspace, userPrompt, options) => {
+        if (workspace) await get().refreshManagedProjectRules(workspace);
+        const discovery = get().refreshMcpDiscovery();
         const admissionState = get();
-        const mcpSnapshot = resolveWorkspaceMcpView({
+        const freezeMcp = () => resolveWorkspaceMcpView({
           workspace,
-          manualServers: admissionState.mcpServers,
-          manualTools: admissionState.mcpDiscoveredTools,
-          manualToolServerMap: admissionState.mcpToolServerMap,
+          manualServers: get().mcpServers,
+          manualTools: get().mcpDiscoveredTools,
+          manualToolServerMap: get().mcpToolServerMap,
+          disabledToolKeys: normalizeMcpRoutingConfig(get().config.mcpRouting).disabledToolKeys,
+          planObservationsAllowed: isRiskAutoExecutable("external_read", normalizeToolPermissionPolicy(get().config.toolPermissionPolicy)),
         });
         const associatedPaths = [
           ...turnInputContextSignals.mentionedFilePaths,
@@ -16088,7 +16429,7 @@ export const useAppStore = create<AppState>()(
               { workspace, projectToUi: false, userPrompt },
             ),
             baseline: null,
-            mcpSnapshot,
+            mcpSnapshot: await bindWorkspaceUnityMcpView(freezeMcp(), undefined),
             warnings: [],
           };
         }
@@ -16102,9 +16443,27 @@ export const useAppStore = create<AppState>()(
           includeProjectBaseline: options?.includeProjectBaseline,
           io: workspaceAdmissionIpcIo,
         });
+        await Promise.race([discovery, new Promise<void>(resolve => setTimeout(resolve, 800))]);
+        const refreshedMetadata = options?.includeProjectBaseline === false
+          ? await buildProjectBaselineContext({ workspace, io: projectBaselineIpcIo, metadataOnly: true }).catch(() => null)
+          : null;
+        const baseline = snapshot.baseline || (refreshedMetadata?.anchors.length ? refreshedMetadata : null);
+        const editorVersion = baseline?.facts.runtimes.find(fact => fact.name === "unity")?.version;
+        const mcpView = freezeMcp();
+        const mcpSnapshot = await Promise.race([
+          bindWorkspaceUnityMcpView(mcpView, editorVersion),
+          new Promise<null>(resolve => setTimeout(() => resolve(null), 800)),
+        ]) || await bindWorkspaceUnityMcpView(mcpView, undefined);
+        logStoreEvent("workspace_mcp_admitted", {
+          workspace,
+          configured: mcpView.mcpServers.length,
+          discovered: mcpView.mcpDiscoveredTools.length,
+          admitted: mcpSnapshot.mcpDiscoveredTools.length,
+          boundEditors: Object.keys(mcpSnapshot.unityBindings || {}).length,
+        });
         return {
           instructions: snapshot.instructions,
-          baseline: snapshot.baseline,
+          baseline,
           mcpSnapshot,
           warnings: snapshot.warnings.map((warning) =>
             `${warning.code}: ${warning.message}`
@@ -16145,8 +16504,9 @@ export const useAppStore = create<AppState>()(
     {
       name: "local-agent-ide",
       version: LOCAL_PERSIST_SCHEMA_VERSION,
+      storage: localPreferencesStorage,
       partialize: (state: AppState) =>
-        buildPersistedAppState(state as Record<string, any>) as Partial<AppState>,
+        selectLocalPreferences(state) as Partial<AppState>,
       migrate: (persistedState: unknown): Partial<AppState> =>
         stripLegacyRuntimeFieldsFromPersistedState(
           (persistedState || {}) as Record<string, unknown>,
@@ -16404,6 +16764,10 @@ export const useAppStore = create<AppState>()(
         },
         sessionsByWorkspace: normalizedSessionsByWorkspace,
         mcpServers: normalizeMcpServers(persistedState.mcpServers),
+        managedProjectRulesByWorkspace: Object.fromEntries(Object.entries(persistedState.managedProjectRulesByWorkspace || {})
+          .filter(([, preference]: [string, any]) =>
+            preference && /^[a-f0-9]{64}$/.test(preference.blockDigest) && ["en", "zh"].includes(preference.locale))),
+        managedProjectRulesReviewNeeded: {},
         mcpDiscoveredTools: [],
         mcpToolServerMap: {},
         runtimeBySessionKey: {},

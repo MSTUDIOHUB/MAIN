@@ -1,3 +1,4 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { estimateMessagesTokens, estimateTokens } from "../../lib/contextTrim";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2/aggregate";
@@ -9,7 +10,11 @@ import { projectPlanSkillGuidance } from "./planSkillGuidance";
 /** A replay adapter, not another history owner. No new evidence is minted. */
 export function restoreReadOnlyHistory(live: RuntimeV2LiveExecutionState, aggregate: TurnAggregateV1): void {
   const commands = new Map(aggregate.events.flatMap((event) => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
+  const hasGuidance = aggregate.events.some(event => event.type === "guidance.admitted");
   for (const event of aggregate.events) {
+    if (hasGuidance && event.type === "command.scheduled" && event.command.kind === "request_model") {
+      appendRuntimeV2GuidanceHistory(live.messages, aggregate, event.run, event.command.idempotencyKey);
+    }
     const reply = runtimeV2ClarificationMessage(event);
     if (reply) live.messages.push(reply);
     if (event.type === "provider.responded") {

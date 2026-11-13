@@ -9,6 +9,7 @@ import {
   type RuntimeV2TurnIdentity, type RuntimeV2WorkPlanReference,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { runtimeV2PendingGuidance } from "./guidance";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import {
   canRecordRuntimeV2Recovery,
@@ -188,6 +189,7 @@ function createInitialAggregate(event: Extract<RuntimeV2Event, { type: "turn.adm
       : {}),
     objective: {
       text: event.objective,
+      ...(event.completionRequirement ? { completionRequirement: event.completionRequirement } : {}),
       ...(event.capabilityRestrictions !== undefined ? {
         capabilityRestrictions: normalizeTurnCapabilityRestrictions(event.capabilityRestrictions),
       } : {}),
@@ -365,6 +367,16 @@ export function tryTransition(
   }
 
   switch (event.type) {
+    case "guidance.admitted":
+      if (state.run?.status !== "running" || state.phase === "finalizing" ||
+        state.phase === "reviewing" || state.scheduledCommands.some(command => command.kind === "finalize_turn") ||
+        runtimeV2PendingGuidance(state)) return rejection(state, "run_not_active");
+      if (typeof event.text !== "string" || !event.text.trim() ||
+        state.events.some(previous => previous.eventId === event.eventId ||
+          event.sourceReceiptId && previous.type === "guidance.admitted" && previous.sourceReceiptId === event.sourceReceiptId)) {
+        return rejection(state, "invalid_event_schema");
+      }
+      return { disposition: "applied", state: append(state, event) };
     case "run.wait_started":
     case "run.wait_ended":
       return { disposition: "applied", state: append(state, event) };
@@ -379,16 +391,26 @@ export function tryTransition(
     case "run.decision_recorded": {
       const blocker = state.run?.blocker;
       if (state.run?.status !== "paused" || !blocker || blocker.requestId !== event.requestId || blocker.decision || !blocker.options.includes(event.choice)) return rejection(state, "run_not_active");
+      if (event.source && (event.source !== "editor_reconnected" || event.choice !== "recheck" ||
+          blocker.reasonCode !== "unity_editor_verification_pending")) return rejection(state, "invalid_event_schema");
       if (blocker.clarification && event.choice !== "stop" && !event.reply?.trim()) return rejection(state, "run_not_active");
       if (event.answer && !blocker.questionnaire) return rejection(state, "invalid_event_schema");
       const checked = blocker.questionnaire && event.choice !== "stop" ? validateUserChoiceAnswer(blocker.questionnaire, event.answer, blocker.requestId) : null;
       if (checked && !checked.ok) return rejection(state, "invalid_event_schema");
       const decision = checked?.ok ? { ...event, answer: checked.answer } : event;
-      return { disposition: "applied", state: append(state, decision, { run: { ...state.run, blocker: { ...blocker, decision: event.choice, ...(event.reply ? { decisionReply: event.reply } : {}), ...(decision.answer ? { decisionAnswer: decision.answer } : {}) } } }) };
+      return { disposition: "applied", state: append(state, decision, { run: { ...state.run, blocker: { ...blocker, decision: event.choice, ...(event.source ? { decisionSource: event.source } : {}), ...(event.reply ? { decisionReply: event.reply } : {}), ...(decision.answer ? { decisionAnswer: decision.answer } : {}) } } }) };
     }
     case "run.resumed": {
-      if (state.run?.status !== "paused" || state.run.blocker?.requestId !== event.requestId || !state.run.blocker.decision || state.run.blocker.decision === "stop") return rejection(state, "run_not_active");
-      return { disposition: "applied", state: append(state, event, { run: { ...state.run, status: "running" } }) };
+      const blocker = state.run?.blocker;
+      if (state.run?.status !== "paused" || blocker?.requestId !== event.requestId || !blocker.decision || blocker.decision === "stop") return rejection(state, "run_not_active");
+      const requirement = event.completionRequirement;
+      if (requirement && (state.strategy !== "execute" || state.objective.completionRequirement?.kind !== "unspecified" ||
+          blocker.reasonCode !== "intent_clarification" || !blocker.decisionReply ||
+          !["workspace_change", "requested_operation"].includes(requirement.kind))) return rejection(state, "invalid_event_schema");
+      return { disposition: "applied", state: append(state, event, {
+        run: { ...state.run, status: "running" },
+        ...(requirement ? { objective: { ...state.objective, completionRequirement: requirement } } : {}),
+      }) };
     }
     case "run.started": {
       if (state.run) return rejection(state, "run_already_started");
@@ -547,13 +569,15 @@ export function tryTransition(
           workPlan: { ...event.workPlan, status: "pending_review" },
           sealedWorkPlan: event.sealedPlan,
           planReviewCommit: event.reviewCommit,
+          ...(event.continuation ? { planContinuation: event.continuation } : state.planContinuation ? { planContinuation: undefined } : {}),
         }),
       };
     }
     case "work_plan.approved": {
       if (state.strategy !== "plan") return rejection(state, "plan_strategy_required");
       if (!state.workPlan || state.run?.status !== "reviewing") return rejection(state, "plan_review_required");
-      if (!isSameWorkPlan(state.workPlan, event.workPlan)) return rejection(state, "plan_identity_mismatch");
+      if (!isSameWorkPlan(state.workPlan, event.workPlan) ||
+        state.planContinuation?.source.approvalEventId !== event.continuationApprovalId) return rejection(state, "plan_identity_mismatch");
       const run = state.run;
       if (!run) return rejection(state, "run_not_started");
       return {
@@ -623,7 +647,9 @@ export function tryTransition(
         event.jobs.length === 0 ||
         maxActiveSubagents <= 0 ||
         event.jobs.some((job) =>
-          !isValidRuntimeV2SubagentJob(job, event.run)
+          !isValidRuntimeV2SubagentJob(job, event.run) ||
+          (job.proactiveKey && !state.scheduledCommands.some(command =>
+            command.kind === "schedule_subagents" && command.payload.proactiveKey === job.proactiveKey))
         )
       ) {
         return rejection(state, "subagent_invalid");

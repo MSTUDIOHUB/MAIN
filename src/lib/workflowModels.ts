@@ -685,6 +685,7 @@ export interface ConversationTurn {
   planDraft?: import("./planDrafts").PlanDraftRecord;
   /** Exact data source for a new Plan Turn; never approval authority. */
   sourcePlanDraft?: import("./planDrafts").PlanDraftRecord;
+  approvedPlanContinuation?: import("./runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   planDocument?: import("./planDocuments").PlanDocumentRef;
   id: string;
   networkRead?: import("./networkRead").NetworkReadPolicy;

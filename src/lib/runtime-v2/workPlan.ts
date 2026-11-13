@@ -2,7 +2,8 @@ import { resolveSessionWorkspaceKey } from "../sessionTypes";
 import { appendPlanDecisionJournal } from "../planDecisionJournal";
 import { sha256Hex } from "../sha256";
 import type { PlanCandidateV5 } from "../planContract";
-import { analyzeValidationCommand } from "../validationContract";
+import { analyzeValidationCommand, unityValidationInvocations } from "../validationContract";
+import { projectEditorPlayModeFilter } from "../unityValidation";
 import { normalizePlanDocumentRef, type PlanDocumentRef } from "../planDocuments";
 
 export const WORK_PLAN_V1_SCHEMA_VERSION = "work-plan.v1" as const;
@@ -44,6 +45,8 @@ export interface WorkPlanDraftV1 {
     readonly kind: WorkPlanValidationKind;
     readonly command?: string;
     readonly cwd?: string;
+    readonly expectedTestCases?: number;
+    readonly useProjectEditor?: true;
     readonly expectedOutcome: string;
     readonly required: boolean;
     /** Admitted user criteria this receipt is expected to prove. */
@@ -309,6 +312,20 @@ export function validateWorkPlanDraftV1(
     if (!normalizeText(validation?.expectedOutcome, 2_000)) {
       issues.push({ path: `validations[${index}].expectedOutcome`, message: "Expected outcome is required." });
     }
+    if (validation?.expectedTestCases !== undefined) {
+      const checks = unityValidationInvocations(validation.command || "");
+      if (validation.kind !== "finite_command" || !Number.isSafeInteger(validation.expectedTestCases) ||
+        validation.expectedTestCases <= 0 || checks.length !== 1 || checks[0]?.kind === "recompile") {
+        issues.push({ path: `validations[${index}].expectedTestCases`, message: "Use a positive expected count with one Unity test runner." });
+      }
+    }
+    if (validation?.useProjectEditor !== undefined && (validation.useProjectEditor !== true ||
+      validation.kind !== "finite_command" || (validation.cwd !== undefined && validation.cwd !== ".") ||
+      !projectEditorPlayModeFilter(validation.command || "") ||
+      !Number.isSafeInteger(validation.expectedTestCases) || (validation.expectedTestCases ?? 0) <= 0)) {
+      issues.push({ path: `validations[${index}].useProjectEditor`,
+        message: "The project Editor route requires unity test . --mode PlayMode --filter SuiteName, the workspace root, and a positive expectedTestCases." });
+    }
     if (validation?.kind === "finite_command" && !normalizeText(validation.command, 2_000)) {
       issues.push({ path: `validations[${index}].command`, message: "Finite command validation needs a command." });
     } else if (
@@ -381,6 +398,8 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
       lines.push(`- 覆盖步骤：${validation.stepIndexes.map(stepId).join("、") || "未指定"}`);
       if (validation.command) lines.push(`- 命令：\`${validation.command.replace(/`/g, "")}\``);
       if (validation.cwd) lines.push(`- 工作目录：\`${validation.cwd.replace(/`/g, "")}\``);
+      if (validation.useProjectEditor) lines.push("- 执行方式：按工程版本使用已连接的 Editor，工程关闭时使用同版本 Editor 批处理。两种方式使用同一测试筛选和用例数。");
+      if (validation.expectedTestCases !== undefined) lines.push(`- 必须通过的测试用例数：${validation.expectedTestCases}`);
       lines.push(`- 要求：${validation.required ? "必须通过" : "建议执行"}`);
       if (validation.criterionIds?.length) lines.push(`- 验收条件：${validation.criterionIds.join("、")}`);
       lines.push(`- 预期结果：${validation.expectedOutcome}`, "");

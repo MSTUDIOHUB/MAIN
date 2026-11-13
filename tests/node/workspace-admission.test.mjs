@@ -417,6 +417,27 @@ test("baseline rendering is deterministic, bounded, and explicitly non-authorita
   assert.equal(admission.renderProjectBaselineContext(null), "");
 });
 
+test("the bounded model baseline prioritizes exact editor and pipeline versions", async () => {
+  const { snapshot } = await buildFixtureSnapshot();
+  const current = {
+    ...snapshot.baseline,
+    facts: {
+      ...snapshot.baseline.facts,
+      runtimes: [
+        { name: "tuanjie", version: "1.10.4", provenance: { path: "ProjectSettings/ProjectVersion.txt", selector: "m_TuanjieEditorVersion" } },
+        { name: "unity", version: "2022.3.62t16", provenance: { path: "ProjectSettings/ProjectVersion.txt", selector: "m_EditorVersion" } },
+      ],
+      packages: [
+        { name: "com.unity.render-pipelines.universal", version: "14.2.0-t1", provenance: { path: "Packages/packages-lock.json", selector: "$.dependencies.urp" } },
+      ],
+    },
+  };
+  const rendered = admission.renderProjectBaselineContext(current, 1100);
+  assert.match(rendered, /runtime="tuanjie"@"1\.10\.4"/);
+  assert.match(rendered, /runtime="unity"@"2022\.3\.62t16"/);
+  assert.match(rendered, /package="com\.unity\.render-pipelines\.universal"@"14\.2\.0-t1"/);
+});
+
 test("canonicalization failure performs no partial workspace reads", async () => {
   let readCalls = 0;
   let loaderCalls = 0;

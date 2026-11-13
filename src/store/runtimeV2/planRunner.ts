@@ -1,3 +1,5 @@
+import { appendPlanToolResult } from "./planHistory";
+import { runtimeV2PendingGuidance } from "../../lib/runtime-v2/guidance";
 import { buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import { WORK_PLAN_V1_SCHEMA_VERSION, isRuntimeV2ProviderTransportsUnavailableError, type RuntimeV2NormalizedProviderResult, type SealedWorkPlanV1 } from "../../lib/runtime-v2";
@@ -26,7 +28,6 @@ import { recoverPendingPlanReadBatch, replayPendingPlanReadBatch } from "./planR
 import { isPlanStreamRepetition, planRepetitionRecovery, restorePlanSynthesisTransport } from "./planRepetitionRecovery";
 import { planValidationRecovery } from "./planValidationRecovery";
 export type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
-
 function truncatedBeforePlanAction(result: RuntimeV2NormalizedProviderResult): boolean {
   return !result.toolCalls.length && !result.visibleText?.trim() && result.diagnostics.some(item => item.code === "output_truncated");
 }
@@ -39,8 +40,7 @@ export async function runSubmitRuntimeV2Plan(
   const bootstrap = await bootstrapRuntimeV2Plan(input);
   if (bootstrap.settlement) return bootstrap.settlement;
   input = { ...input, context: bootstrap.context };
-  const { identity, ledger, evidence, evidenceContents, messages } =
-    bootstrap;
+  const { identity, ledger, evidence, evidenceContents, messages } = bootstrap;
   const planLifecycle = createRuntimeV2PlanSubmissionLifecycle({
     ledger, run: identity.run, messages,
   });
@@ -54,14 +54,17 @@ export async function runSubmitRuntimeV2Plan(
     evidence,
     evidenceContents,
     deadlineAt: originalDeadlineAt,
+    revisionTargetPaths: bootstrap.revisionTargetPaths,
     logStoreEvent: input.logStoreEvent,
   });
   const objective = ledger.snapshot()!.objective;
-  const executablePlanSelected = hasExecutablePlanChoice(ledger.snapshot()!);
+  const executablePlanSelected = !!bootstrap.revisionOf || hasExecutablePlanChoice(ledger.snapshot()!);
+  const focusedRevision = bootstrap.revisionOf?.focused === true;
   const admittedCriterionIds = objective.acceptanceCriteria.map((_, index) =>
     objective.acceptanceCriterionIds?.[index] || `criterion-${index + 1}`,
   );
   try {
+    await planCollaboration.restoreProactive();
     let sealedPlan: SealedWorkPlanV1 | null = null;
     const initialCollaboration = planCollaboration.current().payload;
     if (initialCollaboration.collaborationRequired === true &&
@@ -85,7 +88,8 @@ export async function runSubmitRuntimeV2Plan(
     const priorRequest = [...priorEvents].reverse().find((entry) => entry.type === "command.scheduled" && entry.command.kind === "request_model" && entry.run.runId === identity.run.runId);
     const priorPayload = priorRequest?.type === "command.scheduled" ? priorRequest.command.payload : {};
     const restoreBoundedOutput = priorPayload.compactRecovery !== true && lastResponse?.type === "provider.responded" && truncatedBeforePlanAction(lastResponse.result);
-    let stage: PlanModelStage = initialLifecycle.submissionRepairPending || priorPayload.stage === "synthesis" || restoreBoundedOutput ? "synthesis" : "discovery";
+    let stage: PlanModelStage = initialLifecycle.submissionRepairPending || priorPayload.stage === "synthesis" ||
+      restoreBoundedOutput || (focusedRevision && !priorRequest) ? "synthesis" : "discovery";
     let compactRecoveryStarted = priorPayload.compactRecovery === true || restoreBoundedOutput;
     let synthesisRecoveryCount = compactRecoveryStarted ? 1 : 0;
     let { transport: synthesisTransport, explicitFallback } =
@@ -117,6 +121,7 @@ export async function runSubmitRuntimeV2Plan(
         recoveredReads = null;
         continue;
       }
+      if (!recoveredQuestion && !recoveredSubmission && await planCollaboration.advanceProactive()) continue;
       const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, {
         finalTextIsProgress: false,
       });
@@ -198,6 +203,7 @@ export async function runSubmitRuntimeV2Plan(
           evidence,
           evidenceContents,
           collaboration,
+          focusedRevision,
           submissionRepairPending,
           compactRecovery,
           transport: effectiveTransport,
@@ -391,27 +397,21 @@ export async function runSubmitRuntimeV2Plan(
       if (response.toolCalls.length === 1 && response.toolCalls[0]!.name === ASK_PLAN_QUESTIONS) {
         const pause = await handlePlanQuestionTool({ runner: input, ledger, run: identity.run, call: response.toolCalls[0]!, messages,
           receiptAlreadySettled: questionReceiptAlreadySettled,
-          joinChildren: async () => !planCollaboration.activeChildCount() || planCollaboration.joinActive("plan_question_requires_joined_children"),
+          joinChildren: async () => !planCollaboration.activeChildCount() || planCollaboration.joinActive("plan_question_requires_joined_children", true),
         });
         if (pause) return pause;
         continue;
       }
-      const submitCalls = response.toolCalls.filter((call) => call.name === SUBMIT_WORK_PLAN_TOOL_NAME);
-      if (
-        submitCalls.length === 1 &&
-        response.toolCalls.length === 1
-      ) {
-        const call = submitCalls[0]!;
-        if (planCollaboration.activeChildCount() > 0) {
-          const joined = await planCollaboration.joinActive(
-            "plan_submission_requires_joined_children",
-          );
-          await settlePlanTool({
-            ledger,
-            run: identity.run,
-            call,
-            status: "blocked",
-          });
+      const [firstCall] = response.toolCalls;
+      if (response.toolCalls.length === 1 && firstCall?.name === SUBMIT_WORK_PLAN_TOOL_NAME) {
+        const call = firstCall;
+        const { joined, resubmit } = await planCollaboration.joinForSubmission();
+        if (resubmit || runtimeV2PendingGuidance(ledger.snapshot())) {
+          await settlePlanTool({ ledger, run: identity.run, call, status: "blocked" });
+          if (!resubmit) {
+            appendPlanToolResult(messages, call.id, "New user guidance arrived while this plan was being drafted. Consider it before submitting again.");
+            continue;
+          }
           messages.push({
             role: "tool",
             tool_call_id: call.id,
@@ -438,10 +438,7 @@ export async function runSubmitRuntimeV2Plan(
             detail: "submit one JSON object with a non-empty planMarkdown body",
             submissionChars: String(call.arguments || "").length,
           });
-          await ledger.recordSoftSignal(
-            identity.run,
-            "protocol_drift",
-          );
+          await ledger.recordSoftSignal(identity.run, "protocol_drift");
           stage = "synthesis";
           submissionRepairPending = true;
           continue;
@@ -454,7 +451,7 @@ export async function runSubmitRuntimeV2Plan(
             ledger.snapshot()!.events.some(command => command.type === "command.scheduled" && command.sequence > providerEvent.sequence &&
               command.command.idempotencyKey === event.idempotencyKey && command.command.payload.toolCallId === call.id && command.command.payload.toolName === call.name));
           const assessment = assessPlanSubmission({ candidate, evidence, objective: objective.text, criterionIds: admittedCriterionIds,
-            aggregate: ledger.snapshot(), decisionJournal, requireBehavioralValidation: executablePlanSelected, ...(providerEvent ? { createdAt: providerEvent.at } : {}),
+            aggregate: ledger.snapshot(), decisionJournal, requireBehavioralValidation: executablePlanSelected, revisionOf: bootstrap.revisionOf, ...(providerEvent ? { createdAt: providerEvent.at } : {}),
             collaborationRequired: (ledger.snapshot()?.subagentRequirement ?? input.context.turnInputContextSignals?.subagentRequirement) === "required" });
           if (draftOnlyRecovery && assessment.kind === "reviewable") continue;
           if (assessment.normalizationReasons.length) {
@@ -490,6 +487,11 @@ export async function runSubmitRuntimeV2Plan(
               version: sealedPlan.digest,
             }],
           });
+          if (runtimeV2PendingGuidance(ledger.snapshot())) {
+            sealedPlan = null;
+            messages.push({ role: "system", content: "New user guidance arrived before Plan review. Consider it before submitting again." });
+            continue;
+          }
           break;
         }
       }

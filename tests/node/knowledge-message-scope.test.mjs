@@ -186,3 +186,46 @@ test("durable FIFO freezes selected versions through restore and rejects a same-
   assert.equal(queue.buildWorkspaceTurnQueueEntryIdentity(restored.entries[0]), identity);
   assert.deepEqual(queue.reconcileWorkspaceTurnQueueOnRestore({ ...owner, sessionEpoch: "replacement", snapshot: JSON.parse(JSON.stringify(committed.state)), at: 3 }).entries, []);
 });
+
+test("official TOC and search honor separate authority while explicit selection stays local", async () => {
+  const active = { kind: "base", kbId: "kb-1", indexRevision: "initial", activationMode: "workspace_active", presetId: "tuanjie" };
+  const networkRead = { enabled: true, provider: "bing" };
+  const defaults = { references: [active], allowOfficialDocuments: true, networkRead };
+  assert.deepEqual(refs.knowledgeLookupPolicy(defaults), { mode: "officialToc" });
+  assert.deepEqual(refs.knowledgeLookupPolicy({ ...defaults, requestWebFallback: "true" }), { mode: "officialToc" });
+  assert.deepEqual(refs.knowledgeLookupPolicy({ ...defaults, requestWebFallback: true }), { mode: "officialSearch", provider: "bing" });
+  assert.deepEqual(refs.knowledgeLookupPolicy({ ...defaults, networkRead: { ...networkRead, enabled: false }, requestWebFallback: true }), { mode: "officialToc" });
+  assert.deepEqual(refs.knowledgeLookupPolicy({ ...defaults, allowOfficialDocuments: false, requestWebFallback: true }), { mode: "local" });
+  assert.deepEqual(refs.knowledgeLookupPolicy({ ...defaults, references: [{ ...active, activationMode: "explicit_message" }], requestWebFallback: true }), { mode: "local" });
+  const input = { references: [active], query: "private prompt", budget: null, reservedInputTokens: 0, signal: new AbortController().signal };
+  const packet = await prepareKnowledgeContext(input, { search: async () => assert.fail("standby performed a prefetch") });
+  assert.equal(packet.state, "standby");
+  assert.deepEqual(packet.hits, []);
+  const citation = { kbId: active.kbId, indexRevision: "hydrated" };
+  assert.equal(refs.knowledgeCitationInScope(citation, [active]), false);
+  assert.equal(refs.knowledgeCitationInScope({ ...citation, admittedIndexRevision: "initial" }, [active]), true);
+  assert.equal(refs.knowledgeCitationInScope({ ...citation, admittedIndexRevision: "initial" }, [{ ...active, activationMode: "explicit_message" }]), false);
+});
+
+test("engine binding requires a matching installed preset and preserves explicit scopes", async () => {
+  const { enginePresetFromProjectVersion, resolveActiveEngineKnowledgeReferences } = load("src/lib/engineManualBinding.ts");
+  assert.equal(enginePresetFromProjectVersion("m_EditorVersion: 2022.3.62f1"), null);
+  assert.equal(enginePresetFromProjectVersion("m_EditorVersion: 2022.3.62t16"), "tuanjie");
+  assert.equal(enginePresetFromProjectVersion("m_EditorVersion: 6000.0.32f1"), "unity6");
+  const unity = { id: "unity", enabled: true, sourceCount: 1, presetId: "unity6", indexRevision: "index-u" };
+  const tuanjie = { ...unity, id: "tuanjie", presetId: "tuanjie", indexRevision: "index-t" };
+  const unrelated = { ...unity, id: "unrelated", presetId: undefined, name: "Unity 6" };
+  const listBases = async () => [unity, tuanjie, unrelated];
+  const input = { workspace: "/fixture", knowledgeBases: [] };
+  const unknown = await resolveActiveEngineKnowledgeReferences(input, { detect: async () => null, listBases });
+  assert.deepEqual(unknown.references, []);
+  const matched = await resolveActiveEngineKnowledgeReferences(input, { detect: async () => "tuanjie", listBases });
+  assert.deepEqual(matched.activePresetIds, ["tuanjie"]);
+  assert.equal(matched.references[0].kbId, "tuanjie");
+  const mismatch = await resolveActiveEngineKnowledgeReferences(input, { detect: async () => "tuanjie", listBases: async () => [unity, unrelated] });
+  assert.deepEqual(mismatch.references, []);
+  const explicitReferences = [{ kind: "base", kbId: "unity", indexRevision: "index-u" }];
+  const explicit = await resolveActiveEngineKnowledgeReferences({ ...input, explicitReferences }, { detect: async () => "tuanjie", listBases });
+  assert.deepEqual(explicit.references, explicitReferences);
+  assert.deepEqual(explicit.activePresetIds, []);
+});

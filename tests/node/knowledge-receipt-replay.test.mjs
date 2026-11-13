@@ -98,3 +98,13 @@ test("knowledge receipt reopening requires unchanged frozen scope, larger capaci
   assert.equal(receipts.runtimeV2ProviderOmittedKnowledgeCanReplay({ ...item, name: "run_command" }, pair(omitted), references, 4000), false);
   assert.equal(receipts.runtimeV2ProviderOmittedKnowledgeCanReplay(item, pair(JSON.stringify({ hits: [], truncated: true, omittedHits: 1 })), references, 4000), false, "arbitrary empty JSON is not a runtime-owned omitted delivery receipt");
 });
+
+test("knowledge network tiers respect the sealed network and external-interaction restrictions", () => {
+  const { runtimeV2KnowledgeMayFetch } = load("src/store/runtimeV2/executionCapabilityRestrictions.ts");
+  assert.equal(runtimeV2KnowledgeMayFetch([], []), true);
+  assert.equal(runtimeV2KnowledgeMayFetch(["network"], []), false);
+  assert.equal(runtimeV2KnowledgeMayFetch(["external_interaction"], []), false);
+  assert.equal(runtimeV2KnowledgeMayFetch([], ["network"]), false);
+  assert.equal(runtimeV2KnowledgeMayFetch([], ["external_interaction"]), false);
+  assert.equal(runtimeV2KnowledgeMayFetch(["workspace_write"], ["command"]), true);
+});

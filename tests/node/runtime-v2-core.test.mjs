@@ -473,14 +473,17 @@ function event(state, type, fields = {}) {
 function executeAggregate(
   phase = "observing",
   acceptanceEvidenceRequirements = ["behavioral"],
+  completionRequirement,
+  objective = "Repair the fixture behavior",
 ) {
   let state = runtime.transition(null, event(null, "turn.admitted", {
     turn: baseTurn,
     strategy: "execute",
-    objective: "Repair the fixture behavior",
+    objective,
     constraints: [],
     acceptanceCriteria: ["The repaired behavior works"],
     acceptanceCriterionIds: ["criterion-user-objective"],
+    ...(completionRequirement ? { completionRequirement } : {}),
     ...(acceptanceEvidenceRequirements
       ? { acceptanceEvidenceRequirements }
       : {}),
@@ -1211,7 +1214,7 @@ test("a provider cannot omit direct Execute criteria or mutation targets", () =>
   );
 });
 
-test("a tool-free Execute conclusion ends truthfully without a mutation", () => {
+test("a report without an executed effect leaves Execute open for recovery", () => {
   const state = executeAggregate();
   assert.deepEqual(runtime.decideRuntimeV2TerminalOutcome(state, {
     canceled: false,
@@ -1221,11 +1224,7 @@ test("a tool-free Execute conclusion ends truthfully without a mutation", () => 
     failedValidationCount: 0,
     stalledValidationCount: 0,
     hasProviderConclusion: true,
-  }), {
-    resultKind: "error",
-    resultReason:
-      "模型已结束本轮，但没有形成可验收的实际修改。",
-  });
+  }), null);
 });
 
 const executionOutcome = loadTs(path.join(
@@ -1239,6 +1238,8 @@ function commandOnlyOutcome(state) {
     signal: new AbortController().signal,
   });
 }
+
+const commandRequirement = { kind: "requested_operation", channel: "command" };
 
 function operationReceipt(state, command, options = {}) {
   state = providerResult(state, {
@@ -1261,11 +1262,152 @@ function operationReceipt(state, command, options = {}) {
       ? { failureReasonCode: options.failureReasonCode }
       : {}),
     ...(options.receiptOrigin ? { receiptOrigin: options.receiptOrigin } : {}),
+    ...(options.effectKind ? { effectKind: options.effectKind } : {}),
+    ...(options.modelContent ? { modelContent: options.modelContent } : {}),
+    ...(options.editorConsole ? { editorConsole: options.editorConsole } : {}),
   });
 }
 
+test("a Console investigation and a no-tool reply cannot conclude an admitted repair", () => {
+  for (const requirement of [{ kind: "workspace_change" }, { kind: "unspecified" }, undefined]) {
+    let state = operationReceipt(executeAggregate("observing", [null], requirement, "修复console窗口里的报错"), "read_console", {
+      name: "read_console", arguments: { action: "get" },
+      evidence: [{ id: "old-incident-receipt", kind: "mutation", target: "read_console", version: null }],
+    });
+    state = operationReceipt(state, "Assets/Scripts/Runtime/InstancedMeshDrawer.cs", {
+      name: "read_file", arguments: { path: "Assets/Scripts/Runtime/InstancedMeshDrawer.cs" },
+      evidence: [{ id: "source", kind: "source", target: "Assets/Scripts/Runtime/InstancedMeshDrawer.cs", version: "v1" }],
+    });
+    state = providerResult(state, { visibleText: "现在继续读取出错的文件。" });
+    state = runtime.replayRuntimeV2Events(state.events);
+    assert.equal(commandOnlyOutcome(state), null);
+    assert.equal(runtime.decideNextCommands(state)[0]?.payload.recoveryPressure?.reason, "non_actionable_response");
+    const report = runtime.buildRuntimeV2FinalProjection(state, "fixture-final", "error", "not_repaired");
+    assert.doesNotMatch(report.markdown, /已修改.*read_console/);
+  }
+});
+
+test("an admitted exact command requires its own executed result", () => {
+  const requirement = { kind: "requested_operation", channel: "command", exactCommand: "git status" };
+  let state = operationReceipt(executeAggregate("observing", [null], requirement), "pwd");
+  state = providerResult(state, { visibleText: "Done." });
+  assert.equal(commandOnlyOutcome(state), null);
+  state = operationReceipt(state, "git status");
+  state = providerResult(state, { visibleText: "git status completed." });
+  assert.equal(commandOnlyOutcome(state)?.resultKind, "success");
+});
+
+test("Console repairs need verified C# and Shader results for the original targets and final versions", () => {
+  const { runtimeV2EditorConsoleEvidence } = loadTs("src/lib/runtime-v2/editorConsoleEvidence.ts");
+  const { verifiedUnityConsoleRepair } = loadTs("src/lib/runtime-v2/unityCompilation.ts");
+  const script = "Assets/Draw.cs", shader = "Assets/Facet.shader";
+  const instanceId = "fixture@editor", editorVersion = "2022.3.62t16";
+  const entries = [`${script}(12,5): error CS1002: ; expected`, `Shader error in 'Custom/Facet': missing include at ${shader}(4)`];
+  const scope = runtimeV2EditorConsoleEvidence({ workspace: baseTurn.workspaceKey, binding: { instanceId, editorVersion },
+    args: { action: "get", page_size: 100 }, result: { success: true, data: { truncated: false, total: 2, items: entries } } });
+  assert.deepEqual(scope.diagnostics.map(item => [item.kind, item.path]), [["csharp", script], ["shader_import", shader]]);
+  let state = operationReceipt(executeAggregate("observing", [null], { kind: "workspace_change", editorDiagnostics: true }, "修复console窗口里的报错"),
+    "unity_mcp_console", { name: "unity_mcp_console", arguments: {}, effectKind: "observation", editorConsole: scope });
+  const write = (current, target, hash) => operationReceipt(current, target, {
+    name: "write_file", arguments: { path: target, content: "fixed" }, effectKind: "workspace_change",
+    evidence: [{ id: `${target}-${hash}`, kind: "mutation", target, version: `sha256-${hash.repeat(64)}` }],
+  });
+  const check = (current, kind, target, hash, override = {}) => {
+    const command = runtime.decideNextCommands(current, { checkUnityCompilation: true })[0];
+    assert.equal(command.payload.editorCheckKind, kind);
+    current = schedule(current, command);
+    return runtime.transition(current, event(current, "tool.completed", { run: baseRun, idempotencyKey: command.idempotencyKey,
+      status: "succeeded", evidence: [], modelContent: JSON.stringify({ status: "passed", editor: "connected", editorInstanceId: instanceId,
+        editorVersion, kind, targets: [{ path: target, version: `sha256-${hash.repeat(64)}` }], ...override }) }));
+  };
+  state = check(write(state, script, "a"), "csharp", script, "a");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false);
+  const include = "Assets/Facet.hlsl";
+  const { ensureVersionedReadFileResultForModel } = loadTs("src/lib/readFileWindow.ts");
+  const withInclude = write(state, include, "d");
+  assert.equal(runtime.decideNextCommands(withInclude, { checkUnityCompilation: true })[0].payload.shaderImportTargets, undefined);
+  const shaderHash = `sha256-${"e".repeat(64)}`;
+  const ownerRead = operationReceipt(withInclude, shader, { name: "read_file", arguments: { path: shader },
+    modelContent: ensureVersionedReadFileResultForModel(shader, 'Shader "Custom/Facet" {\n#include "Facet.hlsl"\n}', shaderHash),
+    evidence: [{ id: "exact-shader-include-owner", kind: "source", target: shader, version: shaderHash }],
+  });
+  assert.deepEqual(runtime.decideNextCommands(ownerRead, { checkUnityCompilation: true })[0].payload.shaderImportTargets, [shader]);
+  const includePass = check(ownerRead, "shader_import", shader, "e", { importedPaths: [shader],
+    targets: [{ path: include, version: `sha256-${"d".repeat(64)}` }, { path: shader, version: shaderHash }] });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(includePass), true);
+  const shaderWrite = write(state, shader, "b");
+  const wrong = check(shaderWrite, "shader_import", shader, "b", { editorVersion: "6000.0.0f1" });
+  assert.equal(verifiedUnityConsoleRepair(wrong), null);
+  const stale = check(shaderWrite, "shader_import", shader, "a");
+  assert.equal(verifiedUnityConsoleRepair(stale), null);
+  state = check(shaderWrite, "shader_import", shader, "b");
+  assert.equal(verifiedUnityConsoleRepair(state).receipts.length, 2);
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), true);
+  const finished = providerResult(state, { visibleText: "两类报错已修复，编译和导入均通过。" });
+  assert.equal(commandOnlyOutcome(finished)?.resultKind, "success");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(write(state, shader, "c")), false);
+  const report = runtime.buildRuntimeV2FinalProjection(finished, "fixture-final", "success", "verified");
+  assert.match(report.markdown, /C# 编译通过/);
+  assert.match(report.markdown, /Shader 导入通过/);
+});
+
+test("ordinary Execute delegates two separate versioned diagnostic branches while the parent keeps C#", () => {
+  const { deriveProactiveCollaboration } = loadTs("src/store/runtimeV2/proactiveSubagents.ts");
+  const { formatReadFileWindowForModel, ensureVersionedReadFileResultForModel } = loadTs("src/lib/readFileWindow.ts");
+  const script = "Assets/Draw.cs", first = "Assets/Sky.shader", second = "Assets/Water.shader";
+  const scope = { instanceId: "fixture@editor", editorVersion: "2022.3.62t16", complete: true,
+    diagnostics: [{ kind: "csharp", path: script }, { kind: "shader_import", path: first }, { kind: "shader_import", path: second }] };
+  let state = operationReceipt(executeAggregate("observing", [null], { kind: "workspace_change", editorDiagnostics: true }), "unity_mcp_console", {
+    name: "unity_mcp_console", arguments: {}, effectKind: "observation", editorConsole: scope,
+  });
+  for (const [path, include, hash] of [[first, "Sky.hlsl", "1"], [second, "Water.hlsl", "2"]]) {
+    const version = `sha256-${hash.repeat(64)}`;
+    const content = `Shader "Custom/${hash}" {\n#include "${include}"\n}\n`;
+    state = operationReceipt(state, path, { name: "read_file", arguments: { path },
+      modelContent: ensureVersionedReadFileResultForModel(path, formatReadFileWindowForModel(path, content), version),
+      evidence: [{ id: hash, kind: "source", target: path, version }],
+    });
+  }
+  const policy = { preference: "preferred", capacity: 2, requestMode: "parallel", workspace: baseTurn.workspaceKey, now: 1 };
+  for (const path of [first, second]) {
+    const collaboration = deriveProactiveCollaboration({ ...policy, state });
+    assert.ok(collaboration?.candidate, `${path}: ${JSON.stringify(collaboration)}`);
+    assert.deepEqual(collaboration.candidate.allowedPaths, [path]);
+    const command = runtime.decideNextCommands(state, { subagentPreference: "preferred", subagentCapacity: 2,
+      subagentRequestMode: "parallel", proactiveCollaboration: collaboration })[0];
+    assert.equal(command.kind, "schedule_subagents");
+    state = schedule(state, command);
+    const { jobs } = runtime.scheduleRuntimeV2Subagents({ parentRun: baseRun, candidates: [collaboration.candidate],
+      existingJobs: state.subagents, maxActiveJobs: 2, requestedAt: state.updatedAt, nextId: () => path });
+    state = runtime.transition(state, event(state, "subagents.scheduled", { run: baseRun, jobs, maxActiveSubagents: 2 }));
+    state = runtime.transition(state, event(state, "command.completed", { run: baseRun, idempotencyKey: command.idempotencyKey, status: "succeeded" }));
+  }
+  assert.equal(deriveProactiveCollaboration({ ...policy, state }).reason, "slots_in_use");
+  const next = runtime.decideNextCommands(state, { subagentPreference: "preferred", subagentCapacity: 2, subagentRequestMode: "parallel" })[0];
+  assert.equal(next.kind, "request_model");
+  assert.equal(next.payload.activeSubagents.length, 2);
+});
+
+test("a runtime-only Console repair needs a corresponding Editor test after the scene change", () => {
+  const path = "Assets/RuntimeFixture.unity";
+  let state = operationReceipt(executeAggregate("observing", [null], { kind: "workspace_change", editorDiagnostics: true }), "unity_mcp_console", {
+    name: "unity_mcp_console", arguments: {}, effectKind: "observation", editorConsole: { complete: true,
+      instanceId: "fixture@editor", editorVersion: "2022.3.62t16", diagnostics: [{ kind: "runtime", path }] },
+  });
+  state = operationReceipt(state, path, { name: "write_file", arguments: { path, content: "verified fixture" }, effectKind: "workspace_change",
+    evidence: [{ id: "scene-changed", kind: "mutation", target: path, version: `sha256-${"f".repeat(64)}` }] });
+  const projectTest = "unity test . --mode PlayMode --filter RuntimeRepairTests";
+  for (const command of ["npm test", projectTest]) {
+    let current = providerResult(state, { toolCalls: [{ id: "runtime-repro", name: "run_command", arguments: { command } }] });
+    current = executePendingTool(current, { type: "validation.completed", passed: true,
+      evidence: [{ id: "validated-scene", kind: "validation", target: command, version: "passed" }],
+      presentation: { toolName: "run_command", target: command } });
+    assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(current), command === projectTest);
+  }
+});
+
 test("command-only Execute keeps tools available through four CLI queries and concludes once on a natural final", async () => {
-  let state = executeAggregate("observing", [null]);
+  let state = executeAggregate("observing", [null], commandRequirement);
   state = providerResult(state, {
     toolCalls: ["--version", "status", "projects list", "editor info"].map(
       (command, index) => ({
@@ -1328,7 +1470,7 @@ test("command-only Execute keeps tools available through four CLI queries and co
 });
 
 test("command-only Execute can continue with another tool after one successful command", () => {
-  let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status");
+  let state = operationReceipt(executeAggregate("observing", [null], commandRequirement), "editor-tool status");
   assert.equal(runtime.decideNextCommands(state)[0].payload.mode, "execute");
   state = providerResult(state, {
     toolCalls: [{ id: "continue-development", name: "write_file", arguments: { path: "Assets/Game.cs", content: "class Game {}" } }],
@@ -1339,13 +1481,13 @@ test("command-only Execute can continue with another tool after one successful c
 
 test("source, skill, replay, or control-plane receipts cannot supply command-only completion evidence", () => {
   for (const name of ["read_file", "get_project_skeleton", "load_skill", "web_fetch"]) {
-    let state = operationReceipt(executeAggregate("observing", [null]), name, { name,
+    let state = operationReceipt(executeAggregate("observing", [null], commandRequirement), name, { name,
       ...(name === "web_fetch" ? { evidence: [] } : {}),
     });
     state = providerResult(state, { visibleText: "Done." });
     assert.equal(commandOnlyOutcome(state), null, name);
   }
-  let state = executeAggregate("observing", [null]);
+  let state = executeAggregate("observing", [null], commandRequirement);
   const command = commandFor(state, "execute_tool", "control-only", {
     toolName: "run_command", toolCallId: "control-only", arguments: { command: "editor-tool status" },
   });
@@ -1353,18 +1495,18 @@ test("source, skill, replay, or control-plane receipts cannot supply command-onl
   state = runtime.transition(state, event(state, "command.completed", { run: baseRun, idempotencyKey: command.idempotencyKey, status: "succeeded" }));
   state = providerResult(state, { visibleText: "Done." });
   assert.equal(commandOnlyOutcome(state), null);
-  state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status", { receiptOrigin: "replayed" });
+  state = operationReceipt(executeAggregate("observing", [null], commandRequirement), "editor-tool status", { receiptOrigin: "replayed" });
   state = providerResult(state, { visibleText: "Done." });
   assert.equal(commandOnlyOutcome(state), null, "a replay is not a new executed operation");
 });
 
 test("command-only completion retains file mutation and explicit acceptance debts", () => {
   for (const requirement of ["static", "behavioral", "interaction"]) {
-    let state = operationReceipt(executeAggregate("observing", [requirement]), "editor-tool status");
+    let state = operationReceipt(executeAggregate("observing", [requirement], commandRequirement), "editor-tool status");
     state = providerResult(state, { visibleText: "Done." });
     assert.equal(commandOnlyOutcome(state), null, requirement);
   }
-  let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status");
+  let state = operationReceipt(executeAggregate("observing", [null], commandRequirement), "editor-tool status");
   state = operationReceipt(state, "write", {
     name: "write_file",
     arguments: { path: "Assets/Game.cs", content: "class Game {}" },
@@ -1374,7 +1516,7 @@ test("command-only completion retains file mutation and explicit acceptance debt
   assert.equal(commandOnlyOutcome(state), null);
   assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false);
 
-  state = operationReceipt(executeAggregate("observing", [null]), "contract", {
+  state = operationReceipt(executeAggregate("observing", [null], commandRequirement), "contract", {
     name: "record_execution_contract",
     arguments: {
       summary: "Implement the requested game",
@@ -1388,10 +1530,17 @@ test("command-only completion retains file mutation and explicit acceptance debt
 });
 
 test("command-only completion accepts a real external operation without manufacturing a file mutation", () => {
-  let state = operationReceipt(executeAggregate("observing", [null]), "external-object", {
+  const requirement = { kind: "requested_operation", channel: "external", toolName: "external_create_object" };
+  let state = operationReceipt(executeAggregate("observing", [null], requirement), "other-target", {
+    name: "external_create_folder", effectKind: "external_operation",
+  });
+  state = providerResult(state, { visibleText: "Folder created." });
+  assert.equal(commandOnlyOutcome(state), null);
+  state = operationReceipt(state, "external-object", {
     name: "external_create_object",
     arguments: { object: "GameObject" },
-    evidence: [{ id: "external-effect", kind: "mutation", target: "external-object", version: "created" }],
+    effectKind: "external_operation",
+    evidence: [{ id: "external-effect", kind: "tool", target: "external-object", version: "created" }],
   });
   assert.equal(runtime.summarizeRuntimeV2ExecuteEvidence(state, { isMutationToolName: (name) => name === "write_file" }).mutationCount, 0);
   state = providerResult(state, { visibleText: "The external object was created." });
@@ -1468,7 +1617,7 @@ test("an explicit implementation contract retains its declared coverage and conc
 
 test("command-only completion rejects real failures until that exact action succeeds", () => {
   for (const status of ["failed", "blocked"]) {
-      let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool inspect", { status, evidence: [] });
+      let state = operationReceipt(executeAggregate("observing", [null], commandRequirement), "editor-tool inspect", { status, evidence: [] });
       state = operationReceipt(state, "editor-tool status");
       state = providerResult(state, { visibleText: "Done." });
       assert.equal(commandOnlyOutcome(state), null, status);
@@ -1480,14 +1629,14 @@ test("command-only completion rejects real failures until that exact action succ
 
 test("command-only completion excludes a diagnostic or truncated natural final", () => {
   for (const code of ["output_truncated", "protocol_invalid"]) {
-    let state = operationReceipt(executeAggregate("observing", [null]), "editor-tool status");
+    let state = operationReceipt(executeAggregate("observing", [null], commandRequirement), "editor-tool status");
     state = providerResult(state, { visibleText: "Done.", diagnostics: [{ code, message: code, retryable: true }] });
     assert.equal(commandOnlyOutcome(state), null, code);
   }
 });
 
 test("command-only completion requires an executed validation even if a skipped receipt claims passed", () => {
-  let state = executeAggregate("observing", [null]);
+  let state = executeAggregate("observing", [null], commandRequirement);
   state = providerResult(state, {
     toolCalls: [{ id: "unexecuted-validation", name: "run_command", arguments: { command: "npm test", cwd: "." } }],
   });

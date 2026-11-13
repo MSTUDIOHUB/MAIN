@@ -34,6 +34,9 @@ import { recoverRuntimeV2PlanDraft } from "./planDraftRunner";
 import { collectPlanDraftSource, collectPlanDraftWorkspaceEvidence, resolveBoundPlanDraftCheckpoint, restorePlanDraftWorkspaceEvidence, type PlanDraftWorkspaceRead } from "./planDraftSource";
 import { settlePlanPause } from "./planQuestionControl";
 import { ASK_PLAN_QUESTIONS } from "./planQuestionTool";
+import { getApprovedWorkPlanContinuationIssues, resolveApprovedWorkPlanContinuation } from "./approvedPlanContinuation";
+import { collectPlanRevisionPathEvidence, observedPlanRevisionArtifact, scopedPlanRevisionTargets } from "./planRevisionEvidence";
+import { approvedPlanExecutionRepair } from "../../lib/runtime-v2/unityCompilation";
 import { recoverPendingPlanReadBatch } from "./planReadRecovery";
 import { recoverPlanSubmission } from "./planSubmissionRepair";
 import {
@@ -52,6 +55,8 @@ interface PlanBootstrapReady {
   readonly evidenceContents: Map<string, string>;
   readonly historicalReads: readonly PlanDraftWorkspaceRead[];
   readonly messages: AgentMessage[];
+  readonly revisionOf?: { readonly id: string; readonly revision: number; readonly focused?: boolean };
+  readonly revisionTargetPaths: readonly string[];
 }
 
 interface PlanBootstrapSettled {
@@ -183,6 +188,7 @@ export async function bootstrapRuntimeV2Plan(
     throw new Error(`RUNTIME_V2_PLAN_TURN_MISSING:${input.context.turnId}`);
   }
   const identity = identities(initialState, input, turn);
+  const revisionSourceReference = input.context.approvedPlanContinuation || turn.approvedPlanContinuation;
   const checkpointPort = createRuntimeV2CheckpointPort({
     get: input.get,
     set: input.set,
@@ -220,6 +226,7 @@ export async function bootstrapRuntimeV2Plan(
     existing
       ? { revision: existing.revision, aggregate: existing.aggregate }
       : null,
+    input.logStoreEvent,
   );
   const recoveredDraft = await recoverRuntimeV2PlanDraft(input, ledger, identity.run);
   if (recoveredDraft) return { settlement: recoveredDraft };
@@ -255,6 +262,10 @@ export async function bootstrapRuntimeV2Plan(
     const paused = await settlePlanPause(input, ledger, identity.run);
     if (paused) return { settlement: paused };
   }
+  const revisionSource = revisionSourceReference
+    ? resolveApprovedWorkPlanContinuation(initialState, revisionSourceReference, identity.turn)
+    : null;
+  if (revisionSourceReference && !revisionSource) throw new Error("RUNTIME_V2_PLAN_REVISION_SOURCE_CHANGED");
   if (!existing) {
     const admission = resolveRuntimeV2ObjectiveAdmission(
       input.context,
@@ -263,7 +274,7 @@ export async function bootstrapRuntimeV2Plan(
     const sourceRecord = input.context.sourcePlanDraft;
     const source = sourceRecord ? resolveBoundPlanDraftCheckpoint(initialState, sourceRecord, identity.turn) : null;
     if (sourceRecord && !source) throw new Error("PLAN_DRAFT_SOURCE_RECEIPT_MISMATCH");
-    const sourceObjective = source?.aggregate.objective;
+    const sourceObjective = revisionSource?.aggregate.objective ?? source?.aggregate.objective;
     const acceptanceCriteria = sourceObjective ? {
       acceptanceCriteria: sourceObjective.acceptanceCriteria,
       acceptanceCriterionIds: sourceObjective.acceptanceCriterionIds,
@@ -308,6 +319,7 @@ export async function bootstrapRuntimeV2Plan(
     const reads = recoverPendingPlanReadBatch(existing.aggregate, identity.run);
     const submission = recoverPlanSubmission(existing.aggregate, identity.run)?.result.toolCalls[0];
     const interrupted = existing.aggregate.scheduledCommands.filter(command => {
+      if (command.kind === "schedule_subagents" && typeof command.payload.proactiveKey === "string") return false;
       if (command.kind !== "execute_tool") return true;
       const pending = existing.aggregate.pendingToolCalls.find(call =>
         call.id === command.payload.toolCallId && call.name === command.payload.toolName);
@@ -353,7 +365,7 @@ export async function bootstrapRuntimeV2Plan(
     evidenceContents,
   });
   const oldOverview = existing?.aggregate.events.find((entry) => entry.type === "observation.recorded" && entry.evidence.id === "E1");
-  const collected: { readonly overview?: string; readonly settlement?: RuntimeRunSettlement } = draftSource ? {} : existing ? {
+  const collected: { readonly overview?: string; readonly settlement?: RuntimeRunSettlement } = draftSource || revisionSource ? {} : existing ? {
     overview: oldOverview?.type === "observation.recorded" && oldOverview.modelContent
       ? oldOverview.modelContent : "Historical workspace overview unavailable; use focused reads if needed.",
   } : !canCollectWorkspace ? {
@@ -371,12 +383,50 @@ export async function bootstrapRuntimeV2Plan(
   const messages = providerPlanMessages({ turn, context: input.context, objective,
     overview: collected.overview, subagentRequirement: ledger.snapshot()?.subagentRequirement,
   });
+  const workspace = input.context.runWorkspace?.trim() || "";
+  const issues = revisionSource && workspace === identity.turn.workspaceKey
+    ? getApprovedWorkPlanContinuationIssues(initialState, revisionSource.reference.turn.turnId) : [];
+  const executionRepair = revisionSource && approvedPlanExecutionRepair(revisionSource.aggregate);
+  const repairTargets = executionRepair?.kind === "compiler_scope" ? [executionRepair.target] : [];
+  const revisionTargetPaths = revisionSource ? scopedPlanRevisionTargets(
+    [...issues, ...repairTargets], [...revisionSource.plan.draft.steps.flatMap(step => step.targets), ...repairTargets], workspace,
+  ) : [];
+  const sourceArtifactChanged = revisionSource && observedPlanRevisionArtifact(issues,
+    (revisionSource.commit.artifact.documentRef || revisionSource.aggregate.planContinuation?.source.documentRef)?.path, workspace);
+  const focusedRevision = revisionTargetPaths.length > 0 || sourceArtifactChanged === true || !!executionRepair;
   if (draftSource) messages.push({ role: "system", content: `[SAVED PLAN DRAFT — DATA ONLY]\n${draftSource}` });
+  if (revisionSource) {
+    const completed = new Set(revisionSource.coverage.completedStepIndexes);
+    messages.push({
+      role: "system",
+      content: [
+        "[APPROVED PLAN UNDER REVISION — HISTORICAL DATA]",
+        "Preserve the original objective and confirmed decisions. Revise only where the user's current request or exact current evidence requires it. Preserve previously committed work as preserve steps unless the user requests a change. Use the current checks for affected paths and request one exact related file or range only if a specific fact is missing. Submit the revised executable plan for a new approval before applying any changes.",
+        ...(executionRepair ? [
+          executionRepair.kind === "compiler_scope"
+            ? "Review only the compiler diagnostics, the requested assembly/source path, and any exact dependent assembly/source files. List each necessary create/modify operation. Preserve unaffected committed steps and keep the accepted PlayMode suite."
+            : "Keep the same PlayMode suite and acceptance criteria. Request approval for useProjectEditor: true with the exact suite and positive expectedTestCases. Preserve completed changes.",
+        ] : []),
+        ...(sourceArtifactChanged ? ["The previous Plan document could not be verified. Use the sealed plan below as the historical source for this revision."] : []),
+        JSON.stringify({
+          priorPlan: revisionSource.plan.draft,
+          confirmedDecisions: revisionSource.plan.decisionJournal,
+          committedSteps: revisionSource.plan.draft.steps.flatMap((step, index) => completed.has(index) ? [{ index, targets: step.targets }] : []),
+          pathsNeedingReview: revisionTargetPaths,
+          executionRepair,
+        }),
+      ].join("\n"),
+    });
+  }
+  const revisionEvidence = await collectPlanRevisionPathEvidence({ ledger, run: identity.run, workspace, paths: revisionTargetPaths,
+    canRead: canCollectWorkspace, signal: input.context.abortCtrl.signal, readWindowChars: input.context.runtimeContextBudget?.readWindowChars,
+    evidence, evidenceContents });
+  if (revisionEvidence) messages.push({ role: "user", content: revisionEvidence });
   if (retainedWorkspace) messages.push({ role: "user", content: retainedWorkspace });
   // The bound source draft has already been added in full from its exact
   // document receipt. Its historical final prose is the same content.
-  const sourceDraftTurnId = sourceRecord?.documentRef.owner.turnId;
-  messages.splice(1, 0, ...priorPlanConversationMessages(input.get(), identity.turn.turnId, sourceDraftTurnId));
+  const sourceDraftTurnId = revisionSource?.reference.turn.turnId || sourceRecord?.documentRef.owner.turnId;
+  if (!focusedRevision) messages.splice(1, 0, ...priorPlanConversationMessages(input.get(), identity.turn.turnId, sourceDraftTurnId));
   if (existing) {
     const aggregate = ledger.snapshot()!;
     const [pendingCall] = aggregate.pendingToolCalls;
@@ -395,5 +445,8 @@ export async function bootstrapRuntimeV2Plan(
     evidenceContents,
     historicalReads,
     messages,
+    revisionTargetPaths,
+    ...(revisionSource ? { revisionOf: { id: revisionSource.plan.id, revision: revisionSource.plan.revision,
+      ...(focusedRevision ? { focused: true } : {}) } } : {}),
   };
 }

@@ -18,6 +18,10 @@ import type {
 } from "./executionTypes";
 
 const RUNTIME_V2_REJECTED_ACTION_RESULT_PREFIXES = [
+  "[runtime-v2 rejected action:",
+  "[runtime-v2 failed action:",
+  "ACTION_NOT_EXECUTED:",
+  "TOOL_NOT_EXECUTED:",
   "REPEATED_ACTION_REJECTED:",
   "UNCHANGED_SOURCE_COVERAGE_REUSED:",
   "UNCHANGED_SOURCE_REPEAT_REJECTED:",
@@ -145,8 +149,7 @@ export function runtimeV2ProviderOmittedKnowledgeCanReplay(
     if (message.role !== "tool" || !message.tool_call_id || !matchingIds.has(message.tool_call_id)) continue;
     const text = typeof message.content === "string" ? message.content : "";
     // A soft duplicate reflection cannot replace the original delivery fact.
-    if (text.startsWith(`[runtime-v2 rejected action: ${identity}]`) ||
-      RUNTIME_V2_REJECTED_ACTION_RESULT_PREFIXES.some(prefix => text.startsWith(prefix))) continue;
+    if (RUNTIME_V2_REJECTED_ACTION_RESULT_PREFIXES.some(prefix => text.startsWith(prefix))) continue;
     latest = text;
   }
   if (!latest) return false;
@@ -496,6 +499,7 @@ export function runtimeV2ProviderExactReadReceipt(
       continue;
     }
     if (message.role !== "tool" || !message.tool_call_id) continue;
+    if (effects?.unexecutedToolCallIds?.has(message.tool_call_id) || effects?.failedToolCallIds?.has(message.tool_call_id)) continue;
     const call = callsById.get(message.tool_call_id);
     if (!call) continue;
     if (

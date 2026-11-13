@@ -3,6 +3,7 @@ import {
   inferCommandDirective,
   resolveTurnRunIntent,
   type CommandDirective,
+  type PlanContinuationCandidate,
   type ResolvedRunIntent,
   type RunIntentResolution,
 } from "../lib/runIntent";
@@ -47,6 +48,7 @@ export interface SubmitIntentRoutingInput<
   currentTurn: SubmitEffectiveIntentInput["currentTurn"];
   currentTurnIntent: ResolvedRunIntent;
   hasPlanArtifacts: boolean;
+  planContinuationCandidates?: readonly PlanContinuationCandidate[];
   shouldContinuePlanIntent: boolean;
   shouldContinuePreviousTurnIntent: boolean;
   previousTurnContinuationTarget: SubmitEffectiveIntentInput["previousTurnContinuationTarget"];
@@ -167,6 +169,7 @@ export function resolveAndApplySubmitIntentRouting<
       hasWorkspace: input.hasWorkspace,
       explicitIntent: input.options?.explicitIntent || input.lockedComposerIntent || input.mainIntentShortcut?.intent || undefined,
       previousRequest,
+      planContinuationCandidates: input.planContinuationCandidates,
       text: input.text,
       originalComposerInput: input.submittedText,
       images: input.images,
@@ -181,6 +184,7 @@ export function resolveAndApplySubmitIntentRouting<
         heuristicConfidence: resolution.confidence,
         explicitIntent: blockingPreflightEffect.request.explicitIntent ?? null,
         hasPreviousRequest: !!previousRequest,
+        planContinuationCandidateCount: blockingPreflightEffect.request.planContinuationCandidates?.length ?? 0,
         inputChars: input.text.length,
       });
       input.startBlockingPreflight(blockingPreflightEffect);

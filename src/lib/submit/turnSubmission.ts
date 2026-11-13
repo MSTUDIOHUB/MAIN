@@ -48,6 +48,8 @@ import {
   type PendingRunDecision,
   type PendingRunDecisionChoice,
   type PendingRunDecisionOption,
+  type PlanContinuationCandidate,
+  type PlanContinuationDecision,
   type ResolvedRunIntent,
   type ResolvedUserIntent,
   type RunIntentResolution,
@@ -85,6 +87,25 @@ const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> =
   analyze: { zh: "分析", en: "Analyze" },
   summarize: { zh: "总结", en: "Summarize" },
   report: { zh: "报告", en: "Report" },
+};
+
+const PLAN_CONTINUATION_STATUS_GUIDANCE: Record<Exclude<PlanContinuationCandidate["status"], "canceled">, { zh: string; en: string }> = {
+  review: {
+    zh: "这份计划正在等待审批。请在计划面板查看计划，通过审批后即可执行。",
+    en: "This plan is waiting for approval. Review and approve it in the Plan panel to proceed.",
+  },
+  paused: {
+    zh: "这份计划的执行已暂停。请回到原任务，处理待回答的问题或前置条件后继续。",
+    en: "This run is paused. Resolve its pending choice or prerequisite to continue.",
+  },
+  draft: {
+    zh: "这份计划仍是草稿。请打开该草稿继续规划，再提交审批。",
+    en: "This plan is still a draft. Open the draft to continue planning and submit it for review.",
+  },
+  completed: {
+    zh: "这份计划没有可续跑的剩余工作。如果需要追加任务，请描述新工作。",
+    en: "This plan has no remaining work to resume. Describe any new work you want to add.",
+  },
 };
 
 const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
@@ -255,6 +276,8 @@ export interface SubmitPipelineOptions {
   explicitIntent?: ResolvedUserIntent;
   /** Validated task semantics; capability needs never carry approval. */
   semanticIntent?: SemanticTaskIntent;
+  /** Semantic selection passed only to the store's exact-plan dispatch check. */
+  planContinuation?: PlanContinuationDecision;
   commandDirective?: CommandDirective | null;
   intentSummary?: string;
   turnTitle?: string;
@@ -491,6 +514,7 @@ export interface SubmitPreflightResultDecision {
   intentSummary: string;
   preflightSuggestsOperation: boolean;
   semanticIntent?: SemanticTaskIntent;
+  planContinuation?: PlanContinuationDecision;
 }
 
 export interface SubmitPreflightStalenessDecision {
@@ -521,6 +545,7 @@ export interface SubmitBlockingPreflightEffect<
     hasWorkspace?: boolean;
     explicitIntent?: ResolvedUserIntent;
     previousRequest?: string;
+    planContinuationCandidates?: readonly PlanContinuationCandidate[];
     signal?: AbortSignal;
     config: TConfig;
   };
@@ -590,6 +615,7 @@ export interface SubmitRunStatePatchInput<TConfig extends object> {
   shouldArchiveChoiceFeedback: boolean;
   currentNormalizedStreamState: NormalizedStreamState;
   effectiveWorkflowMode: LegacyWorkflowMode;
+  preserveComposerMode?: boolean;
   preservePlanState: boolean;
   shouldGrantExecutionConsentForTurn: boolean;
   /** Plan execution authority is consumed only after Harness admission. */
@@ -601,11 +627,11 @@ export type SubmitRunStatePatch<TConfig extends object> = {
   currentTurnId: string;
   input: string;
   preferredResponseLanguage: "zh" | "en";
-  lockedComposerIntent: null;
+  lockedComposerIntent?: null;
   pendingRunDecision: null;
   activeActionRequest: null;
   isGenerating: true;
-  config: TConfig & { workflowMode: LegacyWorkflowMode };
+  config?: TConfig & { workflowMode: LegacyWorkflowMode };
   elapsedTime: 0;
   normalizedStreamState?: NormalizedStreamState;
   isPlanApproved?: false;
@@ -1586,6 +1612,7 @@ export function resolveSubmitPreflightResultDecision(params: {
     }),
     preflightSuggestsOperation,
     semanticIntent: preflight.semantic,
+    planContinuation: preflight.planContinuation,
   };
 }
 
@@ -1625,6 +1652,7 @@ export function buildSubmitBlockingPreflightEffect<
   hasWorkspace?: boolean;
   explicitIntent?: ResolvedUserIntent;
   previousRequest?: string;
+  planContinuationCandidates?: readonly PlanContinuationCandidate[];
   text: string;
   originalComposerInput?: string;
   images?: string[];
@@ -1645,6 +1673,8 @@ export function buildSubmitBlockingPreflightEffect<
       ...(params.hasWorkspace ? { hasWorkspace: true } : {}),
       ...(params.explicitIntent ? { explicitIntent: params.explicitIntent } : {}),
       ...(params.previousRequest ? { previousRequest: params.previousRequest } : {}),
+      ...(params.hasWorkspace && params.planContinuationCandidates?.length
+        ? { planContinuationCandidates: params.planContinuationCandidates } : {}),
       config: params.currentConfig,
     },
     originalText: params.text,
@@ -1668,6 +1698,7 @@ export function buildSubmitPreflightResumeOptions<
     ...(params.options || {}),
     resolvedIntent: params.decision.resolvedIntent,
     semanticIntent: params.decision.semanticIntent,
+    planContinuation: params.decision.planContinuation,
     commandDirective: params.decision.commandDirective,
     skipIntentResolution: true,
     turnTitle: params.decision.turnTitle,
@@ -1729,6 +1760,45 @@ export function resolveSubmitPreflightEffectAction<
           : "语义解析请求失败或返回不完整结果，MAIN 未能确定本轮目标，尚未执行工具。请重试。",
     };
   }
+  let planContinuation = params.preflight?.planContinuation;
+  if (planContinuation?.kind === "ambiguous") {
+    // This choice changes the exact source and potentially the strategy. A
+    // generic in-Run reply would resume an unbound Turn, so ask for a new
+    // submission before admitting discovery or any effect.
+    const ids = new Set(planContinuation.candidateIds);
+    const choices = params.effect.request.planContinuationCandidates?.filter(candidate => ids.has(candidate.id))
+      .map(candidate => (candidate.title?.trim() || candidate.objective).replace(/\s+/g, " ").slice(0, 160)) || [];
+    const question = params.effect.preferredLanguage === "en"
+      ? "Which plan do you mean? In your next message, name the plan and what you want to do with it."
+      : "你指的是哪一份计划？请在下一条消息里说明计划名称，以及你希望怎样处理。";
+    return {
+      kind: "conclude_without_execution",
+      resultKind: "blocked",
+      summary: [question, choices.map(choice => `- ${choice}`).join("\n")].filter(Boolean).join("\n\n"),
+    };
+  }
+  if (planContinuation) {
+    const { candidateId, kind } = planContinuation;
+    const selected = params.effect.request.planContinuationCandidates?.find(candidate => candidate.id === candidateId);
+    const language = params.effect.preferredLanguage;
+    if (!selected) {
+      return { kind: "conclude_without_execution", resultKind: "blocked", summary: language === "en"
+        ? "The selected plan is no longer available in this session. Name an available plan in your next message."
+        : "当前会话中已无法找到这份计划。请在下一条消息里说明可用的计划名称。" };
+    }
+    if (selected.status !== "canceled" && kind !== "discuss") {
+      if (kind === "revise" && params.effect.request.explicitIntent === "plan") {
+        // An explicit Plan may use the regular review path for a new revision.
+        // Do not pass an unavailable execution source to the store.
+        planContinuation = undefined;
+      } else {
+        const summary = kind === "continue" ? PLAN_CONTINUATION_STATUS_GUIDANCE[selected.status][language]
+          : language === "en" ? "To revise this plan, select Plan mode and describe the changes."
+          : "如需修订这份计划，请选择计划模式并说明要改动的内容。";
+        return { kind: "conclude_without_execution", resultKind: "blocked", summary };
+      }
+    }
+  }
   const preflightDecision = resolveSubmitPreflightResultDecision({
     text: params.effect.originalText,
     images: params.effect.originalImages,
@@ -1737,7 +1807,7 @@ export function resolveSubmitPreflightEffectAction<
     // Workspace clarifications enter a durable Runtime pause on the admitted
     // Turn. They are neither a new execution approval nor a blocked final.
     preflight: params.effect.request.hasWorkspace && params.preflight
-      ? { ...params.preflight, needsUserChoice: false } : params.preflight,
+      ? { ...params.preflight, planContinuation, needsUserChoice: false } : params.preflight,
   });
 
   if (
@@ -2211,14 +2281,13 @@ export function buildSubmitRunStatePatch<TConfig extends object>(
           },
         }
       : {}),
-    lockedComposerIntent: null,
+    ...(params.preserveComposerMode ? {} : {
+      lockedComposerIntent: null,
+      config: { ...params.currentConfig, workflowMode: params.effectiveWorkflowMode },
+    }),
     pendingRunDecision: null,
     activeActionRequest: null,
     isGenerating: true,
-    config: {
-      ...params.currentConfig,
-      workflowMode: params.effectiveWorkflowMode,
-    },
     ...(params.preservePlanState
       ? {}
       : {

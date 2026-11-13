@@ -112,6 +112,36 @@ const runtimeV2 = loadTranspiledModuleSync(
 const exactPlanSessionKey = "plan-session";
 const exactPlanSessionEpoch = "plan-session-epoch-1";
 
+test("cold restore closes a durable Run and projects its saved final exactly once", () => {
+  const workspace = "/tmp/runtime-terminal-restore";
+  const turn = { workspaceKey: workspace, sessionKey: `${workspace}:74`, sessionEpoch: "same-epoch", turnId: "t74", clientSubmissionId: "s74" };
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId, parentRunId: null, runId: "r74", attemptId: "a74" };
+  const event = (sequence, type, fields) => ({ schemaVersion: runtimeV2.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+    sequence, at: sequence + 1, eventId: `restore-event-${sequence}`, type, ...fields });
+  let state = runtimeV2.transition(null, event(0, "turn.admitted", { turn, strategy: "execute", objective: "Repair fixture", constraints: [], acceptanceCriteria: [] }));
+  state = runtimeV2.transition(state, event(1, "run.started", { run, phase: "finalizing" }));
+  const projection = runtimeV2.buildRuntimeV2FinalProjection(state, "saved-final-74", "partial", "Editor verification pending", "Exact saved result.");
+  state = runtimeV2.transition(state, event(2, "run.completed", { run, finalProjection: projection,
+    outcome: { resultKind: "partial", reason: "Editor verification pending", completedAt: 3, finalProjectionId: projection.id } }));
+  const checkpoint = runtimeV2.createRuntimeV2Checkpoint({ aggregate: state, revision: 3, updatedAt: 3 });
+  const snapshot = { currentTurnId: turn.turnId,
+    conversationTurns: [{ id: turn.turnId, userPrompt: "Repair fixture", status: "executing", mode: "edit", blockIds: [1], createdAt: 1 }],
+    taskFlow: [{ id: 1, turnId: turn.turnId, type: "user", content: "Repair fixture" }],
+    runtimeV2Checkpoints: JSON.parse(JSON.stringify(runtimeV2.serializeRuntimeV2CheckpointMap({ [turn.turnId]: checkpoint }))),
+  };
+  const options = { coldRestore: true, workspacePath: workspace, expectedSessionKey: turn.sessionKey, expectedSessionEpoch: turn.sessionEpoch };
+  const restored = normalizeSessionRuntimeSnapshot(snapshot, options);
+  const reloaded = normalizeSessionRuntimeSnapshot(restored, options);
+  for (const value of [restored, reloaded]) {
+    const closed = value.runtimeV2Checkpoints[turn.turnId];
+    assert.equal(closed.revision, 5);
+    assert.equal(runtimeV2.isRuntimeV2TurnTerminallyClosed(closed.aggregate), true);
+    assert.equal(value.conversationTurns[0].runtimeOutcome.resultKind, "partial");
+    assert.equal(value.runtimeEvents.filter(event => event.type === "turn.completed" && event.turnId === turn.turnId).length, 1);
+    assert.deepEqual(value.taskFlow.filter(block => block.visibility === "assistant_final").map(block => block.content), [projection.markdown]);
+  }
+});
+
 test("global Execute preserves its admitted checkpoint through Session normalization before starting the Run", () => {
   const { createRuntimeV2RunnerIdentity } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionRunnerIdentity.ts"));
   const sessionId = 1788619431453;

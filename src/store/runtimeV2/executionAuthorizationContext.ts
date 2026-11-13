@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
+import { getUnlockedToolsForSession } from "../../lib/toolSearch";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2ForbiddenToolCapability } from "./executionCapabilityRestrictions";
 import {
@@ -27,6 +28,7 @@ import {
 import { runtimeV2ProviderActionWindowFor } from "./executionProviderActionWindow";
 import { runtimeV2ToolDefinitions } from "./executionToolDefinitions";
 import { builtInToolRequiresWorkspace } from "../../lib/workspaceToolScope";
+import { boundUnityMcpObservation, type WorkspaceMcpSnapshot } from "../../lib/workspaceMcp";
 import {
   buildRuntimeV2TextEnvelopeCatalog,
   selectRuntimeV2ProviderToolDefinitions,
@@ -67,6 +69,11 @@ function resolvedRuntimeV2CatalogEntry(
   return resolution.status === "resolved" ? resolution.entry : null;
 }
 
+export function runtimeV2BoundEditorObservation(input: RuntimeV2ExecutionPortsInput, name: string, args: Readonly<Record<string, unknown>>) {
+  const entry = resolvedRuntimeV2CatalogEntry(authorizationFor(input), name);
+  return entry ? boundUnityMcpObservation(input.context.workspaceMcpSnapshot, input.context.runWorkspace, entry, args) : null;
+}
+
 export function runtimeV2CatalogToolSource(
   authorization: RuntimeV2ExecutionAuthorization,
   name: string,
@@ -78,10 +85,11 @@ export function runtimeV2ToolRiskForCall(
   authorization: RuntimeV2ExecutionAuthorization,
   name: string,
   args: Record<string, unknown> = {},
-  context: ToolCallRiskContext = {},
+  context: ToolCallRiskContext & { readonly workspaceMcpSnapshot?: WorkspaceMcpSnapshot | null } = {},
 ): ToolRiskLevel | null {
   const entry = resolvedRuntimeV2CatalogEntry(authorization, name);
   if (!entry || entry.source === "skill") return null;
+  if (boundUnityMcpObservation(context.workspaceMcpSnapshot, context.workspace ?? undefined, entry, args)) return "external_read";
   return getToolRiskLevelForCall(
     entry.exposedName,
     args,
@@ -152,6 +160,7 @@ function mcpEntryMatchesDisabledKey(
 export function runtimeV2ProviderToolDefinitionsForPrompt(
   authorization: RuntimeV2ExecutionAuthorization,
   userPrompt: string,
+  sessionKey?: string,
 ): ToolDefinition[] {
   const mcpEntries = authorization.toolCatalog.entries.filter((entry) =>
     entry.source === "mcp" &&
@@ -192,8 +201,10 @@ export function runtimeV2ProviderToolDefinitionsForPrompt(
       selectedNames.add(entry.exposedName);
     }
   }
+  const unlocked = getUnlockedToolsForSession(sessionKey);
+  for (const entry of mcpEntries) if (unlocked.has(entry.exposedName)) selectedNames.add(entry.exposedName);
 
-  return authorization.toolDefinitions.filter((definition) => {
+  const available = authorization.toolDefinitions.filter((definition) => {
     const entry = resolvedRuntimeV2CatalogEntry(
       authorization,
       definition.function.name,
@@ -201,6 +212,13 @@ export function runtimeV2ProviderToolDefinitionsForPrompt(
     return entry?.source === "built_in" ||
       (entry?.source === "mcp" && selectedNames.has(entry.exposedName));
   });
+  const consoleIndex = available.findIndex(definition => definition.function.name === "unity_mcp_console");
+  const rawConsoleIndex = available.findIndex(definition => {
+    const entry = resolvedRuntimeV2CatalogEntry(authorization, definition.function.name);
+    return entry?.source === "mcp" && entry.executionName === "read_console";
+  });
+  if (rawConsoleIndex >= 0 && consoleIndex > rawConsoleIndex) available.splice(rawConsoleIndex, 0, ...available.splice(consoleIndex, 1));
+  return available;
 }
 
 /** Freeze built-ins, discovered MCP schemas and their shared permission
@@ -309,7 +327,9 @@ export function runtimeV2ToolCapabilityRestriction(
     risk: runtimeV2ToolRiskForCall(authorization, name, args, {
       workspace: input.context.runWorkspace,
       approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths,
+      workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
     }),
+    editorObservation: !!runtimeV2BoundEditorObservation(input, name, args),
     source: runtimeV2CatalogToolSource(authorization, name),
   });
 }
@@ -320,7 +340,8 @@ export function runtimeV2ToolApprovalCapability(
   const authorization = authorizationFor(input);
   return runtimeV2ForbiddenToolCapability({
     restrictions: runtimeV2ApprovalRequiredCapabilities(input), toolName: name,
-    risk: runtimeV2ToolRiskForCall(authorization, name, args, { workspace: input.context.runWorkspace, approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths }),
+    risk: runtimeV2ToolRiskForCall(authorization, name, args, { workspace: input.context.runWorkspace, approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths, workspaceMcpSnapshot: input.context.workspaceMcpSnapshot }),
+    editorObservation: !!runtimeV2BoundEditorObservation(input, name, args),
     source: runtimeV2CatalogToolSource(authorization, name),
   });
 }
@@ -339,7 +360,8 @@ export function providerToolDefinitionsForCommand(
   if (isReadOnlyContext(input)) {
     input.live.latestProviderActionWindow = null;
     const authorization = authorizationFor(input);
-    const available = filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(authorization, aggregate?.objective?.text || ""));
+    const available = filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(
+      authorization, aggregate?.objective?.text || "", input.context.runSessionKey));
     return selectRuntimeV2ProviderToolDefinitions({ ports: input, command, available, capabilityRegistry: authorization.capabilityRegistry });
   }
   const effects = deriveRuntimeV2ProviderEffectFacts(aggregate);
@@ -384,6 +406,7 @@ export function providerToolDefinitionsForCommand(
     available: filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(
       authorization,
       aggregate?.objective?.text || "",
+      input.context.runSessionKey,
     )),
     capabilityRegistry: authorization.capabilityRegistry,
     actionWindow,

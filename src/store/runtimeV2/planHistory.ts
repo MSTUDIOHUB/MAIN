@@ -1,3 +1,4 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 import type { RuntimeV2RunIdentity, TurnAggregateV1, WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
@@ -45,7 +46,11 @@ export function restorePlanHistory(input: {
   const receipts = new Map(events.flatMap((event) => event.type === "tool.completed" || event.type === "command.completed" ? [[event.idempotencyKey, event] as const] : []));
   const responses = events.filter((event) => event.type === "provider.responded");
   const nextResponseSequence = new Map(responses.map((event, index) => [event.sequence, responses[index + 1]?.sequence ?? Infinity]));
+  const hasGuidance = input.aggregate.events.some(event => event.type === "guidance.admitted");
   for (const event of events) {
+    if (hasGuidance && event.type === "command.scheduled" && event.command.kind === "request_model") {
+      appendRuntimeV2GuidanceHistory(input.messages, input.aggregate, event.run, event.command.idempotencyKey);
+    }
     const reply = runtimeV2ClarificationMessage(event);
     if (reply) input.messages.push(reply);
     if (event.type === "provider.responded") {

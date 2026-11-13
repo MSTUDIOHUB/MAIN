@@ -1,5 +1,5 @@
 import type { TurnAggregateV1 } from "./aggregate";
-import type { RuntimeV2CheckpointV3 } from "./checkpoint";
+import { appendRuntimeV2Checkpoint, type RuntimeV2CheckpointV3 } from "./checkpoint";
 import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2ResultKind,
@@ -10,6 +10,44 @@ import {
 import type { RuntimeV2Event, RuntimeV2EventDraft } from "./events";
 import type { CheckpointPort, ProjectionPort } from "./ports";
 import { buildRuntimeV2FinalProjection } from "./projection";
+
+export function runtimeV2TerminalProjection(state: TurnAggregateV1) {
+  const outcome = state.terminalOutcome;
+  if (!outcome) return null;
+  const published = state.events.find(event => event.type === "projection.published" && event.projectionId === outcome.finalProjectionId);
+  const completed = state.events.find(event => event.type === "run.completed" && event.outcome.finalProjectionId === outcome.finalProjectionId);
+  const finalize = [...state.events].reverse().find(event => event.type === "command.scheduled" && event.command.kind === "finalize_turn");
+  return (published?.type === "projection.published" && published.projection) ||
+    (completed?.type === "run.completed" && completed.finalProjection) ||
+    buildRuntimeV2FinalProjection(state, outcome.finalProjectionId, outcome.resultKind, outcome.reason,
+      finalize?.type === "command.scheduled" ? String(finalize.command.payload.finalMarkdown || "") : undefined);
+}
+
+/** Cold restore advances the existing terminal transaction. The same final
+ * projection identity and deterministic receipts survive retries of restore. */
+export function recoverRuntimeV2TerminalCheckpoint(checkpoint: RuntimeV2CheckpointV3): RuntimeV2CheckpointV3 {
+  const { aggregate, owner } = checkpoint;
+  const outcome = aggregate.terminalOutcome;
+  const run = aggregate.run?.identity;
+  if (!outcome || !run || isRuntimeV2TurnTerminallyClosed(aggregate)) return checkpoint;
+  let current = checkpoint;
+  const append = (draft: RuntimeV2EventDraft): boolean => {
+    const event = { ...draft, schemaVersion: RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: current.aggregate.nextSequence,
+      eventId: `${outcome.finalProjectionId}:restore:${draft.type}`, at: Math.max(current.updatedAt, outcome.completedAt) } as RuntimeV2Event;
+    const result = appendRuntimeV2Checkpoint({ checkpoint: current, owner, expectedRevision: current.revision, event });
+    if (!result.checkpoint) return false;
+    current = result.checkpoint;
+    return true;
+  };
+  if (aggregate.finalProjectionId !== outcome.finalProjectionId) {
+    const projection = runtimeV2TerminalProjection(aggregate);
+    if (!projection || !append({ type: "projection.published", run, audience: "final", projectionId: projection.id, projection })) return checkpoint;
+  }
+  if (!current.aggregate.events.some(event => event.type === "turn.completed")) {
+    append({ type: "turn.completed", turn: owner, runId: run.runId, outcome });
+  }
+  return current;
+}
 
 export interface RuntimeV2TerminalCheckpointInput {
   readonly checkpoint: CheckpointPort;
@@ -116,14 +154,7 @@ export async function finishRuntimeV2CheckpointTerminal(
   const outcome = current.aggregate.terminalOutcome!;
   let published = current.aggregate.events.find((event) => event.type === "projection.published" && event.projectionId === outcome.finalProjectionId);
   if (!published) {
-    const completed = current.aggregate.events.find((event) => event.type === "run.completed");
-    const finalProjection = (completed?.type === "run.completed" && completed.finalProjection) || buildRuntimeV2FinalProjection(
-      current.aggregate,
-      outcome.finalProjectionId,
-      outcome.resultKind,
-      outcome.reason,
-      input.finalMarkdown,
-    );
+    const finalProjection = runtimeV2TerminalProjection(current.aggregate)!;
     published = await append({
       type: "projection.published",
       run: input.run,

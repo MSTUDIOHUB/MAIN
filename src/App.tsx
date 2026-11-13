@@ -906,10 +906,8 @@ export default function App() {
   const closeFilePanel = useAppStore((s) => s.closeFilePanel);
   const isRightPanelVisible = showPlanPanel || showDiff || showTerminal || rightPanelTab === "subagents";
   const isFilePanelVisible = showFilePanel;
-  // isResizing is local UI state (mouse drag), not in the store
-  const [isResizing, setIsResizing] = useState(false);
-  const [isFilePanelResizing, setIsFilePanelResizing] = useState(false);
-  const [isSidebarResizing, setIsSidebarResizing] = useState(false);
+  const layoutRef = useRef<HTMLDivElement>(null);
+  const cancelPanelResizeRef = useRef<(() => void) | null>(null);
   const [isWorkspaceDropActive, setIsWorkspaceDropActive] = useState(false);
   const [mainUpdateStatus, setMainUpdateStatus] = useState<MainUpdateStatus>("idle");
   const [availableMainUpdate, setAvailableMainUpdate] = useState<MainUpdateInfo | null>(null);
@@ -917,8 +915,6 @@ export default function App() {
   const [mainUpdateProgress, setMainUpdateProgress] = useState<MainUpdateProgress | null>(null);
   const [lastMainUpdateCheckedAt, setLastMainUpdateCheckedAt] = useState<number | null>(null);
   const [appVersion, setAppVersion] = useState("");
-  const pendingRightPanelWidthRef = useRef<number | null>(null);
-  const rightPanelResizeFrameRef = useRef<number | null>(null);
 
   // ── Modal State ───────────────────────────────────────────────────────
   const isSettingsOpen = useAppStore((s) => s.isSettingsOpen);
@@ -3439,9 +3435,70 @@ export default function App() {
     };
   }, [handleFeishuCardAction, handleFeishuInboundMessage]);
 
-  const startResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsResizing(true); };
-  const startFilePanelResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsFilePanelResizing(true); };
-  const startSidebarResizing = (e: React.MouseEvent) => { e.preventDefault(); setIsSidebarResizing(true); };
+  const startPanelResize = useCallback((event: React.MouseEvent, panel: "sidebar" | "files" | "right") => {
+    if (event.button !== 0) return;
+    const element = layoutRef.current?.querySelector<HTMLElement>(`[data-workbench-panel="${panel}"]`);
+    if (!element) return;
+    event.preventDefault();
+    cancelPanelResizeRef.current?.();
+
+    const state = useAppStore.getState();
+    const widthKey = panel === "sidebar" ? "sidebarWidth" : panel === "files" ? "workspaceTreePanelWidth" : "rightPanelWidth";
+    const commit = panel === "sidebar" ? state.setSidebarWidth : panel === "files" ? state.setWorkspaceTreePanelWidth : state.setRightPanelWidth;
+    const startWidth = state[widthKey];
+    const startX = event.clientX;
+    let pointerX = startX;
+    let width = startWidth;
+    let frame: number | null = null;
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    const preview = () => {
+      frame = null;
+      const current = useAppStore.getState();
+      const files = current.showFilePanel ? current.workspaceTreePanelWidth : 0;
+      const right = (current.showPlanPanel || current.showDiff || current.showTerminal || current.rightPanelTab === "subagents")
+        ? current.rightPanelWidth : 0;
+      const reserved = panel === "sidebar" ? files + right : current.sidebarWidth + (panel === "right" ? files : right);
+      const minimum = panel === "sidebar" ? 220 : panel === "files" ? 260 : 340;
+      const limit = panel === "sidebar" ? 450 : panel === "files" ? 520 : Infinity;
+      const maximum = Math.max(minimum, Math.min(limit, window.innerWidth - reserved - 368));
+      const delta = (pointerX - startX) * (panel === "sidebar" ? 1 : -1);
+      const nextWidth = Math.max(minimum, Math.min(maximum, Math.round(startWidth + delta)));
+      if (nextWidth === width) return;
+      width = nextWidth;
+      element.style.setProperty("--panel-drag-width", `${width}px`);
+    };
+    const move = (moveEvent: MouseEvent) => {
+      pointerX = moveEvent.clientX;
+      if (frame === null) frame = window.requestAnimationFrame(preview);
+    };
+    const cleanup = () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", finish);
+      window.removeEventListener("blur", finish);
+      element.style.removeProperty("--panel-drag-width");
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      cancelPanelResizeRef.current = null;
+    };
+    const finish = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        preview();
+      }
+      cleanup();
+      if (element.isConnected && width !== useAppStore.getState()[widthKey]) commit(width);
+    };
+    cancelPanelResizeRef.current = cleanup;
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", finish);
+    window.addEventListener("blur", finish);
+  }, []);
+  useEffect(() => () => cancelPanelResizeRef.current?.(), [activeSessionKey, isFilePanelVisible, isRightPanelVisible]);
 
   const sidebarWidthRef = useRef(sidebarWidth);
   const languageRef = useRef(config.language);
@@ -3619,108 +3676,6 @@ export default function App() {
       });
     }
   }, [availableMainUpdate, mainUpdateStatus]);
-
-  useEffect(() => {
-    const MIN_SIDEBAR_WIDTH = 220;
-    const MIN_RIGHT_PANEL_WIDTH = 340;
-    const MIN_FILE_PANEL_WIDTH = 260;
-    const MAX_FILE_PANEL_WIDTH = 520;
-    const MIN_CHAT_INPUT_AREA_WIDTH = 368;
-
-    const flushRightPanelWidth = () => {
-      if (rightPanelResizeFrameRef.current !== null) {
-        window.cancelAnimationFrame(rightPanelResizeFrameRef.current);
-        rightPanelResizeFrameRef.current = null;
-      }
-      const nextWidth = pendingRightPanelWidthRef.current;
-      pendingRightPanelWidthRef.current = null;
-      if (typeof nextWidth === "number") {
-        setRightPanelWidth(nextWidth);
-      }
-    };
-
-    const scheduleRightPanelWidth = (nextWidth: number) => {
-      pendingRightPanelWidthRef.current = nextWidth;
-      if (rightPanelResizeFrameRef.current !== null) return;
-      rightPanelResizeFrameRef.current = window.requestAnimationFrame(() => {
-        rightPanelResizeFrameRef.current = null;
-        const width = pendingRightPanelWidthRef.current;
-        pendingRightPanelWidthRef.current = null;
-        if (typeof width === "number") {
-          setRightPanelWidth(width);
-        }
-      });
-    };
-
-    const onMouseMove = (e: MouseEvent) => {
-      if (isResizing) {
-        let w = window.innerWidth - e.clientX;
-        const reservedFileWidth = isFilePanelVisible ? filePanelWidth : 0;
-        const maxRightPanelWidth = Math.max(
-          MIN_RIGHT_PANEL_WIDTH,
-          window.innerWidth - sidebarWidth - reservedFileWidth - MIN_CHAT_INPUT_AREA_WIDTH,
-        );
-        if (w < MIN_RIGHT_PANEL_WIDTH) w = MIN_RIGHT_PANEL_WIDTH;
-        if (w > maxRightPanelWidth) w = maxRightPanelWidth;
-        scheduleRightPanelWidth(w);
-      } else if (isFilePanelResizing) {
-        const reservedRightWidth = isRightPanelVisible ? rightPanelWidth : 0;
-        let w = window.innerWidth - reservedRightWidth - e.clientX;
-        const maxFilePanelWidth = Math.min(
-          MAX_FILE_PANEL_WIDTH,
-          Math.max(
-            MIN_FILE_PANEL_WIDTH,
-            window.innerWidth - sidebarWidth - reservedRightWidth - MIN_CHAT_INPUT_AREA_WIDTH,
-          ),
-        );
-        if (w < MIN_FILE_PANEL_WIDTH) w = MIN_FILE_PANEL_WIDTH;
-        if (w > maxFilePanelWidth) w = maxFilePanelWidth;
-        setFilePanelWidth(w);
-      } else if (isSidebarResizing) {
-        let w = e.clientX;
-        if (w < MIN_SIDEBAR_WIDTH) w = MIN_SIDEBAR_WIDTH;
-        if (w > 500) w = 500;
-        setSidebarWidth(w);
-      }
-    };
-    const onMouseUp = () => {
-      flushRightPanelWidth();
-      setIsResizing(false);
-      setIsFilePanelResizing(false);
-      setIsSidebarResizing(false);
-    };
-
-    if (isResizing || isFilePanelResizing || isSidebarResizing) {
-      window.addEventListener("mousemove", onMouseMove);
-      window.addEventListener("mouseup", onMouseUp);
-      document.body.style.cursor = "col-resize";
-      document.body.style.userSelect = "none";
-    }
-
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-      if (rightPanelResizeFrameRef.current !== null && !isResizing) {
-        window.cancelAnimationFrame(rightPanelResizeFrameRef.current);
-        rightPanelResizeFrameRef.current = null;
-        pendingRightPanelWidthRef.current = null;
-      }
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-  }, [
-    filePanelWidth,
-    isFilePanelResizing,
-    isFilePanelVisible,
-    isRightPanelVisible,
-    isResizing,
-    isSidebarResizing,
-    rightPanelWidth,
-    setFilePanelWidth,
-    setRightPanelWidth,
-    setSidebarWidth,
-    sidebarWidth,
-  ]);
 
   useEffect(() => {
     const MIN_CENTER_WIDTH = 368;
@@ -3909,7 +3864,7 @@ export default function App() {
     </div>
   );
   return (
-    <div className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative">
+    <div ref={layoutRef} className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative">
       <ThemeStyles />
       <Sidebar
         config={{
@@ -3936,7 +3891,7 @@ export default function App() {
         updateProgressPercent={mainUpdateProgress?.percent ?? null}
         onInstallUpdate={handleInstallMainUpdate}
         onSetSidebarWidth={setSidebarWidth}
-        onStartResizing={startSidebarResizing}
+        onStartResizing={(event) => startPanelResize(event, "sidebar")}
         onOpenGlobalChat={handleOpenGlobalChat}
         onAddWorkspace={handleSelectWorkspace}
         onSelectWorkspace={handleSelectWorkspace}
@@ -3947,8 +3902,8 @@ export default function App() {
         onDeleteSession={handleDeleteSession}
       />
       <ChatArea taskFlow={taskFlow} t={t} config={config} setSettingsTab={setSettingsTab} setIsSettingsOpen={setIsSettingsOpen} activeDiffTask={activeDiffTask} endOfFlowRef={endOfFlowRef} isStreaming={isStreaming} activeSessionKey={activeSessionKey} onStopGeneration={handleStopGeneration} onLoadOlderSessionHistory={getCachedSessionTranscript(activeSessionKey)?.hasMore ? handleLoadOlderSessionHistory : undefined} allowToolAction={allowToolAction} rejectToolAction={rejectToolAction} autoApproveTools={autoApproveTools} onToggleAutoApprove={setAutoApproveTools} preferSubagents={preferSubagents} onTogglePreferSubagents={setPreferSubagents} contextMentions={contextMentions} setContextMentions={setContextMentions} attachedFiles={attachedFiles} setAttachedFiles={setAttachedFiles} onAttachFile={handleAttachFile}   currentWorkspace={currentWorkspace} handleAcceptInline={handleAcceptInline} handleRejectInline={handleRejectInline} onSendMessage={handleSendMessage} onQuickReply={handleQuickReply} />
-      <FilePanel width={filePanelWidth} onStartResizing={startFilePanelResizing} />
-      <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={startResizing} />
+      <FilePanel width={filePanelWidth} onStartResizing={(event) => startPanelResize(event, "files")} />
+      <RightPanel activeDiffTask={activeDiffTask} rightPanelWidth={rightPanelWidth} startResizing={(event) => startPanelResize(event, "right")} />
       {pendingSessionDelete && (
         <div
           data-testid="delete-session-confirmation"

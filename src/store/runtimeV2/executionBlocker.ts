@@ -8,9 +8,14 @@ export function createRuntimeV2ExecutionBlockerView(aggregate: TurnAggregateV1, 
   const blocker = aggregate.run?.blocker;
   if (aggregate.run?.status !== "paused" || !blocker) return null;
   const saveFailed = blocker.reasonCode === "document_save_failed";
-  const title = (saveFailed ? (language === "zh" ? "计划文档保存失败" : "Plan document save failed") : blocker.questionnaire?.title) || (language === "zh" ? "执行需要你的选择" : "Execution needs your input");
+  const editorPending = blocker.reasonCode === "unity_editor_verification_pending";
+  const title = (editorPending ? (language === "zh" ? "等待 Editor 验证" : "Editor verification pending") : saveFailed ? (language === "zh" ? "计划文档保存失败" : "Plan document save failed") : blocker.questionnaire?.title) || (language === "zh" ? "执行需要你的选择" : "Execution needs your input");
   const labels = language === "zh" ? { recheck: "我已处理，重新检查", continue: "继续其他可行工作", stop: "停止任务" } : { recheck: "Recheck after my changes", continue: "Continue independent work", stop: "Stop task" };
   if (saveFailed) labels.recheck = language === "zh" ? "重新保存文档" : "Retry document save";
+  if (editorPending) {
+    labels.recheck = language === "zh" ? "重新检查 Editor" : "Recheck Editor";
+    labels.continue = language === "zh" ? "保留修改并结束" : "Finish and retain changes";
+  }
   const options = blocker.questionnaire ? [] : blocker.clarification ? [...(blocker.clarification.choices || []).map(value => ({ label: value, value })), { label: labels.stop, value: "stop" }]
     : blocker.options.map(value => ({ label: labels[value], value }));
   const request: UserChoiceActionRequest = { schemaVersion: 1, kind: "user_choice", requestId: blocker.requestId,
@@ -46,7 +51,7 @@ export function projectRuntimeV2ExecutionBlocker(input: { aggregate: TurnAggrega
 const pendingDecisions = new WeakMap<() => any, Set<string>>();
 export async function resolveRuntimeV2ExecutionBlocker(input: {
   get: () => any; set: (value: any) => void;
-  identity: UserChoiceResolutionIdentity; choice: string; sessionEpoch: string; answer?: UserChoiceAnswer;
+  identity: UserChoiceResolutionIdentity; choice: string; source?: "editor_reconnected"; sessionEpoch: string; answer?: UserChoiceAnswer;
   persist: (state: any, isCurrent: () => boolean) => Promise<unknown>;
   dispatch: (turn: any, requestId: string) => void; stop: (turnId: string) => void;
 }): Promise<boolean> {
@@ -79,7 +84,7 @@ export async function resolveRuntimeV2ExecutionBlocker(input: {
     owner: aggregate.turn, expectedRevision: checkpoint.revision,
     event: { schemaVersion: "runtime-v2-event.v1", type: "run.decision_recorded", eventId: `decision:${blocker.requestId}`,
       at: Math.max(Date.now(), aggregate.updatedAt), sequence: aggregate.nextSequence, run: aggregate.run.identity,
-      requestId: blocker.requestId, choice: choice as "recheck" | "continue" | "stop", ...(reply ? { reply } : {}), ...(answer ? { answer } : {}) } });
+      requestId: blocker.requestId, choice: choice as "recheck" | "continue" | "stop", ...(input.source ? { source: input.source } : {}), ...(reply ? { reply } : {}), ...(answer ? { answer } : {}) } });
   if (appended.disposition !== "committed" || !appended.checkpoint || !current()) return false;
   const projected = { ...state, runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint } };
   const persisted: any = await input.persist(projected, current);

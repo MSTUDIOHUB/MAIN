@@ -1,6 +1,7 @@
 import { appendPlanDecisionJournal, buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
 import { completedAgentLoopOutcome } from "../../lib/runOutcome";
 import type { ProjectInitInspection, RulesDraftReview } from "../../lib/projectInit";
+import { withProjectInitManagedBlock } from "../../lib/projectInit";
 import { planDocumentDisplayTitle, type PlanDocumentRef } from "../../lib/planDocuments";
 import { resolvePlanDocumentFromAggregate } from "../../lib/planDocumentRecords";
 import type { RuntimeV2RunIdentity, RuntimeV2TurnIdentity, WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
@@ -68,10 +69,12 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
     const result = await writePlanDocumentOrPause({ runner: input, ledger, run, command, saveInput: saveRecovery.saveInput });
     return "settlement" in result ? result.settlement : complete(result.documentRef, result.markdown);
   }
+  await collaboration.restoreProactive();
   let recoveryCalls = await recoverPlanDocumentInvocations(ledger, run);
   while (true) {
     if (input.context.abortCtrl.signal.aborted) throw new Error("PLAN_DOCUMENT_CANCELED");
     if (Date.now() >= deadlineAt) throw new Error("PLAN_DOCUMENT_CALLER_DEADLINE");
+    if (!recoveryCalls && await collaboration.advanceProactive()) continue;
     const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, { finalTextIsProgress: false });
     if (recovery && runtimeV2ProviderRecoveryStallExpired({ startedAt: recovery.startedAt, reason: recovery.pressure.reason, latestOccurrence: recovery.pressure.occurrence }, Date.now())) {
       // Stalled exploration changes guidance, never the truth of the Turn.
@@ -109,7 +112,7 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
       if (call.name === ASK_PLAN_QUESTIONS) {
         const pause = await handlePlanQuestionTool({ runner: input, ledger, run, call, messages, includeResultChoice: true,
           receiptAlreadySettled: recovered?.settledQuestion,
-          joinChildren: async () => !collaboration.activeChildCount() || collaboration.joinActive("plan_question_requires_joined_children"),
+          joinChildren: async () => !collaboration.activeChildCount() || collaboration.joinActive("plan_question_requires_joined_children", true),
         });
         if (pause) return pause;
         continue;
@@ -120,9 +123,22 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
         const rawTitle = typeof call.arguments.title === "string" ? call.arguments.title.trim() : "";
         const title = rawTitle ? planDocumentDisplayTitle(rawTitle) : "";
         const body = typeof call.arguments.markdown === "string" ? call.arguments.markdown : "";
-        const markdown = input.context.planPurpose === "rules" ? body : appendPlanDecisionJournal(body, buildPlanDecisionJournal(ledger.snapshot()));
         if (!title || !body.trim()) { await feedback("A document needs a title and its complete Markdown body."); continue; }
-        if (collaboration.activeChildCount()) await collaboration.joinActive("plan_document_submission");
+        let markdown: string;
+        if (input.context.planPurpose === "rules") {
+          const baseline = input.context.projectBaselineContext;
+          try {
+            markdown = baseline?.workspace.identity === inspection?.workspaceIdentity && baseline
+              ? withProjectInitManagedBlock(body, baseline, input.context.phaseLanguage)
+              : body;
+          } catch {
+            await feedback("Submit the rules with human text intact and remove malformed MAIN-managed section markers. MAIN will generate the summary.");
+            continue;
+          }
+        } else {
+          markdown = appendPlanDecisionJournal(body, buildPlanDecisionJournal(ledger.snapshot()));
+        }
+        if (collaboration.activeChildCount()) await collaboration.joinActive("plan_document_submission", true);
         const policy = collaboration.current().payload;
         if (policy.collaborationRequired === true && policy.collaborationRequirementMet !== true) { await feedback("The required planning child has not delivered a joined report. Continue that existing work before saving."); continue; }
         const saveInput = planDocumentSaveInput(ledger.snapshot()!, title, markdown);

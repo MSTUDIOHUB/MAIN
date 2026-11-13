@@ -40,10 +40,12 @@ export function assessPlanSubmission(input: {
   readonly requireBehavioralValidation?: boolean;
   readonly decisionJournal?: string;
   readonly createdAt?: number;
+  readonly revisionOf?: { readonly id: string; readonly revision: number };
 }): PlanSubmissionAssessment {
   let compiled: ReturnType<typeof workPlanDraftFromSubmission>;
   try {
-    compiled = workPlanDraftFromSubmission(input.candidate, input.evidence, input.objective, input.criterionIds);
+    compiled = workPlanDraftFromSubmission(input.candidate, input.evidence, input.objective, input.criterionIds,
+      input.aggregate?.turn?.workspaceKey);
   } catch (error) {
     return { kind: "draft", normalizationReasons: [], diagnostics: [{ code: "plan_submission_compile_invalid", fieldPath: "$",
       criterionIds: [...input.criterionIds], message: error instanceof Error ? error.message : String(error) }] };
@@ -92,6 +94,7 @@ export function assessPlanSubmission(input: {
   if (diagnostics.length) return { kind: "draft", diagnostics, normalizationReasons };
   try {
     return { kind: "reviewable", normalizationReasons, sealedPlan: sealWorkPlanV1({ draft, evidence: input.evidence,
+      ...(input.revisionOf ? { id: input.revisionOf.id, revision: input.revisionOf.revision + 1 } : {}),
       createdAt: input.createdAt ?? Date.now(), ...(input.decisionJournal !== undefined ? { decisionJournal: input.decisionJournal } : {}) }) };
   } catch (error) {
     return { kind: "draft", normalizationReasons, diagnostics: [{ code: "plan_structure_invalid", fieldPath: "$",

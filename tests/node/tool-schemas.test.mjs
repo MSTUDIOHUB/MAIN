@@ -336,7 +336,8 @@ test("knowledge schemas query frozen message scope without allowing model-select
   assert.ok(knowledgeExcerpt);
   assert.deepEqual(knowledgeSearch.function.parameters.required, ["query"]);
   // Scope moved from model arguments to the explicitly selected Turn payload.
-  assert.deepEqual(Object.keys(knowledgeSearch.function.parameters.properties).sort(), ["limit", "query"]);
+  assert.deepEqual(Object.keys(knowledgeSearch.function.parameters.properties).sort(), ["allow_web_fallback", "limit", "query"]);
+  assert.equal(knowledgeSearch.function.parameters.properties.allow_web_fallback.type, "boolean");
   assert.equal(knowledgeSearch.function.parameters.properties.kb_ids, undefined);
   assert.equal(knowledgeSearch.function.parameters.properties.references, undefined);
   assert.ok(knowledgeSearch.function.parameters.properties.limit);

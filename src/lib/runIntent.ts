@@ -110,8 +110,26 @@ export interface SemanticTaskIntent {
   approvalRequiredCapabilities: readonly SemanticCapability[];
 }
 
+/** Store-scoped plan descriptors used for language interpretation only. */
+export interface PlanContinuationCandidate {
+  readonly id: string;
+  readonly title?: string;
+  readonly objective: string;
+  readonly status: "draft" | "review" | "canceled" | "paused" | "completed";
+}
+
+/** A selection still requires the exact Session and plan authority checks. */
+export type PlanContinuationDecision = {
+  readonly kind: "continue" | "revise" | "discuss";
+  readonly candidateId: string;
+} | {
+  readonly kind: "ambiguous";
+  readonly candidateIds: readonly string[];
+};
+
 export interface IntentPreflightResult {
   semantic: SemanticTaskIntent;
+  planContinuation?: PlanContinuationDecision;
   intent: ResolvedUserIntent;
   confidence: number;
   title?: string;
@@ -810,8 +828,8 @@ export function normalizeCommandDirective(
     ...(normalizeDirectiveString(candidate.target) ?? fallback?.target
       ? { target: normalizeDirectiveString(candidate.target) ?? fallback?.target }
       : {}),
-    ...(normalizeDirectiveString(candidate.exactCommand, 1_000) ?? fallback?.exactCommand
-      ? { exactCommand: normalizeDirectiveString(candidate.exactCommand, 1_000) ?? fallback?.exactCommand }
+    ...(normalizeExactCommand(candidate.exactCommand) ?? fallback?.exactCommand
+      ? { exactCommand: normalizeExactCommand(candidate.exactCommand) ?? fallback?.exactCommand }
       : {}),
     requiresWorkspace: typeof candidate.requiresWorkspace === "boolean"
       ? candidate.requiresWorkspace
@@ -853,12 +871,38 @@ export function looksLikeExplicitShellCommandInput(value: unknown): boolean {
   return EXPLICIT_SHELL_COMMAND_RE.test(String(value || "").trim());
 }
 
+function normalizeExactCommand(value: unknown): string | undefined {
+  if (typeof value !== "string") return;
+  const command = value.trim();
+  return command && command.length <= 1_000 ? command : undefined;
+}
+
+export function explicitShellCommandFromRequest(input: string): string | undefined {
+  const text = input.trim();
+  const operation = /^(?:(?:please|can you|could you)\s+)*(?:run|execute)\s+(?:the\s+command\s+)?|^(?:请\s*|帮我\s*)?(?:运行|执行)\s*(?:(?:以下)?命令\s*[:：]?\s*)?/i.exec(text);
+  if (!operation) return looksLikeExplicitShellCommandInput(text) ? normalizeExactCommand(text) : undefined;
+  const tail = text.slice(operation[0].length);
+  const quoted = /^`([^`\r\n]+)`/.exec(tail)?.[1];
+  if (quoted) return normalizeExactCommand(quoted);
+  const bare = tail.split(/\s+and\s+(?:report|show|summari[sz]e|tell)\b|[，。]\s*(?:并|报告|说明)/i, 1)[0].trim();
+  return /^(?:pwd|whoami)$/i.test(bare) || looksLikeExplicitShellCommandInput(bare) && /^[\w./:=@+ -]+$/.test(bare)
+    ? normalizeExactCommand(bare) : undefined;
+}
+
 const UNITY_CONSOLE_DIAGNOSTIC_RE = /console|报错|错误|warning|警告|compile|编译|编译失败|编译错误/i;
 const UNITY_CONSOLE_NEGATION_RE = /(?:没有|无|未见|不是|并非|不\s*是|not|no|without).{0,12}(?:console|报错|错误|warning|警告|compile|编译|编译失败|编译错误)|(?:console|报错|错误|warning|警告|compile|编译|编译失败|编译错误).{0,12}(?:没有|无|未见|不是|并非|not|no|without)/i;
 
 export function hasExplicitUnityConsoleDiagnosticCue(input: string): boolean {
   const normalized = normalizeInput(input);
   return UNITY_CONSOLE_DIAGNOSTIC_RE.test(normalized) && !UNITY_CONSOLE_NEGATION_RE.test(normalized);
+}
+
+/** Recognize a diagnostic-only objective at submission. Additional clauses
+ * keep their ordinary acceptance requirements. */
+export function isEditorDiagnosticRepairRequest(input: string): boolean {
+  const request = input.trim().replace(/[.!。！]+$/, "").trim();
+  return /^(?:请\s*|帮我\s*)?(?:修复|解决)\s*(?:(?:Unity|团结|Editor)\s*)?Console\s*(?:窗口)?\s*(?:里(?:的)?|中(?:的)?|的)?\s*(?:报错|错误)$/i.test(request) ||
+    /^(?:please\s+)?(?:fix|repair|resolve)\s+(?:(?:the|current|all)\s+)*(?:(?:unity|tuanjie|editor)\s+)?console\s+(?:errors?|diagnostics)$/i.test(request);
 }
 
 function inferUnityAction(input: string): string {
@@ -895,7 +939,7 @@ function inferCommandMetadata(
       WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput) &&
       !hasReadOnlyWorkspaceConstraint(normalizedInput)
     );
-  const explicitShellCommand = looksLikeExplicitShellCommandInput(lower);
+  const exactCommand = explicitShellCommandFromRequest(input);
   const remoteShellOperation = /(?:同步|部署|上传|发布).{0,32}(?:服务器|远程|生产|线上|server|remote|production)|(?:服务器|远程|生产|线上|server|remote|production).{0,32}(?:同步|部署|上传|发布)/i.test(normalizedInput);
   const naturalShellOperation = /\b(?:run|execute|start)\b.{0,24}\b(?:command|script|deploy|test|build|server)\b/i.test(lower) ||
     /(?:执行|运行|启动).{0,16}(?:命令|脚本|测试|构建|服务|部署)/i.test(normalizedInput);
@@ -926,6 +970,7 @@ function inferCommandMetadata(
     return createCommandDirective("git", {
       source,
       action: inferGitAction(normalizedInput),
+      ...(exactCommand ? { exactCommand } : {}),
       target: "git",
       requiresWorkspace: true,
       requiresApproval: true,
@@ -936,7 +981,7 @@ function inferCommandMetadata(
 
   if (/\bunity\b|unity\s*mcp|editor\s*plugin|roslyn|prefab|scene|asset|yaml|\.asmdef\b|\.unity\b|\.prefab\b|预制体|场景|资源|编辑器插件|引用搜索|C#执行|c# 执行/i.test(normalizedInput) &&
     (intent === "execute" || intent === "plan" || workspaceMutationExpected ||
-      hasExplicitUnityConsoleDiagnosticCue(normalizedInput) || naturalShellOperation || explicitShellCommand ||
+      hasExplicitUnityConsoleDiagnosticCue(normalizedInput) || naturalShellOperation || exactCommand ||
       DIRECT_OPERATION_REQUEST_RE.test(normalizedInput))) {
     return createCommandDirective("unity", {
       source,
@@ -995,14 +1040,12 @@ function inferCommandMetadata(
     });
   }
 
-  if (explicitShellCommand || naturalShellOperation) {
+  if (exactCommand || naturalShellOperation) {
     return createCommandDirective("shell", {
       source,
       action: inferShellAction(normalizedInput),
       target: normalizeDirectiveString(normalizedInput, 80),
-      ...(explicitShellCommand
-        ? { exactCommand: normalizeDirectiveString(normalizedInput, 1_000) }
-        : {}),
+      ...(exactCommand ? { exactCommand } : {}),
       requiresWorkspace: true,
       requiresApproval: true,
       confidence: 0.9,

@@ -8,6 +8,8 @@ import type {
 import type { RuntimeV2Event } from "./events";
 import { countDistinctRuntimeV2EvidenceFacts } from "./evidenceFacts";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
+import { runtimeV2DirectExecuteMutationTargets } from "./validationReceipt";
+import { deriveUnityCompilation, deriveUnityShaderImport } from "./unityCompilation";
 
 function markdownCode(value: unknown): string {
   const text = String(value || "").trim().replace(/`/g, "");
@@ -230,10 +232,7 @@ export function buildRuntimeV2FinalProjection(
       `final:${resultKind}:${reason}`,
     );
   }
-  const mutationTargets = [...new Set(aggregate.evidence
-    .filter((evidence) => evidence.kind === "mutation")
-    .map((evidence) => evidence.target)
-    .filter(Boolean))];
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(aggregate);
   const validations = aggregate.events.filter(
     isRuntimeV2ValidationAttempt,
   );
@@ -251,6 +250,9 @@ export function buildRuntimeV2FinalProjection(
   const validationLine = validations.length > 0
     ? `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
     : "- 本轮没有完成可确认的验证。";
+  const editorChecks = [["C# 编译", deriveUnityCompilation(aggregate)?.receipt], ["Shader 导入", deriveUnityShaderImport(aggregate)?.receipt]] as const;
+  const editorLines = editorChecks.flatMap(([name, receipt]) => receipt && receipt.result.status !== "not_unity_project" ?
+    [`- ${name}${receipt.result.status === "passed" ? "通过" : receipt.result.status === "failed" ? "仍有错误" : "待验证"}。`] : []);
   return projection(
     aggregate,
     "final",
@@ -259,7 +261,8 @@ export function buildRuntimeV2FinalProjection(
       `### ${terminalTitle(resultKind)}`,
       finalMarkdown?.trim(),
       mutationLine,
-      validationLine,
+      ...(validations.length > 0 || editorLines.length === 0 ? [validationLine] : []),
+      ...editorLines,
       evidenceLine,
       /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
     ].filter(Boolean).join("\n\n"),

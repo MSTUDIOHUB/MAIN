@@ -572,6 +572,27 @@ test("submit pipeline parses MAIN shortcuts before agent-loop routing", () => {
 
 
 
+test("Plan panel follow-ups preserve the Composer mode while creating a running Turn", () => {
+  const patch = buildSubmitRunStatePatch({
+    turnId: "focused-revision",
+    isHidden: false,
+    currentInput: "",
+    preferredLanguage: "zh",
+    shouldArchiveChoiceFeedback: false,
+    currentNormalizedStreamState: {},
+    effectiveWorkflowMode: "plan",
+    preservePlanState: true,
+    preserveComposerMode: true,
+    shouldGrantExecutionConsentForTurn: false,
+    currentConfig: { workflowMode: "chat" },
+  });
+  assert.equal(patch.currentTurnId, "focused-revision");
+  assert.equal(patch.isGenerating, true);
+  assert.equal(Object.hasOwn(patch, "config"), false);
+  assert.equal(Object.hasOwn(patch, "lockedComposerIntent"), false);
+  assert.equal(Object.hasOwn(patch, "currentTurnExecutionConsent"), false);
+});
+
 test("admitted direct Execute binds execution consent to this Turn without enabling auto approval", () => {
   const decision = resolveSubmitRuntimeDecision({
     effectiveRunIntent: "execute",

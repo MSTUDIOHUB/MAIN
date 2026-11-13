@@ -1,5 +1,6 @@
 import type { ProjectBaselineContext, ProjectBaselineFact } from "./projectBaseline";
 import type { PlanDocumentRef } from "./planDocuments";
+import { sha256Hex } from "./sha256";
 
 export const PROJECT_INIT_TARGET_PATH = "AGENTS.md";
 export const PROJECT_INIT_BLOCK_START = "<!-- MAIN:PROJECT_INIT:START v1 -->";
@@ -136,6 +137,11 @@ function safeInline(value: string): string {
   return `\`${bounded || "unknown"}\``;
 }
 
+export function projectInitManagedBlockDigest(content: string): string | null {
+  const block = inspectManagedBlock(content);
+  return block.status === "valid" ? sha256Hex(content.slice(block.start, block.end)) : null;
+}
+
 function factLabel(fact: ProjectBaselineFact): string {
   return `${fact.name}${fact.version ? `@${fact.version}` : ""}${fact.constraint ? ` ${fact.constraint}` : ""}`;
 }
@@ -172,6 +178,9 @@ export function renderProjectInitManagedBlock(
   const languages = sortedUnique(baseline.facts.languages.map(factLabel), PROJECT_INIT_RENDER_LIMITS.facts);
   const managers = sortedUnique(baseline.facts.packageManagers.map(factLabel), PROJECT_INIT_RENDER_LIMITS.facts);
   const runtimes = sortedUnique(baseline.facts.runtimes.map(factLabel), PROJECT_INIT_RENDER_LIMITS.facts);
+  const packages = [...(baseline.facts.packages || [])]
+    .sort((a, b) => Number(b.name.startsWith("com.unity.render-pipelines.")) - Number(a.name.startsWith("com.unity.render-pipelines.")) || compareText(a.name, b.name))
+    .slice(0, PROJECT_INIT_RENDER_LIMITS.facts);
   const scripts = [...baseline.facts.scripts]
     .sort((a, b) => compareText(a.name, b.name))
     .slice(0, PROJECT_INIT_RENDER_LIMITS.scripts);
@@ -185,11 +194,16 @@ export function renderProjectInitManagedBlock(
     PROJECT_INIT_BLOCK_START,
     `<!-- baseline-fingerprint: ${fingerprint} -->`,
     zh ? "## MAIN 项目快速参考" : "## MAIN project quick reference",
-    zh ? "> 此区块由 MAIN `/init` 确定性生成；仅使用项目基线事实。请在区块外维护人工规则。" : "> This block is generated deterministically by MAIN `/init` from project-baseline facts. Keep human rules outside it.",
+    zh ? "> 此区块由 MAIN 确定性生成。请在区块外维护人工规则，版本以当前工程文件为准。" : "> MAIN generates this section from project facts. Keep human rules outside it. Use the current project files as the source of version information.",
     "",
     renderList(zh ? "语言" : "Languages", languages, zh ? "未检测到" : "none detected"),
     renderList(zh ? "包管理器" : "Package managers", managers, zh ? "未检测到" : "none detected"),
     renderList(zh ? "运行时" : "Runtimes", runtimes, zh ? "未检测到" : "none detected"),
+    ...packages.map(fact => `- ${safeInline(factLabel(fact))} — ${safeInline(fact.provenance.path)}`),
+    ...(baseline.facts.runtimes.some(fact => fact.provenance.path === "ProjectSettings/ProjectVersion.txt") ? [
+      zh ? "- 引擎版本来源为 `ProjectSettings/ProjectVersion.txt`。编写引擎代码前核对当前包或匹配版本的文档，修改后查看实际 Editor 编译与 Shader 导入结果。"
+        : "- Read the engine version from `ProjectSettings/ProjectVersion.txt`. Check installed packages or version-matched documentation for engine APIs. Verify actual Editor compilation and shader import after editing.",
+    ] : []),
     "",
     zh ? "### 已声明命令" : "### Declared commands",
     ...(scripts.length
@@ -253,6 +267,17 @@ function appendManagedBlock(existing: string, block: string): string {
 function replaceManagedBlock(existing: string, block: string, state: Extract<ManagedBlockState, { status: "valid" }>): string {
   const localized = block.replace(/\n/g, newlineFor(existing));
   return `${existing.slice(0, state.start)}${localized}${existing.slice(state.end)}`;
+}
+
+export function withProjectInitManagedBlock(
+  content: string,
+  baseline: ProjectBaselineContext,
+  locale: ProjectInitLocale,
+): string {
+  const managed = inspectManagedBlock(content);
+  if (managed.status === "invalid") throw new Error("PROJECT_INIT_INVALID_MANAGED_BLOCK");
+  const block = renderProjectInitManagedBlock(baseline, { locale });
+  return managed.status === "valid" ? replaceManagedBlock(content, block, managed) : appendManagedBlock(content, block);
 }
 
 function normalizedAbsolutePath(value: string): string | null {
@@ -324,10 +349,7 @@ export async function prepareProjectInitPreview(input: {
   if (baseline.workspace.canonicalPath !== inspection.canonicalWorkspace || baseline.workspace.identity !== inspection.workspaceIdentity) {
     throw new Error("PROJECT_INIT_BASELINE_WORKSPACE_MISMATCH");
   }
-  const block = renderProjectInitManagedBlock(baseline, { locale });
-  const proposed = managed.status === "valid"
-    ? replaceManagedBlock(inspection.content, block, managed)
-    : appendManagedBlock(inspection.content, block);
+  const proposed = withProjectInitManagedBlock(inspection.content, baseline, locale);
   if (new TextEncoder().encode(proposed).byteLength > PROJECT_INIT_MAX_CONTENT_BYTES) {
     throw new Error("PROJECT_INIT_CONTENT_TOO_LARGE");
   }
@@ -371,6 +393,41 @@ export async function commitProjectInitPreview(input: {
   if (result.status === "no_op") return result;
   if (result.status === "stale" && ["workspace_identity", "target_path", "base_version"].includes(result.reason)) return result;
   throw new Error("PROJECT_INIT_INVALID_COMMIT_RESULT");
+}
+
+export interface ManagedProjectRulesPreference {
+  readonly blockDigest: string;
+  readonly locale: ProjectInitLocale;
+}
+
+/** Update only a block whose exact bytes the user last approved. */
+export async function refreshApprovedProjectInitBlock(input: {
+  readonly workspace: string;
+  readonly preference: ManagedProjectRulesPreference;
+  readonly io: ProjectInitIo;
+  readonly isCurrent: () => boolean;
+}): Promise<ManagedProjectRulesPreference | "needs_review" | null> {
+  const inspection = await input.io.inspect({ workspace: input.workspace, targetPath: PROJECT_INIT_TARGET_PATH });
+  if (!input.isCurrent()) return null;
+  if (projectInitManagedBlockDigest(inspection.content) !== input.preference.blockDigest) return "needs_review";
+  const preview = await prepareProjectInitPreview({
+    command: "/rules --refresh",
+    workspace: input.workspace,
+    locale: input.preference.locale,
+    io: { ...input.io, inspect: async () => inspection },
+  });
+  if (!input.isCurrent()) return null;
+  if (preview.status === "no_changes") return null;
+  if (preview.status !== "ready_update") return "needs_review";
+  const blockDigest = projectInitManagedBlockDigest(preview.proposed);
+  if (!blockDigest) return "needs_review";
+  const result = await commitProjectInitPreview({
+    preview,
+    currentWorkspaceIdentity: inspection.workspaceIdentity,
+    io: input.io,
+  });
+  return result.status === "committed" || result.status === "no_op"
+    ? { ...input.preference, blockDigest } : "needs_review";
 }
 
 export function cancelProjectInitPreview(_preview: ProjectInitPreview): { readonly status: "canceled" } {

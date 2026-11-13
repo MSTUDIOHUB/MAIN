@@ -1,5 +1,7 @@
 // @ts-nocheck
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useUnityEditorReconnect } from "./useUnityEditorReconnect";
+import { runtimeV2GuidanceDelivery } from "../lib/runtime-v2/guidance";
+import React, { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconImageIcon, IconLogoM, IconSettings, IconStop, IconSubagent, IconSubagentClosed, IconTerminal, IconZap } from "./Icons";
 import ActionCard from "./ActionCard";
@@ -50,7 +52,7 @@ import {
   type ConversationTurn,
   type ReplyOption,
 } from "../lib/workflowModels";
-import { getIntentPolicy, resolveConversationTurnIntent } from "../lib/runIntent";
+import { resolveConversationTurnIntent } from "../lib/runIntent";
 import { formatPlanExecutionProgressSnapshot, summarizePlanExecutionProgressSnapshot } from "../lib/planExecutionRecovery";
 import {
   countCompletedToolCalls,
@@ -154,6 +156,20 @@ function resolveTurnProcessFontSize(chatFontSize: number): number {
 const TURN_PROCESS_FONT_REFERENCE_SIZE = 13;
 const TURN_PROCESS_FONT_STEPS = [9, 10, 10.5, 11, 12, 12.5, 13] as const;
 const EMPTY_CHAT_BLOCKS: any[] = [];
+const turnActivityByBlocks = new WeakMap<any[], {
+  changes: ReturnType<typeof collectTurnChangeEntries>;
+  summaries: Map<"zh" | "en", ReturnType<typeof buildToolExecutionSummary>>;
+  models: Map<string, ReturnType<typeof buildTurnProcessArchiveModel>>;
+}>();
+
+function turnBlockActivity(blocks: any[]) {
+  let activity = turnActivityByBlocks.get(blocks);
+  if (!activity) {
+    activity = { changes: collectTurnChangeEntries(blocks), summaries: new Map(), models: new Map() };
+    turnActivityByBlocks.set(blocks, activity);
+  }
+  return activity;
+}
 
 function getTurnProcessFontStyle(fontSize: number): React.CSSProperties {
   const style = {
@@ -1216,8 +1232,6 @@ function TurnChangesCard({
   totalExecutedEdits,
   language,
   onOpenDiff,
-  defaultExpanded = false,
-  embedded = false,
   chatFontSize,
 }: {
   entries: Array<{
@@ -1231,11 +1245,9 @@ function TurnChangesCard({
   totalExecutedEdits: number;
   language: "zh" | "en";
   onOpenDiff: (taskId: number) => void;
-  defaultExpanded?: boolean;
-  embedded?: boolean;
   chatFontSize?: number;
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [expanded, setExpanded] = useState(false);
   if (entries.length === 0) return null;
 
   const headerText = language === "zh"
@@ -1250,7 +1262,7 @@ function TurnChangesCard({
 
   return (
     <div
-      className={`${embedded ? "" : "turn-process-font-scope ml-9"} rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3`}
+      className="turn-process-font-scope ml-9 rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3"
       style={chatFontSize ? getTurnProcessFontStyle(chatFontSize) : undefined}
     >
       <button
@@ -1656,103 +1668,6 @@ function ChatOperationClusterBlock({
   );
 }
 
-function TurnProcessArchive({
-  archive,
-  language,
-  chatFontSize,
-  renderArchivedItem,
-  onOpenDiff,
-}: {
-  archive: ReturnType<typeof buildTurnProcessArchiveModel>;
-  language: "zh" | "en";
-  chatFontSize: number;
-  renderArchivedItem: (item: any) => React.ReactNode;
-  onOpenDiff: (taskId: number) => void;
-}) {
-  const hasChangeSummary = !!archive && archive.steps.some((step) =>
-    step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
-  );
-  const [expanded, setExpanded] = useState(hasChangeSummary);
-  useEffect(() => {
-    if (hasChangeSummary) setExpanded(true);
-  }, [hasChangeSummary]);
-  if (archive.totalCount === 0) return null;
-
-  const title = language === "zh" ? "本轮过程归档" : "Turn Process Archive";
-  const fallbackSummary = language === "zh" ? "过程记录已折叠保留，可展开追溯。" : "Process records are folded and kept for review.";
-  const previewText = archive.previewTargets.length > 0
-    ? archive.previewTargets.join(language === "zh" ? "、" : ", ")
-    : "";
-  const toggleText = expanded
-    ? language === "zh" ? "收起过程" : "Collapse"
-    : language === "zh" ? "展开过程" : "Expand";
-  const containerClassName = expanded
-    ? "turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_50%,transparent)] transition-all duration-150"
-    : "turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150 hover:ring-[color-mix(in_srgb,var(--accent-light)_44%,transparent)]";
-
-  const thoughtSteps = archive.steps.filter((step) => step.kind === "thinking");
-  const timelineSteps = archive.steps.filter((step) => step.kind !== "thinking");
-
-  return (
-    <div className={containerClassName} style={getTurnProcessFontStyle(chatFontSize)}>
-      <button
-        type="button"
-        data-testid="turn-process-archive-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-transparent"
-      >
-        <span className="min-w-0 flex-1">
-          <span className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-              <IconColumns className="h-3.5 w-3.5" />
-              {title}
-            </span>
-            <span className="text-[10px] text-[var(--surface-text-muted)]">
-              {language === "zh" ? `${archive.stepCount} 步` : `${archive.stepCount} step${archive.stepCount > 1 ? "s" : ""}`}
-            </span>
-          </span>
-          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">
-            {archive.summaryText || fallbackSummary}{previewText ? ` · ${previewText}` : ""}
-          </span>
-        </span>
-        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
-      </button>
-
-      {expanded && (
-        <div data-testid="turn-process-archive-details" className="mt-2 space-y-3 px-2">
-          {thoughtSteps.map((step) => (
-            <div key={step.id} data-testid="turn-archive-thought-step">
-              {buildBlockRenderItems(step.items, false, false, language).map((item: any, index: number) => (
-                <React.Fragment key={`archived-thought-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
-                  {renderArchivedItem(item)}
-                </React.Fragment>
-              ))}
-            </div>
-          ))}
-          {timelineSteps.length > 0 && (
-            <div data-testid="turn-archive-timeline" className="space-y-2">
-              {timelineSteps.map((step) => (
-                <TurnArchiveStepCard
-                  key={step.id}
-                  step={step}
-                  language={language}
-                  chatFontSize={chatFontSize}
-                  renderArchivedItem={renderArchivedItem}
-                  onOpenDiff={onOpenDiff}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function getArchiveStepLabel(step: TurnArchiveStep, language: "zh" | "en") {
   if (step.activity?.label) return step.activity.label;
   if (step.phase?.title) return step.phase.title;
@@ -1885,21 +1800,15 @@ function renderCompactMarkdownText(text: string): React.ReactNode {
 function TurnArchiveStepCard({
   step,
   language,
-  chatFontSize,
   renderArchivedItem,
-  onOpenDiff,
   variant = "archive",
 }: {
   step: TurnArchiveStep;
   language: "zh" | "en";
-  chatFontSize: number;
   renderArchivedItem: (item: any) => React.ReactNode;
-  onOpenDiff: (taskId: number) => void;
   variant?: "archive" | "live";
 }) {
   const isLive = variant === "live";
-  const { entries, totalExecutedEdits } = collectTurnChangeEntries(step.items);
-  const hasChangeSummary = step.kind === "edit" && entries.length > 0;
   const hasSettledDetailItems = step.items.some((item: any) =>
     item?.status === "done" ||
     item?.status === "error" ||
@@ -1907,26 +1816,14 @@ function TurnArchiveStepCard({
     item?.toolStatus === "executed" ||
     item?.toolStatus === "failed"
   );
-  const defaultExpanded =
-    (!isLive && (step.expandedByDefault || hasChangeSummary)) ||
-    (isLive && (
-      hasChangeSummary ||
-      (step.status === "running" && hasSettledDetailItems)
-    ));
+  const runningWithDetail = isLive && step.status === "running" && hasSettledDetailItems;
+  const defaultExpanded = (!isLive && step.expandedByDefault) || runningWithDetail;
   const [expanded, setExpanded] = useState(defaultExpanded);
   useEffect(() => {
-    if (
-      isLive &&
-      (
-        hasChangeSummary ||
-        (step.status === "running" && hasSettledDetailItems)
-      )
-    ) {
-      setExpanded(true);
-    }
-  }, [isLive, hasChangeSummary, hasSettledDetailItems, step.status]);
+    if (runningWithDetail) setExpanded(true);
+  }, [runningWithDetail]);
   const detailItems = buildBlockRenderItems(step.items, false, false, language);
-  const canExpandDetails = hasChangeSummary || detailItems.length > 0;
+  const canExpandDetails = detailItems.length > 0;
   const toggleText = expanded
     ? isLive
       ? language === "zh" ? "收起操作" : "Hide actions"
@@ -2001,115 +1898,126 @@ function TurnArchiveStepCard({
 
       {canExpandDetails && expanded && (
         <div data-testid="turn-archive-step-details" className="mt-2 min-w-0 max-w-full space-y-2 overflow-hidden pl-6 sm:pl-8">
-          {hasChangeSummary ? (
-            <TurnChangesCard
-              entries={entries}
-              totalExecutedEdits={totalExecutedEdits}
-              language={language}
-              onOpenDiff={onOpenDiff}
-              embedded
-              defaultExpanded={hasChangeSummary}
-              chatFontSize={chatFontSize}
-            />
-          ) : (
-            detailItems.map((item: any, index: number) => (
-              <React.Fragment key={`archived-step-${step.id}-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
-                {renderArchivedItem(item)}
-              </React.Fragment>
-            ))
-          )}
+          {detailItems.map((item: any, index: number) => (
+            <React.Fragment key={`archived-step-${step.id}-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
+              {renderArchivedItem(item)}
+            </React.Fragment>
+          ))}
         </div>
       )}
     </div>
   );
 }
 
-function LiveTurnProcessTimeline({
+function TurnActivityDisclosure({
   model,
+  variant,
   language,
   chatFontSize,
-  renderLiveItem,
-  onOpenDiff,
+  renderItem,
 }: {
-  model: ReturnType<typeof buildLiveTurnProcessTimelineModel> | null;
+  model: ReturnType<typeof buildLiveTurnProcessTimelineModel>;
+  variant: "live" | "archive";
   language: "zh" | "en";
   chatFontSize: number;
-  renderLiveItem: (item: any) => React.ReactNode;
-  onOpenDiff: (taskId: number) => void;
+  renderItem: (item: any) => React.ReactNode;
 }) {
-  const hasChangeSummary = !!model && model.steps.some((step) =>
-    step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
-  );
-  // The turn-level disclosure is the primary process collapse control. When
-  // that disclosure is open, expose the step rows immediately instead of
-  // requiring a second nested expansion just to inspect the same process.
-  const [expanded, setExpanded] = useState(true);
-  useEffect(() => {
-    if (hasChangeSummary) setExpanded(true);
-  }, [hasChangeSummary]);
-  if (!model || model.totalCount === 0) return null;
-  const title = language === "zh" ? "本轮步骤" : "Turn steps";
-  const stepCount = model.stepCount;
-  const summary = model.summaryText || (language === "zh" ? "操作已按步骤折叠。" : "Actions are folded by step.");
-  const toggleText = expanded
-    ? language === "zh" ? "收起步骤" : "Collapse steps"
-    : language === "zh" ? "展开步骤" : "Expand steps";
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const isLive = variant === "live";
+  const relevantSteps = model.steps.filter((step) => step.kind !== "thinking");
+  const currentStep = isLive
+    ? [...relevantSteps].reverse().find((step) => step.status === "running") ?? relevantSteps.at(-1)
+    : null;
+  const summary = (currentStep?.activity?.title || currentStep?.intent)?.replace(/\s+/g, " ").trim();
+  const failedCount = relevantSteps.filter((step) => step.status === "failed").length;
+  const blockedCount = relevantSteps.filter((step) => step.status === "blocked" || step.status === "rejected").length;
+  const notRunCount = relevantSteps.filter((step) => step.status === "not_executed").length;
+  const issues = [
+    failedCount > 0 && (language === "zh" ? `失败 ${failedCount}` : `${failedCount} failed`),
+    blockedCount > 0 && (language === "zh" ? `受阻 ${blockedCount}` : `${blockedCount} blocked`),
+    notRunCount > 0 && (language === "zh" ? `未执行 ${notRunCount}` : `${notRunCount} not run`),
+  ].filter(Boolean).join(" · ");
+  const activityCount = language === "zh"
+    ? `${model.stepCount} 项活动`
+    : `${model.stepCount} activit${model.stepCount === 1 ? "y" : "ies"}`;
+  const label = language === "zh" ? "本轮活动" : "Turn activity";
 
   return (
     <div
-      data-testid="live-turn-process-timeline"
-      className="turn-process-font-scope ml-9 max-w-[calc(100%-2.25rem)] min-w-0 overflow-hidden rounded-xl px-1 py-2 ring-1 ring-inset ring-[color-mix(in_srgb,var(--accent-light)_32%,transparent)] transition-all duration-150"
+      data-testid={isLive ? "live-turn-process-timeline" : "turn-activity-archive"}
+      className="turn-process-font-scope ml-9 min-w-0 max-w-[calc(100%-2.25rem)]"
       style={getTurnProcessFontStyle(chatFontSize)}
     >
       <button
+        ref={triggerRef}
         type="button"
-        data-testid="live-turn-process-toggle"
+        data-testid={isLive ? "live-turn-process-toggle" : "turn-process-archive-toggle"}
         aria-expanded={expanded}
+        aria-controls={detailsId}
         onClick={() => setExpanded((value) => !value)}
-        className="group flex w-full min-w-0 flex-wrap items-start justify-between gap-3 rounded-lg px-2 py-1 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]"
+        className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-[var(--surface-text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--surface-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
       >
-        <span className="min-w-0 flex-1">
-          <span className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-              <IconColumns className="h-3.5 w-3.5" />
-              {title}
-            </span>
-            <span className="text-[10px] text-[var(--surface-text-muted)]">
-              {language === "zh" ? `${stepCount} 步` : `${stepCount} step${stepCount > 1 ? "s" : ""}`}
-            </span>
+        {expanded
+          ? <IconChevronDown aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+          : <IconChevronRight aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />}
+        <span className="shrink-0">{label}</span>
+        <span className="min-w-0 flex-1 truncate" title={summary}>
+          {summary ? renderCompactMarkdownInline(summary, "turn-activity-summary") : activityCount}
+        </span>
+        {issues && (
+          <span data-testid="turn-activity-issues" className="min-w-0 max-w-[50%] truncate font-medium text-[var(--surface-text-strong)]" title={issues}>
+            {issues}
           </span>
-          <span className="mt-1 block whitespace-pre-wrap break-words text-[12px] leading-5 text-[var(--surface-text-subtle)]">{summary}</span>
-        </span>
-        <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
+        )}
       </button>
-      {expanded && (
-        <div data-testid="live-turn-process-details" className="min-w-0 max-w-full space-y-2 overflow-hidden px-2 pt-2">
-          {model.steps.map((step) => (
-            <TurnArchiveStepCard
-              key={step.id}
-              step={step}
-              language={language}
-              chatFontSize={chatFontSize}
-              renderArchivedItem={renderLiveItem}
-              onOpenDiff={onOpenDiff}
-              variant="live"
-            />
-          ))}
-          <button
-            type="button"
-            data-testid="live-turn-process-collapse-bottom"
-            aria-expanded={expanded}
-            onClick={() => setExpanded(false)}
-            className="flex w-full items-center justify-center gap-1.5 rounded-lg px-2 py-1.5 text-[10px] text-[var(--surface-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] hover:text-[var(--surface-text)]"
+      <div id={detailsId} hidden={!expanded}>
+        {expanded && (
+          <div
+            data-testid={isLive ? "live-turn-process-details" : "turn-process-archive-details"}
+            className="ml-3 mt-1 min-w-0 space-y-1 border-l border-[var(--surface-border-soft)] pl-3"
           >
-            <IconChevronDown className="h-3.5 w-3.5" />
-            {language === "zh" ? "收起步骤" : "Collapse steps"}
-          </button>
-        </div>
-      )}
+            {model.steps.filter((step) => step.kind === "thinking").map((step) => (
+              <div key={step.id} data-testid="turn-archive-thought-step">
+                {buildBlockRenderItems(step.items, false, false, language).map((item: any, index: number) => (
+                  <React.Fragment key={`activity-thought-${item.block?.id ?? item.blocks?.[0]?.id ?? index}-${index}`}>
+                    {renderItem(item)}
+                  </React.Fragment>
+                ))}
+              </div>
+            ))}
+            {relevantSteps.length > 0 && (
+              <div data-testid={isLive ? undefined : "turn-archive-timeline"} className="space-y-1">
+                {relevantSteps.map((step) => (
+                  <TurnArchiveStepCard
+                    key={step.id}
+                    step={step}
+                    language={language}
+                    renderArchivedItem={renderItem}
+                    variant={variant}
+                  />
+                ))}
+              </div>
+            )}
+            {isLive && (
+              <button
+                type="button"
+                data-testid="live-turn-process-collapse-bottom"
+                aria-controls={detailsId}
+                onClick={() => {
+                  setExpanded(false);
+                  triggerRef.current?.focus();
+                }}
+                className="flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[11px] text-[var(--surface-text-muted)] hover:bg-[var(--surface-2)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+              >
+                <IconChevronDown aria-hidden="true" className="h-3.5 w-3.5" />
+                {language === "zh" ? "收起活动" : "Collapse activity"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2547,6 +2455,7 @@ export default function ChatArea({
   const resolvedTurnProcessFontSize = resolveTurnProcessFontSize(resolvedChatFontSize);
   const copy = useMemo(() => ({
     planLabel: language === "zh" ? "计划" : "Plan",
+    planRevisionLabel: language === "zh" ? "复核修订" : "Plan revision",
     stopLabel: language === "zh" ? "停止" : "Stop",
     processingLabel: language === "zh" ? "处理中..." : "Processing...",
     turnDetails: language === "zh" ? "回合详情" : "Turn Details",
@@ -2661,7 +2570,12 @@ export default function ChatArea({
     dismissPendingRunDecision: useAppStore((s) => s.dismissPendingRunDecision)
   };
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  useUnityEditorReconnect();
   const turnRuntimeCheckpoints = useAppStore((s) => s.turnRuntimeCheckpoints);
+  const workspaceTurnQueue = useAppStore((s) => s.workspaceTurnQueue);
+  const queuedTurnIds = useMemo(() => new Set(workspaceTurnQueue && workspaceTurnQueue.sessionKey === activeSessionKey
+    ? workspaceTurnQueue.entries.filter(entry => entry.status === "queued" || entry.status === "persisting").map(entry => entry.receipt.turnId)
+    : []), [activeSessionKey, workspaceTurnQueue]);
   const activeSessionEpoch = useAppStore((s) => {
     const workspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
     const session = (s.sessionsByWorkspace[workspaceKey] || []).find(
@@ -2719,6 +2633,8 @@ export default function ChatArea({
         "Give me a plan first before execution",
       ];
 
+  const chatAreaRef = useRef<HTMLDivElement>(null);
+  const restoreComposerDraft = useRef<((text: string) => void) | null>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const turnRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const lastScrollTopRef = useRef(0);
@@ -2731,7 +2647,6 @@ export default function ChatArea({
   const [composerHeight, setComposerHeight] = useState(220);
   const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
   const [approvalDialogRequest, setApprovalDialogRequest] = useState<PlanReviewActionRequest | null>(null);
-  const [chatAreaHeight, setChatAreaHeight] = useState(0);
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
   const [capsulePopover, setCapsulePopover] = useState<"progress" | "tasks" | null>(null);
   const showProgressPopover = capsulePopover === "progress";
@@ -2793,16 +2708,21 @@ export default function ChatArea({
   // endregion
 
   useEffect(() => {
-    if (!chatContainerRef.current) return;
-    const resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        setChatAreaHeight(entry.contentRect.height);
-      }
+    const container = chatContainerRef.current;
+    const area = chatAreaRef.current;
+    if (!container || !area) return;
+    let height = 0;
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      if (!entry || entry.contentRect.height === height) return;
+      height = entry.contentRect.height;
+      if (height > 0) area.style.setProperty("--chat-visible-height", `${height}px`);
+      else area.style.removeProperty("--chat-visible-height");
     });
-    resizeObserver.observe(chatContainerRef.current);
+    resizeObserver.observe(container);
     return () => resizeObserver.disconnect();
   }, []);
 
+  const committedBlockGroups = useRef(new Map<string, any[]>());
   const blocksByTurnId = useMemo(() => {
     const next = new Map<string, any[]>();
     const legacyBlocks: any[] = [];
@@ -2820,8 +2740,17 @@ export default function ChatArea({
         next.set(turnId, [block]);
       }
     }
+    for (const [turnId, blocks] of next) {
+      const previous = committedBlockGroups.current.get(turnId);
+      if (previous?.length === blocks.length && blocks.every((block, index) => block === previous[index])) {
+        next.set(turnId, previous);
+      }
+    }
     return { byTurnId: next, legacyBlocks };
   }, [taskFlow]);
+  useLayoutEffect(() => {
+    committedBlockGroups.current = blocksByTurnId.byTurnId;
+  }, [blocksByTurnId]);
   const visibleConversationTurns = useMemo(
     () => conversationTurns.filter((turn) => turn?.uiVisibility !== "internal"),
     [conversationTurns],
@@ -2836,7 +2765,7 @@ export default function ChatArea({
 
     return visibleConversationTurns.map((turn) => ({
       turn,
-      blocks: blocksByTurnId.byTurnId.get(turn.id) || [],
+      blocks: blocksByTurnId.byTurnId.get(turn.id) || EMPTY_CHAT_BLOCKS,
     }));
   }, [blocksByTurnId, visibleConversationTurns]);
   useEffect(() => {
@@ -2893,6 +2822,7 @@ export default function ChatArea({
     );
   const composerTurnIngress = useMemo(() => selectTurnIngressAvailability({
     checkpoint: pinnedTurn ? turnRuntimeCheckpoints?.[pinnedTurn.id] : null,
+    runtimeV2Checkpoint: pinnedTurn ? runtimeV2Checkpoints[pinnedTurn.id] : null,
     expectedOwner: pinnedTurn && activeSessionKey && activeSessionEpoch
       ? {
           workspaceKey: resolveSessionWorkspaceKey(currentWorkspace),
@@ -2910,6 +2840,7 @@ export default function ChatArea({
     currentWorkspace,
     pinnedTurn,
     turnRuntimeCheckpoints,
+    runtimeV2Checkpoints,
   ]);
   const shouldKeepExecutionCapsuleResident =
     !!pinnedTurn &&
@@ -3290,19 +3221,19 @@ export default function ChatArea({
     setIsAutoScroll((value) => (value === nextAutoScroll ? value : nextAutoScroll));
     lastScrollTopRef.current = currentScrollTop;
 
-    const turnEntries = groupedTurns
-      .map((entry) => {
-        const turnId = entry.turn?.id;
-        if (!turnId) return null;
-        const node = turnRefs.current[turnId];
-        if (!node) return null;
-        return { turnId, offset: node.offsetTop };
-      })
-      .filter(Boolean) as Array<{ turnId: string; offset: number }>;
-
-    const current = [...turnEntries].reverse().find((entry) => entry.offset <= el.scrollTop + 120);
-    setActiveVisibleTurnId(current?.turnId || visibleConversationTurns[visibleConversationTurns.length - 1]?.id || null);
-  }, [groupedTurns, visibleConversationTurns]);
+    // Live output keeps the newest turn active. Measuring all previous DOM
+    // offsets here would force layout again on every automatic scroll.
+    if (nextAutoScroll) return;
+    for (let index = visibleConversationTurns.length - 1; index >= 0; index -= 1) {
+      const { id } = visibleConversationTurns[index];
+      const node = turnRefs.current[id];
+      if (node && node.offsetTop <= currentScrollTop + 120) {
+        setActiveVisibleTurnId(id);
+        return;
+      }
+    }
+    setActiveVisibleTurnId(visibleConversationTurns.at(-1)?.id || null);
+  }, [visibleConversationTurns]);
 
   useEffect(() => {
     if (!isAutoScroll) return;
@@ -3310,12 +3241,8 @@ export default function ChatArea({
     const el = chatContainerRef.current;
     if (!el) return;
 
-    el.scrollTo({
-      top: el.scrollHeight,
-      behavior: isStreaming ? "auto" : "smooth",
-    });
-
     const rafId = window.requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: isStreaming ? "auto" : "smooth" });
       lastScrollTopRef.current = el.scrollTop;
     });
 
@@ -3383,6 +3310,8 @@ export default function ChatArea({
       const planAggregate = normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate;
       const savedPlan = resolvePlanDocumentFromAggregate(planAggregate);
       const savedDraft = resolvePlanDraftFromAggregate(planAggregate);
+      const guidanceDelivery = block.runtimeGuidance?.id
+        ? runtimeV2GuidanceDelivery(planAggregate, block.runtimeGuidance.id) : null;
       const hasImageContext = userContextItems.some((item: UserContextItem) => item.kind === "image");
       const visualContextProgress = hasImageContext
         ? visualContextProgressByTurnId.get(String(block.turnId || ""))
@@ -3394,10 +3323,26 @@ export default function ChatArea({
               <div
                 data-testid="runtime-guidance-record"
                 data-guidance-id={block.runtimeGuidance.id}
-                className="mb-2 flex items-center justify-end gap-1.5 text-[10px] font-semibold text-emerald-400"
+                className="mb-2 flex items-center justify-end gap-1.5 text-[10px] font-semibold"
+                style={{ color: "var(--surface-text-muted)" }}
               >
                 <IconZap className="h-3 w-3" />
-                {language === "en" ? "Guided this Turn" : "已引导本回合"}
+                {(!guidanceDelivery || guidanceDelivery === "waiting")
+                  ? (language === "en" ? "Waiting to guide this turn" : "等待引导本回合")
+                  : guidanceDelivery === "unapplied"
+                    ? (language === "en" ? "Guidance not applied" : "引导未应用")
+                    : (language === "en" ? "Guided this Turn" : "已引导本回合")}
+                {guidanceDelivery === "unapplied" && block.content && (
+                  <button
+                    type="button"
+                    data-testid="restore-unapplied-guidance"
+                    className="ml-2 rounded border px-1.5 py-0.5"
+                    style={{ borderColor: "var(--surface-border)", color: "var(--surface-text)" }}
+                    onClick={() => restoreComposerDraft.current?.(block.content)}
+                  >
+                    {language === "en" ? "Restore to composer" : "恢复到输入框"}
+                  </button>
+                )}
               </div>
             )}
             {block.content && (
@@ -3417,7 +3362,7 @@ export default function ChatArea({
               language={language}
               onPreviewImage={setPreviewImageItem}
             />
-            <KnowledgeEvidence packet={normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate.knowledgeContext} language={language} />
+            <KnowledgeEvidence packet={planAggregate?.knowledgeContext} language={language} />
             <PlanDocumentCard reference={savedPlan?.documentRef} draft={savedDraft}
               language={language} continuationDisabled={agentStatus !== "idle" || isStreaming || activeActionRequest?.status === "pending"}
               onCompleteValidation={savedDraft ? async (supplement) => (await continuePlanDraft({ get: useAppStore.getState, record: savedDraft, supplement })).accepted : undefined}
@@ -3629,15 +3574,13 @@ export default function ChatArea({
     }
 
     const turn: ConversationTurn = entry.turn;
+    const turnIsQueued = queuedTurnIds.has(turn.id);
     const blocks = entry.blocks;
     const turnIntent = resolveConversationTurnIntent(turn);
     const displayTurnIntent = turn.displayIntent || turnIntent;
     const isChatIntent = turnIntent === "respond" || turnIntent === "discuss";
-    const turnIntentPolicy = getIntentPolicy(displayTurnIntent);
-    const turnIntentLabel = turnIntentPolicy.intent === displayTurnIntent
-      ? (language === "en" ? turnIntentPolicy.label.en : turnIntentPolicy.label.zh)
-      : (language === "zh" ? "任务" : "Task");
-    const shouldShowIntentBadge = displayTurnIntent === "plan";
+    const isPlanRevision = turn.approvedPlanContinuation?.revise === true;
+    const shouldShowPlanBadge = isPlanRevision || displayTurnIntent === "plan";
     const isPlanTurn = turnIntent === "plan";
     const turnProgressSnapshot =
       planExecutionProgressSnapshot?.turnId === turn.id
@@ -3667,7 +3610,7 @@ export default function ChatArea({
     const turnPresentation = buildTurnPresentationModel({
       turn,
       language,
-      statusLabel: copy.turnStatusLabels[turn.status] || turn.status,
+      statusLabel: turnIsQueued ? (language === "en" ? "Queued" : "已排队") : copy.turnStatusLabels[turn.status] || turn.status,
       // A workspace submission is always a durable Turn. Keep its title,
       // lifecycle, and timer visible even when intent resolution says respond.
       // Only global chat uses the anchorless continuous transcript.
@@ -3683,7 +3626,8 @@ export default function ChatArea({
           .filter(({ block }) => block.type === "user" && block.id !== userBlock.id)
       : [];
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
-    const { entries: turnChangeEntries, totalExecutedEdits } = collectTurnChangeEntries(blocks);
+    const activity = turnBlockActivity(blocks);
+    const { entries: turnChangeEntries, totalExecutedEdits } = activity.changes;
     const shouldShowTurnChanges = turnChangeEntries.length > 0 || totalExecutedEdits > 0;
     const explicitFinalAgentIndex = [...blocks]
       .map((block, idx) => ({ block, idx }))
@@ -3780,15 +3724,15 @@ export default function ChatArea({
       finalVisibleAgentIndex >= 0 &&
       !hasSubstantiveIntermediateAgentText &&
       !shouldKeepContinuousProcessTimeline;
-    const processArchive = shouldArchiveCompletedProcess
-      ? buildTurnProcessArchiveModel({
-          blocks,
-          finalVisibleAgentIndex,
-          language,
-          includeThoughts: false,
-          includeThoughtNotes: true,
-        })
-      : null;
+    let processArchive = null;
+    if (shouldArchiveCompletedProcess) {
+      const key = `archive:${language}:${finalVisibleAgentIndex}`;
+      processArchive = activity.models.get(key);
+      if (!processArchive) {
+        processArchive = buildTurnProcessArchiveModel({ blocks, finalVisibleAgentIndex, language, includeThoughts: false });
+        activity.models.set(key, processArchive);
+      }
+    }
     const collapsedProcessCount = finalVisibleAgentBlock
       ? processArchive?.stepCount ?? blocks.filter((block, idx) => block.type !== "user" && idx !== finalVisibleAgentIndex).length
       : hiddenCount + (shouldShowTurnChanges ? 1 : 0);
@@ -3828,17 +3772,22 @@ export default function ChatArea({
             planExecutionProgress: turnProgressSnapshot,
           }
         : null;
-    const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
+    if (!activity.summaries.has(language)) activity.summaries.set(language, buildToolExecutionSummary(blocks, language));
+    const toolExecutionSummary = activity.summaries.get(language);
     const turnToolCount = blocks.filter((block) =>
       block.type === "tool" && ["executed", "running", "failed"].includes(String(block.toolStatus || ""))
     ).length;
     const turnSubagentRuns = subagentRuns.filter((run) => run.parentTurnId === turn.id);
-    const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
-      ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
-      : null;
-    const liveProcessHasChangeSummary = !!liveProcessTimeline && liveProcessTimeline.steps.some((step) =>
-      step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
-    );
+    let liveProcessTimeline = null;
+    if (!shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline) {
+      const key = `live:${language}:${showReasoningDebug}`;
+      liveProcessTimeline = activity.models.get(key);
+      if (!liveProcessTimeline) {
+        liveProcessTimeline = buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug });
+        activity.models.set(key, liveProcessTimeline);
+      }
+    }
+    const activityModel = processArchive ?? liveProcessTimeline;
     const liveProcessBlockIds = new Set(
       (liveProcessTimeline?.blocks || [])
         .map((block: any) => block?.id)
@@ -4111,23 +4060,25 @@ export default function ChatArea({
             className={turnHeaderClass}
           >
             <div className="min-w-0 flex flex-wrap items-center gap-2">
-              {shouldShowIntentBadge && turnIntentLabel && (
-                <span data-testid={`turn-intent-badge-${displayTurnIntent}`} className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${displayTurnIntent === "plan" ? "theme-plan-pill" : "border-[rgba(52,211,153,0.22)] bg-[rgba(52,211,153,0.1)] text-[#86efac]"}`}>
-                  {turnIntentLabel}
+              {shouldShowPlanBadge && (
+                <span data-testid={isPlanRevision ? "turn-intent-badge-plan-revision" : "turn-intent-badge-plan"} className="theme-plan-pill rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em]">
+                  {isPlanRevision ? copy.planRevisionLabel : copy.planLabel}
                 </span>
               )}
               <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turnPresentation.status)}`}>
                 {turnPresentation.statusLabel}
               </span>
-              <TurnTimer
-                turnId={turn.id}
-                status={turnPresentation.status}
-                isStreaming={isStreaming}
-                currentTurnId={currentTurnId}
-                activeSessionKey={activeSessionKey}
-                savedElapsedTime={turn.elapsedTime}
-                isLightThemeMode={isLightThemeMode}
-              />
+              {!turnIsQueued && (
+                <TurnTimer
+                  turnId={turn.id}
+                  status={turnPresentation.status}
+                  isStreaming={isStreaming}
+                  currentTurnId={currentTurnId}
+                  activeSessionKey={activeSessionKey}
+                  savedElapsedTime={turn.elapsedTime}
+                  isLightThemeMode={isLightThemeMode}
+                />
+              )}
               {shouldShowTurnChanges && (
                 <span className="rounded-full border border-[rgba(37,99,235,0.25)] bg-[rgba(37,99,235,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
                   {language === "zh" ? `${turnChangeEntries.length} 个变更文件` : `${turnChangeEntries.length} changed file${turnChangeEntries.length > 1 ? "s" : ""}`}
@@ -4180,7 +4131,40 @@ export default function ChatArea({
             />
           )}
 
-          {isTurnExpanded && shouldShowTurnChanges && !shouldArchiveCompletedProcess && !liveProcessHasChangeSummary && (
+          {isTurnExpanded && shouldArchiveCompletedProcess && hasProposalCheckpoint && proposalCheckpointBlock && (
+            <>
+              <TurnPhaseDivider label={phaseLabels.analysis} />
+              <AgentContentBlock
+                key={`${proposalCheckpointBlock.id}-${proposalBlockIndex}-archived-proposal`}
+                block={{ ...proposalCheckpointBlock, archivedAfterChoice: false }}
+                language={language}
+                chatFontSize={resolvedChatFontSize}
+              />
+            </>
+          )}
+          {isTurnExpanded && shouldArchiveCompletedProcess && hasProposalCheckpoint && proposalApprovalBlock && (
+            <>
+              <TurnPhaseDivider label={phaseLabels.approval} />
+              {renderBlock(proposalApprovalBlock, approvalBlockIndex)}
+            </>
+          )}
+          {isTurnExpanded && activityModel && activityModel.stepCount > 0 && (
+            <React.Fragment key="turn-activity">
+              {shouldArchiveCompletedProcess && hasProposalCheckpoint && (
+                <TurnPhaseDivider label={phaseLabels.execution} />
+              )}
+              <TurnActivityDisclosure
+                key="activity-disclosure"
+                model={activityModel}
+                variant={shouldArchiveCompletedProcess ? "archive" : "live"}
+                language={language}
+                chatFontSize={resolvedTurnProcessFontSize}
+                renderItem={shouldArchiveCompletedProcess ? renderArchivedBlockItem : renderBlockItem}
+              />
+            </React.Fragment>
+          )}
+
+          {shouldShowTurnChanges && (
             <TurnChangesCard
               key="turn-changes-card"
               entries={turnChangeEntries}
@@ -4199,61 +4183,9 @@ export default function ChatArea({
                 ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
                 : null}
             </React.Fragment>
-          ) : (
-            <React.Fragment key="turn-details">
-              {shouldArchiveCompletedProcess ? (
-                <React.Fragment key="archived-process">
-                  {hasProposalCheckpoint && proposalCheckpointBlock && (
-                    <>
-                      <TurnPhaseDivider key={`${turn.id}-archived-phase-analysis`} label={phaseLabels.analysis} />
-                      <AgentContentBlock
-                        key={`${proposalCheckpointBlock.id}-${proposalBlockIndex}-archived-proposal`}
-                        block={{ ...proposalCheckpointBlock, archivedAfterChoice: false }}
-                        language={language}
-                        chatFontSize={resolvedChatFontSize}
-                      />
-                    </>
-                  )}
-                  {hasProposalCheckpoint && proposalApprovalBlock && (
-                    <>
-                      <TurnPhaseDivider key={`${turn.id}-archived-phase-approval`} label={phaseLabels.approval} />
-                      {renderBlock(proposalApprovalBlock, approvalBlockIndex)}
-                    </>
-                  )}
-                  {hasProposalCheckpoint && processArchive && processArchive.totalCount > 0 && (
-                    <TurnPhaseDivider key={`${turn.id}-archived-phase-execution`} label={phaseLabels.execution} />
-                  )}
-                  {processArchive && processArchive.totalCount > 0 && (
-                    <TurnProcessArchive
-                      key="turn-process-archive"
-                      archive={processArchive}
-                      language={language}
-                      chatFontSize={resolvedTurnProcessFontSize}
-                      renderArchivedItem={renderArchivedBlockItem}
-                      onOpenDiff={openDiffForTask}
-                    />
-                  )}
-                  {finalVisibleAgentBlock
-                    ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
-                    : null}
-                </React.Fragment>
-              ) : (
-                <React.Fragment key="live-process">
-                  {liveProcessTimeline && liveProcessTimeline.totalCount > 0 && (
-                    <LiveTurnProcessTimeline
-                      key="live-turn-timeline"
-                      model={liveProcessTimeline}
-                      language={language}
-                      chatFontSize={resolvedTurnProcessFontSize}
-                      renderLiveItem={renderBlockItem}
-                      onOpenDiff={openDiffForTask}
-                    />
-                  )}
-                  {buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
-                </React.Fragment>
-              )}
-            </React.Fragment>
-          )}
+          ) : shouldArchiveCompletedProcess ? (
+            finalVisibleAgentBlock ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex) : null
+          ) : buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
           {isTurnExpanded && turnSubagentRuns.length > 0 && (
             <SubagentActivityNotice
               key="subagent-activity-notice"
@@ -4624,7 +4556,7 @@ export default function ChatArea({
     false;
 
   return (
-    <div className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
+    <div ref={chatAreaRef} className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
       <div className="h-[48px] shrink-0 border-b border-[#27272a] bg-[#000000] px-4 flex items-center justify-between select-none" data-tauri-drag-region>
         <button data-testid={"model-settings-button"} onClick={() => {
 
@@ -4919,8 +4851,8 @@ export default function ChatArea({
                 style={{
                   fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
                   lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
-                  maxHeight: !isCapsuleCollapsed && chatAreaHeight
-                    ? `${chatAreaHeight * (hasTypedCapsuleControls ? 1 : 0.58)}px`
+                  maxHeight: !isCapsuleCollapsed
+                    ? `calc(var(--chat-visible-height, 100vh) * ${hasTypedCapsuleControls ? 1 : 0.58})`
                     : undefined,
                   // The inner scroll container is the sole overflow owner.
                   // Keeping a second scrollbar on the Capsule shell produced
@@ -5055,6 +4987,9 @@ export default function ChatArea({
         isRunActive={composerRunActive}
         turnIngressMode={composerTurnIngress.mode}
         guidanceTarget={composerTurnIngress.guidanceTarget}
+        runtimeV2Guidance={composerTurnIngress.runtimeV2Guidance}
+        restoreDraftRef={restoreComposerDraft}
+        guidancePending={composerTurnIngress.guidancePending}
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}

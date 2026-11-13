@@ -12,6 +12,7 @@ import {
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { isRuntimeV2UnexecutedToolReceipt } from "../../lib/runtime-v2/toolReceipt";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { runtimeV2WorkspaceChangeReceipts } from "../../lib/runtime-v2/validationReceipt";
 
 export interface RuntimeV2ProviderEffectFacts {
   readonly failedToolCallIds?: ReadonlySet<string>;
@@ -109,6 +110,7 @@ const SOURCE_PREREQUISITE_REJECTION_CODES = new Set([
 export function deriveRuntimeV2ProviderEffectFacts(
   aggregate: TurnAggregateV1 | null,
 ): RuntimeV2ProviderEffectFacts {
+  const writes = new Set(aggregate ? runtimeV2WorkspaceChangeReceipts(aggregate) : []);
   const toolCallIdsByCommand = new Map<string, string>();
   const commandsByIdempotencyKey =
     new Map<string, RuntimeV2Command>();
@@ -211,8 +213,7 @@ export function deriveRuntimeV2ProviderEffectFacts(
     }
     if (
       event.type === "subagent.completed" &&
-      event.status === "completed" &&
-      event.evidence.some((evidence) => evidence.kind === "mutation")
+      writes.has(event)
     ) {
       for (const toolCallId of sourceReadVersionsByToolCallId.keys()) {
         invalidatedSourceReadToolCallIds.add(toolCallId);
@@ -232,12 +233,12 @@ export function deriveRuntimeV2ProviderEffectFacts(
     const command = commandsByIdempotencyKey.get(
       event.idempotencyKey,
     );
-    const targets = [...new Set(
+    const targets = writes.has(event) ? [...new Set(
       event.evidence
         .filter((evidence) => evidence.kind === "mutation")
         .map((evidence) => String(evidence.target || "").trim())
         .filter(Boolean),
-    )];
+    )] : [];
     const toolCallId = toolCallIdsByCommand.get(event.idempotencyKey);
     const rawArguments = command?.payload.arguments;
     const argumentsValue =
@@ -359,13 +360,12 @@ export function deriveRuntimeV2ProviderEffectFacts(
       evidence.kind === "source" || evidence.kind === "tool"
     );
     const observationVersion = String(
-      observation?.version || "",
+      event.status === "succeeded" ? observation?.version || "" : event.diagnosticVersion || "",
     ).trim();
     const observationSummary = String(
       event.presentation?.observationSummary || "",
     ).trim();
     if (
-      event.status === "succeeded" &&
       event.receiptOrigin !== "replayed" &&
       toolName &&
       RESULT_SEMANTIC_TOOL_NAMES.has(toolName) &&

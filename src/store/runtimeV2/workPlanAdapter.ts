@@ -4,6 +4,7 @@ import type {
   RuntimeV2WorkPlanReference,
 } from "../../lib/runtime-v2/contracts";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2/aggregate";
+import type { RuntimeV2Event } from "../../lib/runtime-v2/events";
 import {
   RUNTIME_V2_PLAN_ARTIFACT_PATH,
   RUNTIME_V2_PLAN_REVIEW_COMMIT_SCHEMA_VERSION,
@@ -368,6 +369,29 @@ export function resolveRuntimeV2PlanReviewFromAggregate(
   const pending = aggregate.phase === "reviewing" &&
     aggregate.workPlan?.status === "pending_review";
   return { plan, commit, pending };
+}
+
+/** A historical source may be reviewed for continuation; it never becomes an
+ * active authority for the completed owner or another workspace/session. */
+export function resolveHistoricalRuntimeV2ApprovedWorkPlan(aggregate: TurnAggregateV1 | null | undefined):
+  (RuntimeV2ResolvedApprovedWorkPlan & { approvalEvent: Extract<RuntimeV2Event, { type: "work_plan.approved" }> }) | null {
+  if (!aggregate || aggregate.workPlan?.status !== "approved" || aggregate.run?.status !== "completed" ||
+    !aggregate.events.some(event => event.type === "turn.completed")) return null;
+  const run = aggregate.run.identity;
+  const result = aggregate.terminalOutcome?.resultKind;
+  const blockedByDrift = result === "blocked" && aggregate.planContinuation && aggregate.events.some(event =>
+    event.type === "observation.recorded" && event.run.runId === run.runId && event.run.attemptId === run.attemptId &&
+    event.evidence.kind === "tool" && /^approved-plan-drift:\d+$/.test(event.evidence.id) && !!event.evidence.target.trim());
+  if (result !== "canceled" && result !== "partial" && !blockedByDrift) return null;
+  const review = resolveRuntimeV2PlanReviewFromAggregate(aggregate);
+  if (!review || !sameAuthority(aggregate.workPlan, review.commit.authority)) return null;
+  const approvalEvent = [...aggregate.events].reverse().find(
+    (event): event is Extract<RuntimeV2Event, { type: "work_plan.approved" }> =>
+      event.type === "work_plan.approved" && event.workPlan.status === "approved" &&
+      sameAuthority(event.workPlan, review.commit.authority) && sameOwner(review.commit.review, aggregate.turn, event.run) &&
+      event.run.attemptId === run.attemptId,
+  );
+  return approvalEvent ? { plan: review.plan, commit: review.commit, approvalEvent } : null;
 }
 
 /**

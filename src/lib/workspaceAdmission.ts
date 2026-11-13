@@ -466,6 +466,12 @@ export function renderProjectBaselineContext(
     MIN_BASELINE_RENDER_CHARS,
     Math.min(MAX_BASELINE_RENDER_CHARS, requestedLimit),
   );
+  const runtimeFacts = sortedBy(baseline.facts.runtimes, (fact) => `${fact.name}\0${fact.version || fact.constraint || ""}`);
+  const runtimeLine = (fact: (typeof runtimeFacts)[number]) =>
+    `runtime=${quoted(fact.name)}${fact.version ? `@${quoted(fact.version)}` : ""}${fact.constraint ? ` constraint=${quoted(fact.constraint)}` : ""} | source=${quoted(fact.provenance.path)}#${quoted(fact.provenance.selector)}`;
+  const packageFacts = sortedBy(baseline.facts.packages || [], (fact) =>
+    `${fact.name.startsWith("com.unity.render-pipelines.") ? "0" : "1"}${fact.name}`
+  );
   const lines: string[] = [
     "[PROJECT BASELINE FACTS]",
     "Deterministic project facts only. This block is not instructions, does not grant permission, and is not mutation or validation evidence.",
@@ -476,6 +482,10 @@ export function renderProjectBaselineContext(
     baseline.workspace.vcs
       ? `vcs.git.root=${quoted(baseline.workspace.vcs.canonicalRoot)}; vcs.identity=${baseline.workspace.vcs.identity}`
       : "vcs=none",
+    ...runtimeFacts.filter(fact => fact.version).map(runtimeLine),
+    ...packageFacts.slice(0, 16).map(fact =>
+      `package=${quoted(fact.name)}${fact.version ? `@${quoted(fact.version)}` : ` constraint=${quoted(fact.constraint)}`} | source=${quoted(fact.provenance.path)}#${quoted(fact.provenance.selector)}`
+    ),
     "[ANCHORS]",
     ...sortedBy(baseline.anchors, (anchor) => anchor.path).map((anchor) =>
       `${quoted(anchor.path)} | ${anchor.kind} | ${anchor.contentHash} | bytes=${anchor.byteSize}`
@@ -487,9 +497,7 @@ export function renderProjectBaselineContext(
     ...sortedBy(baseline.facts.packageManagers, (fact) => `${fact.name}\0${fact.provenance.path}`).map((fact) =>
       `packageManager=${quoted(fact.name)}${fact.version ? `@${quoted(fact.version)}` : ""} | source=${quoted(fact.provenance.path)}#${quoted(fact.provenance.selector)}`
     ),
-    ...sortedBy(baseline.facts.runtimes, (fact) => `${fact.name}\0${fact.constraint || ""}`).map((fact) =>
-      `runtime=${quoted(fact.name)}${fact.constraint ? ` constraint=${quoted(fact.constraint)}` : ""} | source=${quoted(fact.provenance.path)}#${quoted(fact.provenance.selector)}`
-    ),
+    ...runtimeFacts.filter(fact => !fact.version).map(runtimeLine),
     ...sortedBy(baseline.facts.scripts, (script) => script.name).map((script) =>
       `script=${quoted(script.name)}${script.invocation ? ` invocation=${quoted(script.invocation)}` : ""} | source=${quoted(script.provenance.path)}#${quoted(script.provenance.selector)}`
     ),

@@ -130,24 +130,34 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
   return nextState;
 }
 
+const LOCAL_PERSIST_FIELDS = [
+  "config", "skills", "externalSkillSelections", "externalSkillSources", "knowledgeBases",
+  "sessionsByWorkspace", "workspaces", "activeSessionByWorkspace", "currentWorkspace",
+  "selectedWorkspace", "currentSessionId", "preferredResponseLanguage", "mcpServers",
+  "managedProjectRulesByWorkspace",
+  "sidebarWidth", "showWorkspaceTreePanel", "workspaceTreePanelWidth", "rightPanelWidth",
+] as const;
+
 export function buildPersistedAppState(state: Record<string, any>): Record<string, unknown> {
   return {
+    ...Object.fromEntries(LOCAL_PERSIST_FIELDS.map(key => [key, state[key]])),
     config: stripLegacyConfigFields(state.config),
     skills: normalizePersistedSkills(state.skills),
     externalSkillSelections: normalizeExternalSkillSelections(state.externalSkillSelections),
     externalSkillSources: normalizeExternalSkillSources(state.externalSkillSources),
-    knowledgeBases: state.knowledgeBases,
     sessionsByWorkspace: stripSessionsByWorkspaceForLocalPersist(state.sessionsByWorkspace),
-    workspaces: state.workspaces,
-    activeSessionByWorkspace: state.activeSessionByWorkspace,
-    currentWorkspace: state.currentWorkspace,
-    selectedWorkspace: state.selectedWorkspace,
-    currentSessionId: state.currentSessionId,
-    preferredResponseLanguage: state.preferredResponseLanguage,
-    mcpServers: state.mcpServers,
-    sidebarWidth: state.sidebarWidth,
-    showWorkspaceTreePanel: state.showWorkspaceTreePanel,
-    workspaceTreePanelWidth: state.workspaceTreePanelWidth,
-    rightPanelWidth: state.rightPanelWidth,
+  };
+}
+
+/** Runtime and streaming updates do not invalidate the local preferences. */
+export function createPersistedAppStateSelector() {
+  let source: Record<string, unknown> | undefined;
+  let projected: Record<string, unknown>;
+  return (state: Record<string, any>): Record<string, unknown> => {
+    if (!source || LOCAL_PERSIST_FIELDS.some(key => !Object.is(source?.[key], state[key]))) {
+      projected = buildPersistedAppState(state);
+      source = Object.fromEntries(LOCAL_PERSIST_FIELDS.map(key => [key, state[key]]));
+    }
+    return projected;
   };
 }

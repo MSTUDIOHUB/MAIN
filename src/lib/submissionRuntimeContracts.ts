@@ -67,6 +67,7 @@ export interface SubmissionRuntimeContext {
   capabilityRestrictions?: readonly import("./turnCapabilities").TurnCapability[];
   approvalRequiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
+  semanticWorkType?: import("./runIntent").SemanticTaskIntent["workType"];
   intentClarification?: import("./turnClarification").TurnClarification;
 
 
@@ -81,6 +82,7 @@ export interface SubmissionRuntimeContext {
   workspaceInstructionContext?: string;
   planPurpose?: "rules";
   sourcePlanDraft?: import("./planDrafts").PlanDraftRecord;
+  approvedPlanContinuation?: import("./runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
   knowledgeContext?: import("./knowledgeReferences").KnowledgeContextPacket;
   /** Rebuildable workspace facts captured once for this Run. */

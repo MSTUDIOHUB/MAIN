@@ -210,6 +210,16 @@ async fn dispatch(request: &Value) -> Result<Value, String> {
         "commit_project_init" => serde_json::to_value(tauri_app_lib::commit_project_init_in_workspace(&root,
             args["expectedTargetPath"].as_str().unwrap_or("AGENTS.md"), args["expectedBaseVersion"].as_str(), args["content"].as_str().unwrap_or_default().to_owned())?).map_err(|e| e.to_string()),
         "knowledge_list_bases" => serde_json::to_value(tauri_app_lib::knowledge::list_knowledge_bases(&root.join(".MAIN-test-appdata"))?).map_err(|e| e.to_string()),
+        "knowledge_list_presets" => serde_json::to_value(tauri_app_lib::knowledge::presets::list_engine_manual_presets()).map_err(|e| e.to_string()),
+        "knowledge_bootstrap_preset" => {
+            let preset_id = args["presetId"].as_str().unwrap_or_default();
+            serde_json::to_value(tauri_app_lib::bootstrap_preset_in_app_data(&root.join(".MAIN-test-appdata"), preset_id, None).await?).map_err(|e| e.to_string())
+        }
+        "knowledge_set_base_enabled" => {
+            let kb_id = args["kbId"].as_str().unwrap_or_default();
+            let enabled = args["enabled"].as_bool().unwrap_or(true);
+            serde_json::to_value(tauri_app_lib::knowledge::set_knowledge_base_enabled(&root.join(".MAIN-test-appdata"), kb_id, enabled)?).map_err(|e| e.to_string())
+        }
         "knowledge_list_sources" => serde_json::to_value(tauri_app_lib::knowledge::list_sources(&root.join(".MAIN-test-appdata"), args["kbId"].as_str().unwrap_or_default())?).map_err(|e| e.to_string()),
         "knowledge_create_base" => serde_json::to_value(tauri_app_lib::knowledge::create_knowledge_base(&root.join(".MAIN-test-appdata"), args["name"].as_str().unwrap_or_default(), args["description"].as_str().unwrap_or_default())?).map_err(|e| e.to_string()),
         "knowledge_import_source" => {
@@ -221,7 +231,13 @@ async fn dispatch(request: &Value) -> Result<Value, String> {
         }
         "knowledge_search" => {
             let references: Vec<tauri_app_lib::knowledge::KnowledgeReference> = serde_json::from_value(args["references"].clone()).map_err(|e| e.to_string())?;
-            serde_json::to_value(tauri_app_lib::knowledge::search(&root.join(".MAIN-test-appdata"), args["query"].as_str().unwrap_or_default(), &references, args["limit"].as_u64().unwrap_or(6) as usize)?).map_err(|e| e.to_string())
+            let limit = args["limit"].as_u64().map(|v| v as usize);
+            let policy = if args["policy"].is_null() {
+                tauri_app_lib::KnowledgeLookupPolicy::Local
+            } else {
+                serde_json::from_value(args["policy"].clone()).map_err(|e| e.to_string())?
+            };
+            serde_json::to_value(tauri_app_lib::search_with_tier_penetration_in_app_data(&root.join(".MAIN-test-appdata"), args["query"].as_str().unwrap_or_default(), &references, limit, policy).await?).map_err(|e| e.to_string())
         }
         "knowledge_get_excerpt" => {
             let references: Vec<tauri_app_lib::knowledge::KnowledgeReference> = serde_json::from_value(args["references"].clone()).map_err(|e| e.to_string())?;

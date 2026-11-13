@@ -472,6 +472,7 @@ export interface SubagentCapacityPolicy {
   maxTotalRequests: number;
   /** Highest simultaneous first-token overlap confirmed for this lane. */
   confirmedTotalRequests: number;
+  confirmedOverlappingChildren: number;
   capacitySource: "configured" | "observed" | "probing";
   /** Whether parent and child provider requests can actually overlap. */
   modelRequestMode: "parallel" | "serialized";
@@ -775,6 +776,7 @@ export function resolveSubagentCapacityPolicy(
       model: "Unknown",
       maxTotalRequests: 1,
       confirmedTotalRequests: 0,
+      confirmedOverlappingChildren: 0,
       capacitySource: "probing",
       modelRequestMode: "serialized",
       maxActiveRequests: 0,
@@ -792,6 +794,7 @@ export function resolveSubagentCapacityPolicy(
     model: configured.model,
     maxTotalRequests: observed.maxActiveRequests,
     confirmedTotalRequests: observed.maxConfirmedActiveRequests,
+    confirmedOverlappingChildren: observed.maxConfirmedOverlappingChildren,
     capacitySource: observed.configured
       ? "configured"
       : observed.maxConfirmedActiveRequests > 1

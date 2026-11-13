@@ -67,7 +67,8 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "get_workspace_root") return workspace;
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? workspace);
-      if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return [];
+      if (["list_all_session_snapshots", "list_legacy_session_files", "list_project_sessions", "rebuild_project_sessions_index"].includes(cmd)) return [];
+      if (cmd === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
       if (cmd === "save_project_session") return args?.session ?? {};
       if (cmd === "load_project_session") return {};
       if (cmd === "get_file_metadata") {
@@ -107,20 +108,26 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("live turn steps expose concrete edit diff entries", async ({ page }) => {
+test("live file changes are reachable without opening turn activity", async ({ page }) => {
   await page.goto("/?e2eScenario=live-edit-diff-steps");
 
-  const editStep = page.getByTestId("live-turn-step").filter({ hasText: "本轮改动" });
-  await expect(editStep).toBeVisible();
-  await expect(editStep.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "true");
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toBeVisible();
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "generated.ts" })).toBeVisible();
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).getByText("+2")).toBeVisible();
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).getByText("-1")).toBeVisible();
+  const activity = page.getByTestId("live-turn-process-toggle");
+  await expect(activity).toHaveAttribute("aria-expanded", "false");
+  const changes = page.getByTestId("turn-changes-toggle");
+  await expect(changes).toContainText("3 个文件");
+  await changes.click();
+  const details = page.getByTestId("turn-changes-details");
+  await expect(details.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
+  await expect(details.getByTestId("turn-change-entry").filter({ hasText: "generated.ts" })).toBeVisible();
+  const main = details.getByTestId("turn-change-entry").filter({ hasText: "main.ts" });
+  await expect(main.getByText("+2")).toBeVisible();
+  await expect(main.getByText("-1")).toBeVisible();
+  await expect(activity).toHaveAttribute("aria-expanded", "false");
 
-  await editStep.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
+  await main.click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
+  await activity.click();
+  await expect(page.getByTestId("turn-changes-toggle")).toHaveCount(1);
 });
 
 test("substantive stage conclusions stay visible outside the process archive", async ({ page }) => {
@@ -136,18 +143,17 @@ test("substantive stage conclusions stay visible outside the process archive", a
 test("diff summary exposes concrete files and remains clickable after reload", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
-  // A completed Turn without intermediate public updates keeps its concrete
-  // changes in the durable archive rather than the continuous live timeline.
+  // The archive and file changes remain separately accessible on a completed Turn.
   const processDisclosure = page.getByTestId("turn-process-archive-toggle");
-  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
   await expect(page.getByTestId("turn-changes-toggle")).toContainText("3 个文件");
   await expect(page.getByTestId("turn-process-disclosure")).toHaveCount(0);
   await expect(page.getByTestId("live-turn-process-toggle")).toHaveCount(0);
-  const editStep = page.getByTestId("turn-archive-step").filter({ hasText: "本轮改动" });
-  await expect(editStep.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "true");
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toBeVisible();
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
-  await expect(editStep.getByTestId("turn-change-entry").filter({ hasText: "generated.ts" })).toBeVisible();
+  await page.getByTestId("turn-changes-toggle").click();
+  await expect(page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" })).toBeVisible();
+  await expect(page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" })).toBeVisible();
+  await expect(page.getByTestId("turn-change-entry").filter({ hasText: "generated.ts" })).toBeVisible();
+  await processDisclosure.click();
   await expect(page.getByTestId("turn-archive-step").filter({ hasText: "npm test -- --runInBand" })).toBeVisible();
   await expect(page.getByText("已完成三个文件的修改，你可以在摘要卡中查看每个文件的 Diff。")).toBeVisible();
   await expect
@@ -186,8 +192,9 @@ test("diff summary exposes concrete files and remains clickable after reload", a
   await page.reload();
 
   await expect(page.getByTestId("turn-changes-toggle")).toContainText("3 个文件");
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveAttribute("aria-expanded", "true");
-  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveAttribute("aria-expanded", "false");
+  await expect(page.getByTestId("turn-changes-toggle")).toHaveAttribute("aria-expanded", "false");
+  await page.getByTestId("turn-changes-toggle").click();
 
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
@@ -199,6 +206,7 @@ test("diff summary exposes concrete files and remains clickable after reload", a
 test("diff panel reverts one file with confirmation and updates the summary", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
+  await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "main.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/main.ts");
 
@@ -223,6 +231,7 @@ test("diff panel reverts one file with confirmation and updates the summary", as
 test("diff panel reverts all files and deletes files created by the AI", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
+  await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await expect(page.getByTestId("diff-panel-title")).toContainText("src/utils/helper.ts");
 
@@ -254,6 +263,7 @@ test("diff panel reverts all files and deletes files created by the AI", async (
 test("diff revert refuses to overwrite later user edits", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
 
+  await page.getByTestId("turn-changes-toggle").click();
   await page.getByTestId("turn-change-entry").filter({ hasText: "helper.ts" }).click();
   await page.evaluate(() => {
     (window as any).__DIFF_REVERT_TEST__.set("src/utils/helper.ts", "manual edit\n");

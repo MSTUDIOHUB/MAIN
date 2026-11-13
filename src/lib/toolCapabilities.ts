@@ -9,6 +9,7 @@ import type { ResolvedUserIntent } from "./runIntent";
 import type { ToolCatalog } from "./toolCatalog";
 import type { ToolDefinition } from "./toolSchemas";
 import { looksDangerousShellCommand } from "./toolExecutionContract";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "./runtime-v2/workspaceReadPolicy";
 
 export type PromptLanguageStrategy = "english_core_localized_output" | "model_aware" | "pure_english" | "pure_user_language";
 
@@ -42,6 +43,7 @@ export interface ToolCapability {
   description?: string;
   serverName?: string;
   serverUrl?: string;
+  mcpConnector?: "unity";
 }
 
 export interface ToolCapabilityRegistry {
@@ -178,12 +180,12 @@ const READ_ONLY_BUILT_INS = new Set([
   "get_file_outline",
 ]);
 
-const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file", "apply_patch"]);
+const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file", "apply_patch", "unity_create_scene"]);
 const SHELL_BUILT_INS = new Set(["run_command", "execute_command", "send_pty_input"]);
 const BROWSER_CONTROL_BUILT_INS = new Set(["browser_evaluate"]);
 const DESKTOP_CONTROL_BUILT_INS = new Set(["computer_use"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
-const EXTERNAL_READ_BUILT_INS = new Set(["web_search", "web_fetch"]);
+const EXTERNAL_READ_BUILT_INS = new Set(["web_search", "web_fetch", ...RUNTIME_V2_EDITOR_READ_TOOL_NAMES]);
 
 export interface BuiltInValidationAdapterCapability {
   surface: "browser" | "desktop";
@@ -749,8 +751,16 @@ export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): Tool
 export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLevel {
   const remoteName = getMcpToolRemoteName(tool);
   const text = normalizeText(`${server?.name || ""} ${remoteName} ${tool.description || ""}`);
+  const unityConnector = getMcpToolOrigin(tool)?.connector === "unity";
+  if (unityConnector && remoteName === "read_console") return "external_write";
   if (EXTERNAL_READ_MCP_TOOL_NAMES.has(remoteName)) return "external_read";
+  const risk = classifyMcpToolDescription(text);
+  // A raw Editor tool may run code or combine actions. Only the explicit
+  // read-only tools above and the fixed built-in aliases can grant reads.
+  return unityConnector && risk === "external_read" ? "external_write" : risk;
+}
 
+function classifyMcpToolDescription(text: string): ToolRiskLevel {
   if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
   if (containsAny(text, DESKTOP_CONTROL_TERMS)) return "desktop_control";
 
@@ -867,6 +877,7 @@ export function buildToolCapabilityRegistry(params: {
       description: definition.function.description,
       serverName: server?.name,
       serverUrl,
+      ...(source === "mcp" && origin?.connector ? { mcpConnector: origin.connector } : {}),
     };
   }
 
@@ -900,6 +911,9 @@ export function getToolRiskLevelForCall(
   context: ToolCallRiskContext = {},
 ): ToolRiskLevel {
   const capability = registry?.tools[name];
+  // The Editor contract owns this risk. Generic SQL/argument heuristics
+  // must not reinterpret a raw Editor action as a read.
+  if (capability?.mcpConnector === "unity") return capability.risk;
   const localFileReadPath = getLocalFileReadPathForToolCall(name, args, context.workspace);
   if (
     localFileReadPath &&
@@ -922,6 +936,8 @@ export function getToolRiskLevelForCall(
   if (SHELL_BUILT_INS.has(name) && looksDangerousShellCommand(args.command)) {
     return "destructive";
   }
+  if (capability?.source === "mcp" && /(?:^|_)read_console$/.test(name) &&
+    String(args.action ?? "get").toLowerCase() !== "get") return "external_write";
   if (capability) return capability.risk;
   return classifyBuiltInTool(name);
 }

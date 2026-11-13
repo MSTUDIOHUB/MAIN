@@ -21,8 +21,11 @@ async function loadCommonJs(relativePath, dependencies = {}) {
     fileName: sourcePath,
   }).outputText;
   const module = { exports: {} };
+  const loadTs = createTsModuleLoader();
   const localRequire = (id) => Object.hasOwn(dependencies, id) ? dependencies[id]
-    : id === "./runtime-v2/checkpoint" ? createTsModuleLoader()("src/lib/runtime-v2/checkpoint.ts") : require(id);
+    : ["./runtime-v2/checkpoint", "./runtime-v2/checkpointMerge"].includes(id)
+      ? loadTs("src/lib/" + id.slice(2) + ".ts")
+      : require(id);
   const factory = new Function("exports", "module", "require", transpiled);
   factory(module.exports, module, localRequire);
   return module.exports;
@@ -53,7 +56,6 @@ async function loadIpcWithInvoke(invoke, coordinatorOptions = null) {
       }
     : projectSessionMutationCoordinator;
   return loadCommonJs("src/lib/ipc.ts", {
-    "./runtime-v2/checkpoint": createTsModuleLoader()("src/lib/runtime-v2/checkpoint.ts"),
     "@tauri-apps/api/core": { invoke },
     "@tauri-apps/api/event": {
       listen: async () => () => {},
@@ -306,6 +308,64 @@ test("queued Project Session saves resolve the latest SQLite revision at queue h
   assert.deepEqual(invokedRevisions, [capturedRevision, capturedRevision + 1]);
   assert.equal(firstSaved.storageRevision, capturedRevision + 1);
   assert.equal(secondSaved.storageRevision, capturedRevision + 2);
+});
+
+test("queued stale autosave cannot erase turn.completed or replace the same Turn with a fork", async () => {
+  const runtime = createTsModuleLoader()("src/lib/runtime-v2/index.ts");
+  const workspace = "/workspace/terminal-prefix", sessionId = 52, turnId = "turn-52";
+  const owner = { workspaceKey: workspace, sessionKey: `${workspace}:${sessionId}`, sessionEpoch: "epoch", clientSubmissionId: "submission", turnId };
+  const run = { sessionKey: owner.sessionKey, sessionEpoch: owner.sessionEpoch, turnId, runId: "run", attemptId: "attempt", parentRunId: null };
+  let state = null;
+  const append = (type, payload) => {
+    const sequence = state?.nextSequence ?? 0;
+    state = runtime.transition(state, { type, sequence, eventId: `e${sequence}`, at: sequence + 1,
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, ...payload });
+  };
+  append("turn.admitted", { turn: owner, strategy: "execute", objective: "Repair the fixture", constraints: [], acceptanceCriteria: [] });
+  append("run.started", { run, phase: "finalizing" });
+  const final = runtime.buildRuntimeV2FinalProjection(state, "final", "partial", "Verified changes pending", "Existing final text");
+  const outcome = { resultKind: "partial", reason: "Verified changes pending", completedAt: 3, finalProjectionId: final.id };
+  append("run.completed", { run, outcome, finalProjection: final });
+  const missingProjection = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
+  append("projection.published", { run, audience: "final", projectionId: final.id, projection: final });
+  const old = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
+  const newest = runtime.recoverRuntimeV2TerminalCheckpoint(old);
+  for (const prefix of [missingProjection, old]) {
+    const recovered = runtime.recoverRuntimeV2TerminalCheckpoint(prefix);
+    assert.equal(runtime.isRuntimeV2TurnTerminallyClosed(recovered.aggregate), true);
+    assert.equal(runtime.recoverRuntimeV2TerminalCheckpoint(recovered), recovered);
+    assert.equal(recovered.events.filter(item => item.type === "projection.published").length, 1);
+    assert.equal(recovered.events.filter(item => item.type === "turn.completed").length, 1);
+    assert.equal(runtime.runtimeV2TerminalProjection(recovered.aggregate).markdown, final.markdown);
+  }
+  const row = (checkpoint) => ({ id: sessionId, storageRevision: 8, messages: [{ id: 1 }], runtimeSnapshot: {
+    conversationTurns: [{ id: turnId }], runtimeV2Checkpoints: { [turnId]: checkpoint },
+  } });
+  let durable = row(old);
+  const began = deferred(), release = deferred();
+  const writes = [];
+  const ipc = await loadIpcWithInvoke(async (command, args) => {
+    if (command === "load_project_session" || command === "load_project_session_meta") return durable;
+    assert.equal(command, "save_project_session");
+    assert.equal(args.session.storageRevision, durable.storageRevision);
+    writes.push(args.session.runtimeSnapshot.runtimeV2Checkpoints[turnId].revision);
+    if (writes.length === 1) { began.resolve(); await release.promise; }
+    durable = { ...args.session, storageRevision: durable.storageRevision + 1 };
+    return durable;
+  });
+  await ipc.loadProjectSession(workspace, sessionId);
+  const close = ipc.saveProjectSession(workspace, row(newest));
+  await began.promise;
+  const autosave = ipc.saveProjectSession(workspace, row(old));
+  release.resolve();
+  await Promise.all([close, autosave]);
+  assert.deepEqual(writes, [newest.revision, newest.revision]);
+
+  const forkedEvents = old.events.map((item, index) => index === 0 ? { ...item, objective: "Different admitted task" } : item);
+  const forked = runtime.replayRuntimeV2Events(forkedEvents);
+  const fork = runtime.createRuntimeV2Checkpoint({ aggregate: forked, revision: old.revision, updatedAt: forked.updatedAt });
+  await assert.rejects(ipc.saveProjectSession(workspace, { ...row(fork), storageRevision: durable.storageRevision }), { code: "runtime_v2_checkpoint_fork" });
+  assert.equal(writes.length, 2);
 });
 
 test("an explicitly stale caller revision is not upgraded from the owner cache", async () => {

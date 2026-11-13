@@ -1166,6 +1166,18 @@ test("exact small and search receipts remain cacheable only until a mutation ope
   );
 });
 
+test("a deferred glob cannot be replayed as a successful read", () => {
+  const search = { id: "next", name: "glob_search", arguments: { pattern: "Assets/Scripts/**/*.cs" } };
+  const transcript = [{ role: "assistant", content: "", tool_calls: [{ id: "deferred", type: "function",
+    function: { name: search.name, arguments: JSON.stringify(search.arguments) } }] },
+  { role: "tool", tool_call_id: "deferred", content: `[runtime-v2 rejected action: ${surface.runtimeV2ProviderToolCallIdentity(search)}]\nACTION_NOT_EXECUTED: this call was deferred by batch ordering.` }];
+  assert.equal(surface.runtimeV2ProviderReusableReadReceipt(search, transcript), null);
+  const successfulLookingPair = [transcript[0], { ...transcript[1], content: "Assets/Scripts/Fixture.cs" }];
+  assert.equal(surface.runtimeV2ProviderReusableReadReceipt(search, successfulLookingPair, {
+    unexecutedToolCallIds: new Set(["deferred"]), committedMutationTargetsByToolCallId: new Map(),
+  }), null);
+});
+
 test("Execute keeps safe reads available beside mutations after source freshness", () => {
   const available = [
     definition("read_file"),

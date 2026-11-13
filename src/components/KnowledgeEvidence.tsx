@@ -7,6 +7,7 @@ export default function KnowledgeEvidence({ packet, language }: { packet?: Knowl
   const omittedAll = !packet.hits.length && !!packet.omittedHits;
   const label = packet.state === "stale" ? (zh ? "资料已变化，请重新选择" : "Sources changed; select again")
     : packet.state === "error" ? (zh ? "资料检索失败" : "Source retrieval failed")
+      : packet.state === "standby" ? (zh ? "官方手册已绑定 · 按需检索" : "Official manual available on demand")
       : omittedAll ? (zh ? "资料片段超出本轮上下文预算" : "Source excerpts exceeded this Run's context budget")
         : packet.state === "no_hits" ? (zh ? "所选资料没有匹配片段" : "No matching excerpts in selected sources")
           : overview ? (zh ? "所选资料 · 有限开头概览" : "Selected source · limited opening overview")
@@ -14,7 +15,7 @@ export default function KnowledgeEvidence({ packet, language }: { packet?: Knowl
   const note = overview
     ? (zh ? "没有词面匹配，展示所选单篇资料的开头供继续读取。这不是检索命中，也不是全文总结。" : "No lexical match. This opening from the selected document supports further reading; it is not a search match or a complete summary.")
     : omittedAll ? (zh ? "本轮没有放入可引用的资料正文。请缩小所选范围或聚焦问题后重试。" : "No source text fits this Run. Narrow the selection or focus the question and try again.")
-      : packet.state === "retrieved" ? "" : packet.note;
+      : packet.state === "retrieved" || packet.state === "standby" ? "" : packet.note;
   return <details className="mt-2 max-w-full rounded-lg border px-3 py-2 text-xs" data-testid="knowledge-evidence"
     style={{ borderColor: "var(--surface-border)", background: "var(--surface-1)", color: "var(--surface-text)" }}>
     <summary className="cursor-pointer">{label}</summary>
@@ -29,6 +30,8 @@ export default function KnowledgeEvidence({ packet, language }: { packet?: Knowl
       </p>}
       {hit.sourceOverview && <p className="mt-1 text-[10px] opacity-75">{zh ? `索引共 ${hit.sourceOverview.totalChunks} 个分块，累计 ${hit.sourceOverview.totalChars} 字符（可能含重叠）` : `${hit.sourceOverview.totalChunks} indexed chunks, ${hit.sourceOverview.totalChars} characters including possible overlap`}</p>}
       {hit.sourceOverview?.nextChunkId && <p className="mt-1 break-all text-[10px] opacity-75" data-testid="knowledge-next-chunk">{zh ? "后续片段" : "Next chunk"}: {hit.sourceOverview.nextChunkId}</p>}
+      {hit.citation.documentationVersion && <div className="mt-1 opacity-70">{[hit.citation.documentationVersion, hit.citation.documentationCoverage].filter(Boolean).join(" · ")}</div>}
+      {hit.citation.sourceKind === "builtin_summary" && <div className="mt-1 opacity-70">{language === "en" ? "Built-in summary" : "内置摘要"}</div>}
       {hit.citation.sourceUrl && /^https?:\/\//i.test(hit.citation.sourceUrl) && <a href={hit.citation.sourceUrl} target="_blank" rel="noreferrer" className="mt-1 block break-all underline">{hit.citation.sourceUrl}</a>}
       <p className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap leading-relaxed">{hit.text}</p>
     </div>)}

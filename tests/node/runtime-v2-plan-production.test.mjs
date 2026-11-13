@@ -396,12 +396,12 @@ function event(sequence, at, value) {
   };
 }
 
-function reviewCheckpoint() {
+function reviewCheckpoint(owner = turn, ownerRun = run) {
   const sealed = plan();
   const commit = adapter.createRuntimeV2PlanReviewCommit({
     plan: sealed,
-    turn,
-    run,
+    turn: owner,
+    run: ownerRun,
     requestId: "review-request-a",
     createdAt: 20,
   });
@@ -409,7 +409,7 @@ function reviewCheckpoint() {
   const append = (value) => {
     const result = runtime.appendRuntimeV2Checkpoint({
       checkpoint,
-      owner: turn,
+      owner,
       expectedRevision: checkpoint?.revision || 0,
       event: value,
     });
@@ -418,16 +418,16 @@ function reviewCheckpoint() {
   };
   append(event(0, 10, {
     type: "turn.admitted",
-    turn,
+    turn: owner,
     strategy: "plan",
     objective: sealed.draft.objective,
     constraints: [],
     acceptanceCriteria: [],
   }));
-  append(event(1, 11, { type: "run.started", run, phase: "planning" }));
+  append(event(1, 11, { type: "run.started", run: ownerRun, phase: "planning" }));
   append(event(2, 20, {
     type: "work_plan.sealed",
-    run,
+    run: ownerRun,
     workPlan: adapter.toRuntimeV2WorkPlanReference(sealed),
     sealedPlan: sealed,
     reviewCommit: commit,
@@ -959,22 +959,26 @@ async function runProductionPlanScenario(
   const logs = [];
   const savedDocuments = [];
   const runSessionKey = options.runSessionKey || turn.sessionKey;
+  const revision = options.revision;
   let state = {
-    conversationTurns: [{
+    ...(revision ? { currentWorkspace: turn.workspaceKey, currentSessionId: 1 } : {}),
+    conversationTurns: [...(revision?.turns || []), {
       id: turn.turnId,
       clientSubmissionId: turn.clientSubmissionId,
       userPrompt: options.userPrompt ?? "修复文件打开与标签显示",
       status: "running",
       blockIds: [],
+      ...(revision ? { approvedPlanContinuation: { ...revision.source, revise: true } } : {}),
     }],
     config: options.config || { language: "zh" },
     planLifecycle: {
       sessionKey: runSessionKey,
       sessionEpoch: turn.sessionEpoch,
     },
-    runtimeV2Checkpoints: options.initialCheckpoint
-      ? { [turn.turnId]: options.initialCheckpoint }
-      : {},
+    runtimeV2Checkpoints: {
+      ...revision?.checkpoints,
+      ...(options.initialCheckpoint ? { [turn.turnId]: options.initialCheckpoint } : {}),
+    },
     runtimeEvents: [],
     taskFlow: [],
     harnessRunMarker: {
@@ -1069,7 +1073,7 @@ async function runProductionPlanScenario(
         },
     }],
     ["../../lib/toolExecutor", { executeTool: toolExecution }],
-    ["../../lib/ipc", { savePlanDocument: async input => {
+    ["../../lib/ipc", { ...revision?.ipc, savePlanDocument: async input => {
       savedDocuments.push(input);
       if (options.saveDocument) return options.saveDocument(input, savedDocuments.length);
       return { owner: input.owner, documentId: input.documentId, revision: 1,
@@ -1177,6 +1181,7 @@ async function runProductionPlanScenario(
         availableMemoryBytes: null,
       },
       networkRead: options.networkRead,
+      projectBaselineContext: options.projectBaselineContext,
       capabilityRestrictions: options.capabilityRestrictions,
       approvalRequiredCapabilities: options.approvalRequiredCapabilities,
       turnInputContextSignals: options.turnInputContextSignals || {
@@ -6208,6 +6213,128 @@ function simplePlanSubmission(target = "src/new-fixture.js") {
     validations: [{ kind: "finite_command", command: "npm run build", expectedOutcome: "Build passes.", required: true, stepIndexes: [0], criterionIds: ["criterion-user-objective"] }],
   };
 }
+
+test("production Plan actively starts a scoped child and keeps the parent moving without a spawn call", async () => {
+  let parentRound = 0;
+  let childStarted = false;
+  let releaseChild;
+  const parentContinued = new Promise(resolve => { releaseChild = resolve; });
+  const result = await runProductionPlanScenario(async (messages, _settings, callbacks) => {
+    if (messages.some(message => String(message.content).includes("You are a read-only child"))) {
+      childStarted = true;
+      callbacks.onLifecycle?.({ phase: "model_progress", chunkCount: 1, byteCount: 10 });
+      await parentContinued;
+      return { content: "The scoped project manifest identifies the verification entry point.", toolCalls: [], usage: {} };
+    }
+    parentRound++;
+    if (parentRound === 1) return {
+      content: "", toolCalls: ["src/main.js", "package.json"].map((path, index) => ({
+        id: `source-${index}`, name: "read_file", arguments: JSON.stringify({ path }),
+      })), usage: {},
+    };
+    if (parentRound === 2) {
+      assert.equal(childStarted, true);
+      releaseChild();
+      return planProviderReply("parent-continues", "read_file", { path: "src/other.js" });
+    }
+    return planProviderReply("plan", "submit_runtime_v2_work_plan", simplePlanSubmission());
+  }, (name, args) => planFixtureTool(name, args), {
+    initialCheckpoint: planningCheckpointWithRequirement("optional"),
+    turnInputContextSignals: { subagentPreference: "preferred" },
+    subagentCapacityPolicy: { maxActiveRequests: 1, modelRequestMode: "parallel" },
+    projectBaselineContext: { kind: "project_baseline_context", workspace: { canonicalPath: turn.workspaceKey },
+      fingerprints: { overall: "fixture" }, anchors: [{ path: "package.json", kind: "manifest" }],
+      facts: { languages: [], packageManagers: [], runtimes: [], scripts: [] }, topology: [], truncated: {}, omissions: [], diagnostics: [] },
+  });
+  assert.equal(result.settlement.outcome.status, "paused");
+  const { events, subagents } = result.checkpoint.aggregate;
+  assert.equal(subagents.length, 1);
+  assert.ok(subagents[0].proactiveKey);
+  assert.equal(subagents[0].sourceToolCallId, undefined);
+  assert.ok(events.some(event => event.type === "subagent.telemetry" && event.telemetry.phase === "first_token"));
+  assert.ok(events.some(event => event.type === "tool.completed" && event.evidence.some(item => item.target === "src/other.js")));
+});
+
+test("approved Plan revision opens a child on the exact changed target before the parent provider", async () => {
+  const sessionKey = `${turn.workspaceKey}:1`;
+  const sourceTurn = { ...turn, sessionKey, turnId: "reviewed-plan", clientSubmissionId: "reviewed-plan-receipt" };
+  const sourceRun = { ...run, sessionKey, turnId: sourceTurn.turnId, runId: "reviewed-run", attemptId: "reviewed-run" };
+  const { checkpoint: review, commit } = reviewCheckpoint(sourceTurn, sourceRun);
+  const append = (state, fields) => runtime.transition(state, event(state?.nextSequence || 0, (state?.updatedAt || 20) + 1, fields));
+  const checkpoint = aggregate => runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt });
+  const close = (aggregate, owner, active, resultKind) => {
+    const finalProjection = runtime.buildRuntimeV2FinalProjection(aggregate, `final-${owner.turnId}`, resultKind, resultKind);
+    const outcome = { resultKind, reason: resultKind, completedAt: aggregate.updatedAt + 2, finalProjectionId: finalProjection.id };
+    if (resultKind === "canceled") aggregate = append(aggregate, { type: "run.aborted", run: active, reason: outcome.reason });
+    aggregate = append(aggregate, { type: "run.completed", run: active, outcome, finalProjection });
+    aggregate = append(aggregate, { type: "projection.published", run: active, audience: "final", projectionId: finalProjection.id, projection: finalProjection });
+    return append(aggregate, { type: "turn.completed", turn: owner, runId: active.runId, outcome });
+  };
+  const approved = append(review.aggregate, { type: "work_plan.approved", run: sourceRun,
+    workPlan: { ...review.aggregate.workPlan, status: "approved" } });
+  const source = { turn: sourceTurn, approvalEventId: approved.events.at(-1).eventId, authority: commit.authority };
+  const driftTurn = { ...turn, sessionKey, turnId: "blocked-resume", clientSubmissionId: "blocked-resume-receipt" };
+  const driftRun = { ...run, sessionKey, turnId: driftTurn.turnId, runId: "blocked-run", attemptId: "blocked-run" };
+  const target = "src/main.js";
+  let drift = append(null, { type: "turn.admitted", turn: driftTurn, strategy: "plan", objective: "Continue the approved plan",
+    constraints: [], acceptanceCriteria: [] });
+  drift = append(drift, { type: "run.started", run: driftRun, phase: "planning" });
+  drift = append(drift, { type: "observation.recorded", run: driftRun, evidence: { id: "approved-plan-drift:0", kind: "tool", target } });
+  const currentSource = "export const changed = true;\n";
+  const observed = [];
+  const dispatches = [];
+  let abort;
+  let releaseChild;
+  const parentEntered = new Promise(resolve => { releaseChild = resolve; });
+  const result = await runProductionPlanScenario(async (messages, _settings, callbacks) => {
+    const transcript = messages.map(message => String(message.content)).join("\n");
+    if (transcript.includes("You are a read-only child")) {
+      dispatches.push("child");
+      callbacks.onLifecycle?.({ phase: "model_progress", chunkCount: 1, byteCount: 10 });
+      await parentEntered;
+      return { content: "The exact source is available for review.", toolCalls: [], usage: {} };
+    }
+    dispatches.push("parent");
+    releaseChild();
+    assert.match(transcript, /CURRENT REVISION PATH CHECKS/);
+    assert.match(transcript, /export const changed = true/);
+    abort.abort("fixture verified overlapping provider requests");
+    return { content: "", toolCalls: [], usage: {} };
+  }, async name => { throw new Error(`unexpected workspace tool ${name}`); }, {
+    runSessionKey: sessionKey,
+    revision: {
+      source,
+      turns: [{ id: sourceTurn.turnId, clientSubmissionId: sourceTurn.clientSubmissionId, userPrompt: "Prepare the plan" },
+        { id: driftTurn.turnId, approvedPlanContinuation: source }],
+      checkpoints: { [sourceTurn.turnId]: checkpoint(close(approved, sourceTurn, sourceRun, "canceled")),
+        [driftTurn.turnId]: checkpoint(close(drift, driftTurn, driftRun, "blocked")) },
+      ipc: {
+        getFileMetadata: async path => ({ path }),
+        readFileWindow: async path => {
+          observed.push(path);
+          return { path, content: currentSource, contentVersion: `sha256-${createHash("sha256").update(currentSource).digest("hex")}`,
+            totalLines: 1, totalChars: currentSource.length, returnedStartLine: 1, returnedEndLine: 1,
+            returnedStartChar: 0, returnedEndChar: currentSource.length, complete: true };
+        },
+      },
+    },
+    onAbortCtrl: value => { abort = value; },
+    turnInputContextSignals: { subagentPreference: "preferred" },
+    subagentCapacityPolicy: { maxActiveRequests: 1, modelRequestMode: "parallel" },
+  });
+  assert.deepEqual(observed, [target]);
+  assert.deepEqual(dispatches, ["child", "parent"]);
+  const { events, subagents } = result.checkpoint.aggregate;
+  assert.equal(subagents.length, 1);
+  assert.deepEqual(subagents[0].allowedPaths, [target]);
+  assert.equal(subagents[0].accessMode, "read");
+  assert.equal(subagents[0].taskKind, "review");
+  const childOpened = events.findIndex(event => event.type === "subagent.telemetry" && event.telemetry.phase === "request_opened");
+  const parentScheduled = events.findIndex(event => event.type === "command.scheduled" && event.command.kind === "request_model");
+  assert.ok(childOpened >= 0 && childOpened < parentScheduled);
+  assert.ok(!events.some(event => event.type === "work_plan.approved"));
+});
+
 const planProviderReply = (id, name, args) => ({ content: "", toolCalls: [{ id, name, arguments: JSON.stringify(args) }], usage: {}, protocolViolation: null });
 const planFixtureTool = async (name, args) => {
   if (name === "get_project_skeleton") return "src/main.js";
@@ -6726,6 +6853,42 @@ test("Plan cold history never attaches a future receipt to an interrupted reused
   assert.equal(tools[1].content, "The resumed file's actual source.");
 });
 
+
+test("a focused approved-Plan revision advertises exact reads and synthesis without workspace discovery", async () => {
+  const requests = [];
+  const logs = [];
+  const port = loadTsWithMocks(path.join(workspaceRoot, "src/store/runtimeV2/planProviderPort.ts"), new Map([
+    ["../../lib/streaming", {
+      isStreamOutputLimited,
+      streamChatCompletion: async (...args) => {
+        requests.push(args[4].map(tool => tool.function.name));
+        return { content: "", toolCalls: [], usage: {}, finishReason: "stop" };
+      },
+    }],
+    ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ markFirstToken() {}, reportFailure() {}, release() {}, setPressureHandler() {} }) }],
+    ["../../lib/providerLaneSettings", {
+      deriveBudgetedStreamSettings: () => ({}),
+      deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+    }],
+  ]));
+  for (const focusedRevision of [true, false]) await port.requestPlanModel({
+    get: () => ({ config: {} }),
+    context: { abortCtrl: new AbortController(), phaseLanguage: "en", runWorkspace: "/fixture", runSessionKey: run.sessionKey },
+    ledger: {
+      snapshot: () => ({ objective: { text: "Revise the reviewed plan" }, evidence: [] }),
+      schedule: async () => ({ idempotencyKey: "revision-request" }),
+      settleCommand: async () => {},
+    },
+    run, messages: [{ role: "user", content: "Review the changed source." }],
+    deadlineAt: Date.now() + 30_000, stage: "synthesis", evidence: [], evidenceContents: new Map(),
+    collaboration: { collaborationAllowed: true, remainingSubagentCapacity: 1 },
+    submissionRepairPending: false, focusedRevision,
+    logStoreEvent: (name, data) => logs.push({ name, data }),
+  });
+  assert.deepEqual(requests[0], ["read_file", "spawn_subagent", "submit_runtime_v2_work_plan"]);
+  assert.ok(requests[1].includes("glob_search") && requests[1].includes("grep_search"));
+  assert.equal(logs.find(item => item.name === "runtime_v2_plan_provider_request_opened").data.reasoningOnlyTimeoutMs, 60_000);
+});
 
 test("Plan distinguishes client output guards from real provider length without accepting an incomplete response", async () => {
   for (const cause of ["reasoning_char_limit", "action_char_limit", "provider_length", "stop"]) {

@@ -81,6 +81,7 @@ export function providerModeInstruction(
       }[];
     }[];
     readonly actionWindow?: RuntimeV2ProviderActionWindow | null;
+    readonly editorDiagnosticRepair?: boolean;
     readonly executionContract?: RuntimeV2ExecutionContract | null;
     readonly executionContractAdvanceRequired?: boolean;
     readonly executionContractCommittedTargets?: readonly string[];
@@ -232,7 +233,9 @@ export function providerModeInstruction(
   if (mode === "validate") {
     return [
       recoveryGuidance,
-      "Verify the latest committed mutation by running a finite validation tool (such as run_command for build/test/lint/typecheck, or browser_evaluate/computer_use for UI verification) before returning your final summary; read_file or prose alone does not satisfy validation. Still-needed authorized external actions remain available. Ordinary shell actions produce tool results and do not discharge file validation debt attached to the newest committed mutation. If verification reveals an issue, fix the code and re-verify.",
+      toolSurface.editorDiagnosticRepair
+        ? "Use the current Editor compiler and Shader import receipts to settle static Console diagnostics. Runtime exceptions require a reproduction or test in the project. Continue any remaining fixes or report the verified outcome."
+        : "Verify the latest committed mutation by running a finite validation tool (such as run_command for build/test/lint/typecheck, or browser_evaluate/computer_use for UI verification) before returning your final summary; read_file or prose alone does not satisfy validation. Still-needed authorized external actions remain available. Ordinary shell actions produce tool results and do not discharge file validation debt attached to the newest committed mutation. If verification reveals an issue, fix the code and re-verify.",
       sourceGuidance,
       creationGuidance,
       validationGuidance,

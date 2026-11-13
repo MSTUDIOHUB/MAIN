@@ -1,3 +1,4 @@
+import { knowledgeLookupPolicy } from "./knowledgeReferences";
 // lib/toolExecutor.ts
 // Routes agent tool calls to the correct execution backend.
 // ALL file operations go through Tauri IPC (invoke) to the Rust backend,
@@ -28,6 +29,7 @@ import {
   getPtyStatus,
   findSymbolReferences,
   runCommand,
+  runUnityEditorOperation,
   getFileOutline,
   getFileMetadata,
   ingestAttachmentFile,
@@ -44,7 +46,8 @@ import {
 } from "./ipc";
 import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
-import { isMcpTool, executeMcpTool, getMcpServerUrl } from "./mcpClient";
+import { isMcpTool, executeMcpTool, getMcpServerUrl, getMcpToolOrigin } from "./mcpClient";
+import { executeUnityMcpObservation, normalizeMcpWorkspace } from "./workspaceMcp";
 import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import {
   classifyBuiltInTool,
@@ -53,10 +56,12 @@ import {
   normalizeLocalFileReadPath,
 } from "./toolCapabilities";
 import { getShellToolCwd } from "./toolExecutionContract";
+import { UNITY_CREATE_SCENE_TOOL } from "./workspaceMutationTools";
 import { formatDirectoryNodesForTool } from "./workspacePaths";
 import { builtInToolRequiresWorkspace } from "./workspaceToolScope";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import { sha256Hex } from "./sha256";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
 import {
@@ -230,13 +235,18 @@ function buildChatTempSuccessMessage(
 export interface ToolExecutionOptions {
   /** Internal Runtime preparation fact; model arguments never supply this. */
   writeFileTarget?: import("./workspaceMutationPreflight").WorkspaceWriteFileTargetFact;
+  unitySceneAuthority?: { signal: AbortSignal; lifecycleDeadlineAt?: number };
+  unityConsoleRepairScope?: true;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
   toolCatalog?: ToolCatalog;
+  availableToolNames?: ReadonlySet<string>;
+  workspaceMcpSnapshot?: import("./workspaceMcp").WorkspaceMcpSnapshot | null;
   skillCatalog?: SkillCatalogSnapshot | null;
   /** Captured message scope; model-supplied kb/source ids cannot widen it. */
   knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
+  knowledgeLookup?: { allowOfficialDocuments: boolean; signal?: AbortSignal };
 }
 
 async function prepareExternalLocalReadArgs(
@@ -308,10 +318,16 @@ export async function executeTool(
       if (!resolution.entry.serverUrl) {
         throw new Error(`MCP server URL not found for tool "${resolution.entry.canonicalName}".`);
       }
+      const binding = options.workspaceMcpSnapshot?.unityBindings?.[resolution.entry.serverUrl];
+      const origin = resolution.entry.mcpTool && getMcpToolOrigin(resolution.entry.mcpTool);
+      if (origin?.connector === "unity" && (!binding || options.workspaceMcpSnapshot?.workspace !== normalizeMcpWorkspace(workspace))) {
+        throw new Error("MCP_UNITY_OBSERVATION_SCOPE_MISMATCH");
+      }
       return await executeMcpTool(
         resolution.entry.serverUrl,
         resolution.entry.executionName,
         args,
+        binding,
       );
     }
     if (resolution.entry.source === "skill") {
@@ -341,6 +357,10 @@ export async function executeTool(
     }
   }
 
+  if (executionName === "unity_mcp_scene" || executionName === "unity_mcp_console") {
+    return executeUnityMcpObservation({ snapshot: options.workspaceMcpSnapshot, workspace, name: executionName, args, repairScope: options.unityConsoleRepairScope });
+  }
+
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
   if (executionName === LOAD_SKILL_TOOL_NAME) {
@@ -350,7 +370,15 @@ export async function executeTool(
     return executeToolSearch(args, {
       sessionKey,
       toolCatalog: options.toolCatalog,
+      availableToolNames: options.availableToolNames,
     });
+  }
+  if (executionName === UNITY_CREATE_SCENE_TOOL) {
+    const authority = options.unitySceneAuthority;
+    if (!authority || !workspace) throw new Error("UNITY_SCENE_REQUIRES_APPROVED_PLAN");
+    return runUnityEditorOperation(UNITY_CREATE_SCENE_TOOL, {
+      workspace, path: args.path, rootName: args.root_name, scriptPath: args.script_path,
+    }, authority.signal, Math.min(Date.now() + 175_000, authority.lifecycleDeadlineAt ?? Infinity));
   }
   unlockToolsForSession(sessionKey, [executionName]);
 
@@ -874,11 +902,14 @@ export async function executeTool(
     case "knowledge_search": {
       const query = parseOptionalString(args.query);
       if (!query) throw new Error("Missing required parameter 'query'.");
-      return await knowledgeSearch(
-        query,
-        [...(options.knowledgeReferences || [])],
-        parseOptionalNumber(args.limit),
-      );
+      const references = options.knowledgeReferences || [];
+      const policy = knowledgeLookupPolicy({
+        references,
+        allowOfficialDocuments: options.knowledgeLookup?.allowOfficialDocuments,
+        networkRead: options.networkRead,
+        requestWebFallback: args.allow_web_fallback,
+      });
+      return await knowledgeSearch(query, references, parseOptionalNumber(args.limit), policy, options.knowledgeLookup?.signal);
     }
 
     case "knowledge_get_excerpt": {
@@ -919,6 +950,7 @@ export async function executeTool(
       return JSON.stringify({
         success: true,
         changedPaths: [replacePath],
+        mutationVersions: [{ path: replacePath, version: `sha256-${sha256Hex(updated)}` }],
         message: `File ${replacePath} updated successfully.`,
       });
     }
@@ -938,12 +970,17 @@ export async function executeTool(
         } else {
           const current = temporary ? await readChatTempFile(sessionKey!, writePath) : await readFile(writePath, workspace);
           if (current !== reviewed.content) throw new Error("WRITE_FILE_SOURCE_STALE: target changed after mutation preparation");
+          if (current === writeContent) {
+            return JSON.stringify({ success: true, noOp: true, message: `File ${writePath} already matched requested content.` });
+          }
           if (temporary) temporaryPath = await writeChatTempFile(sessionKey!, writePath, writeContent);
           else await writeFile(writePath, writeContent, workspace);
         }
         return temporaryPath
           ? buildChatTempSuccessMessage("written", writePath, temporaryPath)
-          : JSON.stringify({ success: true, changedPaths: [writePath], message: `File ${writePath} written successfully.` });
+          : JSON.stringify({ success: true, changedPaths: [writePath],
+              mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}` }],
+              message: `File ${writePath} written successfully.` });
       }
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
         try {
@@ -969,6 +1006,7 @@ export async function executeTool(
       return JSON.stringify({
         success: true,
         changedPaths: [writePath],
+        mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}` }],
         message: `File ${writePath} written successfully.`,
       });
     }
@@ -1034,10 +1072,21 @@ export async function executeTool(
       if (!result.ok) {
         throw new Error(result.error || "apply_patch failed.");
       }
+      const versions = new Map<string, { before: string | null; after: string | null }>();
+      for (const change of result.changes) {
+        const previous = versions.get(change.path);
+        versions.set(change.path, {
+          before: previous ? previous.before : change.existed ? change.oldContent : null,
+          after: change.kind === "delete" ? null : change.newContent,
+        });
+      }
       return JSON.stringify({
         success: true,
         message: `Patch applied to ${summarizeApplyPatchTarget(patch) || "workspace"}.`,
         changedFiles: result.changes.map((change) => change.path),
+        mutationVersions: [...versions].flatMap(([path, { before, after }]) => before === after ? [] : [{
+          path, version: after === null ? "deleted" : `sha256-${sha256Hex(after)}`,
+        }]),
       });
     }
 
@@ -1054,6 +1103,7 @@ export async function executeTool(
       await deleteWorkspacePath(targetPath, workspace);
       return JSON.stringify({
         success: true,
+        mutationVersions: [{ path: targetPath, version: "deleted" }],
         message: `Path ${targetPath} deleted successfully.`,
       });
     }
