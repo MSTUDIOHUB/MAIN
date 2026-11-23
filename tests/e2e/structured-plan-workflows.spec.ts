@@ -77,9 +77,13 @@ async function mountWorkflow(page: Page, surface: Surface, theme = "dark") {
 
 async function fillValidAnswers(page: Page) {
   const form = page.getByTestId("structured-user-questionnaire");
+  const steps = form.getByTestId("structured-question-step");
+  await steps.nth(0).click();
   await form.getByRole("radio", { name: /桌面应用/ }).check();
+  await steps.nth(1).click();
   await form.getByRole("checkbox", { name: "界面验证", exact: true }).check();
   await form.getByRole("checkbox", { name: "单元验证", exact: true }).check();
+  await steps.nth(2).click();
   await form.getByRole("textbox", { name: "补充限制", exact: true }).fill("  保留现有资料，离线运行。  ");
 }
 
@@ -87,7 +91,16 @@ for (const surface of ["form", "capsule"] as const) {
   test(`${surface}: required and selection-count validation emits only typed answer IDs`, async ({ page }) => {
     await mountWorkflow(page, surface);
     const form = page.getByTestId("structured-user-questionnaire");
+    const steps = form.getByTestId("structured-question-step");
     const submit = form.getByRole("button", { name: "确认并继续", exact: true });
+    const next = form.getByRole("button", { name: "下一题 →", exact: true });
+    // Non-last steps promote "下一题 →" instead of showing "确认并继续".
+    await expect(submit).toHaveCount(0);
+    await expect(next).toBeVisible();
+    await next.click();
+    await expect(submit).toHaveCount(0);
+    await next.click();
+    await expect(submit).toBeVisible();
     await submit.click();
     await expect(form.getByRole("alert")).toBeVisible();
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers.length)).toBe(0);
@@ -96,14 +109,22 @@ for (const surface of ["form", "capsule"] as const) {
     await submit.click();
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers.length)).toBe(0);
     await form.getByRole("textbox").fill("  保留现有资料，离线运行。  ");
+    await steps.nth(1).click();
     await form.getByRole("checkbox", { name: "文档检查", exact: true }).check();
+    await expect(submit).toHaveCount(0);
+    await next.click();
     await submit.click();
+    // Auto-jumps to the first invalid question (step 1: too many checkboxes selected).
+    await expect(steps.nth(1)).toHaveAttribute("aria-selected", "true");
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers.length)).toBe(0);
     await form.getByRole("checkbox", { name: "文档检查", exact: true }).uncheck();
     await form.getByRole("checkbox", { name: "界面验证", exact: true }).uncheck();
+    await next.click();
     await submit.click();
+    await expect(steps.nth(1)).toHaveAttribute("aria-selected", "true");
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers.length)).toBe(0);
     await form.getByRole("checkbox", { name: "界面验证", exact: true }).check();
+    await next.click();
     await submit.click();
     await expect(form.getByRole("alert")).toHaveCount(0);
     const result = await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers[0]);
@@ -119,13 +140,16 @@ for (const surface of ["form", "capsule"] as const) {
     await mountWorkflow(page, surface);
     await fillValidAnswers(page);
     const form = page.getByTestId("structured-user-questionnaire");
+    const steps = form.getByTestId("structured-question-step");
     await page.evaluate(() => { (window as any).__STRUCTURED_PLAN_UI__.submitMode = "hold"; });
     await form.getByRole("button", { name: "确认并继续", exact: true }).click();
     await expect(form.getByRole("button", { name: "正在提交…", exact: true })).toBeDisabled();
-    await expect(form.getByRole("radio").first()).toBeDisabled();
     await expect(form.getByRole("textbox")).toBeDisabled();
+    await steps.nth(0).click();
+    await expect(form.getByRole("radio").first()).toBeDisabled();
     await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.pending.shift()(false));
     await expect(form.getByRole("alert")).toBeVisible();
+    await steps.nth(2).click();
     await expect(form.getByRole("textbox")).toHaveValue("  保留现有资料，离线运行。  ");
     await page.evaluate(() => { (window as any).__STRUCTURED_PLAN_UI__.submitMode = "throw"; });
     await form.getByRole("button", { name: "确认并继续", exact: true }).click();
@@ -140,9 +164,12 @@ for (const surface of ["form", "capsule"] as const) {
       { id: "notes", prompt: "可选补充要求", selectionMode: "text", required: false, options: [] },
     ] }));
     const form = page.getByTestId("structured-user-questionnaire");
+    const next = form.getByRole("button", { name: "下一题 →", exact: true });
     const submit = form.getByRole("button", { name: "确认并继续", exact: true });
-    const notes = form.getByRole("textbox", { name: "可选补充要求", exact: true });
     await expect(form.getByRole("radio").first()).not.toBeChecked();
+    await expect(submit).toHaveCount(0);
+    await next.click();
+    const notes = form.getByRole("textbox", { name: "可选补充要求", exact: true });
     await expect(notes).toHaveValue("");
     await submit.click();
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers)).toEqual([]);
@@ -150,7 +177,9 @@ for (const surface of ["form", "capsule"] as const) {
     await notes.fill("   ");
     await submit.click();
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers)).toEqual([]);
+    await form.getByRole("button", { name: "← 上一题", exact: true }).click();
     await form.getByRole("radio", { name: "桌面应用", exact: true }).check();
+    await next.click();
     await submit.click();
     await expect(form.getByRole("alert")).toHaveCount(0);
     expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers.map((entry: any) => entry.answer))).toEqual([
@@ -158,6 +187,7 @@ for (const surface of ["form", "capsule"] as const) {
     ]);
     await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.replaceRequest({ requestId: "question-optional-text" }));
     await expect(form.getByRole("radio").first()).not.toBeChecked();
+    await next.click();
     await expect(notes).toHaveValue("");
     await notes.fill("  只保留本地运行要求。  ");
     await submit.click();
@@ -165,6 +195,7 @@ for (const surface of ["form", "capsule"] as const) {
       requestId: "question-optional-text", revision: 2, answers: [{ questionId: "platform", selectedValues: [] }, { questionId: "notes", selectedValues: [], text: "只保留本地运行要求。" }],
     });
     await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.replaceRequest({ requestId: "question-optional-stop" }));
+    await next.click();
     await expect(notes).toHaveValue("");
     await form.getByRole("button", { name: "停止", exact: true }).click();
     expect(await page.evaluate(() => ({ answers: (window as any).__STRUCTURED_PLAN_UI__.answers.length, cancelled: (window as any).__STRUCTURED_PLAN_UI__.cancelled, legacyReplies: (window as any).__STRUCTURED_PLAN_UI__.legacyReplies }))).toEqual({ answers: 2, cancelled: 1, legacyReplies: [] });
@@ -176,12 +207,16 @@ test("same request/revision with a replacement owner resets old answers in the r
   await fillValidAnswers(page);
   await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.replaceRequest({ sessionKey: "__MAIN_GLOBAL_CHAT__:replacement", turnId: "turn-2", runId: "run-2", executionBlocker: { sessionEpoch: "epoch-2" } }));
   const form = page.getByTestId("structured-user-questionnaire");
+  const steps = form.getByTestId("structured-question-step");
   await expect(form.getByRole("radio").first()).not.toBeChecked();
+  await steps.nth(1).click();
   await expect(form.getByRole("checkbox").first()).not.toBeChecked();
+  await steps.nth(2).click();
   await expect(form.getByRole("textbox")).toHaveValue("");
   await fillValidAnswers(page);
   await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.reviseQuestions({ revision: 2 }));
   await expect(form.getByRole("radio").first()).not.toBeChecked();
+  await steps.nth(2).click();
   await expect(form.getByRole("textbox")).toHaveValue("");
 });
 
@@ -192,6 +227,7 @@ test("a changed request clears answers and a late old false result cannot mark t
   await page.evaluate(() => { (window as any).__STRUCTURED_PLAN_UI__.submitMode = "hold"; });
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
   await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.replaceRequest({ requestId: "question-2" }));
+  await form.getByTestId("structured-question-step").nth(2).click();
   await expect(form.getByRole("textbox")).toHaveValue("");
   await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toBeEnabled();
   await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.pending.shift()(false));
@@ -206,6 +242,7 @@ test("an old submission cannot unlock or invalidate the replacement request's pe
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
   await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.replaceRequest({ requestId: "question-2" }));
   await expect(form.getByRole("radio").first()).toHaveAttribute("name", "question-2:platform");
+  await form.getByTestId("structured-question-step").nth(2).click();
   await expect(form.getByRole("textbox")).toHaveValue("");
   await fillValidAnswers(page);
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
@@ -219,11 +256,57 @@ test("an old submission cannot unlock or invalidate the replacement request's pe
   expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers.map((entry: any) => entry.answer.requestId))).toEqual(["question-1", "question-2"]);
 });
 
+test("choice question supports keyboard 1-9 quick select and inline custom '其他（自定义输入）' row", async ({ page }) => {
+  await mountWorkflow(page, "capsule", "dark");
+  await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.reviseQuestions({
+    revision: 3,
+    questions: [{
+      id: "arch",
+      prompt: "选择架构方式",
+      selectionMode: "single",
+      required: true,
+      allowText: true,
+      minSelections: 0,
+      maxSelections: 1,
+      options: [
+        { id: "mvp", label: "MVP 架构" },
+        { id: "mvvm", label: "MVVM 架构" },
+      ],
+    }],
+  }));
+  const form = page.getByTestId("structured-user-questionnaire");
+  const mvp = form.getByRole("radio", { name: "MVP 架构", exact: true });
+  const mvvm = form.getByRole("radio", { name: "MVVM 架构", exact: true });
+  const other = form.getByTestId("structured-question-other-option");
+  await expect(other).toBeVisible();
+
+  // Keyboard quick select 2 selects the 2nd predefined option
+  await page.keyboard.press("2");
+  await expect(mvvm).toBeChecked();
+  await expect(mvp).not.toBeChecked();
+
+  // Activating inline "其他（自定义输入）" unselects predefined radio and focuses the custom editor
+  await other.getByRole("button").click();
+  await expect(mvvm).not.toBeChecked();
+  await expect(other).toHaveAttribute("data-selected", "true");
+  const customInput = form.getByRole("textbox", { name: "选择架构方式 - 其他（自定义输入）", exact: true });
+  await expect(customInput).toBeFocused();
+  await customInput.fill("采用轻量 ServiceLocator + EventBus");
+  await form.getByRole("button", { name: "确认并继续", exact: true }).click();
+
+  expect(await page.evaluate(() => (window as any).__STRUCTURED_PLAN_UI__.answers[0].answer)).toEqual({
+    requestId: "question-1",
+    revision: 3,
+    answers: [{ questionId: "arch", selectedValues: [], text: "采用轻量 ServiceLocator + EventBus" }],
+  });
+});
+
 for (const theme of ["light", "dark", "black"] as const) {
   test(`structured Capsule choices remain readable in ${theme}`, async ({ page }, testInfo) => {
     await mountWorkflow(page, "capsule", theme);
     await fillValidAnswers(page);
     const form = page.getByTestId("structured-user-questionnaire");
+    await form.getByTestId("structured-question-step").nth(0).click();
     const desktop = form.getByRole("radio", { name: /桌面应用/ });
     const web = form.getByRole("radio", { name: /网页应用/ });
     const metrics = await form.evaluate(element => {

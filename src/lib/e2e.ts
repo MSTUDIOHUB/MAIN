@@ -6386,7 +6386,7 @@ function seedExecutionCapsulePanelStabilityScenario() {
     turnId,
     type: "agent" as const,
     content: [
-      "### 修复计划已准备好",
+      "### 实施计划已准备好",
       "",
       "**根本原因**：审批状态与右侧面板选择共享了旧的展示条件。",
       "",

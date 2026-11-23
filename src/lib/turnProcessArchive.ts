@@ -156,8 +156,15 @@ function isFinalConclusionBlock(block: any, finalVisibleAgentIndex: number, bloc
   return block?.type === "agent" && blockIndex === finalVisibleAgentIndex;
 }
 
+function isQuestionnaireAnchorBlock(block: any): boolean {
+  if (!block || block.type !== "agent") return false;
+  if (block.choiceRequest?.questionnaire) return true;
+  return /^plan-questionnaire-\d+:/.test(String(block.choiceRequest?.requestId || ""));
+}
+
 function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, blockIndex: number): boolean {
   if (!block || block.type === "user") return false;
+  if (isQuestionnaireAnchorBlock(block)) return false;
   if (isFinalConclusionBlock(block, finalVisibleAgentIndex, blockIndex)) return false;
   if (isPlanGenerationFailureBlock(block)) return false;
   if (isPlanCandidateBlock(block) && !isReviewablePlanBlock(block)) return false;
@@ -173,6 +180,7 @@ function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, b
 
 function isLiveProcessCandidate(block: any): boolean {
   if (!block || block.type === "user" || block.type === "thought") return false;
+  if (isQuestionnaireAnchorBlock(block)) return false;
   if (isPlanGenerationFailureBlock(block)) return false;
   if (block.type === "agent") {
     return block.hiddenProcess === true &&

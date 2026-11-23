@@ -183,7 +183,7 @@ export default function WorkspaceTreePanel({
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
   const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});
   const [fileTreeError, setFileTreeError] = useState("");
-  const [planCleanupByWorkspace, setPlanCleanupByWorkspace] = useState<Record<string, "pending" | "failed">>({});
+  const [planCleanupByWorkspace, setPlanCleanupByWorkspace] = useState<Record<string, "pending" | "failed" | "protected">>({});
   const planCleanup = planCleanupByWorkspace[currentWorkspace];
   const treeNodesRef = useRef<Record<string, FileNode[]>>({});
   const loadingPathsRef = useRef<Record<string, boolean>>({});
@@ -205,6 +205,7 @@ export default function WorkspaceTreePanel({
     clearPlans: language === "en" ? "Clear Plans" : "清理计划文件",
     clearingPlans: language === "en" ? "Clearing plan files…" : "正在清理计划文件…",
     clearPlansFailed: language === "en" ? "Could not clear plan files. Please retry." : "清理计划文件失败，请重试。",
+    clearPlansProtected: language === "en" ? "Active executing plan files were skipped." : "当前有正在执行的计划任务，对应计划文件已跳过清理。",
     clearBrowserValidation: language === "en" ? "Clear Validation Shots" : "清理验证截图",
     close: language === "en" ? "Close file tree" : "关闭文件树",
   }), [language]);
@@ -312,10 +313,20 @@ export default function WorkspaceTreePanel({
     if (!currentWorkspace || planCleanup === "pending") return;
     setPlanCleanupByWorkspace((previous) => ({ ...previous, [currentWorkspace]: "pending" }));
     try {
-      await deletePersistedPlanFiles();
+      const result = await deletePersistedPlanFiles();
+      await refreshLoadedDirectories();
+      const onlyProtectedRemaining =
+        !!result &&
+        result.removedDocumentIds.length === 0 &&
+        result.removedLegacyFiles === 0 &&
+        result.protectedTurnCount > 0;
       setPlanCleanupByWorkspace((previous) => {
         const next = { ...previous };
-        delete next[currentWorkspace];
+        if (onlyProtectedRemaining) {
+          next[currentWorkspace] = "protected";
+        } else {
+          delete next[currentWorkspace];
+        }
         return next;
       });
     } catch {
@@ -433,6 +444,15 @@ export default function WorkspaceTreePanel({
           className={`shrink-0 px-3 py-2 text-[11px] ${themeMode === "light" ? "text-[#be123c]" : "text-[#f48771]"}`}
         >
           {copy.clearPlansFailed}
+        </p>
+      )}
+      {planCleanup === "protected" && (
+        <p
+          role="status"
+          data-testid="workspace-clear-plan-files-notice"
+          className={`shrink-0 px-3 py-2 text-[11px] ${themeMode === "light" ? "text-[#b45309]" : "text-[#fbbf24]"}`}
+        >
+          {copy.clearPlansProtected}
         </p>
       )}
 

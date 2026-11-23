@@ -3,10 +3,7 @@ import { RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES } from "../../lib/runtime-v2/works
 import { type ToolDefinition } from "../../lib/toolSchemas";
 import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName, UNITY_CREATE_SCENE_TOOL } from "../../lib/workspaceMutationTools";
-import {
-  runtimeV2SubagentStartHasRunway,
-  type RuntimeV2Command,
-} from "../../lib/runtime-v2";
+import { type RuntimeV2Command } from "../../lib/runtime-v2";
 import {
   RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES,
   RUNTIME_V2_SKILL_READ_TOOL_NAMES,
@@ -37,24 +34,30 @@ function collaborationToolNames(input: {
   readonly command: RuntimeV2Command;
 }): ReadonlySet<string> {
   const names = new Set<string>();
-  if (input.command.payload.collaborationAllowed === false) return names;
+  const mode = String(input.command.payload.mode || "").trim();
   const active = Array.isArray(input.command.payload.activeSubagents)
     ? input.command.payload.activeSubagents
     : [];
-  const remainingCapacity = Math.max(
-    0,
-    Number(input.command.payload.remainingSubagentCapacity) || 0,
-  );
-  if (
-    remainingCapacity > 0 &&
-    runtimeV2SubagentStartHasRunway({
-      now: input.ports.now(),
-      lifecycleDeadlineAt: input.ports.lifecycleDeadlineAt,
-    })
-  ) {
-    names.add("spawn_subagent");
+  if (mode === "conclude") {
+    if (
+      input.command.payload.collaborationAllowed !== false &&
+      active.length > 0
+    ) {
+      names.add("wait_subagents");
+    }
+    return names;
   }
-  if (active.length > 0) names.add("wait_subagents");
+  if (input.command.payload.collaborationAllowed !== true) return names;
+  const hasWorkspace = !!String(input.ports.context.runWorkspace || "").trim();
+  if (mode === "chat" || !hasWorkspace || isChatContext(input.ports)) {
+    return names;
+  }
+  // Keep the collaboration tool schema surface stable across non-conclude
+  // workspace turns whenever collaboration is admitted so KV cache prefixes
+  // are not invalidated when activeSubagents or remainingSubagentCapacity
+  // flips between 0 and >0. Runway and capacity are enforced at admission/schedule.
+  names.add("spawn_subagent");
+  names.add("wait_subagents");
   return names;
 }
 
@@ -275,6 +278,7 @@ export function prioritizeRuntimeV2ProviderToolDefinitions(input: {
 
 export {
   buildRuntimeV2TextEnvelopeCatalog,
+  formatRuntimeV2ToolSchemaHint,
   normalizeRuntimeV2ProviderToolCalls,
   runtimeV2ProviderToolArgumentViolation,
 } from "./executionProviderToolSchema";

@@ -12,7 +12,7 @@ export interface UserQuestion {
 }
 export interface UserQuestionnaire {
   readonly revision: number;
-  readonly purpose: "plan_confirmation" | "plan_interview" | "rules_interview";
+  readonly purpose: "plan_confirmation" | "plan_interview" | "rules_interview" | "plan_verification_confirmation";
   readonly title: string;
   readonly summary?: string;
   readonly questions: readonly UserQuestion[];
@@ -47,7 +47,7 @@ export function validateUserQuestionnaireDefinition(value: unknown): UserQuestio
   if (!record(value)) return invalid("$", "Expected a questionnaire object.");
   if (!Number.isSafeInteger(value.revision) || Number(value.revision) < 1) return invalid("revision", "Expected a positive integer revision.");
   if (!text(value.title)) return invalid("title", "Provide a nonempty questionnaire title.");
-  if (!["plan_confirmation", "plan_interview", "rules_interview"].includes(String(value.purpose))) return invalid("purpose", "Unknown questionnaire purpose.");
+  if (!["plan_confirmation", "plan_interview", "rules_interview", "plan_verification_confirmation"].includes(String(value.purpose))) return invalid("purpose", "Unknown questionnaire purpose.");
   if (!Array.isArray(value.questions) || !value.questions.length) return invalid("questions", "Provide at least one real question.");
   const ids = new Set<string>();
   const questions: UserQuestion[] = [];

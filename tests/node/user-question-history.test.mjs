@@ -27,7 +27,7 @@ function load(file) {
   return module.exports;
 }
 
-const { buildUserQuestionHistory } = load("src/lib/userQuestionHistory.ts");
+const { buildUserQuestionHistory, collectPausedQuestionnaireRequestIds } = load("src/lib/userQuestionHistory.ts");
 const runtime = load("src/lib/runtime-v2/index.ts");
 const owner = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch-1", clientSubmissionId: "submission-1", turnId: "turn-1" };
 const run = { sessionKey: owner.sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId, runId: "run-1", parentRunId: null, attemptId: "attempt-1" };
@@ -108,4 +108,19 @@ test("confirmed history survives canonical checkpoint serialization and cold led
   assert.ok(restored);
   assert.deepEqual(buildUserQuestionHistory(restored.aggregate), buildUserQuestionHistory(state));
   assert.equal(buildUserQuestionHistory(restored.aggregate).length, 2);
+});
+
+test("collectPausedQuestionnaireRequestIds tracks pending and answered questionnaires within turn scope", () => {
+  const foreignRun = { ...run, turnId: "other-turn" };
+  const agg = aggregate([
+    paused("request-1", spec),
+    paused("request-2", { ...spec, revision: 2 }),
+    { type: "run.paused", run: foreignRun, blocker: { requestId: "foreign-request", questionnaire: spec } },
+    decided(),
+  ]);
+  const ids = collectPausedQuestionnaireRequestIds(agg);
+  assert.equal(ids.has("request-1"), true);
+  assert.equal(ids.has("request-2"), true);
+  assert.equal(ids.has("foreign-request"), false);
+  assert.equal(collectPausedQuestionnaireRequestIds(null).size, 0);
 });

@@ -1272,7 +1272,7 @@ test("production Plan queues three independent native spawns on an unknown lane 
           await Promise.race([thirdStarted.promise, aborted]);
         } else {
           assert.equal(ordinal, 3);
-          assert.equal(lanes.getModelLaneCapacityObservation(config).maxActiveRequests, 3);
+          assert.equal(lanes.getModelLaneCapacityObservation(config).maxActiveRequests, 8);
           thirdStarted.resolve();
           callbacks.onLifecycle?.({ phase: "model_progress" });
         }

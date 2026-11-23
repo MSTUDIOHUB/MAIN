@@ -187,19 +187,61 @@ function buildPlanPanelProjection(
   };
 }
 
+function formatPlanChatLead(summary: string, objective: string): string {
+  const normalized = summary.replace(/\r\n?/g, "\n");
+  const blocks: string[] = [];
+  let current: string[] = [];
+  let inFence = false;
+  for (const line of normalized.split("\n")) {
+    if (/^\s*```/.test(line)) inFence = !inFence;
+    if (!inFence && !line.trim()) {
+      if (current.length) { blocks.push(current.join("\n")); current = []; }
+      continue;
+    }
+    if (!inFence && current.length === 0 && /^#{1,6}\s+/.test(line.trim())) continue;
+    current.push(line);
+  }
+  if (current.length) blocks.push(current.join("\n"));
+  for (const block of blocks) {
+    const trimmed = block.trim();
+    if (!trimmed || trimmed.startsWith("```")) continue;
+    const lines = block.split("\n").map((item) => item.trimEnd()).filter(Boolean);
+    if (!lines.length) continue;
+    const isTable = lines.length >= 2 && lines[0]!.includes("|") &&
+      /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[1]!);
+    if (isTable) {
+      const kept: string[] = [];
+      let totalChars = 0;
+      for (const row of lines.slice(0, 12)) {
+        const nextChars = totalChars + (kept.length ? 1 : 0) + row.length;
+        if (kept.length >= 2 && nextChars > 1400) break;
+        kept.push(row);
+        totalChars = nextChars;
+      }
+      return kept.join("\n");
+    }
+    const isStructuredListOrQuote = lines.every((line) => /^\s*(?:[-*+]|\d+\.|>)\s+/.test(line));
+    if (isStructuredListOrQuote) {
+      const kept: string[] = [];
+      let totalChars = 0;
+      for (const item of lines) {
+        const nextChars = totalChars + (kept.length ? 1 : 0) + item.length;
+        if (kept.length > 0 && nextChars > 800) break;
+        kept.push(item);
+        totalChars = nextChars;
+      }
+      return kept.join("\n");
+    }
+    return trimmed.replace(/\s+/g, " ").slice(0, 600);
+  }
+  return objective;
+}
+
 function buildPlanChatProjection(
   plan: SealedWorkPlanV1,
   authority: RuntimeV2PlanAuthority,
 ): RuntimeV2PlanChatProjection {
-  const narrativeLead = plan.draft.summary
-    .replace(/\r\n?/g, "\n")
-    .replace(/^#{1,6}\s+.*$/gm, "")
-    .split(/\n\s*\n/)
-    .map((paragraph) => paragraph
-      .replace(/\s+/g, " ")
-      .trim())
-    .find(Boolean)
-    ?.slice(0, 600) || plan.draft.objective;
+  const narrativeLead = formatPlanChatLead(plan.draft.summary, plan.draft.objective);
   const stepLines = plan.draft.steps
     .slice(0, 4)
     .map((step, index) => `- S${index + 1} · ${step.title}`);
@@ -208,7 +250,7 @@ function buildPlanChatProjection(
     audience: "chat_milestone",
     authority,
     markdown: [
-      "### 修复计划已准备好",
+      "### 实施计划已准备好",
       "",
       narrativeLead,
       "",

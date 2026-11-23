@@ -375,6 +375,26 @@ export function runtimeV2ProviderToolArgumentViolation(
   return null;
 }
 
+/** Summarizes required top-level and item fields for a tool so rejected calls self-correct in one turn. */
+export function formatRuntimeV2ToolSchemaHint(
+  toolName: string,
+  tools: readonly ToolDefinition[],
+): string {
+  const definition = tools.find((tool) => tool.function.name === toolName);
+  if (!definition) return "";
+  const params = definition.function.parameters;
+  const required = params.required || [];
+  const itemHints = Object.entries(params.properties || {}).flatMap(([name, schema]) => {
+    const itemsRequired = schema.type === "array" ? schema.items?.required : undefined;
+    return itemsRequired?.length ? [`${name}[] items require ${JSON.stringify(itemsRequired)}`] : [];
+  });
+  if (!required.length && !itemHints.length) return "";
+  return [
+    required.length ? `Required fields for ${toolName}: ${JSON.stringify(required)}` : "",
+    ...itemHints,
+  ].filter(Boolean).join("; ") + ".";
+}
+
 export function buildRuntimeV2TextEnvelopeCatalog(
   tools: readonly ToolDefinition[],
 ): string {

@@ -393,6 +393,13 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
   if (draft.validations.length === 0) {
     lines.push("- 未定义自动验证。", "");
   } else {
+    const manualOnly = draft.validations.every(validation => !validation.required);
+    if (manualOnly) {
+      lines.push(
+        "> **人工 / 外部验证模式**：本计划已由用户确认不包含必选自动测试命令。批准执行后将完成全部修改并输出待人工/外部确认的验收清单（不宣称已通过自动测试）。",
+        "",
+      );
+    }
     for (const [index, validation] of draft.validations.entries()) {
       lines.push(`### ${validationId(index)} · ${validation.kind}`, "");
       lines.push(`- 覆盖步骤：${validation.stepIndexes.map(stepId).join("、") || "未指定"}`);
@@ -400,7 +407,12 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
       if (validation.cwd) lines.push(`- 工作目录：\`${validation.cwd.replace(/`/g, "")}\``);
       if (validation.useProjectEditor) lines.push("- 执行方式：按工程版本使用已连接的 Editor，工程关闭时使用同版本 Editor 批处理。两种方式使用同一测试筛选和用例数。");
       if (validation.expectedTestCases !== undefined) lines.push(`- 必须通过的测试用例数：${validation.expectedTestCases}`);
-      lines.push(`- 要求：${validation.required ? "必须通过" : "建议执行"}`);
+      const requirementText = validation.required
+        ? "必须通过"
+        : validation.kind === "advisory" || validation.kind === "assertion"
+          ? "人工 / 外部确认（非自动测试）"
+          : "建议执行";
+      lines.push(`- 要求：${requirementText}`);
       if (validation.criterionIds?.length) lines.push(`- 验收条件：${validation.criterionIds.join("、")}`);
       lines.push(`- 预期结果：${validation.expectedOutcome}`, "");
     }

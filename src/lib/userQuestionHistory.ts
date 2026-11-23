@@ -55,3 +55,22 @@ export function buildUserQuestionHistory(aggregate: TurnAggregateV1 | null | und
   }
   return entries;
 }
+
+export function collectPausedQuestionnaireRequestIds(
+  aggregate: TurnAggregateV1 | null | undefined,
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  if (!aggregate) return ids;
+  for (const event of aggregate.events) {
+    if (event.type !== "run.paused") continue;
+    if (
+      event.run.sessionKey !== aggregate.turn.sessionKey ||
+      event.run.sessionEpoch !== aggregate.turn.sessionEpoch ||
+      event.run.turnId !== aggregate.turn.turnId
+    ) continue;
+    if (normalizeUserQuestionnaire(event.blocker.questionnaire)) {
+      ids.add(event.blocker.requestId);
+    }
+  }
+  return ids;
+}

@@ -42,7 +42,7 @@ import {
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { withRuntimeV2HardDeadline, withRuntimeV2ProgressDeadline } from "./hardDeadline";
-import { normalizeRuntimeV2ProviderToolCalls, runtimeV2ProviderToolArgumentViolation } from "./executionProviderTools";
+import { formatRuntimeV2ToolSchemaHint, normalizeRuntimeV2ProviderToolCalls, runtimeV2ProviderToolArgumentViolation } from "./executionProviderTools";
 import { PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE } from "./planCollaborationAcquisition";
 import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } from "../../lib/runtime-v2/lifecycle";
 import { planRequestMetrics } from "./planRequestMetrics";
@@ -387,11 +387,9 @@ export async function requestPlanModel(input: {
             argumentViolation
               ? {
                   code: "tool_arguments_rejected",
-                  message: [
-                    `${argumentViolation.call.name} did not satisfy its exact advertised Plan schema: ${argumentViolation.reason}.`,
-                    `Allowed tools: ${advertisedToolNames.join(", ")}.`,
-                    "The entire provider-selected batch was rejected; no tool was admitted or executed.",
-                  ].join(" "),
+                  message: [`${argumentViolation.call.name} did not satisfy its exact advertised Plan schema: ${argumentViolation.reason}.`,
+                    formatRuntimeV2ToolSchemaHint(argumentViolation.call.name, planTools), `Allowed tools: ${advertisedToolNames.join(", ")}.`,
+                    "The entire provider-selected batch was rejected; no tool was admitted or executed."].filter(Boolean).join(" "),
                   retryable: true,
                 }
               : {

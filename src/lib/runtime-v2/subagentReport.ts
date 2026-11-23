@@ -73,8 +73,9 @@ export function explicitlyReferencesEvidenceId(
   return false;
 }
 
-const SOURCE_PATH_REFERENCE_DELIMITER = /[\s`"'<>，。；：！？、\p{Ps}\p{Pe}\p{Pi}\p{Pf}]/u;
+const SOURCE_PATH_REFERENCE_DELIMITER = /[\s`"'<>|*，。；：！？、\p{Ps}\p{Pe}\p{Pi}\p{Pf}]/u;
 const SOURCE_PATH_SENTENCE_PUNCTUATION = /[.,;:!?]/u;
+const SOURCE_PATH_LINE_ANCHOR = /^(?::\d+(?:-\d+)?|#L\d+(?:-L\d+)?)/;
 
 function sourcePathHasReferenceBoundary(
   value: string,
@@ -82,6 +83,10 @@ function sourcePathHasReferenceBoundary(
   direction: -1 | 1,
 ): boolean {
   let cursor = index;
+  if (direction === 1 && cursor >= 0 && cursor < value.length) {
+    const anchor = SOURCE_PATH_LINE_ANCHOR.exec(value.slice(cursor));
+    if (anchor) cursor += anchor[0].length;
+  }
   while (cursor >= 0 && cursor < value.length) {
     const character = value[cursor]!;
     if (SOURCE_PATH_REFERENCE_DELIMITER.test(character)) return true;
@@ -124,10 +129,14 @@ function citedSourceEvidenceIds(input: {
   const ids = new Set<string>();
   for (const [path, receipts] of sources) {
     if (
+      receipts.length > 0 &&
       receipts.every((item) => Boolean(item.version)) &&
-      new Set(receipts.map((item) => item.version)).size === 1 &&
       explicitlyReferencesSourcePath(input.summary, path)
-    ) ids.add(receipts[0]!.id);
+    ) {
+      for (const receipt of receipts) {
+        ids.add(receipt.id);
+      }
+    }
   }
   return ids;
 }
@@ -270,4 +279,35 @@ export function validateRuntimeV2SubagentReport(input: {
   } catch {
     return false;
   }
+}
+
+/** Build a one-shot prompt asking a child to preserve findings and add retained citations. */
+export function buildRuntimeV2SubagentReportRepairPrompt(input: {
+  readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
+  readonly sourceEvidenceIds: ReadonlySet<string>;
+  readonly hasPreviousSummary: boolean;
+}): string {
+  const readSourcePaths = [...new Set(
+    input.evidence
+      .filter((item) => input.sourceEvidenceIds.has(item.id) && Boolean(item.version) && Boolean(item.target))
+      .map((item) => item.target),
+  )].slice(0, 20);
+  const evidenceIds = [...new Set(
+    [...input.evidence, ...input.inheritedEvidence].map((item) => item.id).filter(Boolean),
+  )].slice(0, 20);
+  const statusLine = input.hasPreviousSummary
+    ? "Your previous final summary was rejected because it did not cite retained evidence."
+    : "Your previous final response was empty and could not be accepted.";
+  const actionLine = input.hasPreviousSummary
+    ? "Preserve your findings and return your final summary without calling new tools."
+    : "Return a concise final summary of your findings without calling new tools.";
+  const citationLine = readSourcePaths.length > 0
+    ? "Explicitly cite at least one exact workspace-relative file path or evidence ID below:"
+    : "Explicitly cite at least one exact evidence ID below:";
+  return [
+    `${statusLine} ${actionLine} ${citationLine}`,
+    readSourcePaths.length > 0 ? `Available read source paths: ${readSourcePaths.join(", ")}` : "",
+    evidenceIds.length > 0 ? `Available evidence IDs: ${evidenceIds.join(", ")}` : "",
+  ].filter(Boolean).join("\n");
 }

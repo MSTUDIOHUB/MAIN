@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 
 const load = createTsModuleLoader();
-const { assessPlanSubmission } = load("src/store/runtimeV2/planSubmissionAssessment.ts");
+const { assessPlanSubmission, isValidationReadinessOnlyDiagnostics } = load("src/store/runtimeV2/planSubmissionAssessment.ts");
 const { assertAdmittedPlanCriteriaMapped } = load("src/store/runtimeV2/planSubmissionPolicy.ts");
 const { workPlanDraftFromSubmission } = load("src/store/runtimeV2/workPlanSubmission.ts");
 const { PLAN_SUBMISSION_VALIDATION_REJECTION_CODE, recordRuntimeV2PlanSubmissionRejection,
@@ -214,4 +214,31 @@ test("reviewable Markdown cannot use compiler title fallback to bypass a missing
   const result = assess(submission);
   assert.equal(result.kind, "draft");
   assert.ok(result.diagnostics.some(item => item.code === "plan_structure_invalid" && item.fieldPath === "changes[0].change"));
+});
+
+test("allowManualAdvisoryValidation seals explicit manual and static checks while still enforcing structure and non-empty validations", () => {
+  const submission = candidate();
+  submission.validations = [{ kind: "advisory", required: true, expectedOutcome: "Compile Assets/MFramework in Unity Editor with zero errors." }];
+  const blocked = assess(submission, { requireBehavioralValidation: true });
+  assert.equal(blocked.kind, "draft");
+  assert.equal(isValidationReadinessOnlyDiagnostics(blocked.diagnostics), true);
+
+  const allowed = assess(submission, { requireBehavioralValidation: true, allowManualAdvisoryValidation: true });
+  assert.equal(allowed.kind, "reviewable");
+  assert.equal(allowed.sealedPlan.draft.validations[0].required, false);
+
+  const staticBuild = candidate();
+  staticBuild.validations = [{ kind: "finite_command", command: "dotnet build", expectedOutcome: "Scripts compile." }];
+  assert.equal(assess(staticBuild, { requireBehavioralValidation: true, allowManualAdvisoryValidation: true }).kind, "reviewable");
+
+  const emptyValidations = candidate();
+  emptyValidations.validations = [];
+  assert.equal(assess(emptyValidations, { requireBehavioralValidation: true, allowManualAdvisoryValidation: true }).kind, "draft");
+
+  const structuralError = candidate();
+  structuralError.validations = [{ kind: "advisory", expectedOutcome: "Check in Editor." }];
+  delete structuralError.changes[0].change;
+  const invalid = assess(structuralError, { requireBehavioralValidation: true, allowManualAdvisoryValidation: true });
+  assert.equal(invalid.kind, "draft");
+  assert.equal(isValidationReadinessOnlyDiagnostics(invalid.diagnostics), false);
 });

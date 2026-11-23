@@ -6,14 +6,13 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
-import { countDistinctRuntimeV2EvidenceFacts } from "./evidenceFacts";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { runtimeV2DirectExecuteMutationTargets } from "./validationReceipt";
 import { deriveUnityCompilation, deriveUnityShaderImport } from "./unityCompilation";
 
-function markdownCode(value: unknown): string {
+function markdownCode(value: unknown, language: "zh" | "en" = "zh"): string {
   const text = String(value || "").trim().replace(/`/g, "");
-  return text ? `\`${text}\`` : "当前工作区";
+  return text ? `\`${text}\`` : language === "en" ? "current workspace" : "当前工作区";
 }
 
 function workspaceRelativeTarget(value: unknown, workspaceKey = ""): string {
@@ -99,13 +98,14 @@ function visibleProviderCommentary(
   }
   if (/```|<tool(?:_use)?>|<runtime-v2-tools>/i.test(commentary)) return "";
   const compact = commentary.replace(/\s+/g, " ").trim();
-  if (compact.length <= 180) return compact;
-  const completeSentences = compact.match(/[^。！？!?]+[。！？!?]+/g) || [];
+  if (compact.length <= 420) return compact;
+  const completeSentences =
+    compact.match(/(?:[^。！？!?.]|\.(?=\S))+(?:[。！？!?]+|\.(?=\s|$))/g) || [];
   let selected = "";
   for (const sentence of completeSentences) {
-    if (`${selected}${sentence}`.length > 180) break;
+    if (`${selected}${sentence}`.length > 420) break;
     selected += sentence;
-    if (selected.length >= 80) break;
+    if (selected.length >= 260) break;
   }
   // Never cut a provider sentence in half or append synthetic ellipses. When
   // no concise complete public sentence exists, the structured action below
@@ -127,15 +127,18 @@ function phaseTitle(phase: TurnAggregateV1["phase"]): string {
   return labels[phase];
 }
 
-function terminalTitle(resultKind: RuntimeV2ResultKind): string {
-  const labels: Record<RuntimeV2ResultKind, string> = {
-    success: "已完成",
-    partial: "已部分完成",
-    blocked: "需要继续处理",
-    error: "执行遇到错误",
-    canceled: "已取消",
+function terminalTitle(
+  resultKind: RuntimeV2ResultKind,
+  language: "zh" | "en" = "zh",
+): string {
+  const labels: Record<RuntimeV2ResultKind, { zh: string; en: string }> = {
+    success: { zh: "已完成", en: "Completed" },
+    partial: { zh: "已部分完成", en: "Partially completed" },
+    blocked: { zh: "需要继续处理", en: "Action needed" },
+    error: { zh: "执行遇到错误", en: "Execution failed" },
+    canceled: { zh: "已取消", en: "Canceled" },
   };
-  return labels[resultKind];
+  return labels[resultKind][language];
 }
 
 function projection(
@@ -221,13 +224,25 @@ export function buildRuntimeV2FinalProjection(
   resultKind: RuntimeV2ResultKind,
   reason: string,
   finalMarkdown?: string,
+  language: "zh" | "en" = "zh",
 ): RuntimeV2Projection {
+  const trimmedFinal = finalMarkdown?.trim();
+  if (trimmedFinal) {
+    return projection(
+      aggregate,
+      "final",
+      id,
+      trimmedFinal,
+      "final",
+      `final:${resultKind}:${reason}`,
+    );
+  }
   if (aggregate.strategy === "chat" || aggregate.strategy === "analyze" || (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan)) {
     return projection(
       aggregate,
       "final",
       id,
-      finalMarkdown?.trim() || `### ${terminalTitle(resultKind)}\n\n${reason}`,
+      `### ${terminalTitle(resultKind, language)}\n\n${reason}`,
       "final",
       `final:${resultKind}:${reason}`,
     );
@@ -238,32 +253,46 @@ export function buildRuntimeV2FinalProjection(
   );
   const passedValidations = validations.filter((event) => event.passed).length;
   const failedValidations = validations.length - passedValidations;
-  const evidenceCount = countDistinctRuntimeV2EvidenceFacts(
-    aggregate.evidence,
-  );
-  const evidenceLine = evidenceCount > 0
-    ? `- 已保留 ${evidenceCount} 条证据。`
-    : "- 本轮没有可保留的证据。";
+  const isEn = language === "en";
   const mutationLine = mutationTargets.length > 0
-    ? `- 已修改：${mutationTargets.map(markdownCode).join("、")}。`
-    : "- 本轮没有已提交的文件修改。";
+    ? isEn
+      ? `- Modified: ${mutationTargets.map((t) => markdownCode(t, "en")).join(", ")}.`
+      : `- 已修改：${mutationTargets.map((t) => markdownCode(t, "zh")).join("、")}。`
+    : isEn
+      ? "- No committed file changes in this turn."
+      : "- 本轮没有已提交的文件修改。";
+  const manualChecks = validations.length === 0
+    ? (aggregate.sealedWorkPlan?.draft.validations || []).filter(validation => !validation.required)
+    : [];
   const validationLine = validations.length > 0
-    ? `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
-    : "- 本轮没有完成可确认的验证。";
-  const editorChecks = [["C# 编译", deriveUnityCompilation(aggregate)?.receipt], ["Shader 导入", deriveUnityShaderImport(aggregate)?.receipt]] as const;
-  const editorLines = editorChecks.flatMap(([name, receipt]) => receipt && receipt.result.status !== "not_unity_project" ?
-    [`- ${name}${receipt.result.status === "passed" ? "通过" : receipt.result.status === "failed" ? "仍有错误" : "待验证"}。`] : []);
+    ? isEn
+      ? `- Verification: ${passedValidations} passed, ${failedValidations} failed.`
+      : `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
+    : manualChecks.length > 0
+      ? isEn
+        ? `- Automated tests: not run (manual / external verification confirmed).\n- Manual / external verification checklist:\n${manualChecks.map(item => `  - ${item.expectedOutcome}`).join("\n")}`
+        : `- 自动测试：未运行（已按用户确认采用人工/外部验证）。\n- 待你人工/外部确认：\n${manualChecks.map(item => `  - ${item.expectedOutcome}`).join("\n")}`
+    : isEn
+      ? "- No confirmed verification run completed in this turn."
+      : "- 本轮没有完成可确认的验证。";
+  const editorChecks = [
+    [isEn ? "C# compilation" : "C# 编译", deriveUnityCompilation(aggregate)?.receipt],
+    [isEn ? "Shader import" : "Shader 导入", deriveUnityShaderImport(aggregate)?.receipt],
+  ] as const;
+  const editorLines = editorChecks.flatMap(([name, receipt]) => receipt && receipt.result.status !== "not_unity_project" ? [
+    isEn
+      ? `- ${name} ${receipt.result.status === "passed" ? "passed" : receipt.result.status === "failed" ? "has remaining errors" : "is pending verification"}.`
+      : `- ${name}${receipt.result.status === "passed" ? "通过" : receipt.result.status === "failed" ? "仍有错误" : "待验证"}。`,
+  ] : []);
   return projection(
     aggregate,
     "final",
     id,
     [
-      `### ${terminalTitle(resultKind)}`,
-      finalMarkdown?.trim(),
+      `### ${terminalTitle(resultKind, language)}`,
       mutationLine,
       ...(validations.length > 0 || editorLines.length === 0 ? [validationLine] : []),
       ...editorLines,
-      evidenceLine,
       /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
     ].filter(Boolean).join("\n\n"),
     "final",

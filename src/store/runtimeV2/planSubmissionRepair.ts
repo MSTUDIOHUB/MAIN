@@ -149,12 +149,23 @@ export function resolveRuntimeV2PlanSubmissionLifecycle(input: {
 }
 
 function formatPlanSubmissionRejection(diagnostics: readonly PlanSubmissionDiagnostic[]): string {
+  const hasValidationGap = diagnostics.some((item) =>
+    item.code === "plan_validation_not_required" ||
+    item.code === "plan_validation_missing" ||
+    item.code === "plan_validation_evidence_mismatch"
+  );
   const selected: PlanSubmissionDiagnostic[] = [];
   const format = () => {
     const omittedDiagnosticCount = diagnostics.length - selected.length;
     return PLAN_SUBMISSION_FEEDBACK_PREFIX + JSON.stringify({
       code: "PLAN_EXECUTION_READINESS_INCOMPLETE",
       diagnostics: selected,
+      ...(hasValidationGap
+        ? {
+            guidance:
+              "Do NOT fabricate test commands (such as dotnet test, npm test, or pytest) that cannot run in this workspace. Either add real runnable test project/files in changes[], or call ask_plan_questions if the workspace has no test harness or the user wants editor/manual verification.",
+          }
+        : {}),
       ...(omittedDiagnosticCount > 0 ? { omittedDiagnosticCount } : {}),
     });
   };

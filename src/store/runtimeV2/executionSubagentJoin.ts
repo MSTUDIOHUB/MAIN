@@ -1,7 +1,113 @@
-import type { SchedulerPort } from "../../lib/runtime-v2";
-import type { RuntimeV2ExecutionPortsInput } from "./executionContext";
+import {
+  runtimeV2SubagentModelHandle,
+  type RuntimeV2Command,
+  type RuntimeV2SubagentJob,
+  type SchedulerPort,
+} from "../../lib/runtime-v2";
+import { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
+import { closeCollaborationToolCall } from "./executionSchedulerAdmission";
 import { commitRuntimeV2StagedChildMutation } from "./executionSubagentMutation";
-import type { RuntimeV2ChildResult } from "./executionTypes";
+import type {
+  RuntimeV2ChildResult,
+  RuntimeV2ExecutionPortsInput,
+} from "./executionTypes";
+
+export const SUBAGENT_WAIT_NO_ACTIVE_RESPONSE =
+  "SUBAGENT_WAIT_NO_ACTIVE: All spawned subagents have already completed and been joined above. No active subagents remain; do not call wait_subagents again. Continue directly or conclude.";
+
+/** Close an explicit wait_subagents call when no active children remain. */
+export function closeNoActiveSubagentWaitCall(
+  input: RuntimeV2ExecutionPortsInput,
+  command: RuntimeV2Command,
+): void {
+  closeCollaborationToolCall(input, command, SUBAGENT_WAIT_NO_ACTIVE_RESPONSE);
+}
+
+/** Record one joined child's context anchor and report whether it landed in live messages. */
+export function recordRuntimeV2JoinedChildAnchor(
+  live: RuntimeV2ExecutionPortsInput["live"],
+  result: RuntimeV2ChildResult,
+): {
+  readonly contextEntryId: string;
+  readonly evidenceIds: readonly string[];
+  readonly delivered: boolean;
+} {
+  const contextEntryId = `child:${result.job.id}`;
+  const evidenceIds = [...new Set(result.evidence.map((evidence) => evidence.id))];
+  const content = [
+    `Scope: ${result.job.scopeKey} (${result.job.allowedPaths.join(", ")})`,
+    `Status: ${result.status}`,
+    `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
+    `Report: ${result.summary}`,
+    evidenceIds.length > 0
+      ? "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer."
+      : "No child evidence id is available for parent adoption; continue the objective directly.",
+  ].join("\n");
+  upsertRuntimeV2ContextAnchor(live, { key: contextEntryId, content });
+  const delivered = live.messages.some((message) =>
+    message.role === "system" &&
+    typeof message.content === "string" &&
+    message.content.startsWith(`[runtime-v2 context: ${contextEntryId}]`) &&
+    message.content.includes(`Report: ${result.summary}`) &&
+    message.content.includes(`Evidence ids: ${evidenceIds.join(", ") || "none"}`)
+  );
+  return { contextEntryId, evidenceIds, delivered };
+}
+
+/** Write the batch-level settled summary anchor when all children in the Run have settled. */
+export function writeRuntimeV2SettledBatchAnchor(
+  live: RuntimeV2ExecutionPortsInput["live"],
+  allObservedJobs: readonly RuntimeV2SubagentJob[],
+  batchCount: number,
+): void {
+  const settledJobs = allObservedJobs.filter((job) =>
+    job.status !== "queued" && job.status !== "running"
+  );
+  const completedCount = settledJobs.filter((job) => job.status === "completed").length;
+  const degradedCount = settledJobs.filter((job) => job.status === "degraded").length;
+  const otherSettledCount = settledJobs.length - completedCount - degradedCount;
+  const settledHandles = settledJobs.map((job) => {
+    const handle = runtimeV2SubagentModelHandle(job);
+    const scopeSuffix = job.scopeKey && job.scopeKey !== handle ? ` / scope=${job.scopeKey}` : "";
+    const pathSuffix = job.allowedPaths.length > 0 ? ` [${job.allowedPaths.join(", ")}]` : "";
+    return `${handle}${scopeSuffix}${pathSuffix}: ${job.status}`;
+  });
+  upsertRuntimeV2ContextAnchor(live, {
+    key: "subagent-batch-settled",
+    content: [
+      `Total settled subagents: ${settledJobs.length} (completed: ${completedCount}, degraded: ${degradedCount}${
+        otherSettledCount > 0 ? `, failed/canceled: ${otherSettledCount}` : ""
+      }).`,
+      `Joined in this batch: ${batchCount}.`,
+      `Handles/scopes: ${settledHandles.join("; ")}.`,
+      "No active subagents remain; do NOT call wait_subagents again. Continue directly from the delivered child results or conclude.",
+    ].join("\n"),
+  });
+}
+
+/** Format joined child summaries for the parent's wait_subagents tool result. */
+export function formatRuntimeV2SubagentJoinResults(
+  results: readonly (RuntimeV2ChildResult | null)[],
+  observedJobs: readonly RuntimeV2SubagentJob[],
+): string {
+  return [
+    "SUBAGENT_RESULTS",
+    ...results.flatMap((result) =>
+      result
+        ? [
+            `Handle: ${runtimeV2SubagentModelHandle(result.job)}`,
+            `Status: ${result.status}`,
+            `Evidence ids: ${result.evidence.map((evidence) => evidence.id).join(", ") || "none"}`,
+            `Summary: ${result.summary}`,
+          ]
+        : []
+    ),
+    observedJobs.some((job) => job.status !== "completed")
+      ? "One or more child tasks did not complete. Continue the objective directly using any retained evidence."
+      : "Apply child findings only when they are relevant to the parent objective.",
+    "When relying on a child fact, explicitly cite its exact evidence id. An uncited child result remains delivered but not adopted.",
+  ].join("\n");
+}
 
 /** Revalidate and atomically join a child's single staged write transaction. */
 export async function commitCompletedRuntimeV2ChildTransaction(input: {

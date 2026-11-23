@@ -287,8 +287,9 @@ export function decideRuntimeV2TerminalOutcome(
     return facts.hasProviderConclusion
       ? {
           resultKind: "success",
-          resultReason:
-            "已批准 WorkPlan 的全部修改目标和必需验证均由最终修改后的匹配回执覆盖。",
+          resultReason: approvedPlanCoverage.requiredValidationIndexes.length === 0
+            ? "已批准 WorkPlan 的全部修改目标已完成；按已确认方案保留人工/外部验收清单，未运行自动测试。"
+            : "已批准 WorkPlan 的全部修改目标和必需验证均由最终修改后的匹配回执覆盖。",
         }
       : null;
   }

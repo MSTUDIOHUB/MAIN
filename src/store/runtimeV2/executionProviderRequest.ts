@@ -55,6 +55,7 @@ import {
   RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT,
   RUNTIME_V2_EXECUTION_REASONING_ONLY_TIMEOUT_MS,
   RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
+  buildRuntimeV2ConcludePrompt,
   providerMessageChars,
   runtimeV2CurrentToolSurfaceInstruction,
   runtimeV2ExecutionEffectiveToolChoice,
@@ -64,6 +65,11 @@ import {
   runtimeV2RecoveryRequiresStructuredAction,
   shouldRetryRuntimeV2WithoutReasoning,
 } from "./executionProviderRequestPolicy";
+import {
+  createRuntimeV2RetryMessageRebuilder,
+  createRuntimeV2WireCallbacks,
+  retryRuntimeV2ProviderLanguageMismatch,
+} from "./executionProviderLanguageRetry";
 
 export * from "./executionProviderRequestPolicy";
 
@@ -286,6 +292,7 @@ async function performRuntimeV2ProviderRequest(
           replacementValidationExhausted:
             validationCorrection.validationCommandUnavailable &&
             validationCorrection.repeatedFailedValidations >= 1,
+          responseLanguage: input.ports.context.phaseLanguage,
         },
       ),
       projectValidationCommands.length
@@ -314,8 +321,9 @@ async function performRuntimeV2ProviderRequest(
     input.command.payload.conclusionKind === "read_only" ||
     providerTools.length === 0 ||
     (Array.isArray(input.command.payload.allowedToolNames) && input.command.payload.allowedToolNames.length === 0);
-  const concludePrompt =
-    "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags.";
+  const concludePrompt = buildRuntimeV2ConcludePrompt(
+    input.ports.context.phaseLanguage,
+  );
   const concludeInstructions = toolsClosed ? [{ role: "user" as const, content: concludePrompt }] : [];
   const initialCoverage = input.live.latestProviderRequestSourceCoverage;
   const inputBudget = budget ? budget.inputBudget ?? computeContextBudgets(budget.contextLimit, maxOutputTokens).inputBudget : null;
@@ -508,42 +516,27 @@ async function performRuntimeV2ProviderRequest(
   let result: Awaited<ReturnType<typeof streamChatCompletion>>;
   let reasoningFallbackApplied = false;
   let carryReasoningFallback = reuseReasoningFallback;
-  const wireCallbacks = (attempt: "initial" | "reasoning_retry"): Parameters<typeof streamChatCompletion>[2] => {
-    let dispatchAt = 0;
-    let dispatchCount = 0;
-    let modelProgressSeen = false;
-    const onModelProgress = () => {
-      lane.markFirstToken();
-      if (modelProgressSeen) return;
-      modelProgressSeen = true;
-      logRequestTiming("first_model_progress", {
-        attempt, dispatchCount, elapsedMs: dispatchAt ? Date.now() - dispatchAt : null,
-      });
-    };
-    return {
-      onToken: token => {
-        onModelProgress();
-        streamedText += token;
-      },
-      onDone: () => undefined,
-      onError: () => undefined,
-      onRequestDispatched() {
-        dispatchAt = Date.now();
-        dispatchCount += 1;
-        modelProgressSeen = false;
-        logRequestTiming("dispatched", { attempt, dispatchCount });
-        return activity.requestDispatched();
-      },
-      onLifecycle(event) {
-        if (event.phase === "model_progress") onModelProgress();
-        if (event.phase === "first_chunk") {
-          logRequestTiming("first_chunk", {
-            attempt, dispatchCount, streamId: event.streamId, elapsedMs: event.elapsedMs,
-          });
-        }
-      },
-    };
-  };
+  const rebuildRetryMessages = createRuntimeV2RetryMessageRebuilder({
+    live: input.live,
+    ports: input.ports,
+    initialMessages: messages,
+    canonicalDecisionConversation,
+    initialLiveMessageCount: input.live.messages.length,
+    readOnly,
+    budget,
+    maxOutputTokens,
+    providerTools,
+    providerEffectFacts,
+    assembleExecuteRequest,
+  });
+  const wireCallbacks = createRuntimeV2WireCallbacks({
+    lane,
+    activity,
+    logRequestTiming,
+    appendStreamedText: (token) => {
+      streamedText += token;
+    },
+  });
   try {
     activity.preparing();
     result = await streamChatCompletion(
@@ -634,29 +627,7 @@ async function performRuntimeV2ProviderRequest(
                 : "If a specific missing fact still requires verification, the currently advertised tools remain available.",
             ].join(" "),
       });
-      const unboundedRecoveryMessages = [
-        ...messages,
-        ...input.live.messages.slice(recoveryHistoryStart),
-      ];
-      const recoveredExecuteRequest = readOnly ? null : assembleExecuteRequest([
-        ...canonicalDecisionConversation, ...input.live.messages.slice(recoveryHistoryStart),
-      ]);
-      const recoveryMessages = recoveredExecuteRequest?.messages || (budget
-          ? boundReadOnlyHistory(unboundedRecoveryMessages, {
-              contextLimit: budget.contextLimit,
-              reservedOutputTokens: maxOutputTokens,
-              tools: providerTools,
-              preserveUserMessages: unboundedRecoveryMessages.some(message => "runtimeGuidanceId" in message && !!message.runtimeGuidanceId),
-            })
-        : unboundedRecoveryMessages);
-      input.live.latestProviderRequestSourceCoverage = recoveredExecuteRequest?.coverage ||
-        materializedRuntimeV2SourceCoverage(
-          recoveryMessages,
-          input.ports.context.runWorkspace || "",
-          providerEffectFacts,
-        );
-      input.live.latestProviderRequestSkillGuidanceWindows = runtimeV2TranscriptSkillGuidanceWindows(recoveryMessages)
-        .map(({ documentKey, version, returnedRange, readTarget }) => ({ documentKey, version, returnedRange, readTarget }));
+      const recoveryMessages = rebuildRetryMessages(recoveryHistoryStart);
       result = await streamChatCompletion(
         recoveryMessages,
         adapterCapabilities.reasoningToggle
@@ -682,6 +653,29 @@ async function performRuntimeV2ProviderRequest(
         },
       );
     }
+    result = await retryRuntimeV2ProviderLanguageMismatch({
+      live: input.live,
+      ports: input.ports,
+      command: input.command,
+      requestMode,
+      result,
+      streamedText,
+      resetStreamedText: () => {
+        streamedText = "";
+      },
+      providerTools,
+      requestSettings,
+      textEnvelope: input.textEnvelope,
+      effectiveToolChoice,
+      maxOutputTokens,
+      timeoutMs: input.timeoutMs,
+      signal: input.signal,
+      reasoningOnlyCharLimit,
+      actionOnlyCharLimit,
+      activity,
+      rebuildRetryMessages,
+      wireCallbacks,
+    });
   } catch (error) {
     lane.reportFailure(error);
     throw error;

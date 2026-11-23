@@ -1466,7 +1466,7 @@ export interface AppState {
   setPlanStage: (stage: PlanStage) => void;
   upsertPlanArtifact: (artifact: PlanArtifact) => void;
   clearPlanArtifacts: () => void;
-  deletePersistedPlanFiles: () => Promise<void>;
+  deletePersistedPlanFiles: () => Promise<{ removedDocumentIds: string[]; removedLegacyFiles: number; protectedTurnCount: number } | null>;
   deleteBrowserValidationArtifacts: () => Promise<void>;
   setPlanTasks: (tasks: PlanTask[]) => void;
   setNormalizedStreamState: (state: NormalizedStreamState) => void;
@@ -11447,21 +11447,18 @@ export const useAppStore = create<AppState>()(
     const workspace = state.currentWorkspace.trim();
     const chatTempSessionKey = workspace ? null : resolveGlobalChatSessionKey(state.currentSessionId);
     const scope = workspace ? { workspace } : chatTempSessionKey ? { chatTempSessionKey } : null;
-    if (!scope) return;
+    if (!scope) return null;
     const runtimeSessionKey = state.getCurrentSessionKey();
     const sessionEpoch = runtimeSessionKey && resolveActiveSessionPlanLifecycleEpoch(state, runtimeSessionKey);
     const before = summarizePlanWorkspaceStateForLog(state);
     const protectedTurnIds = new Set<string>();
     const collectLivePlanTurns = (runtime: Pick<SessionRuntimeState, "activeActionRequest" | "conversationTurns" | "currentTurnId" | "isGenerating">) => {
-      // A running Turn may have committed its document before projecting a reference.
+      // Only protect turns currently generating or executing so user-initiated
+      // cleanup can delete idle/paused/awaiting-review plans on disk.
       if (runtime.isGenerating && runtime.currentTurnId) protectedTurnIds.add(runtime.currentTurnId);
-      const request = runtime.activeActionRequest;
-      if (request?.kind === "plan_review" && request.status === "pending" && request.documentRef) {
-        protectedTurnIds.add(request.turnId);
-      }
       for (const turn of runtime.conversationTurns) {
         if (turn.planDocument?.kind === "plan" && !isConversationTurnRuntimeClosed(turn.runtimeOutcome) &&
-          (turn.status === "awaiting_approval" || turn.status === "executing" || turn.status === "paused")) {
+          turn.status === "executing") {
           protectedTurnIds.add(turn.id);
         }
       }
@@ -11478,24 +11475,45 @@ export const useAppStore = create<AppState>()(
         ...scope,
         ...(protectedTurnIds.size ? { protectedTurnIds: [...protectedTurnIds] } : {}),
       });
+      const removedDocumentIds = result?.removedDocumentIds || [];
+      const removedLegacyFiles = result?.removedLegacyFiles || 0;
+      const removedIds = new Set(removedDocumentIds);
       const latest = get();
-      if (!currentPlanProtected && !latest.isGenerating &&
-        latest.currentWorkspace.trim() === workspace && latest.getCurrentSessionKey() === runtimeSessionKey &&
-        (!runtimeSessionKey || resolveActiveSessionPlanLifecycleEpoch(latest, runtimeSessionKey) === sessionEpoch) &&
-        latest.currentTurnId === state.currentTurnId && latest.activeActionRequest === state.activeActionRequest) {
-        latest.clearPlanArtifacts();
+      const reviewDocId = latest.activeActionRequest?.kind === "plan_review"
+        ? latest.activeActionRequest.documentRef?.documentId
+        : undefined;
+      const sameOwner =
+        latest.currentWorkspace.trim() === workspace &&
+        latest.getCurrentSessionKey() === runtimeSessionKey &&
+        (!runtimeSessionKey || resolveActiveSessionPlanLifecycleEpoch(latest, runtimeSessionKey) === sessionEpoch);
+      const clearedReviewRequest = Boolean(sameOwner && reviewDocId && removedIds.has(reviewDocId));
+      if (clearedReviewRequest) {
+        set({ activeActionRequest: null });
+      }
+      const afterClear = get();
+      if ((!currentPlanProtected || clearedReviewRequest) && !afterClear.isGenerating &&
+        afterClear.currentWorkspace.trim() === workspace && afterClear.getCurrentSessionKey() === runtimeSessionKey &&
+        (!runtimeSessionKey || resolveActiveSessionPlanLifecycleEpoch(afterClear, runtimeSessionKey) === sessionEpoch) &&
+        afterClear.currentTurnId === state.currentTurnId &&
+        afterClear.activeActionRequest === (clearedReviewRequest ? null : state.activeActionRequest)) {
+        afterClear.clearPlanArtifacts();
       }
       logStoreEvent("planFilesCleared", {
         path: ".MAIN/plans",
         workspace: workspace || null,
         chatTempSessionKey,
         runtimeSessionKey,
-        removedDocumentCount: result?.removedDocumentIds.length,
-        removedLegacyFiles: result?.removedLegacyFiles,
+        removedDocumentCount: removedDocumentIds.length,
+        removedLegacyFiles,
         protectedTurnCount: protectedTurnIds.size,
         before,
         after: summarizePlanWorkspaceStateForLog(get()),
       });
+      return {
+        removedDocumentIds,
+        removedLegacyFiles,
+        protectedTurnCount: protectedTurnIds.size,
+      };
     } catch (error) {
       logStoreEvent("planFilesClearFailed", {
         workspace: workspace || null,

@@ -25,8 +25,9 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
     (event.type === "command.scheduled" && event.command.payload.planDraftMetadata))) return null;
   if (existing?.aggregate.sealedWorkPlan) return null;
   const questions = (existing?.aggregate.events || []).filter(event => event.type === "run.paused" && event.blocker.questionnaire);
+  const interviewQuestions = questions.filter(event => event.type === "run.paused" && event.blocker.questionnaire?.purpose !== "plan_verification_confirmation");
   // Existing pre-interview WorkPlan checkpoints retain their original contract.
-  if (existing && !existing.aggregate.planPurpose && !questions.length) return null;
+  if (existing && !existing.aggregate.planPurpose && !interviewQuestions.length) return null;
   input = { ...input, context: { ...input.context, planPurpose: existing ? existing.aggregate.planPurpose || "plan" : input.context.planPurpose || "plan", workspaceInstructionContext: existing?.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext, knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext } };
   const ledger = new PlanLedger(identity.turn, createRuntimeV2CheckpointPort({ ...input, scopeKey: input.context.runScopeKey, sessionId: input.context.runSessionId }),
     createRuntimeV2ProjectionPort({ ...input, language: input.context.phaseLanguage, nextTaskId: () => input.get()._nextTaskId() }), existing || null, input.logStoreEvent);

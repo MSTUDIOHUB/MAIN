@@ -5867,7 +5867,7 @@ async function settleVisiblePlanInterview(
       }
       const key = `${request?.requestId}:${request?.questionnaire?.revision}`;
       if (request?.kind === "user_choice" && request.questionnaire && !answered.has(key)) {
-        expect(["plan_confirmation", "plan_interview", "rules_interview"]).toContain(request.questionnaire.purpose);
+        expect(["plan_confirmation", "plan_interview", "rules_interview", "plan_verification_confirmation"]).toContain(request.questionnaire.purpose);
         owner ||= { sessionKey: request.sessionKey, turnId: request.turnId, runId: request.runId };
         expect(request.sessionKey).toBe(owner.sessionKey);
         expect(request.turnId).toBe(owner.turnId);
@@ -5876,7 +5876,10 @@ async function settleVisiblePlanInterview(
         await expect(form).toBeVisible();
         for (let index = 0; index < request.questionnaire.questions.length; index++) {
           const question = request.questionnaire.questions[index];
-          const field = form.locator("fieldset").nth(index);
+          if (request.questionnaire.questions.length > 1) {
+            await form.getByTestId("structured-question-step").nth(index).click();
+          }
+          const field = form.locator("fieldset").first();
           const choices = question.options || [];
           if (question.selectionMode === "text" && options.answerText) {
             const answer = options.answerText(question);

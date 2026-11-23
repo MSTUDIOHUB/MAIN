@@ -23,8 +23,10 @@ export function createRuntimeV2ExecutionBlockerView(aggregate: TurnAggregateV1, 
     parentRunId: aggregate.run.identity.parentRunId, title, status: "pending", createdAt: aggregate.updatedAt,
     optionValues: options.map(option => option.value), allowCustomReply: !!blocker.clarification,
     ...(blocker.questionnaire ? { questionnaire: blocker.questionnaire } : {}), executionBlocker: { sessionEpoch: aggregate.turn.sessionEpoch } };
+  const messageText = String(blocker.message || "").trim();
+  const content = messageText && messageText !== title ? `${title}\n\n${messageText}` : title;
   const block = { id: taskId, type: "agent" as const, visibility: "assistant_update" as const, turnId: request.turnId,
-    content: `${title}\n\n${blocker.message}`, options, choiceRequest: request };
+    content, options, choiceRequest: request };
   return { request, block };
 }
 
@@ -86,10 +88,17 @@ export async function resolveRuntimeV2ExecutionBlocker(input: {
       at: Math.max(Date.now(), aggregate.updatedAt), sequence: aggregate.nextSequence, run: aggregate.run.identity,
       requestId: blocker.requestId, choice: choice as "recheck" | "continue" | "stop", ...(input.source ? { source: input.source } : {}), ...(reply ? { reply } : {}), ...(answer ? { answer } : {}) } });
   if (appended.disposition !== "committed" || !appended.checkpoint || !current()) return false;
-  const projected = { ...state, runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint } };
+  const markResolvedChoiceBlock = (blocks: any[]) => blocks.map((item: any) =>
+    item?.choiceRequest?.requestId === request.requestId
+      ? { ...item, choiceRequest: { ...item.choiceRequest, status: choice === "stop" ? "cancelled" : "resolved" } }
+      : item
+  );
+  const projected = { ...state, taskFlow: markResolvedChoiceBlock(state.taskFlow || []), runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint } };
   const persisted: any = await input.persist(projected, current);
   if (!current()) return false;
-  input.set((latest: any) => ({ runtimeV2Checkpoints: { ...latest.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint },
+  input.set((latest: any) => ({
+    taskFlow: markResolvedChoiceBlock(latest.taskFlow || []),
+    runtimeV2Checkpoints: { ...latest.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint },
     ...(persisted?.sessionsByWorkspace ? { sessionsByWorkspace: Object.fromEntries(Object.entries(latest.sessionsByWorkspace || {}).map(([scope, records]) => [scope,
       (records as any[]).map(record => scope === aggregate.turn.workspaceKey && record.id === state.currentSessionId ?
         { ...record, ...(persisted.sessionsByWorkspace[scope] || []).find((saved: any) => saved.id === record.id) } : record)])) } : {}) }));

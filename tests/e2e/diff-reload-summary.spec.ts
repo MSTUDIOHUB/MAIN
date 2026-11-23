@@ -164,8 +164,8 @@ test("diff summary exposes concrete files and remains clickable after reload", a
         const conclusion = Array.from(document.querySelectorAll(".chat-agent-content"))
           .find((node) => node.textContent?.includes("已完成三个文件的修改"));
         if (!changes || !disclosure || !conclusion) return false;
-        return disclosure.getBoundingClientRect().top < changes.getBoundingClientRect().top &&
-          changes.getBoundingClientRect().top < conclusion.getBoundingClientRect().top;
+        return disclosure.getBoundingClientRect().top < conclusion.getBoundingClientRect().top &&
+          conclusion.getBoundingClientRect().top < changes.getBoundingClientRect().top;
       }),
     )
     .toBe(true);

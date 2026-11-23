@@ -2962,8 +2962,8 @@ test("presentation counts repeated source receipts as one evidence fact without 
     "error",
     "lifecycle deadline",
   );
-  assert.match(finalProjection.markdown, /已保留 2 条证据/);
-  assert.doesNotMatch(finalProjection.markdown, /已保留 3 条证据/);
+  assert.doesNotMatch(finalProjection.markdown, /已保留 \d+ 条证据/);
+  assert.match(finalProjection.markdown, /### 执行遇到错误/);
   assert.equal(runtime.countDistinctRuntimeV2EvidenceFacts([
     {
       id: "grep-first",

@@ -124,3 +124,19 @@ test("recheck can reopen a pre-execution denial but cannot replay a command that
     assert.equal(facts(aggregate).rejectedActionIdentities.has(identity), shouldStayClosed);
   }
 });
+
+test("createRuntimeV2ExecutionBlockerView does not duplicate title when blocker message matches title", () => {
+  const event = (state, type, fields) => ({ schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, type,
+    eventId: `${type}:${state?.nextSequence || 0}`, sequence: state?.nextSequence || 0, at: (state?.updatedAt || 0) + 1, ...fields });
+  let aggregate = runtime.transition(null, event(null, "turn.admitted", { turn, strategy: "plan", planPurpose: "plan", objective: "Design MFramework", constraints: [], acceptanceCriteria: ["Works"] }));
+  aggregate = runtime.transition(aggregate, event(aggregate, "run.started", { run, phase: "planning" }));
+  aggregate = runtime.transition(aggregate, event(aggregate, "run.paused", { run, blocker: { requestId: "plan-questionnaire-1", reasonCode: "user_questionnaire", evidenceSequence: 1,
+    message: "MFramework 框架设计关键决策", options: ["recheck", "stop"],
+    questionnaire: { revision: 1, purpose: "plan_confirmation", title: "MFramework 框架设计关键决策", questions: [
+      { id: "q1", prompt: "Choose", selectionMode: "single", options: [{ id: "a", label: "A" }] },
+    ] } } }));
+  const { createRuntimeV2ExecutionBlockerView } = load("src/store/runtimeV2/executionBlocker.ts");
+  const view = createRuntimeV2ExecutionBlockerView(aggregate, "zh", 7);
+  assert.ok(view);
+  assert.equal(view.block.content, "MFramework 框架设计关键决策");
+});

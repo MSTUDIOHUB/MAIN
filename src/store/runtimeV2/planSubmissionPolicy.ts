@@ -62,6 +62,7 @@ function admittedPlanCriteriaGaps(input: {
   readonly draft: WorkPlanDraftV1;
   readonly criterionIds: readonly string[];
   readonly evidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
+  readonly allowManualAdvisoryValidation?: boolean;
 }) {
   const missingChanges = input.criterionIds.filter((criterionId) =>
     !input.draft.steps.some((step) =>
@@ -69,6 +70,19 @@ function admittedPlanCriteriaGaps(input: {
     )
   );
   const executableChecks = input.draft.validations.map(validation => {
+    if (input.allowManualAdvisoryValidation) {
+      if (validation.kind === "browser" || validation.kind === "desktop") return "interaction";
+      if (validation.kind === "finite_command") {
+        const spec = analyzeValidationCommand(validation.command || "", { cwd: validation.cwd }).spec;
+        if (spec?.kind !== "finite_command") return null;
+        return spec.segments.some(segment => segment.capability === "test" || segment.capability === "inline_assertion")
+          ? "behavioral" : "static";
+      }
+      if ((validation.kind === "advisory" || validation.kind === "assertion") && String(validation.expectedOutcome || "").trim()) {
+        return "manual_advisory";
+      }
+      return null;
+    }
     if (!validation.required) return null;
     if (validation.kind === "browser" || validation.kind === "desktop") return "interaction";
     if (validation.kind !== "finite_command") return null;
@@ -78,12 +92,15 @@ function admittedPlanCriteriaGaps(input: {
       ? "behavioral" : "static";
   });
   const covers = (check: typeof executableChecks[number], requirement: RuntimeV2AcceptanceEvidenceRequirementSlot | undefined) =>
-    check !== null && (requirement !== "behavioral" || check !== "static") &&
-    (requirement !== "interaction" || check === "interaction");
+    check !== null && (
+      input.allowManualAdvisoryValidation === true ||
+      ((requirement !== "behavioral" || check !== "static") &&
+        (requirement !== "interaction" || check === "interaction"))
+    );
   const requirementByCriterion = new Map(input.criterionIds.map((id, index) => [id, input.evidenceRequirements?.[index]]));
   const missingValidations = input.criterionIds.filter(criterionId => !input.draft.validations.some((validation, index) =>
     validation.criterionIds?.includes(criterionId) && covers(executableChecks[index] ?? null, requirementByCriterion.get(criterionId))));
-  const mismatchedValidations = input.draft.validations.flatMap((validation, index) => {
+  const mismatchedValidations = input.allowManualAdvisoryValidation ? [] : input.draft.validations.flatMap((validation, index) => {
     const criterionIds = validation.criterionIds?.filter(id => missingValidations.includes(id) &&
       !!requirementByCriterion.get(id) && !covers(executableChecks[index] ?? null, requirementByCriterion.get(id))) || [];
     return validation.required && criterionIds.length ? [{ index, kind: validation.kind, criterionIds,
@@ -91,7 +108,7 @@ function admittedPlanCriteriaGaps(input: {
         ? `validations[${index}] needs a required browser or desktop interaction with the expected observable result.`
         : `validations[${index}] needs a runnable test with a pass/fail result or an interaction that demonstrates the required behavior. Build, lint and typecheck can supplement it.` }] : [];
   });
-  const nonRequiredValidations = input.draft.validations.flatMap((validation, index) => {
+  const nonRequiredValidations = input.allowManualAdvisoryValidation ? [] : input.draft.validations.flatMap((validation, index) => {
     const criterionIds = validation.criterionIds?.filter((id) => missingValidations.includes(id)) || [];
     const repair = criterionIds.some(id => requirementByCriterion.get(id) === "interaction")
       ? "Provide a required browser or desktop interaction with the expected observable result."
@@ -112,6 +129,7 @@ export function admittedPlanCriteriaDiagnostics(input: {
   readonly draft: WorkPlanDraftV1;
   readonly criterionIds: readonly string[];
   readonly evidenceRequirements?: readonly RuntimeV2AcceptanceEvidenceRequirementSlot[];
+  readonly allowManualAdvisoryValidation?: boolean;
 }): PlanSubmissionDiagnostic[] {
   const { missingChanges, missingValidations, nonRequiredValidations, mismatchedValidations } = admittedPlanCriteriaGaps(input);
   const unrepresented = missingValidations.filter(id => ![...nonRequiredValidations, ...mismatchedValidations].some(validation => validation.criterionIds.includes(id)));

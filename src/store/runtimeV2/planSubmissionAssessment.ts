@@ -28,6 +28,20 @@ const COMMAND_REPAIR: Record<NonNullable<WorkPlanValidationOrigin["commandReject
   service_observation: "A service startup is advisory. Use a separate finite check that exits with a pass/fail result.",
 };
 
+const VALIDATION_READINESS_ONLY_CODES = new Set([
+  "plan_validation_not_required",
+  "plan_validation_missing",
+  "plan_validation_evidence_mismatch",
+]);
+
+export function isValidationReadinessOnlyDiagnostics(
+  diagnostics: readonly PlanSubmissionDiagnostic[],
+): boolean {
+  return diagnostics.length > 0 && diagnostics.every((diagnostic) =>
+    VALIDATION_READINESS_ONLY_CODES.has(diagnostic.code)
+  );
+}
+
 /** Assess executable readiness without interpreting error prose or discarding
  * the user's reviewable document when that readiness is incomplete. */
 export function assessPlanSubmission(input: {
@@ -38,6 +52,7 @@ export function assessPlanSubmission(input: {
   readonly aggregate: TurnAggregateV1 | null;
   readonly collaborationRequired?: boolean;
   readonly requireBehavioralValidation?: boolean;
+  readonly allowManualAdvisoryValidation?: boolean;
   readonly decisionJournal?: string;
   readonly createdAt?: number;
   readonly revisionOf?: { readonly id: string; readonly revision: number };
@@ -52,10 +67,15 @@ export function assessPlanSubmission(input: {
   }
   const { draft, normalizationReasons, validationOrigins } = compiled;
   const origins = new Map(validationOrigins.map(origin => [origin.fieldPath, origin]));
-  const evidenceRequirements = input.requireBehavioralValidation
+  const evidenceRequirements = input.requireBehavioralValidation && !input.allowManualAdvisoryValidation
     ? input.criterionIds.map((_, index) => input.aggregate?.objective.acceptanceEvidenceRequirements?.[index] ?? "behavioral")
     : undefined;
-  const diagnostics: PlanSubmissionDiagnostic[] = admittedPlanCriteriaDiagnostics({ draft, criterionIds: input.criterionIds, evidenceRequirements })
+  const diagnostics: PlanSubmissionDiagnostic[] = admittedPlanCriteriaDiagnostics({
+    draft,
+    criterionIds: input.criterionIds,
+    evidenceRequirements,
+    allowManualAdvisoryValidation: input.allowManualAdvisoryValidation,
+  })
     .map(diagnostic => {
       const validationOrigin = origins.get(diagnostic.fieldPath);
       if (!validationOrigin) return diagnostic;

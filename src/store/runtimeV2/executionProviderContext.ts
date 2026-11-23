@@ -127,7 +127,12 @@ export function recordApprovedPlanContext(
   }
   const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
   const frontier = deriveRuntimeV2PlanExecutionFrontier(aggregate);
+  const coverage = deriveRuntimeV2PlanExecutionCoverage(aggregate);
   const compileFailed = unresolvedUnityEditorCheck(aggregate)?.result.status === "failed";
+  const manualVerificationOnly = !!frontier?.validationReady &&
+    !!coverage &&
+    coverage.missingRequiredValidationIndexes.length === 0 &&
+    approved.plan.draft.validations.some(validation => !validation.required);
   return {
     approvalKey: approvalEvent.eventId,
     frontierInstruction: [
@@ -148,6 +153,8 @@ export function recordApprovedPlanContext(
         } : null,
       }),
       compileFailed ? "Resolve the current compiler diagnostics before PlayMode."
+        : manualVerificationOnly
+        ? "All planned mutations are complete and no required automated checks remain. Write the final summary clearly separating completed automated checks (if any) from the user-confirmed manual/external verification checklist; never claim automated tests passed when none ran."
         : frontier?.validationReady
         ? "All mutation stages are complete. Run the planned validations."
         : "Follow the approved WorkPlan steps and verify once changes are complete.",

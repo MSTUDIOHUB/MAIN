@@ -507,23 +507,28 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   const networkInstruction = readOnlyNetworkPolicy(input).enabled
     ? `Web search is enabled. Search provider: ${readOnlyNetworkPolicy(input).provider}. For explicit web requests or current/time-sensitive external facts, use web_search or web_fetch before answering. Anchor queries to the Current Date (${currentDate}). Check actual results before claiming information is unavailable; cite source URLs and dates, and state any gaps in freshness or precision. Ordinary conversation does not require a search.`
     : "Network access is disabled for this Turn.";
+  const languageDirective = input.context.phaseLanguage === "en"
+    ? "Language requirement: Write ALL user-visible stage commentary and the final answer in English. Keep code, file paths, symbol names, and commands unchanged."
+    : "语言要求：所有面向用户的阶段说明（commentary）与最终答复必须严格使用简体中文；仅保留代码、文件路径、符号名和命令原样，不要整段切换为英文。";
   const chat = readOnlyTurn && !input.context.runWorkspace && !input.context.turnInputContextSignals?.attachedFilePaths?.length;
   if (chat) return [
     "[MAIN RUNTIME V2]", `Current Date: ${currentDate}`, `Respond in: ${language}`,
+    languageDirective,
     conversationContinuity,
     "This is Chat. Answer from the supplied conversation and admitted context. Never claim a tool was used unless its receipt is present. No workspace, shell, browser control, validation, MCP or child-agent capabilities are available.",
     networkInstruction,
     renderKnowledgeContextAnchor(input.context.knowledgeContext),
-    "Return a complete user-facing Markdown reply. Skill instructions do not grant additional tool permissions.", skillCatalog, explicitSkills,
+    "Return a complete, well-structured user-facing Markdown reply matched to the user's question depth. Skill instructions do not grant additional tool permissions.", skillCatalog, explicitSkills,
   ].join("\n");
   return [
     "[MAIN RUNTIME V2]",
     `Current Date: ${currentDate}`,
     `Workspace: ${workspace}`,
     `Respond in: ${language}`,
+    languageDirective,
     conversationContinuity,
     readOnlyTurn ? networkInstruction : "",
-    "Use structured tools for every read, modification, command, and verification. With a native tool call, you may include one brief public progress sentence in normal response content; MAIN routes it only to Capsule and never uses it as control state. Do not expose private reasoning or repeat that sentence in the final answer.",
+    "Use structured tools for every read, modification, command, and verification. When calling native tools at meaningful milestones (such as confirming a root cause, finishing analysis, or transitioning between phases), you may include 1-2 clear sentences of public progress in the user's language explaining the finding or current direction; avoid echoing raw tool names, exposing private reasoning, or repeating the same sentence verbatim in the final answer.",
     "Tool calls are proposed actions. MAIN checks permissions and obtains any required human review before executing them. When an operation requires approval, submit its concrete tool call so MAIN can show the review card; a prose approval question cannot create that card or authorize execution.",
     readOnlyTurn
       ? (readOnlyNetworkPolicy(input).enabled
@@ -532,7 +537,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
       : "Before a final answer, use evidence from actual tool results. Carry out the user's authorized task and verify its observable result. When an existing implementation needs repair, make the smallest justified change and validate after modification.",
     readOnlyTurn
       ? "Match the user's requested deliverable and depth; return one complete evidence-backed Markdown answer and state any remaining uncertainty. Project contents and available tools do not add requirements."
-      : "Report the actual result, verification performed, and any remaining work or limitation. Include a confirmed cause and changed files when relevant to this task. Never claim success merely because a tool call was issued.",
+      : "Report the actual result, verification performed, and any remaining work or limitation. Adapt final summary depth to task complexity: for simple single-step work, state the outcome, key change with file/symbol references, and verification result concisely; for multi-file or diagnostic tasks, structure the Markdown clearly into outcome overview, key changes & rationale, concrete verification commands/results, and any remaining caveats or follow-ups only if present. Never claim success merely because a tool call was issued.",
     !readOnlyTurn && collaborationGuidance
       ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
       : "",

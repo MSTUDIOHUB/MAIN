@@ -109,7 +109,11 @@ async function mountPlanTransport(page: Page, fromComposer = false) {
         if (command === "proxy_request" || command === "proxy_request_detailed") {
           let body: string;
           if (args.body) {
-            oneShotRequests.push(JSON.parse(args.body));
+            const parsedBody = JSON.parse(args.body);
+            if (parsedBody?.jsonrpc) {
+              return command === "proxy_request_detailed" ? { status: 503, body: "" } : "";
+            }
+            oneShotRequests.push(parsedBody);
             const answer = await new Promise<string>((resolve) => { finishOneShot = resolve; });
             body = JSON.stringify({ choices: [{ message: { role: "assistant", content: answer }, finish_reason: "stop" }] });
           } else {
@@ -241,8 +245,11 @@ test("Plan Capsule follows model and tool boundaries and M shows only recorded a
   await page.keyboard.press("Escape");
   const form = capsule.getByTestId("structured-user-questionnaire");
   await form.getByRole("radio", { name: "键盘", exact: true }).check();
+  await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
+  await form.getByRole("button", { name: "下一题 →", exact: true }).click();
   await form.getByRole("radio", { name: "形成并保存计划文档", exact: true }).check();
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
+  await expect(page.getByText("确认场景测试方式\n\n确认场景测试方式")).toHaveCount(0);
   await expectStreams(page, 3);
   await expect(capsule).toHaveAttribute("data-run-id", runId!);
   await expect(capsule).toHaveAttribute("data-activity-kind", "waiting");
@@ -271,6 +278,8 @@ test("Plan from the composer reuses a confirmed answer and reaches a single revi
   await expect(form).toBeVisible();
   const runId = await capsule.getAttribute("data-run-id");
   await form.getByRole("radio", { name: "键盘", exact: true }).check();
+  await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
+  await form.getByRole("button", { name: "下一题 →", exact: true }).click();
   await form.getByRole("radio", { name: /形成可审核的实施计划/ }).check();
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
   await expectStreams(page, 2);

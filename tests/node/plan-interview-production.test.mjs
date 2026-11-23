@@ -440,8 +440,10 @@ for (const corrected of [true, false]) test(`a repeated identical candidate gets
     assert.equal(h.get().activeActionRequest.kind, "plan_review");
     assert.equal(aggregate.sealedWorkPlan.draft.validations[0].command, "npm test");
   } else {
-    assert.equal(settlement.outcome.resultKind, "error");
+    assert.equal(settlement.outcome.resultKind, "partial");
     assert.equal(aggregate.sealedWorkPlan, null);
+    assert.ok(h.load("src/lib/planDocumentRecords.ts").resolvePlanDraftFromAggregate(aggregate));
+    assert.equal(h.saves.length, 1);
     assert.equal(aggregate.events.filter(event => event.type === "turn.completed").length, 1);
   }
 });

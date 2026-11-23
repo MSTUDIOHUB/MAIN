@@ -776,7 +776,7 @@ test("typed Plan review Capsule preserves the exact request and artifact identit
     '[data-testid="assistant-update"][data-turn-id="e2e-execution-capsule-panel-stability-turn"]',
   );
   await expect(milestone).toBeVisible();
-  await expect(milestone).toContainText("修复计划已准备好");
+  await expect(milestone).toContainText("实施计划已准备好");
   await expect(milestone).toContainText("根本原因");
   const milestoneTypography = await milestone.evaluate((element) => {
     const markdown = element.querySelector<HTMLElement>("[data-markdown-presentation]");

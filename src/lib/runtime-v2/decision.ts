@@ -8,35 +8,15 @@ import { analyzeValidationCommand } from "../validationContract";
 import { deriveReadOnlyRecoveryWindow } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
 import { runtimeV2ProviderAnswerText } from "./providerAnswer";
-import type {
-  RuntimeV2Command,
-  RuntimeV2CommandKind,
-  RuntimeV2ExecutionValidationAuthority,
-  RuntimeV2ResultKind,
-} from "./contracts";
+import type { RuntimeV2Command, RuntimeV2CommandKind, RuntimeV2ExecutionValidationAuthority, RuntimeV2ResultKind } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
-import {
-  resolveRuntimeV2SubagentReferences,
-  runtimeV2SubagentModelHandle,
-  type RuntimeV2SubagentScopeCandidate,
-} from "./subagents";
-import {
-  deriveRuntimeV2PlanExecutionCoverage,
-  resolveRuntimeV2PlanValidationScope,
-  runtimeV2PlanValidationAuthority,
-} from "./planExecution";
-import {
-  isRuntimeV2ValidationToolCall,
-  runtimeV2DirectExecuteReadyForConclusion,
-} from "./phaseTransition";
-import {
-  deriveRuntimeV2ValidationBoundary,
-  latestRuntimeV2WorkspaceChange,
-  resolveRuntimeV2DirectExecuteValidationAuthority,
-} from "./validationReceipt";
+import { resolveRuntimeV2SubagentReferences, runtimeV2SubagentModelHandle, type RuntimeV2SubagentScopeCandidate } from "./subagents";
+import { deriveRuntimeV2PlanExecutionCoverage, resolveRuntimeV2PlanValidationScope, runtimeV2PlanValidationAuthority } from "./planExecution";
+import { isRuntimeV2ValidationToolCall, runtimeV2DirectExecuteReadyForConclusion } from "./phaseTransition";
+import { deriveRuntimeV2ValidationBoundary, latestRuntimeV2WorkspaceChange, resolveRuntimeV2DirectExecuteValidationAuthority } from "./validationReceipt";
 
 export interface RuntimeV2DecisionInput {
   /**
@@ -127,12 +107,13 @@ export function runtimeV2CollaborationPayload(
       id: runtimeV2SubagentModelHandle(job),
       name: job.name || job.scopeKey,
       objective: job.objective,
+      allowedPaths: job.allowedPaths,
     }));
   const failedSubagents = runSubagents
     .filter((job) =>
       job.status === "failed" || job.status === "degraded"
     )
-    .slice(-Math.max(1, maxActiveSubagents))
+    .slice(-8)
     .map((job) => ({
       id: runtimeV2SubagentModelHandle(job),
       name: job.name || job.scopeKey,
@@ -140,6 +121,11 @@ export function runtimeV2CollaborationPayload(
       status: job.status,
       summary: job.summary || "No structured report was committed.",
     }));
+  const settledSubagentCount = runSubagents.filter(
+    (job) => job.status !== "queued" && job.status !== "running",
+  ).length;
+  const allSubagentsSettled =
+    runSubagents.length > 0 && activeSubagents.length === 0;
   return {
     collaborationAllowed,
     collaborationPreferred:
@@ -156,6 +142,8 @@ export function runtimeV2CollaborationPayload(
       : {}),
     activeSubagents,
     failedSubagents,
+    settledSubagentCount,
+    allSubagentsSettled,
     maxActiveSubagents,
     maxChildRuns,
     // Explicitly requested jobs can queue. Proactive dispatch checks free
@@ -559,6 +547,15 @@ function projectValidationRecoveryCommand(state: TurnAggregateV1, option: Runtim
   });
 }
 
+function finalJoinActiveSubagentsCommand(state: TurnAggregateV1): RuntimeV2Command | null {
+  const activeJobIds = currentRunSubagents(state)
+    .filter((job) => job.status === "queued" || job.status === "running")
+    .map((job) => job.id);
+  return activeJobIds.length > 0
+    ? boundedCommand(state, "join_subagents", { mode: "read_only", jobIds: activeJobIds, finalJoin: true })
+    : null;
+}
+
 /**
  * Pure next-command policy. It never chooses an outcome from model prose and
  * it never hides an Execute tool because the current phase looks inconvenient.
@@ -584,35 +581,19 @@ export function decideNextCommands(
         })];
       }
     }
-    const activeJobIds = currentRunSubagents(state)
-      .filter((job) => job.status === "queued" || job.status === "running")
-      .map((job) => job.id);
-    if (activeJobIds.length > 0) {
-      return [boundedCommand(state, "join_subagents", {
-        mode: "read_only",
-        jobIds: activeJobIds,
-        finalJoin: true,
-      })];
-    }
+    const finalJoin = finalJoinActiveSubagentsCommand(state);
+    if (finalJoin) return [finalJoin];
     return [makeCommand(state, "finalize_turn", {
       resultKind: input.resultKind,
       resultReason: input.resultReason,
       ...(typeof input.finalMarkdown === "string" && input.finalMarkdown.trim()
         ? { finalMarkdown: input.finalMarkdown.trim().slice(0, 24_000) }
-      : {}),
+        : {}),
     })];
   }
   if (state.recovery.exhausted) {
-    const activeJobIds = currentRunSubagents(state)
-      .filter((job) => job.status === "queued" || job.status === "running")
-      .map((job) => job.id);
-    if (activeJobIds.length > 0) {
-      return [boundedCommand(state, "join_subagents", {
-        mode: "read_only",
-        jobIds: activeJobIds,
-        finalJoin: true,
-      })];
-    }
+    const finalJoin = finalJoinActiveSubagentsCommand(state);
+    if (finalJoin) return [finalJoin];
     return [makeCommand(state, "finalize_turn", {
       resultKind: state.recovery.exhausted.scope === "transport"
         ? "error"

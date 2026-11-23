@@ -258,41 +258,51 @@ function collaborationSurfaceFixture(mode, payload = {}, options = {}) {
   return selected.map((tool) => tool.function.name);
 }
 
-test("admitted collaboration survives the compact tool surface without prompt keywords", () => {
+test("admitted collaboration keeps a stable tool surface without prompt keywords", () => {
   for (const mode of ["execute", "validate", "analyze"]) {
     const selected = collaborationSurfaceFixture(mode);
     assert.ok(selected.includes("spawn_subagent"), `${mode} must retain the admitted child capability`);
-    assert.ok(!selected.includes("wait_subagents"), "no join is advertised without an active child");
+    assert.ok(selected.includes("wait_subagents"), `${mode} stabilizes wait_subagents in the workspace tool schema for KV cache stability`);
     assert.ok(!selected.includes("browser_evaluate"), "ordinary extensions still require discovery");
     assert.ok(selected.includes("read_file"));
     assert.equal(selected.includes("write_file"), mode !== "analyze", "analysis remains read-only");
   }
 });
 
-test("compact collaboration tools retain capacity, runway and mode boundaries", () => {
+test("compact collaboration tools keep stable workspace schema while retaining forbidden, conclude, and no-workspace boundaries", () => {
   for (const mode of ["execute", "validate", "analyze"]) {
+    const baseline = collaborationSurfaceFixture(mode);
+    const forbidden = collaborationSurfaceFixture(mode, { collaborationAllowed: false });
+    assert.ok(!forbidden.includes("spawn_subagent"), `${mode} cannot bypass collaborationAllowed=false`);
+    assert.ok(!forbidden.includes("wait_subagents"), `${mode} cannot expose wait_subagents when collaborationAllowed=false`);
+    const omitted = collaborationSurfaceFixture(mode, { collaborationAllowed: undefined });
+    assert.ok(!omitted.includes("spawn_subagent"), `${mode} does not inject spawn_subagent when collaborationAllowed is omitted`);
+    assert.ok(!omitted.includes("wait_subagents"), `${mode} does not inject wait_subagents when collaborationAllowed is omitted`);
+
     for (const [payload, options] of [
-      [{ collaborationAllowed: false }, {}],
       [{ remainingSubagentCapacity: 0 }, {}],
       [{}, { deadlineAt: 120_000 }],
+      [{ remainingSubagentCapacity: 0, activeSubagents: [{ id: "active-child" }] }, {}],
     ]) {
-      assert.ok(!collaborationSurfaceFixture(mode, payload, options).includes("spawn_subagent"),
-        `${mode} cannot bypass collaboration admission: ${JSON.stringify({ payload, options })}`);
+      const stabilized = collaborationSurfaceFixture(mode, payload, options);
+      assert.deepEqual(
+        stabilized,
+        baseline,
+        `${mode} keeps identical tool definitions across capacity, active-child, and runway transitions: ${JSON.stringify({ payload, options })}`,
+      );
     }
-    const waiting = collaborationSurfaceFixture(mode, {
-      remainingSubagentCapacity: 0, activeSubagents: [{ id: "active-child" }],
-    });
-    assert.ok(waiting.includes("wait_subagents"), `${mode} preserves the join while capacity is exhausted`);
-    assert.ok(!waiting.includes("spawn_subagent"));
   }
   for (const [mode, options] of [
     ["chat", { workspace: "" }],
     ["analyze", { workspace: "", attachedFilePaths: ["/fixture/report.csv"] }],
+    ["execute", { workspace: "" }],
   ]) {
     const selected = collaborationSurfaceFixture(mode, {}, options);
-    assert.ok(!selected.includes("spawn_subagent"), "global chat and attachment-only analysis do not gain workspace delegation");
-    assert.ok(!selected.includes("write_file"));
+    assert.ok(!selected.includes("spawn_subagent"), `${mode} without workspace does not gain workspace delegation`);
+    assert.ok(!selected.includes("wait_subagents"), `${mode} without workspace does not gain wait_subagents`);
+    if (mode !== "execute") assert.ok(!selected.includes("write_file"));
   }
+  assert.deepEqual(collaborationSurfaceFixture("conclude", {}), []);
   assert.deepEqual(collaborationSurfaceFixture("conclude", { activeSubagents: [{ id: "active-child" }] }), ["wait_subagents"]);
   assert.deepEqual(collaborationSurfaceFixture("conclude", {
     conclusionKind: "read_only", activeSubagents: [{ id: "active-child" }],
@@ -2014,7 +2024,7 @@ test("Runtime v2 collaboration schema exposes read investigations and transactio
   ]);
 });
 
-test("Execute hides late spawn while retaining wait and rejects a raced spawn before scheduling", async () => {
+test("Execute keeps stable collaboration schema across runway boundary while rejecting a raced spawn before scheduling", async () => {
   const minimum = runtime.RUNTIME_V2_SUBAGENT_MIN_START_REMAINING_MS;
   const available = ["spawn_subagent", "wait_subagents"].map(definition);
   const providerCommand = {
@@ -2046,7 +2056,7 @@ test("Execute hides late spawn while retaining wait and rejects a raced spawn be
     command: providerCommand,
     available,
   }).map((tool) => tool.function.name);
-  assert.deepEqual(afterBoundary, ["wait_subagents"]);
+  assert.deepEqual(afterBoundary, ["spawn_subagent", "wait_subagents"]);
 
   const run = providerCommand.run;
   const live = executionTypes.createRuntimeV2LiveExecutionState();
@@ -11373,4 +11383,289 @@ test("real ProviderPort and ToolPort share one Run window across CLI and mixed o
       }
     });
   }
+});
+
+test("runtimeV2CollaborationPayload exposes active allowedPaths, preserves up to 8 failed children at zero capacity, and tracks settled counts", () => {
+  const run = {
+    sessionKey: "session-collab-payload",
+    sessionEpoch: "epoch",
+    turnId: "turn-collab-payload",
+    runId: "run-collab-payload",
+    parentRunId: null,
+    attemptId: "attempt",
+  };
+  const makeJob = (index, status, allowedPaths = [`src/file-${index}.ts`]) => ({
+    id: `child-${index}`,
+    run: {
+      ...run,
+      runId: `${run.runId}:child:${index}`,
+      parentRunId: run.runId,
+    },
+    parentRunId: run.runId,
+    scopeKey: `scope-${index}`,
+    name: `worker-${index}`,
+    taskKind: "review",
+    objective: `Inspect ${index}`,
+    allowedPaths,
+    status,
+    requestedAt: 10 + index,
+    firstTokenAt: status === "queued" ? null : 11 + index,
+    closedAt: status === "queued" || status === "running" ? null : 20 + index,
+    summary: status === "failed" || status === "degraded" ? `Summary ${index}` : null,
+    report: null,
+  });
+
+  const activeState = {
+    run: { identity: run, status: "running", phase: "acting", terminalOutcome: null },
+    events: [],
+    subagents: [
+      makeJob(1, "running", ["src/a.ts", "src/b.ts"]),
+      ...Array.from({ length: 10 }, (_unused, idx) =>
+        makeJob(idx + 2, idx % 2 === 0 ? "failed" : "degraded")
+      ),
+    ],
+  };
+  const whileActive = runtime.runtimeV2CollaborationPayload(activeState, {
+    subagentPreference: "preferred",
+    subagentCapacity: 0,
+  });
+  assert.deepEqual(whileActive.activeSubagents, [{
+    id: "scope-1",
+    name: "worker-1",
+    objective: "Inspect 1",
+    allowedPaths: ["src/a.ts", "src/b.ts"],
+  }]);
+  assert.equal(whileActive.failedSubagents.length, 8, "failedSubagents keeps up to 8 entries even when capacity drops to 0");
+  assert.deepEqual(
+    whileActive.failedSubagents.map((entry) => entry.id),
+    ["scope-4", "scope-5", "scope-6", "scope-7", "scope-8", "scope-9", "scope-10", "scope-11"],
+  );
+  assert.equal(whileActive.settledSubagentCount, 10);
+  assert.equal(whileActive.allSubagentsSettled, false);
+
+  const settledState = {
+    ...activeState,
+    subagents: [
+      makeJob(1, "completed", ["src/a.ts", "src/b.ts"]),
+      makeJob(2, "degraded", ["src/c.ts"]),
+    ],
+  };
+  const whenAllSettled = runtime.runtimeV2CollaborationPayload(settledState, {
+    subagentPreference: "allowed",
+    subagentCapacity: 2,
+  });
+  assert.deepEqual(whenAllSettled.activeSubagents, []);
+  assert.equal(whenAllSettled.settledSubagentCount, 2);
+  assert.equal(whenAllSettled.allSubagentsSettled, true);
+
+  const noChildrenState = { ...activeState, subagents: [] };
+  const whenNoneSpawned = runtime.runtimeV2CollaborationPayload(noChildrenState, {
+    subagentPreference: "allowed",
+    subagentCapacity: 2,
+  });
+  assert.equal(whenNoneSpawned.settledSubagentCount, 0);
+  assert.equal(whenNoneSpawned.allSubagentsSettled, false);
+});
+
+test("providerModeInstruction gates collaboration hints on live activeSubagents, capacity, and allSubagentsSettled", () => {
+  const activeInstruction = providerRequest.providerModeInstruction({
+    payload: {
+      mode: "execute",
+      collaborationPreferred: true,
+      remainingSubagentCapacity: 0,
+      allSubagentsSettled: false,
+      activeSubagents: [{
+        id: "review-a",
+        name: "Reviewer A",
+        objective: "Inspect module A",
+        allowedPaths: ["src/a.ts", "src/b.ts"],
+      }],
+    },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: true,
+    hasWaitSubagents: true,
+  });
+  assert.match(activeInstruction, /Reviewer A \(review-a\) \[paths: src\/a\.ts, src\/b\.ts\]: Inspect module A/);
+  assert.match(activeInstruction, /Do not reread files already assigned to active children/i);
+  assert.match(activeInstruction, /Child-request capacity is currently 0/i);
+  assert.doesNotMatch(activeInstruction, /explicitly prefers collaboration/i);
+  assert.doesNotMatch(activeInstruction, /All spawned subagents have finished/i);
+
+  const settledInstruction = providerRequest.providerModeInstruction({
+    payload: {
+      mode: "execute",
+      collaborationPreferred: true,
+      remainingSubagentCapacity: 2,
+      allSubagentsSettled: true,
+      activeSubagents: [],
+    },
+  }, "", {
+    hasReadFile: true,
+    hasMutation: true,
+    hasSpawnSubagent: true,
+    hasWaitSubagents: true,
+  });
+  assert.doesNotMatch(settledInstruction, /Child work is active/i, "stabilized wait_subagents schema alone must not claim child work is active");
+  assert.match(settledInstruction, /All spawned subagents have finished and settled; no active subagents remain/i);
+  assert.match(settledInstruction, /Do NOT call wait_subagents again/i);
+  assert.match(settledInstruction, /explicitly prefers collaboration; current child-request capacity is 2/i);
+});
+
+test("executionSchedulerPort logs rejected spawns in catch, returns empty on wait with no active children, and writes batch-settled anchor on finalJoin", async () => {
+  const run = {
+    sessionKey: "session-scheduler-c3",
+    sessionEpoch: "epoch",
+    turnId: "turn-scheduler-c3",
+    runId: "run-scheduler-c3",
+    parentRunId: null,
+    attemptId: "attempt",
+  };
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  live.messages.push({
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      id: "spawn-too-many",
+      type: "function",
+      function: { name: "spawn_subagent", arguments: "{}" },
+    }, {
+      id: "wait-no-active",
+      type: "function",
+      function: { name: "wait_subagents", arguments: "{}" },
+    }],
+  });
+  const logged = [];
+  const port = schedulerPort.createRuntimeV2SchedulerPort({
+    get: () => ({ runtimeV2Checkpoints: {} }),
+    context: { runWorkspace: "/fixture", turnId: run.turnId },
+    live,
+    nextId: (scope) => `${scope}-1`,
+    now: () => 100,
+    lifecycleDeadlineAt: 200_000,
+    logStoreEvent: (name, payload) => logged.push({ name, payload }),
+  });
+
+  await assert.rejects(
+    port.prepareSchedule({
+      command: {
+        idempotencyKey: "schedule-over-six-paths",
+        kind: "schedule_subagents",
+        phase: "observing",
+        run,
+        payload: {
+          toolCallId: "spawn-too-many",
+          maxActiveSubagents: 2,
+          arguments: {
+            task_key: "over-limit-scope",
+            objective: "Inspect seven files",
+            required_paths: "a.ts,b.ts,c.ts,d.ts,e.ts,f.ts,g.ts",
+          },
+        },
+      },
+    }),
+    /at most 6 narrow workspace-relative paths/i,
+  );
+  const rejectedLog = logged.find((entry) =>
+    entry.name === "runtime_v2_subagent_schedule_rejected"
+  );
+  assert.ok(rejectedLog, "prepareSchedule catch block must log runtime_v2_subagent_schedule_rejected");
+  assert.equal(rejectedLog.payload.turnId, run.turnId);
+  assert.equal(rejectedLog.payload.runId, run.runId);
+  assert.equal(rejectedLog.payload.scopeKey, "over-limit-scope");
+  assert.match(rejectedLog.payload.reason, /at most 6 narrow workspace-relative paths/i);
+
+  const waitEvents = await port.execute({
+    command: {
+      idempotencyKey: "join-when-none-active",
+      kind: "join_subagents",
+      phase: "acting",
+      run,
+      payload: {
+        toolCallId: "wait-no-active",
+        requestedJobIds: [],
+        jobIds: [],
+      },
+    },
+    run,
+    signal: new AbortController().signal,
+    scheduledSubagents: [],
+  });
+  assert.deepEqual(waitEvents, []);
+  const waitToolResult = live.messages.find((message) =>
+    message.role === "tool" && message.tool_call_id === "wait-no-active"
+  );
+  assert.ok(waitToolResult);
+  assert.match(String(waitToolResult.content), /SUBAGENT_WAIT_NO_ACTIVE/);
+  assert.match(String(waitToolResult.content), /do not call wait_subagents again/i);
+
+  const completedJob = {
+    id: "child-ok",
+    run: { ...run, runId: `${run.runId}:child:ok`, parentRunId: run.runId },
+    parentRunId: run.runId,
+    scopeKey: "review-a",
+    taskKind: "review",
+    objective: "Inspect a.ts",
+    allowedPaths: ["src/a.ts"],
+    status: "running",
+    requestedAt: 10,
+    firstTokenAt: 20,
+    closedAt: 30,
+    summary: null,
+    report: null,
+  };
+  const degradedJob = {
+    ...completedJob,
+    id: "child-deg",
+    run: { ...run, runId: `${run.runId}:child:deg`, parentRunId: run.runId },
+    scopeKey: "review-b",
+    objective: "Inspect b.ts",
+    allowedPaths: ["src/b.ts"],
+  };
+  live.childRuns.set(completedJob.id, Promise.resolve({
+    job: completedJob,
+    status: "completed",
+    summary: "Checked src/a.ts.",
+    report: null,
+    inheritedEvidence: [],
+    evidence: [{ id: "child:ok:E1", kind: "subagent", target: "src/a.ts", version: "v1" }],
+  }));
+  live.childRuns.set(degradedJob.id, Promise.resolve({
+    job: degradedJob,
+    status: "degraded",
+    summary: "Partial findings for src/b.ts.",
+    report: null,
+    inheritedEvidence: [],
+    evidence: [{ id: "child:deg:E1", kind: "subagent", target: "src/b.ts", version: "v1" }],
+  }));
+  live.childTelemetry.set(completedJob.id, { firstTokenAt: 20, closedAt: 30 });
+  live.childTelemetry.set(degradedJob.id, { firstTokenAt: 21, closedAt: 35 });
+
+  await port.execute({
+    command: {
+      idempotencyKey: "auto-final-join",
+      kind: "join_subagents",
+      phase: "acting",
+      run,
+      payload: {
+        mode: "read_only",
+        jobIds: [completedJob.id, degradedJob.id],
+        finalJoin: true,
+      },
+    },
+    run,
+    signal: new AbortController().signal,
+    scheduledSubagents: [completedJob, degradedJob],
+  });
+  const batchAnchor = live.messages.find((message) =>
+    message.role === "system" &&
+    typeof message.content === "string" &&
+    message.content.startsWith("[runtime-v2 context: subagent-batch-settled]")
+  );
+  assert.ok(batchAnchor, "finalJoin without toolCallId must write subagent-batch-settled anchor");
+  assert.match(String(batchAnchor.content), /Total settled subagents: 2 \(completed: 1, degraded: 1\)/);
+  assert.match(String(batchAnchor.content), /review-a \[src\/a\.ts\]: completed/);
+  assert.match(String(batchAnchor.content), /review-b \[src\/b\.ts\]: degraded/);
+  assert.match(String(batchAnchor.content), /No active subagents remain/i);
 });

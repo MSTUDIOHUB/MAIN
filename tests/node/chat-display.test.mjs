@@ -139,7 +139,7 @@ test("explicit assistant milestones are not hidden as superseded plan drafts", (
     type: "agent",
     visibility: "assistant_update",
     content: [
-      "### 修复计划已准备好",
+      "### 实施计划已准备好",
       "",
       "**根本原因**：在 `src/main.js` 的 `createTab` 函数中，当创建新标签页时，代码不仅更新标签标题，还调用 `toolbar.setCurrentFile()` 更新工具栏路径。对于未保存文件，`file.path` 为空，但 `file.title` 仍是临时文档名，因此旧的计划草稿识别器也会把这段正式说明识别成计划候选。",
       "",

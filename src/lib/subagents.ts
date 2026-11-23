@@ -2545,7 +2545,7 @@ export function reportSubagentCapacityFailure(
   const message = error instanceof Error ? error.message : String(error || "");
   const shouldDegrade = /SUBAGENT_MEMORY_PRESSURE_DEGRADED|\b(?:oom|out of memory|memory allocation|429|524)\b|connection reset|socket hang up|gateway timeout|no visible progress|stream.*timeout/i.test(message);
   if (!shouldDegrade) return false;
-  degradedUntilByLane.set(policy.laneKey, Date.now() + 5 * 60_000);
+  degradedUntilByLane.set(policy.laneKey, Date.now() + 16_000);
   const lane = capacityLanes.get(policy.laneKey);
   if (lane) {
     lane.limit = 1;

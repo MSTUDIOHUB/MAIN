@@ -15,19 +15,19 @@ import { SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlan
 import { runtimeV2ParallelReadCount } from "./executionText";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { assessPlanSubmission } from "./planSubmissionAssessment";
-import { saveRuntimeV2PlanDraft } from "./planDraftRunner";
-import { createRuntimeV2PlanSubmissionLifecycle, recordRuntimeV2PlanSubmissionRejection, recoverPlanSubmission } from "./planSubmissionRepair";
+import { createRuntimeV2PlanSubmissionLifecycle, recoverPlanSubmission } from "./planSubmissionRepair";
 import { deriveReadOnlyRecoveryWindow } from "../../lib/runtime-v2/readOnlyProgress";
 import { isRuntimeV2LifecycleDeadlineError, runtimeV2ProviderRecoveryStallExpired } from "../../lib/runtime-v2/lifecycle";
 import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 import { runRuntimeV2PlanInterview } from "./planInterview";
 import { handlePlanQuestionTool, recoverPlanQuestion } from "./planQuestionControl";
+import { handleWorkPlanDraftRejection, maybeRecoverExhaustedPlanValidationDraft, resolvePlanVerificationPolicyResume } from "./planVerificationControl";
 import { ASK_PLAN_QUESTIONS, hasExecutablePlanChoice } from "./planQuestionTool";
-import { hashPlanDraftCandidate } from "../../lib/planDrafts";
 import { recoverPendingPlanReadBatch, replayPendingPlanReadBatch } from "./planReadRecovery";
 import { isPlanStreamRepetition, planRepetitionRecovery, restorePlanSynthesisTransport } from "./planRepetitionRecovery";
 import { planValidationRecovery } from "./planValidationRecovery";
 export type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
+
 function truncatedBeforePlanAction(result: RuntimeV2NormalizedProviderResult): boolean {
   return !result.toolCalls.length && !result.visibleText?.trim() && result.diagnostics.some(item => item.code === "output_truncated");
 }
@@ -122,6 +122,14 @@ export async function runSubmitRuntimeV2Plan(
         continue;
       }
       if (!recoveredQuestion && !recoveredSubmission && await planCollaboration.advanceProactive()) continue;
+      const policyResume = await resolvePlanVerificationPolicyResume({
+        runner: input, ledger, run: identity.run, aggregate: ledger.snapshot()!, evidence,
+        objectiveText: objective.text, criterionIds: admittedCriterionIds, revisionOf: bootstrap.revisionOf,
+        liveMessages: planCollaboration.live, executablePlanSelected,
+      });
+      if (policyResume.kind === "settled") return policyResume.settlement;
+      if (policyResume.kind === "sealed") { sealedPlan = policyResume.sealedPlan; break; }
+      const verificationPolicy = policyResume.verificationPolicy;
       const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, {
         finalTextIsProgress: false,
       });
@@ -136,6 +144,11 @@ export async function runSubmitRuntimeV2Plan(
         await planCollaboration.joinActive("plan_recovery_waits_for_active_children");
         continue;
       }
+      const draftFallback = await maybeRecoverExhaustedPlanValidationDraft({
+        runner: input, ledger, run: identity.run, aggregate: ledger.snapshot()!,
+        evidenceCount: evidence.length, validationKind: validation?.kind,
+      });
+      if (draftFallback) return draftFallback;
       if (repetition?.kind === "exhausted" || validation?.kind === "exhausted") {
         terminalFailure = {
           resultKind: "error",
@@ -450,8 +463,10 @@ export async function runSubmitRuntimeV2Plan(
           const priorReceipt = providerEvent && ledger.snapshot()!.events.some(event => event.type === "tool.completed" && event.sequence > providerEvent.sequence &&
             ledger.snapshot()!.events.some(command => command.type === "command.scheduled" && command.sequence > providerEvent.sequence &&
               command.command.idempotencyKey === event.idempotencyKey && command.command.payload.toolCallId === call.id && command.command.payload.toolName === call.name));
+          const allowManualAdvisoryValidation = verificationPolicy?.policy === "manual_advisory";
           const assessment = assessPlanSubmission({ candidate, evidence, objective: objective.text, criterionIds: admittedCriterionIds,
-            aggregate: ledger.snapshot(), decisionJournal, requireBehavioralValidation: executablePlanSelected, revisionOf: bootstrap.revisionOf, ...(providerEvent ? { createdAt: providerEvent.at } : {}),
+            aggregate: ledger.snapshot(), decisionJournal, requireBehavioralValidation: executablePlanSelected && !allowManualAdvisoryValidation,
+            allowManualAdvisoryValidation, revisionOf: bootstrap.revisionOf, ...(providerEvent ? { createdAt: providerEvent.at } : {}),
             collaborationRequired: (ledger.snapshot()?.subagentRequirement ?? input.context.turnInputContextSignals?.subagentRequirement) === "required" });
           if (draftOnlyRecovery && assessment.kind === "reviewable") continue;
           if (assessment.normalizationReasons.length) {
@@ -464,29 +479,17 @@ export async function runSubmitRuntimeV2Plan(
             });
           }
           if (assessment.kind === "draft") {
-            if (!priorReceipt) await recordRuntimeV2PlanSubmissionRejection({ ledger, run: identity.run, call, messages,
-              diagnostics: assessment.diagnostics });
-            input.logStoreEvent("runtime_v2_plan_submission_rejected", { turnId: identity.turn.turnId, runId: identity.run.runId, round,
-              diagnostics: assessment.diagnostics, normalizationReasons: assessment.normalizationReasons, submissionChars: JSON.stringify(candidate).length,
-              candidateHash: hashPlanDraftCandidate(call.arguments),
-              disposition: executablePlanSelected ? "continue_validation_readiness" : "save_reviewable_draft" });
-            if (executablePlanSelected) continue;
-            return await saveRuntimeV2PlanDraft({ runner: input, ledger, run: identity.run, call, candidate,
-              diagnostics: assessment.diagnostics, decisionJournal });
+            const draftSettlement = await handleWorkPlanDraftRejection({
+              runner: input, ledger, run: identity.run, call, candidate,
+              diagnostics: assessment.diagnostics, normalizationReasons: assessment.normalizationReasons,
+              decisionJournal, verificationPolicy, messages, round,
+              priorReceipt: Boolean(priorReceipt), executablePlanSelected,
+            });
+            if (draftSettlement) return draftSettlement;
+            continue;
           }
           sealedPlan = assessment.sealedPlan;
-          if (!priorReceipt) await settlePlanTool({
-            ledger,
-            run: identity.run,
-            call,
-            status: "succeeded",
-            evidence: [{
-              id: `work-plan:${sealedPlan.id}:${sealedPlan.revision}`,
-              kind: "tool",
-              target: WORK_PLAN_V1_SCHEMA_VERSION,
-              version: sealedPlan.digest,
-            }],
-          });
+          if (!priorReceipt) await settlePlanTool({ ledger, run: identity.run, call, status: "succeeded", evidence: [{ id: `work-plan:${sealedPlan.id}:${sealedPlan.revision}`, kind: "tool", target: WORK_PLAN_V1_SCHEMA_VERSION, version: sealedPlan.digest }] });
           if (runtimeV2PendingGuidance(ledger.snapshot())) {
             sealedPlan = null;
             messages.push({ role: "system", content: "New user guidance arrived before Plan review. Consider it before submitting again." });
@@ -495,53 +498,20 @@ export async function runSubmitRuntimeV2Plan(
           break;
         }
       }
-      const parallelReadCount = runtimeV2ParallelReadCount(
-        response.toolCalls,
-      );
+      const parallelReadCount = runtimeV2ParallelReadCount(response.toolCalls);
       for (const call of response.toolCalls) {
         if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
-        if (
-          call.name === "spawn_subagent" ||
-          call.name === "wait_subagents"
-        ) {
-          await planCollaboration.executeProviderCall(
-            call,
-            planCollaboration.current().decision,
-          );
+        if (call.name === "spawn_subagent" || call.name === "wait_subagents") {
+          await planCollaboration.executeProviderCall(call, planCollaboration.current().decision);
           continue;
         }
-        await executeReadOnlyPlanTool({
-          context: input.context,
-          ledger,
-          run: identity.run,
-          call,
-          messages,
-          evidence,
-          evidenceContents,
-          parallelReadCount,
-          ...(executablePlanSelected ? { reuseRetainedRead: { historicalReads: bootstrap.historicalReads } } : {}),
-          logStoreEvent: input.logStoreEvent,
-        });
+        await executeReadOnlyPlanTool({ context: input.context, ledger, run: identity.run, call, messages, evidence, evidenceContents, parallelReadCount,
+          ...(executablePlanSelected ? { reuseRetainedRead: { historicalReads: bootstrap.historicalReads } } : {}), logStoreEvent: input.logStoreEvent });
       }
     }
-    return settleRuntimeV2PlanCompletion(await completeRuntimeV2Plan({
-      runner: input,
-      ledger,
-      turn: identity.turn,
-      run: identity.run,
-      evidence,
-      sealedPlan,
-      terminalFailure,
-      collaboration: planCollaboration,
-    }));
+    return settleRuntimeV2PlanCompletion(await completeRuntimeV2Plan({ runner: input, ledger, turn: identity.turn, run: identity.run, evidence, sealedPlan, terminalFailure, collaboration: planCollaboration }));
   } catch (error) {
-    return settleRuntimeV2PlanCompletion(await recoverRuntimeV2PlanFailure({
-      error,
-      runner: input,
-      ledger,
-      run: identity.run,
-      collaboration: planCollaboration,
-    }));
+    return settleRuntimeV2PlanCompletion(await recoverRuntimeV2PlanFailure({ error, runner: input, ledger, run: identity.run, collaboration: planCollaboration }));
   } finally {
     planCollaboration.abortChildren("runtime_v2_plan_runner_closed");
     clearInterval(input.context.timerInterval as ReturnType<typeof setInterval>);

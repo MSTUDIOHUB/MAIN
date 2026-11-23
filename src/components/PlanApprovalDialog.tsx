@@ -29,6 +29,7 @@ export default function PlanApprovalDialog({ request, markdown, language, onClos
   }, []);
 
   const button = "rounded-lg border px-3 py-2 text-xs font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2";
+  const isManualVerification = markdown.includes("人工 / 外部验证模式");
   return createPortal(
     <dialog ref={dialogRef} aria-labelledby={titleId} aria-describedby={descriptionId} data-testid="plan-approval-dialog"
       data-request-id={request.requestId} data-artifact-hash={request.artifactHash}
@@ -41,6 +42,14 @@ export default function PlanApprovalDialog({ request, markdown, language, onClos
           <p id={descriptionId} className="mt-1 text-xs opacity-80">
             {zh ? `批准修订 ${request.planRevision} 后，MAIN 将开始执行以下计划。` : `Approving revision ${request.planRevision} starts execution of the plan below.`}
           </p>
+          {isManualVerification && (
+            <div data-testid="plan-manual-verification-notice" className="mt-2.5 rounded-lg border px-3 py-2 text-xs leading-relaxed"
+              style={{ borderColor: "color-mix(in srgb, #d97706 42%, var(--surface-border))", background: "color-mix(in srgb, #d97706 10%, var(--surface-2))", color: "var(--surface-text)" }}>
+              {zh
+                ? "人工 / 外部验证模式：本计划未绑定必选自动测试。执行完成后将生成代码改动与待你人工确认的验收清单。"
+                : "Manual / external verification mode: no required automated tests are bound. Execution will apply changes and provide a manual verification checklist."}
+            </div>
+          )}
         </header>
         <div className="min-h-0 overflow-y-auto px-5 py-4">
           <MarkdownRenderer content={markdown} sourceId={`plan-review:${request.requestId}`} />

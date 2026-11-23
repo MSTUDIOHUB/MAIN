@@ -47,3 +47,31 @@ test("question definitions reject duplicate IDs and impossible constraints", () 
     { ...questionnaire, questions: [{ ...questionnaire.questions[1], minSelections: 3 }] },
   ]) assert.equal(normalizeUserQuestionnaire(value), null);
 });
+
+test("plan_verification_confirmation purpose is accepted and validates single-choice policy answers", () => {
+  const policyQuestionnaire = normalizeUserQuestionnaire({
+    revision: 3,
+    purpose: "plan_verification_confirmation",
+    title: "确认计划验收方式",
+    questions: [{
+      id: "verification_policy",
+      prompt: "如何继续？",
+      selectionMode: "single",
+      required: true,
+      allowText: false,
+      minSelections: 1,
+      maxSelections: 1,
+      options: [
+        { id: "manual_advisory", label: "按人工 / 外部验证继续审阅" },
+        { id: "save_draft", label: "保存为可审阅的计划草稿" },
+      ],
+    }],
+  });
+  assert.ok(policyQuestionnaire);
+  assert.equal(policyQuestionnaire.purpose, "plan_verification_confirmation");
+  assert.equal(validateUserChoiceAnswer(policyQuestionnaire, {
+    requestId: "req-policy",
+    revision: 3,
+    answers: [{ questionId: "verification_policy", selectedValues: ["manual_advisory"] }],
+  }, "req-policy").ok, true);
+});

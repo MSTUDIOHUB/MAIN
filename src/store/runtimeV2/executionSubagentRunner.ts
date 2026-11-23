@@ -11,6 +11,7 @@ import { executeTool } from "../../lib/toolExecutor";
 import { getToolTarget } from "../../lib/toolTarget";
 import {
   advanceRuntimeV2ChildRecoveryStallLease,
+  buildRuntimeV2SubagentReportRepairPrompt,
   compileRuntimeV2SubagentTextReport,
   runtimeV2ChildRecoveryStallExpired,
   runtimeV2ChildEvidenceId,
@@ -154,6 +155,14 @@ function inheritedReviewEvidence(
     .slice(-16);
 }
 
+/** Return the interruption error only when the class exists in the loaded module graph. */
+function asModelLaneResourceInterruption(error: unknown): ModelLaneResourceInterruption | null {
+  return typeof ModelLaneResourceInterruption === "function" &&
+      error instanceof ModelLaneResourceInterruption
+    ? error
+    : null;
+}
+
 function completedChildResult(input: {
   readonly job: RuntimeV2SubagentJob;
   readonly summary: string;
@@ -176,6 +185,40 @@ function completedChildResult(input: {
     inheritedEvidence: input.inheritedEvidence,
     evidence: input.evidence,
     stagedMutations: input.stagedMutations,
+  };
+}
+
+/** Build the terminal degraded/canceled/failed child result and close child telemetry. */
+function childFailureResult(input: {
+  readonly job: RuntimeV2SubagentJob;
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+  readonly recoveryStalled: boolean;
+  readonly evidence: readonly RuntimeV2EvidenceReference[];
+  readonly inheritedEvidence: readonly RuntimeV2EvidenceReference[];
+  readonly error?: unknown;
+  readonly telemetry?: { closedAt: number | null };
+  readonly now: number;
+}): RuntimeV2ChildResult {
+  const deadlineExceeded = runtimeV2ChildDeadlineExceeded({ signal: input.signal, deadlineAt: input.deadlineAt });
+  const canceled = input.signal.aborted && !deadlineExceeded;
+  const resource = !canceled ? asModelLaneResourceInterruption(input.error)?.causeKind : undefined;
+  const status = canceled ? "canceled" : resource || input.evidence.length > 0 ? "degraded" : "failed";
+  if (input.telemetry) input.telemetry.closedAt = input.now;
+  return {
+    job: input.job,
+    status,
+    ...(resource ? { resourceInterruption: resource } : {}),
+    summary: runtimeV2SubagentFailureSummary({
+      canceled,
+      recoveryStalled: input.recoveryStalled,
+      deadlineExceeded,
+      ...(resource ? { resource } : {}),
+      evidence: input.evidence,
+    }),
+    report: null,
+    inheritedEvidence: input.inheritedEvidence,
+    evidence: input.evidence,
   };
 }
 
@@ -300,6 +343,7 @@ async function runRuntimeV2Child(input: {
     ),
   );
   let ordinal = 0;
+  let reportRepairAttempts = 0;
   let recoveryLease: RuntimeV2ChildRecoveryStallLease | null = null;
   let recoveryStalled = false;
   const rejectedClosedActionIdentities = new Set<string>();
@@ -319,7 +363,7 @@ async function runRuntimeV2Child(input: {
           recoveryOccurrence: recoveryLease?.occurrence || 0,
         });
       } catch (error) {
-        if (error instanceof ModelLaneResourceInterruption) throw error;
+        if (asModelLaneResourceInterruption(error)) throw error;
         if (
           evidence.length + inheritedEvidence.length > 0 &&
           !input.signal.aborted
@@ -353,16 +397,41 @@ async function runRuntimeV2Child(input: {
           if (telemetry) telemetry.closedAt = input.ports.now();
           return completed;
         } catch (error) {
-          input.ports.logStoreEvent(
-            "runtime_v2_subagent_report_rejected",
-            {
+          const reason = error instanceof Error ? error.message : String(error);
+          if (
+            reason.startsWith("RUNTIME_V2_SUBAGENT_REPORT_INVALID") &&
+            evidence.length + inheritedEvidence.length > 0 &&
+            reportRepairAttempts < 1 &&
+            !input.signal.aborted &&
+            Date.now() < deadlineAt
+          ) {
+            reportRepairAttempts += 1;
+            input.ports.logStoreEvent("runtime_v2_subagent_report_repair_requested", {
               turnId: input.job.run.turnId,
               runId: input.job.run.runId,
               jobId: input.job.id,
               evidenceCount: evidence.length,
-              reason: error instanceof Error ? error.message : String(error),
-            },
-          );
+              reason,
+            });
+            if (summary.trim()) messages.push({ role: "assistant", content: summary });
+            messages.push({
+              role: "user",
+              content: buildRuntimeV2SubagentReportRepairPrompt({
+                evidence,
+                inheritedEvidence,
+                sourceEvidenceIds,
+                hasPreviousSummary: Boolean(summary.trim()),
+              }),
+            });
+            continue;
+          }
+          input.ports.logStoreEvent("runtime_v2_subagent_report_rejected", {
+            turnId: input.job.run.turnId,
+            runId: input.job.run.runId,
+            jobId: input.job.id,
+            evidenceCount: evidence.length,
+            reason,
+          });
           break;
         }
       }
@@ -643,58 +712,28 @@ async function runRuntimeV2Child(input: {
       }
     }
   } catch (error) {
-    const deadlineExceeded = runtimeV2ChildDeadlineExceeded({
+    return childFailureResult({
+      job: input.job,
       signal: input.signal,
       deadlineAt,
-    });
-    const canceled = input.signal.aborted && !deadlineExceeded;
-    const resource = !canceled && error instanceof ModelLaneResourceInterruption ? error.causeKind : undefined;
-    const status = canceled
-      ? "canceled"
-      : resource || evidence.length > 0
-        ? "degraded"
-        : "failed";
-    if (telemetry) telemetry.closedAt = input.ports.now();
-    return {
-      job: input.job,
-      status,
-      ...(resource ? { resourceInterruption: resource } : {}),
-      summary: runtimeV2SubagentFailureSummary({
-        canceled,
-        recoveryStalled,
-        deadlineExceeded,
-        resource,
-        evidence,
-      }),
-      report: null,
-      inheritedEvidence,
+      recoveryStalled,
       evidence,
-    };
+      inheritedEvidence,
+      error,
+      telemetry,
+      now: input.ports.now(),
+    });
   }
-  const deadlineExceeded = runtimeV2ChildDeadlineExceeded({
+  return childFailureResult({
+    job: input.job,
     signal: input.signal,
     deadlineAt,
-  });
-  const canceled = input.signal.aborted && !deadlineExceeded;
-  const status = canceled
-    ? "canceled"
-    : evidence.length > 0
-      ? "degraded"
-      : "failed";
-  if (telemetry) telemetry.closedAt = input.ports.now();
-  return {
-    job: input.job,
-    status,
-    summary: runtimeV2SubagentFailureSummary({
-      canceled,
-      recoveryStalled,
-      deadlineExceeded,
-      evidence,
-    }),
-    report: null,
-    inheritedEvidence,
+    recoveryStalled,
     evidence,
-  };
+    inheritedEvidence,
+    telemetry,
+    now: input.ports.now(),
+  });
 }
 
 export async function startRuntimeV2Child(

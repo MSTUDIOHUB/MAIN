@@ -9,122 +9,90 @@ import {
 } from "../../lib/runtime-v2";
 import type { RuntimeV2ExecutionPortsInput } from "./executionContext";
 import { aggregateForCurrentTurn } from "./executionAggregate";
-import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
-import {
-  assertRuntimeV2SubagentScheduleRunway,
-  closeCollaborationToolCall,
-} from "./executionSchedulerAdmission";
-import {
-  runtimeV2ModelSelectedSubagentCandidate,
-  runtimeV2SubagentCapacityFromCommand,
-} from "./executionSubagentCandidate";
+import { assertRuntimeV2SubagentScheduleRunway, closeCollaborationToolCall } from "./executionSchedulerAdmission";
+import { runtimeV2ModelSelectedSubagentCandidate, runtimeV2SubagentCapacityFromCommand } from "./executionSubagentCandidate";
 import { startRuntimeV2Child } from "./executionSubagentRunner";
-import { commitCompletedRuntimeV2ChildTransaction } from "./executionSubagentJoin";
+import {
+  closeNoActiveSubagentWaitCall,
+  commitCompletedRuntimeV2ChildTransaction,
+  formatRuntimeV2SubagentJoinResults,
+  recordRuntimeV2JoinedChildAnchor,
+  writeRuntimeV2SettledBatchAnchor,
+} from "./executionSubagentJoin";
 import { runtimeV2ParentOverlapDiagnostics } from "./executionSubagentOverlap";
-import {
-  parentHasImplementationSourceAuthority,
-} from "./executionSubagentAuthority";
+import { parentHasImplementationSourceAuthority } from "./executionSubagentAuthority";
 import type { RuntimeV2ChildResult } from "./executionTypes";
-import {
-  deriveRuntimeV2ExecutionContract,
-  runtimeV2ExecutionContractAllowsTargets,
-} from "./executionContract";
-import {
-  deriveRuntimeV2ValidationCorrectionWindow,
-} from "./executionValidationCorrection";
+import { deriveRuntimeV2ExecutionContract, runtimeV2ExecutionContractAllowsTargets } from "./executionContract";
+import { deriveRuntimeV2ValidationCorrectionWindow } from "./executionValidationCorrection";
 
-export function createRuntimeV2SchedulerPort(
-  input: RuntimeV2ExecutionPortsInput,
-): SchedulerPort {
+function fallbackScheduleScopeKey(command: Parameters<NonNullable<SchedulerPort["prepareSchedule"]>>[0]["command"]): string {
+  const args = command.payload.arguments && typeof command.payload.arguments === "object" && !Array.isArray(command.payload.arguments)
+    ? command.payload.arguments as Record<string, unknown>
+    : {};
+  return (typeof args.task_key === "string" && args.task_key.trim().slice(0, 256)) ||
+    (typeof command.payload.toolCallId === "string" && command.payload.toolCallId.trim().slice(0, 256)) ||
+    command.idempotencyKey.slice(0, 256);
+}
+
+export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput): SchedulerPort {
   return {
     async prepareSchedule({ command }) {
       if (command.kind !== "schedule_subagents") return null;
       assertRuntimeV2SubagentScheduleRunway(input, command);
-      const existingJobs =
-        (aggregateForCurrentTurn(input)?.subagents || []).filter((job) =>
-          job.parentRunId === command.run.runId
-        );
+      const existingJobs = (aggregateForCurrentTurn(input)?.subagents || []).filter((job) =>
+        job.parentRunId === command.run.runId
+      );
       const requestCapacity = runtimeV2SubagentCapacityFromCommand(command);
       if (requestCapacity <= 0) {
-        const detail =
-          "The current provider lane does not admit child requests. Continue the parent task directly.";
-        closeCollaborationToolCall(
-          input,
-          command,
-          `SUBAGENT_SCHEDULE_REJECTED: ${detail}`,
-        );
+        const detail = "The current provider lane does not admit child requests. Continue the parent task directly.";
+        closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED: ${detail}`);
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          reason: "child_request_capacity_unavailable",
-          requestCapacity,
+          turnId: command.run.turnId, runId: command.run.runId,
+          reason: "child_request_capacity_unavailable", requestCapacity,
         });
         throw new Error(detail);
       }
+      let candidateScopeKey = fallbackScheduleScopeKey(command);
       let decision;
       try {
         const candidate = runtimeV2ModelSelectedSubagentCandidate(command);
+        candidateScopeKey = candidate.scopeKey;
         const aggregate = aggregateForCurrentTurn(input);
-        if (
-          (candidate.taskKind === "implement" ||
-            candidate.accessMode === "write") &&
-          aggregate?.strategy !== "execute"
-        ) {
-          throw new Error(
-            "Only an Execute Run may delegate an implement/write child; planning and analysis children are read-only.",
-          );
+        if ((candidate.taskKind === "implement" || candidate.accessMode === "write") && aggregate?.strategy !== "execute") {
+          throw new Error("Only an Execute Run may delegate an implement/write child; planning and analysis children are read-only.");
         }
-        if (
-          candidate.taskKind === "implement" &&
-          candidate.accessMode === "write" &&
-          aggregate?.strategy === "execute"
-        ) {
-          const executionContract =
-            deriveRuntimeV2ExecutionContract(aggregate);
-          const validationCorrection =
-            deriveRuntimeV2ValidationCorrectionWindow(aggregate);
+        if (candidate.taskKind === "implement" && candidate.accessMode === "write" && aggregate?.strategy === "execute") {
+          const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
+          const validationCorrection = deriveRuntimeV2ValidationCorrectionWindow(aggregate);
           if (!executionContract && !validationCorrection.active) {
             throw new Error(
               "implement subagents require a recorded parent execution contract; use a read-only child until the parent has an evidence-backed solution.",
             );
           }
-          if (
-            executionContract &&
-            !validationCorrection.active &&
-            !runtimeV2ExecutionContractAllowsTargets({
-              contract: executionContract,
-              targets: candidate.allowedPaths,
-            })
-          ) {
-            throw new Error(
-              "implement subagent write paths must be exact mutation targets in the current parent execution contract.",
-            );
+          if (executionContract && !validationCorrection.active &&
+              !runtimeV2ExecutionContractAllowsTargets({ contract: executionContract, targets: candidate.allowedPaths })) {
+            throw new Error("implement subagent write paths must be exact mutation targets in the current parent execution contract.");
           }
         }
-        if (!parentHasImplementationSourceAuthority({
-          ports: input,
-          candidate,
-        })) {
+        if (!parentHasImplementationSourceAuthority({ ports: input, candidate })) {
           throw new Error(
             "implement subagents may modify or delete only after the parent has versioned source evidence for every exact assigned file path.",
           );
         }
         decision = scheduleRuntimeV2Subagents({
-          parentRun: command.run,
-          candidates: [candidate],
-          existingJobs,
-          maxActiveJobs: requestCapacity,
-          requestedAt: input.now(),
-          nextId: input.nextId,
+          parentRun: command.run, candidates: [candidate], existingJobs,
+          maxActiveJobs: requestCapacity, requestedAt: input.now(), nextId: input.nextId,
         });
       } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
         closeCollaborationToolCall(
           input,
           command,
-          `SUBAGENT_SCHEDULE_REJECTED: ${
-            error instanceof Error ? error.message : String(error)
-          } If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.`,
+          `SUBAGENT_SCHEDULE_REJECTED: ${reason} If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.`,
         );
+        input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
+          turnId: command.run.turnId, runId: command.run.runId, reason, scopeKey: candidateScopeKey,
+        });
         throw error;
       }
       if (decision.jobs.length !== 1) {
@@ -133,41 +101,29 @@ export function createRuntimeV2SchedulerPort(
           `or violates the access/scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
           }. If required collaboration is still pending, delegate a genuinely different task; otherwise continue the parent task.`;
-        closeCollaborationToolCall(
-          input,
-          command,
-          `SUBAGENT_SCHEDULE_REJECTED: ${detail}`,
-        );
+        closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED: ${detail}`);
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
           turnId: command.run.turnId,
           runId: command.run.runId,
           rejectedScopeKeys: decision.rejectedScopeKeys,
           activeTaskHandles: existingJobs
-            .filter((job) =>
-              job.status === "queued" || job.status === "running"
-            )
+            .filter((job) => job.status === "queued" || job.status === "running")
             .map(runtimeV2SubagentModelHandle),
         });
-        throw new Error(
-          detail,
-        );
+        throw new Error(detail);
       }
       return {
         type: "subagents.scheduled",
         run: command.run,
-        maxActiveSubagents:
-          runtimeV2SubagentCapacityFromCommand(command),
+        maxActiveSubagents: runtimeV2SubagentCapacityFromCommand(command),
         jobs: decision.jobs,
       };
     },
     async execute({ command, signal, scheduledSubagents }) {
-      const runSubagents = (scheduledSubagents || []).filter((job) =>
-        job.parentRunId === command.run.runId
-      );
+      const runSubagents = (scheduledSubagents || []).filter((job) => job.parentRunId === command.run.runId);
       if (command.kind === "schedule_subagents") {
         const jobs = runSubagents.filter((job) =>
-          (job.status === "queued" || job.status === "running") &&
-          runtimeV2JobMatchesSchedule(job, command)
+          (job.status === "queued" || job.status === "running") && runtimeV2JobMatchesSchedule(job, command)
         );
         if (jobs.length === 0) {
           closeCollaborationToolCall(
@@ -175,143 +131,82 @@ export function createRuntimeV2SchedulerPort(
             command,
             "SUBAGENT_SCHEDULE_REJECTED: no committed child matched this request. If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.",
           );
-          throw new Error(
-            "Runtime v2 scheduler could not resolve the child job committed for this spawn_subagent call.",
-          );
+          throw new Error("Runtime v2 scheduler could not resolve the child job committed for this spawn_subagent call.");
         }
         const events: RuntimeV2EventDraft[] = [];
         input.logStoreEvent("runtime_v2_subagent_batch_starting", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
+          turnId: command.run.turnId, runId: command.run.runId,
           sessionKey: command.run.sessionKey, commandKey: command.idempotencyKey,
           jobCount: jobs.length,
-          modelRequestMode: String(
-            command.payload.collaborationRequestMode || "serialized",
-          ),
+          modelRequestMode: String(command.payload.collaborationRequestMode || "serialized"),
           scopes: jobs.map((job) => job.scopeKey),
-          tasks: jobs.map((job) => ({
-            id: job.id,
-            taskKind: job.taskKind,
-            allowedPathCount: job.allowedPaths.length,
-          })),
-          concurrent: runSubagents.filter((job) =>
-            job.status === "queued" || job.status === "running"
-          ).length > 1,
+          tasks: jobs.map((job) => ({ id: job.id, taskKind: job.taskKind, allowedPathCount: job.allowedPaths.length })),
+          concurrent: runSubagents.filter((job) => job.status === "queued" || job.status === "running").length > 1,
           resumed: jobs.some((job) => job.status === "running"),
         });
         for (const job of jobs) {
           if (!input.live.childRuns.has(job.id)) {
-            input.live.childTelemetry.set(job.id, {
-              firstTokenAt: job.firstTokenAt,
-              closedAt: job.closedAt,
-            });
+            input.live.childTelemetry.set(job.id, { firstTokenAt: job.firstTokenAt, closedAt: job.closedAt });
             if (job.taskKind === "implement" && job.accessMode === "write") {
               input.live.childWriteScopes.set(job.id, [...job.allowedPaths]);
             }
-            input.live.childRuns.set(
-              job.id,
-              startRuntimeV2Child(input, job, signal),
-            );
+            input.live.childRuns.set(job.id, startRuntimeV2Child(input, job, signal));
           }
           if (job.status === "queued") {
             input.logStoreEvent("runtime_v2_subagent_request_opened", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              jobId: job.id,
-              scopeKey: job.scopeKey,
-              allowedPaths: job.allowedPaths,
-              taskKind: job.taskKind || "explore",
-              accessMode: job.accessMode || "read",
-              implementationOperation:
-                job.implementationOperation || null,
-              startedInPhase: command.phase,
+              turnId: command.run.turnId, runId: command.run.runId,
+              jobId: job.id, scopeKey: job.scopeKey, allowedPaths: job.allowedPaths,
+              taskKind: job.taskKind || "explore", accessMode: job.accessMode || "read",
+              implementationOperation: job.implementationOperation || null, startedInPhase: command.phase,
             });
-            events.push({
-              type: "subagent.telemetry",
-              run: command.run,
-              telemetry: {
-                jobId: job.id,
-                phase: "request_opened",
-                at: input.now(),
-              },
-            });
+            events.push({ type: "subagent.telemetry", run: command.run, telemetry: { jobId: job.id, phase: "request_opened", at: input.now() } });
           } else {
             input.logStoreEvent("runtime_v2_subagent_request_resumed", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              jobId: job.id,
-              scopeKey: job.scopeKey,
+              turnId: command.run.turnId, runId: command.run.runId, jobId: job.id, scopeKey: job.scopeKey,
             });
           }
         }
-        closeCollaborationToolCall(
-          input,
-          command,
-          [
-            "SUBAGENT_STARTED",
-            `Handles: ${jobs.map(runtimeV2SubagentModelHandle).join(", ")}`,
-            "Continue independent parent work. Use wait_subagents only when a child result becomes a dependency.",
-          ].join("\n"),
-        );
+        closeCollaborationToolCall(input, command, [
+          "SUBAGENT_STARTED",
+          `Handles: ${jobs.map(runtimeV2SubagentModelHandle).join(", ")}`,
+          "Continue independent parent work. Use wait_subagents only when a child result becomes a dependency.",
+        ].join("\n"));
         return events;
       }
       if (command.kind === "join_subagents") {
         const runSubagentIds = new Set(runSubagents.map((job) => job.id));
         const jobIds = Array.isArray(command.payload.jobIds)
-          ? command.payload.jobIds
-              .map((value) => String(value || ""))
-              .filter((jobId) => !!jobId && runSubagentIds.has(jobId))
+          ? command.payload.jobIds.map((value) => String(value || "")).filter((jobId) => !!jobId && runSubagentIds.has(jobId))
           : [];
-        const requestedJobIds =
-          Array.isArray(command.payload.requestedJobIds)
-            ? command.payload.requestedJobIds
-                .map((value) => String(value || "").trim())
-                .filter(Boolean)
-            : [];
-        const automaticJoinReason =
-          typeof command.payload.automaticJoinReason === "string"
-            ? command.payload.automaticJoinReason
-            : "";
+        const requestedJobIds = Array.isArray(command.payload.requestedJobIds)
+          ? command.payload.requestedJobIds.map((value) => String(value || "").trim()).filter(Boolean)
+          : [];
+        const automaticJoinReason = typeof command.payload.automaticJoinReason === "string" ? command.payload.automaticJoinReason : "";
         if (requestedJobIds.length > 0 && jobIds.length === 0) {
           const activeTaskHandles = runSubagents
-            .filter((job) =>
-              job.status === "queued" || job.status === "running"
-            )
+            .filter((job) => job.status === "queued" || job.status === "running")
             .map(runtimeV2SubagentModelHandle);
-          const detail =
-            `wait_subagents did not match an active child task handle: ${
-              requestedJobIds.join(", ")
-            }. Active handles: ${activeTaskHandles.join(", ") || "none"}.`;
+          const detail = `wait_subagents did not match an active child task handle: ${requestedJobIds.join(", ")}. Active handles: ${activeTaskHandles.join(", ") || "none"}.`;
           input.logStoreEvent("runtime_v2_subagent_reference_rejected", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            requestedJobIds,
-            activeTaskHandles,
+            turnId: command.run.turnId, runId: command.run.runId, requestedJobIds, activeTaskHandles,
           });
-          closeCollaborationToolCall(
-            input,
-            command,
-            `SUBAGENT_WAIT_REJECTED: ${detail} Continue independent parent work.`,
-          );
-          throw new Error(
-            detail,
-          );
+          closeCollaborationToolCall(input, command, `SUBAGENT_WAIT_REJECTED: ${detail} Continue independent parent work.`);
+          throw new Error(detail);
+        }
+        const hasToolCallId = typeof command.payload.toolCallId === "string" && command.payload.toolCallId.trim().length > 0;
+        if (hasToolCallId && jobIds.length === 0 && requestedJobIds.length === 0) {
+          closeNoActiveSubagentWaitCall(input, command);
+          return [];
         }
         if (jobIds.length > 0) {
           if (automaticJoinReason) {
             input.logStoreEvent("runtime_v2_subagent_auto_join", {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              jobIds,
-              reason: automaticJoinReason,
+              turnId: command.run.turnId, runId: command.run.runId, jobIds, reason: automaticJoinReason,
             });
           }
           input.logStoreEvent("runtime_v2_subagent_wait_requested", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            jobIds,
-            finalJoin: command.payload.finalJoin === true,
-            automaticJoinReason: automaticJoinReason || null,
+            turnId: command.run.turnId, runId: command.run.runId, jobIds,
+            finalJoin: command.payload.finalJoin === true, automaticJoinReason: automaticJoinReason || null,
           });
         }
         if (command.payload.cancelUnusedProactive === true ||
@@ -325,34 +220,18 @@ export function createRuntimeV2SchedulerPort(
         const rawResults = await Promise.all(jobIds.map(async (jobId) => {
           const promise = input.live.childRuns.get(jobId);
           if (promise) return await promise;
-          const job = runSubagents.find(
-            (candidate) => candidate.id === jobId,
-          );
-          return job
-            ? {
-                job,
-                status: "failed" as const,
-                summary:
-                  "子智能体请求在进程重启后无法继续；已结束该子任务并保留父任务证据。",
-                report: null,
-                inheritedEvidence: [],
-                evidence: [],
-              }
-            : null;
+          const job = runSubagents.find((candidate) => candidate.id === jobId);
+          return job ? {
+            job, status: "failed" as const,
+            summary: "子智能体请求在进程重启后无法继续；已结束该子任务并保留父任务证据。",
+            report: null, inheritedEvidence: [], evidence: [],
+          } : null;
         }));
         const results: Array<RuntimeV2ChildResult | null> = [];
         for (const result of rawResults) {
-          if (!result) {
-            results.push(null);
-            continue;
-          }
+          if (!result) { results.push(null); continue; }
           try {
-            results.push(await commitCompletedRuntimeV2ChildTransaction({
-              ports: input,
-              command,
-              result,
-              signal,
-            }));
+            results.push(await commitCompletedRuntimeV2ChildTransaction({ ports: input, command, result, signal }));
           } finally {
             input.live.childWriteScopes.delete(result.job.id);
           }
@@ -361,172 +240,64 @@ export function createRuntimeV2SchedulerPort(
         const observedJobs: RuntimeV2SubagentJob[] = [];
         for (const result of results) {
           if (!result) continue;
-          const committedJob = runSubagents.find(
-            (job) => job.id === result.job.id,
-          );
-          const telemetry =
-            input.live.childTelemetry.get(result.job.id);
+          const committedJob = runSubagents.find((job) => job.id === result.job.id);
+          const telemetry = input.live.childTelemetry.get(result.job.id);
           if (committedJob?.status === "queued") {
-            events.push({
-              type: "subagent.telemetry",
-              run: command.run,
-              telemetry: {
-                jobId: result.job.id,
-                phase: "request_opened",
-                at: input.now(),
-              },
-            });
+            events.push({ type: "subagent.telemetry", run: command.run, telemetry: { jobId: result.job.id, phase: "request_opened", at: input.now() } });
           }
           if (telemetry && telemetry.firstTokenAt !== null) {
-            events.push({
-              type: "subagent.telemetry",
-              run: command.run,
-              telemetry: {
-                jobId: result.job.id,
-                phase: "first_token",
-                at: telemetry.firstTokenAt,
-              },
-            });
+            events.push({ type: "subagent.telemetry", run: command.run, telemetry: { jobId: result.job.id, phase: "first_token", at: telemetry.firstTokenAt } });
           }
+          events.push({ type: "subagent.telemetry", run: command.run, telemetry: { jobId: result.job.id, phase: "closed", at: telemetry?.closedAt || input.now() } });
           events.push({
-            type: "subagent.telemetry",
-            run: command.run,
-            telemetry: {
-              jobId: result.job.id,
-              phase: "closed",
-              at: telemetry?.closedAt || input.now(),
-            },
-          });
-          events.push({
-            type: "subagent.completed",
-            run: command.run,
-            jobId: result.job.id,
-            status: result.status,
+            type: "subagent.completed", run: command.run, jobId: result.job.id, status: result.status,
             ...(result.resourceInterruption ? { resourceInterruption: result.resourceInterruption } : {}),
             summary: result.summary,
-            ...(result.inheritedEvidence.length > 0
-              ? { inheritedEvidence: result.inheritedEvidence }
-              : {}),
+            ...(result.inheritedEvidence.length > 0 ? { inheritedEvidence: result.inheritedEvidence } : {}),
             evidence: result.evidence,
             ...(result.report ? { report: result.report } : {}),
           });
           observedJobs.push({
-            ...result.job,
-            status: result.status,
-            firstTokenAt: telemetry?.firstTokenAt || null,
-            closedAt: telemetry?.closedAt || input.now(),
-            summary: result.summary,
-            report: result.report,
+            ...result.job, status: result.status,
+            firstTokenAt: telemetry?.firstTokenAt || null, closedAt: telemetry?.closedAt || input.now(),
+            summary: result.summary, report: result.report,
           });
-          const contextEntryId = `child:${result.job.id}`;
-          const evidenceIds = [...new Set(
-            result.evidence.map((evidence) => evidence.id),
-          )];
-          const contextContent = [
-            `Scope: ${result.job.scopeKey} (${
-              result.job.allowedPaths.join(", ")
-            })`,
-            `Status: ${result.status}`,
-            `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
-            `Report: ${result.summary}`,
-            evidenceIds.length > 0
-              ? "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer."
-              : "No child evidence id is available for parent adoption; continue the objective directly.",
-          ].join("\n");
-          upsertRuntimeV2ContextAnchor(input.live, {
-            key: contextEntryId,
-            content: contextContent,
-          });
-          const deliveredContext = input.live.messages.find((message) =>
-            message.role === "system" &&
-            typeof message.content === "string" &&
-            message.content.startsWith(
-              `[runtime-v2 context: ${contextEntryId}]`,
-            ) &&
-            message.content.includes(
-              `Report: ${result.summary}`,
-            ) &&
-            message.content.includes(
-              `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
-            )
-          );
-          if (deliveredContext) {
+          const handoff = recordRuntimeV2JoinedChildAnchor(input.live, result);
+          if (handoff.delivered) {
             events.push({
-              type: "subagent.handoff_delivered",
-              run: command.run,
-              jobId: result.job.id,
-              contextEntryId,
-              evidenceIds,
+              type: "subagent.handoff_delivered", run: command.run, jobId: result.job.id,
+              contextEntryId: handoff.contextEntryId, evidenceIds: handoff.evidenceIds,
             });
           }
           input.logStoreEvent("runtime_v2_subagent_joined", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            jobId: result.job.id,
-            status: result.status,
-            firstTokenAt: telemetry?.firstTokenAt || null,
-            closedAt: telemetry?.closedAt || null,
-            evidenceTargets: result.evidence.map(
-              (evidence) => evidence.target,
-            ),
-            structuredReport: !!result.report,
+            turnId: command.run.turnId, runId: command.run.runId, jobId: result.job.id, status: result.status,
+            firstTokenAt: telemetry?.firstTokenAt || null, closedAt: telemetry?.closedAt || null,
+            evidenceTargets: result.evidence.map((evidence) => evidence.target), structuredReport: !!result.report,
           });
           input.live.childRuns.delete(result.job.id);
         }
         const aggregate = aggregateForCurrentTurn(input);
-        const observedById = new Map(
-          observedJobs.map((job) => [job.id, job]),
-        );
+        const observedById = new Map(observedJobs.map((job) => [job.id, job]));
         const allObservedJobs = (aggregate?.subagents || [])
           .filter((job) => job.parentRunId === command.run.runId)
           .map((job) => observedById.get(job.id) || job);
         for (const job of observedJobs) {
-          if (!allObservedJobs.some((candidate) => candidate.id === job.id)) {
-            allObservedJobs.push(job);
-          }
+          if (!allObservedJobs.some((candidate) => candidate.id === job.id)) allObservedJobs.push(job);
         }
-        const concurrency =
-          deriveRuntimeV2SubagentConcurrency(allObservedJobs);
-        const overlapDiagnostics = runtimeV2ParentOverlapDiagnostics({
-          jobs: allObservedJobs,
-          aggregate,
-          measuredAt: input.now(),
-        });
+        const concurrency = deriveRuntimeV2SubagentConcurrency(allObservedJobs);
+        const overlapDiagnostics = runtimeV2ParentOverlapDiagnostics({ jobs: allObservedJobs, aggregate, measuredAt: input.now() });
         input.logStoreEvent("runtime_v2_subagent_batch_joined", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          jobCount: observedJobs.length,
-          peakInFlight: concurrency.peakInFlight,
-          hasRequestOverlap: concurrency.hasRequestOverlap,
-          ...overlapDiagnostics,
+          turnId: command.run.turnId, runId: command.run.runId, jobCount: observedJobs.length,
+          peakInFlight: concurrency.peakInFlight, hasRequestOverlap: concurrency.hasRequestOverlap, ...overlapDiagnostics,
         });
-        closeCollaborationToolCall(
-          input,
-          command,
-          [
-            "SUBAGENT_RESULTS",
-            ...results.flatMap((result) => result
-              ? [
-                  `Handle: ${runtimeV2SubagentModelHandle(result.job)}`,
-                  `Status: ${result.status}`,
-                  `Evidence ids: ${
-                    result.evidence.map((evidence) => evidence.id)
-                      .join(", ") || "none"
-                  }`,
-                  `Summary: ${result.summary}`,
-                ]
-              : []),
-            observedJobs.some((job) => job.status !== "completed")
-              ? "One or more child tasks did not complete. Continue the objective directly using any retained evidence."
-              : "Apply child findings only when they are relevant to the parent objective.",
-            "When relying on a child fact, explicitly cite its exact evidence id. An uncited child result remains delivered but not adopted.",
-          ].join("\n"),
-        );
+        const remainingActiveJobs = allObservedJobs.filter((job) => job.status === "queued" || job.status === "running");
+        if (!hasToolCallId && observedJobs.length > 0 && remainingActiveJobs.length === 0) {
+          writeRuntimeV2SettledBatchAnchor(input.live, allObservedJobs, observedJobs.length);
+        }
+        closeCollaborationToolCall(input, command, formatRuntimeV2SubagentJoinResults(results, observedJobs));
         return events;
       }
-      throw new Error(
-        `Unsupported Runtime v2 scheduler command: ${command.kind}`,
-      );
+      throw new Error(`Unsupported Runtime v2 scheduler command: ${command.kind}`);
     },
   };
 }

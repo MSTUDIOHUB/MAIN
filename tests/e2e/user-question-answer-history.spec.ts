@@ -90,7 +90,11 @@ test("a restored validation question opens the hidden capsule and resumes the or
   expect(turnId).toBeTruthy();
   expect(runId).toBeTruthy();
   await form.getByRole("radio", { name: /桌面应用/ }).check();
+  await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
+  await form.getByRole("button", { name: "下一题 →", exact: true }).click();
   await form.getByRole("checkbox", { name: "单元验证", exact: true }).check();
+  await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
+  await form.getByRole("button", { name: "下一题 →", exact: true }).click();
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
   await expect(form).toHaveCount(0);
   await page.evaluate(async () => {
@@ -153,10 +157,15 @@ for (const theme of ["light", "dark", "black"] as const) {
     const history = page.getByTestId("user-question-answer-history");
     await expect(history).toHaveCount(0);
     await form.getByRole("radio", { name: /桌面应用/ }).check();
+    await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
+    await form.getByRole("button", { name: "下一题 →", exact: true }).click();
     await form.getByRole("checkbox", { name: "单元验证", exact: true }).check();
     await form.getByRole("checkbox", { name: "界面验证", exact: true }).check();
+    await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
+    await form.getByRole("button", { name: "下一题 →", exact: true }).click();
     await form.getByRole("textbox", { name: "还有哪些补充要求？", exact: true }).fill("保留现有资料。\n全程离线运行。");
     await expect(history).toHaveCount(0);
+    await expect(form.getByRole("button", { name: "下一题 →", exact: true })).toHaveCount(0);
     await form.getByRole("button", { name: "确认并继续", exact: true }).click();
     await expect.poll(() => page.evaluate(() => (window as any).__QUESTION_HISTORY_DISPATCHES__.length)).toBe(1);
     await expect(history).toBeVisible();
@@ -200,5 +209,177 @@ for (const theme of ["light", "dark", "black"] as const) {
     await expect(rows.nth(0)).toContainText("桌面应用");
     await expect(rows.nth(2)).toContainText("全程离线运行。");
     await expect(history).toBeVisible();
+  });
+
+  test(`anchored questionnaire blocks deduplicate ChatArea bubbles and smart-collapse long rounds in ${theme}`, async ({ page }, testInfo) => {
+    await mountPlanQuestions(page, theme);
+    await page.evaluate(async () => {
+      const store = await import("/src/store/useAppStore.ts");
+      const runtime = await import("/src/lib/runtime-v2/index.ts");
+      const state = store.useAppStore.getState();
+      const marker = state.harnessRunMarker!;
+      const turn = {
+        workspaceKey: state.currentWorkspace!,
+        sessionKey: marker.sessionKey,
+        sessionEpoch: "plan-session-e2e-awaiting-choice",
+        clientSubmissionId: "submit-dedupe-collapse",
+        turnId: marker.turnId,
+      };
+      const run = {
+        sessionKey: turn.sessionKey,
+        sessionEpoch: turn.sessionEpoch,
+        turnId: turn.turnId,
+        runId: marker.runId,
+        parentRunId: null,
+        attemptId: "attempt-dedupe-collapse",
+      };
+      let sequence = 0;
+      const event = (type: string, fields: any) => ({
+        schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+        type,
+        eventId: `dedupe-collapse-${sequence}`,
+        sequence: sequence++,
+        at: Date.now() + sequence,
+        ...fields,
+      });
+      const q1 = {
+        revision: 1,
+        purpose: "plan_interview",
+        title: "MFramework 框架设计关键决策",
+        summary: "请确认架构与核心模块",
+        questions: [
+          { id: "arch", prompt: "核心架构模式？", selectionMode: "single", required: true, options: [{ id: "mvp", label: "轻量 MVP" }, { id: "ecs", label: "ECS 模式" }] },
+          { id: "scope", prompt: "优先交付范围？", selectionMode: "single", required: true, options: [{ id: "core", label: "DI 与对象池骨架" }, { id: "full", label: "全量工具集" }] },
+        ],
+      };
+      const q2 = {
+        revision: 2,
+        purpose: "plan_interview",
+        title: "验证与测试方式确认",
+        summary: "请确认编译与验证边界",
+        questions: [
+          { id: "test_mode", prompt: "自动化测试策略？", selectionMode: "single", required: true, options: [{ id: "no_test", label: "暂不搭建测试" }, { id: "nunit", label: "引入 EditMode 测试" }] },
+          { id: "compile_check", prompt: "编译验证环境？", selectionMode: "single", required: true, options: [{ id: "unity_compile", label: "仅在 Unity 编译检查" }, { id: "cli", label: "命令行批处理编译" }] },
+          { id: "scene_verify", prompt: "场景验证方式？", selectionMode: "single", required: true, options: [{ id: "manual", label: "人工示例场景验证" }, { id: "auto", label: "自动冒烟脚本" }] },
+          { id: "extra_note", prompt: "额外说明？", selectionMode: "text", required: false, options: [] },
+        ],
+      };
+      let aggregate = runtime.transition(null, event("turn.admitted", {
+        turn, strategy: "plan", planPurpose: "plan", objective: "制作 MFramework", constraints: [], acceptanceCriteria: [],
+      }) as any);
+      aggregate = runtime.transition(aggregate, event("run.started", { run, phase: "planning" }) as any);
+      aggregate = runtime.transition(aggregate, event("run.paused", {
+        run,
+        blocker: { requestId: "req-round-1", reasonCode: "user_questionnaire", evidenceSequence: 1, message: q1.title, options: ["recheck", "stop"], questionnaire: q1 },
+      }) as any);
+      aggregate = runtime.transition(aggregate, event("run.decision_recorded", {
+        run, requestId: "req-round-1", choice: "recheck",
+        answer: { requestId: "req-round-1", revision: 1, answers: [
+          { questionId: "arch", selectedValues: ["mvp"] },
+          { questionId: "scope", selectedValues: ["core"] },
+        ] },
+      }) as any);
+      aggregate = runtime.transition(aggregate, event("run.resumed", { run, requestId: "req-round-1" }) as any);
+      aggregate = runtime.transition(aggregate, event("run.paused", {
+        run,
+        blocker: { requestId: "req-round-2", reasonCode: "user_questionnaire", evidenceSequence: 4, message: q2.title, options: ["recheck", "stop"], questionnaire: q2 },
+      }) as any);
+      aggregate = runtime.transition(aggregate, event("run.decision_recorded", {
+        run, requestId: "req-round-2", choice: "recheck",
+        answer: { requestId: "req-round-2", revision: 2, answers: [
+          { questionId: "test_mode", selectedValues: ["no_test"] },
+          { questionId: "compile_check", selectedValues: ["unity_compile"] },
+          { questionId: "scene_verify", selectedValues: ["manual"] },
+          { questionId: "extra_note", selectedValues: [], text: "重点验证 DI 与对象池生命周期" },
+        ] },
+      }) as any);
+      aggregate = runtime.transition(aggregate, event("run.resumed", { run, requestId: "req-round-2" }) as any);
+
+      const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt });
+      const userBlocks = state.taskFlow.filter((block: any) => block.type === "user").slice(0, 1);
+      const taskFlow = [
+        ...userBlocks,
+        {
+          id: 901,
+          turnId: turn.turnId,
+          type: "agent",
+          visibility: "assistant_update",
+          // Simulate legacy doubled title content and missing choiceRequest.questionnaire
+          content: "MFramework 框架设计关键决策\n\nMFramework 框架设计关键决策",
+          choiceRequest: { requestId: "req-round-1", options: ["recheck", "stop"] },
+        },
+        {
+          id: 902,
+          turnId: turn.turnId,
+          type: "agent",
+          visibility: "assistant_update",
+          content: "阶段进展：正在整理验证方式。",
+        },
+        {
+          id: 903,
+          turnId: turn.turnId,
+          type: "agent",
+          visibility: "assistant_update",
+          content: "验证与测试方式确认\n\n验证与测试方式确认",
+          choiceRequest: { requestId: "req-round-2", options: ["recheck", "stop"], questionnaire: q2 },
+        },
+        {
+          id: 904,
+          turnId: turn.turnId,
+          type: "agent",
+          visibility: "assistant_final",
+          content: "已完成两轮决策确认。",
+        },
+      ];
+      store.useAppStore.setState({
+        activeActionRequest: null,
+        harnessRunMarker: { ...marker, status: "completed" },
+        taskFlow,
+        conversationTurns: state.conversationTurns.map((item: any) => ({ ...item, status: "completed", collapsed: false })),
+        runtimeV2Checkpoints: runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: checkpoint }),
+      } as any);
+    });
+
+    await expect(page.getByText("MFramework 框架设计关键决策")).toHaveCount(1);
+    await expect(page.getByText("验证与测试方式确认")).toHaveCount(1);
+    await expect(page.getByText("阶段进展：正在整理验证方式。")).toBeVisible();
+    await expect(page.getByText("已完成两轮决策确认。")).toBeVisible();
+
+    const cards = page.getByTestId("user-question-answer-card");
+    await expect(cards).toHaveCount(2);
+    const card1 = cards.nth(0);
+    const card2 = cards.nth(1);
+    await expect(card1).toHaveAttribute("data-request-id", "req-round-1");
+    await expect(card2).toHaveAttribute("data-request-id", "req-round-2");
+
+    await expect(card1.getByTestId("user-question-answer-toggle")).toHaveAttribute("aria-expanded", "true");
+    await expect(card1.getByTestId("user-question-answer-row")).toHaveCount(2);
+    await expect(card2.getByTestId("user-question-answer-toggle")).toHaveAttribute("aria-expanded", "false");
+    const preview = card2.getByTestId("user-question-answer-preview");
+    await expect(preview).toBeVisible();
+    await expect(preview).toContainText("其余 2 项已确认决策");
+    await expect(card2.getByTestId("user-question-answer-row")).toHaveCount(0);
+
+    const chronological = await page.evaluate(() => {
+      const container = document.querySelector("[data-testid='user-question-answer-card']")?.closest(".space-y-4") || document.body;
+      const text = container.textContent || "";
+      return {
+        c1: text.indexOf("MFramework 框架设计关键决策"),
+        mid: text.indexOf("阶段进展：正在整理验证方式。"),
+        c2: text.indexOf("验证与测试方式确认"),
+        fin: text.indexOf("已完成两轮决策确认。"),
+      };
+    });
+    expect(chronological.c1).toBeGreaterThanOrEqual(0);
+    expect(chronological.mid).toBeGreaterThan(chronological.c1);
+    expect(chronological.c2).toBeGreaterThan(chronological.mid);
+    expect(chronological.fin).toBeGreaterThan(chronological.c2);
+
+    await page.screenshot({ path: testInfo.outputPath(`qa-inline-cards-${theme}.png`), animations: "disabled" });
+
+    await card2.getByTestId("user-question-answer-toggle").click();
+    await expect(card2.getByTestId("user-question-answer-toggle")).toHaveAttribute("aria-expanded", "true");
+    await expect(card2.getByTestId("user-question-answer-row")).toHaveCount(4);
+    await expect(card2).toContainText("重点验证 DI 与对象池生命周期");
   });
 }

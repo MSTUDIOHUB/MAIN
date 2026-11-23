@@ -1,47 +1,138 @@
+import { useEffect, useState } from "react";
 import type { TurnAggregateV1 } from "../lib/runtime-v2/aggregate";
-import { buildUserQuestionHistory } from "../lib/userQuestionHistory";
-import { IconCheck } from "./Icons";
+import { buildUserQuestionHistory, type UserQuestionHistoryEntry, type UserQuestionHistoryItem } from "../lib/userQuestionHistory";
+import { IconCheck, IconChevronDown, IconChevronRight } from "./Icons";
+import "./UserQuestionAnswerHistory.css";
 
-export interface UserQuestionAnswerHistoryProps {
-  aggregate: TurnAggregateV1 | null | undefined;
+export interface UserQuestionAnswerCardProps {
+  entry: UserQuestionHistoryEntry;
   language: "zh" | "en";
   chatFontSize?: number;
 }
 
-export default function UserQuestionAnswerHistory({ aggregate, language, chatFontSize = 13 }: UserQuestionAnswerHistoryProps) {
-  const entries = buildUserQuestionHistory(aggregate);
-  if (!entries.length) return null;
-  return <div data-testid="user-question-answer-history" className="flex w-full min-w-0 flex-col items-end gap-3 text-left"
-    style={{ fontSize: chatFontSize, lineHeight: 1.6 }}>
-    {entries.map(entry => <section key={`${entry.runId}:${entry.requestId}:${entry.revision}`}
-      data-testid="user-question-answer-card" data-request-id={entry.requestId}
-      aria-label={language === "zh" ? `已确认回答：${entry.title}` : `Confirmed answers: ${entry.title}`}
-      className="w-[85%] min-w-0 rounded-2xl rounded-tr-sm border px-4 py-3 max-sm:w-full"
-      style={{ borderColor: "color-mix(in srgb, var(--accent) 32%, var(--surface-border))", background: "color-mix(in srgb, var(--accent) 5%, var(--surface-1))", color: "var(--surface-text)" }}>
-      <header className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 border-b pb-3" style={{ borderColor: "color-mix(in srgb, var(--accent) 14%, var(--surface-border-soft))" }}>
-        <h3 className="min-w-0 flex-1 break-words font-semibold text-[var(--surface-text-strong)]">{entry.title}</h3>
-        <span className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 font-medium"
-          style={{ fontSize: "0.82em", background: "color-mix(in srgb, var(--accent) 12%, transparent)", color: "var(--surface-text)" }}>
-          <IconCheck className="h-3 w-3" aria-hidden="true" />{language === "zh" ? "已确认" : "Confirmed"}
+export interface UserQuestionAnswerHistoryProps {
+  aggregate?: TurnAggregateV1 | null | undefined;
+  entries?: readonly UserQuestionHistoryEntry[];
+  language: "zh" | "en";
+  chatFontSize?: number;
+}
+
+function summarizeAnswer(item: UserQuestionHistoryItem, language: "zh" | "en"): string {
+  const parts = [
+    ...item.selectedLabels,
+    ...(item.text ? [item.text.replace(/\s+/g, " ").trim()] : []),
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : (language === "zh" ? "未补充" : "Not provided");
+}
+
+export function UserQuestionAnswerCard({ entry, language, chatFontSize = 13 }: UserQuestionAnswerCardProps) {
+  const zh = language === "zh";
+  const defaultExpanded = entry.questions.length <= 3;
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  useEffect(() => {
+    setExpanded(entry.questions.length <= 3);
+  }, [entry.requestId, entry.revision, entry.questions.length]);
+
+  const previewItems = entry.questions.slice(0, 2);
+  const remainingCount = Math.max(0, entry.questions.length - previewItems.length);
+  const countLabel = zh ? `已确认 · ${entry.questions.length} 题` : `Confirmed · ${entry.questions.length}`;
+
+  return (
+    <section
+      data-testid="user-question-answer-card"
+      data-request-id={entry.requestId}
+      aria-label={zh ? `已确认回答：${entry.title}` : `Confirmed answers: ${entry.title}`}
+      className="qa-history-card"
+      style={{ fontSize: chatFontSize, lineHeight: 1.6 }}
+    >
+      <button
+        type="button"
+        data-testid="user-question-answer-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded(current => !current)}
+        className={`qa-history-header${expanded ? " is-expanded" : ""}`}
+      >
+        <span className="qa-history-check" aria-hidden="true">
+          <IconCheck className="h-3 w-3" />
         </span>
-      </header>
-      <dl className="space-y-4 pt-3">
-        {entry.questions.map((question, index) => <div key={question.id} data-testid="user-question-answer-row" className="grid min-w-0 grid-cols-[1.5em_minmax(0,1fr)] gap-x-2">
-          <dt className="col-span-2 grid grid-cols-subgrid items-start gap-x-2">
-            <span aria-hidden="true" className="mt-0.5 flex h-[1.5em] w-[1.5em] items-center justify-center rounded-full font-medium"
-              style={{ fontSize: "0.8em", color: "var(--surface-text-muted)", background: "color-mix(in srgb, var(--accent) 8%, var(--surface-2))" }}>{index + 1}</span>
-            <span className="min-w-0 break-words font-medium text-[var(--surface-text-muted)]" style={{ fontSize: "0.9em" }}>{question.prompt}</span>
-          </dt>
-          <dd className="col-start-2 mt-1.5 min-w-0 space-y-2">
-            {!!question.selectedLabels.length && <div className="flex min-w-0 flex-wrap gap-1.5">
-              {question.selectedLabels.map((label, optionIndex) => <span key={optionIndex} className="max-w-full whitespace-pre-wrap break-words rounded-lg border px-2.5 py-1 font-medium text-[var(--surface-text-strong)]"
-                style={{ borderColor: "color-mix(in srgb, var(--accent) 20%, transparent)", background: "color-mix(in srgb, var(--accent) 10%, transparent)" }}>{label}</span>)}
-            </div>}
-            {question.text && <p className="whitespace-pre-wrap break-words text-[var(--surface-text-strong)]">{question.text}</p>}
-            {!question.selectedLabels.length && !question.text && <p className="text-[var(--surface-text-subtle)]" style={{ fontSize: "0.9em" }}>{language === "zh" ? "未补充" : "Not provided"}</p>}
-          </dd>
-        </div>)}
-      </dl>
-    </section>)}
-  </div>;
+        <span className="qa-history-title">{entry.title}</span>
+        <span className="qa-history-meta">
+          <span>{countLabel}</span>
+          {expanded
+            ? <IconChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+            : <IconChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
+        </span>
+      </button>
+
+      {!expanded && previewItems.length > 0 && (
+        <button
+          type="button"
+          data-testid="user-question-answer-preview"
+          onClick={() => setExpanded(true)}
+          className="qa-history-preview"
+        >
+          {previewItems.map((question, index) => (
+            <div key={question.id} className="qa-history-preview-row">
+              <span className="qa-history-preview-q">{index + 1}. {question.prompt}</span>
+              <span className="qa-history-preview-arrow" aria-hidden="true">→</span>
+              <span className="qa-history-preview-a">{summarizeAnswer(question, language)}</span>
+            </div>
+          ))}
+          {remainingCount > 0 && (
+            <div className="qa-history-preview-more">
+              {zh ? `+ 其余 ${remainingCount} 项已确认决策，点击展开` : `+ ${remainingCount} more confirmed decisions, click to expand`}
+            </div>
+          )}
+        </button>
+      )}
+
+      {expanded && (
+        <dl className="qa-history-list">
+          {entry.questions.map((question, index) => (
+            <div key={question.id} data-testid="user-question-answer-row" className="qa-history-row">
+              <dt className="qa-history-row-dt">
+                <span aria-hidden="true" className="qa-history-idx">{index + 1}</span>
+                <span className="qa-history-prompt">{question.prompt}</span>
+              </dt>
+              <dd className="qa-history-dd">
+                {!!question.selectedLabels.length && (
+                  <div className="qa-history-chips">
+                    {question.selectedLabels.map((label, optionIndex) => (
+                      <span key={optionIndex} className="qa-history-chip">{label}</span>
+                    ))}
+                  </div>
+                )}
+                {question.text && <p className="qa-history-text">{question.text}</p>}
+                {!question.selectedLabels.length && !question.text && (
+                  <p className="qa-history-empty">{zh ? "未补充" : "Not provided"}</p>
+                )}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </section>
+  );
+}
+
+export default function UserQuestionAnswerHistory({ aggregate, entries: explicitEntries, language, chatFontSize = 13 }: UserQuestionAnswerHistoryProps) {
+  const entries = explicitEntries ?? buildUserQuestionHistory(aggregate);
+  if (!entries.length) return null;
+  return (
+    <div
+      data-testid="user-question-answer-history"
+      className="qa-history-group"
+      style={{ fontSize: chatFontSize, lineHeight: 1.6 }}
+    >
+      {entries.map(entry => (
+        <UserQuestionAnswerCard
+          key={`${entry.runId}:${entry.requestId}:${entry.revision}`}
+          entry={entry}
+          language={language}
+          chatFontSize={chatFontSize}
+        />
+      ))}
+    </div>
+  );
 }

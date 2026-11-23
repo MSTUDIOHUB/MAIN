@@ -1,6 +1,7 @@
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import { isStreamOutputLimited, type OpenAiToolChoice, type StreamResult, type StreamSettings } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
+import { detectResponseLanguageMismatch } from "../../lib/workflowModels";
 import {
   RuntimeV2ProviderProtocolError,
   type RuntimeV2Command,
@@ -218,4 +219,53 @@ export function runtimeV2ExecutionProviderDeadlineAt(
   return Number.isFinite(lifecycleDeadlineAt)
     ? Number(lifecycleDeadlineAt)
     : undefined;
+}
+
+export function buildRuntimeV2ConcludePrompt(language: "zh" | "en"): string {
+  if (language === "en") {
+    return "All tools are closed. Deliver the final Markdown answer directly from the conversation and available evidence, and do not output <tool_call> tags.";
+  }
+  return "工具调用已结束。请直接基于本轮对话和已确认的真实证据，用简体中文输出清晰、完整、结构化的最终 Markdown 总结（按任务复杂度自适应详略，说明关键改动/结论、原因与验证结果），不要输出 <tool_call> 标签。";
+}
+
+export function buildRuntimeV2LanguageRetryFeedback(language: "zh" | "en"): string {
+  if (language === "en") {
+    return "The previous reply used the wrong natural language. Rewrite the complete, well-structured final Markdown answer in English; keep code, paths, identifiers, and commands unchanged, and do not mention the retry.";
+  }
+  return "上一次回复使用了错误的自然语言（英文）。请直接用简体中文重新输出完整、结构清晰的最终 Markdown 答复；保留代码、路径、标识符和命令原样，不要提及语言纠错或重试过程。";
+}
+
+export function evaluateRuntimeV2LanguageRetry(input: {
+  readonly text: string;
+  readonly targetLanguage: "zh" | "en";
+  readonly aborted: boolean;
+  readonly toolCallCount: number;
+  readonly hasProtocolViolation: boolean;
+  readonly outputTruncated: boolean;
+}): {
+  readonly shouldRetry: boolean;
+  readonly detectedLanguage: "zh" | "en" | null;
+  readonly hanCount: number;
+  readonly latinWords: number;
+} {
+  const candidate = String(input.text || "").trim();
+  if (
+    input.aborted ||
+    input.toolCallCount > 0 ||
+    input.hasProtocolViolation ||
+    input.outputTruncated ||
+    !candidate
+  ) {
+    return { shouldRetry: false, detectedLanguage: null, hanCount: 0, latinWords: 0 };
+  }
+  const check = detectResponseLanguageMismatch({
+    text: candidate,
+    targetLanguage: input.targetLanguage,
+  });
+  return {
+    shouldRetry: check.mismatch,
+    detectedLanguage: check.detectedLanguage,
+    hanCount: check.hanCount,
+    latinWords: check.latinWords,
+  };
 }

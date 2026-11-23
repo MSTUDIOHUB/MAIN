@@ -29,7 +29,7 @@ import {
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
-import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
+import { isRuntimeV2ValidationAttempt, normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
 import {
   deriveTurnElapsedSeconds,
   resolveTurnRunTimeWindow,
@@ -125,7 +125,8 @@ import { buildCapsuleActivityHistory } from "../lib/capsuleActivityHistory";
 import { describeCapsuleToolActivity } from "../lib/capsuleToolActivity";
 import CapsuleActivityPopover, { CapsuleActivityText, type CapsuleActivityLine } from "./CapsuleActivityPopover";
 import { resolveSessionWorkspaceKey } from "../lib/sessionTypes";
-import UserQuestionAnswerHistory from "./UserQuestionAnswerHistory";
+import UserQuestionAnswerHistory, { UserQuestionAnswerCard } from "./UserQuestionAnswerHistory";
+import { buildUserQuestionHistory, collectPausedQuestionnaireRequestIds } from "../lib/userQuestionHistory";
 import {
   resolveTurnStrategyFromIntent,
   selectTurnIngressAvailability,
@@ -1233,6 +1234,7 @@ function TurnChangesCard({
   language,
   onOpenDiff,
   chatFontSize,
+  validationSummary,
 }: {
   entries: Array<{
     taskId: number;
@@ -1246,59 +1248,103 @@ function TurnChangesCard({
   language: "zh" | "en";
   onOpenDiff: (taskId: number) => void;
   chatFontSize?: number;
+  validationSummary?: { passed: number; failed: number } | null;
 }) {
   const [expanded, setExpanded] = useState(false);
   if (entries.length === 0) return null;
 
   const headerText = language === "zh"
-    ? `本轮改动 · ${entries.length} 个文件`
-    : `Turn Changes · ${entries.length} file${entries.length > 1 ? "s" : ""}`;
+    ? `变更文件 · ${entries.length} 个文件`
+    : `Changed files · ${entries.length} file${entries.length > 1 ? "s" : ""}`;
   const subText = language === "zh"
-    ? `${totalExecutedEdits} 次已执行修改`
-    : `${totalExecutedEdits} executed edit${totalExecutedEdits > 1 ? "s" : ""}`;
-  const toggleText = expanded
-    ? language === "zh" ? "收起" : "Collapse"
-    : language === "zh" ? "展开" : "Expand";
+    ? `${totalExecutedEdits} 次修改`
+    : `${totalExecutedEdits} edit${totalExecutedEdits > 1 ? "s" : ""}`;
+  const hasValidation = !!validationSummary && (validationSummary.passed > 0 || validationSummary.failed > 0);
+  const validationFailed = !!validationSummary && validationSummary.failed > 0;
 
   return (
     <div
-      className="turn-process-font-scope ml-9 rounded-2xl border border-[#1d4ed8]/18 bg-[#060b14] px-4 py-3"
+      className="turn-process-font-scope ml-9 rounded-xl border border-[var(--surface-border)] bg-[var(--surface-1)] px-3.5 py-2.5"
       style={chatFontSize ? getTurnProcessFontStyle(chatFontSize) : undefined}
     >
-      <button
-        type="button"
-        data-testid="turn-changes-toggle"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
-        className="flex w-full items-center justify-between gap-3 text-left"
-      >
-        <div className="min-w-0">
-          <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[#93c5fd]">
-            <IconCode className="h-3.5 w-3.5" />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-testid="turn-changes-toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((value) => !value)}
+            title={subText}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-1.5 py-0.5 text-left text-[12px] font-medium text-[var(--surface-text-strong)] transition-colors hover:bg-[var(--surface-2)]"
+          >
+            <IconCode className="h-3.5 w-3.5 text-[#60a5fa]" />
             <span>{headerText}</span>
-          </div>
-          <div className="mt-1 text-[12px] text-[#64748b]">{subText}</div>
+            {expanded
+              ? <IconChevronDown className="h-3.5 w-3.5 text-[var(--surface-text-subtle)]" />
+              : <IconChevronRight className="h-3.5 w-3.5 text-[var(--surface-text-subtle)]" />}
+          </button>
+          {!expanded && entries.slice(0, 3).map((entry) => (
+            <button
+              key={`chip-${entry.target}-${entry.taskId}`}
+              type="button"
+              onClick={() => onOpenDiff(entry.taskId)}
+              title={entry.target}
+              className="inline-flex max-w-[220px] items-center gap-1.5 rounded-lg border border-[var(--surface-border-soft)] bg-[var(--surface-2)] px-2 py-0.5 text-[11px] transition-colors hover:border-[var(--surface-border)] hover:bg-[var(--surface-3)]"
+            >
+              <span className="truncate font-mono text-[var(--surface-text)]">{entry.displayTarget}</span>
+              <span className="shrink-0 font-medium text-[#10b981]">+{entry.added}</span>
+              <span className="shrink-0 font-medium text-[#f87171]">-{entry.removed}</span>
+            </button>
+          ))}
+          {!expanded && entries.length > 3 && (
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              className="rounded-lg px-1.5 py-0.5 text-[11px] text-[var(--surface-text-muted)] transition-colors hover:text-[var(--surface-text-strong)]"
+            >
+              +{entries.length - 3}
+            </button>
+          )}
         </div>
-        <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-[#1e293b] bg-[#05070d] px-2.5 py-1 text-[10px] text-[#93c5fd]">
-          {expanded ? <IconChevronDown className="h-3.5 w-3.5" /> : <IconChevronRight className="h-3.5 w-3.5" />}
-          {toggleText}
-        </span>
-      </button>
-      {expanded && <div data-testid="turn-changes-details" className="mt-3 space-y-2">
+        <div className="flex shrink-0 items-center gap-2">
+          {hasValidation && (
+            <span
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px] font-medium ${
+                validationFailed
+                  ? "border-[#f87171]/30 bg-[#f87171]/10 text-[#f87171]"
+                  : "border-[#10b981]/30 bg-[#10b981]/10 text-[#34d399]"
+              }`}
+            >
+              {validationFailed
+                ? (language === "zh" ? "验证未通过" : "Checks failed")
+                : (language === "zh" ? "✓ 验证通过" : "✓ Verified")}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => onOpenDiff(entries[0].taskId)}
+            className="rounded-lg px-2 py-0.5 text-[11px] font-medium text-[var(--surface-text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--surface-text-strong)]"
+          >
+            {language === "zh" ? "查看 Diff →" : "View Diff →"}
+          </button>
+        </div>
+      </div>
+      {expanded && <div data-testid="turn-changes-details" className="mt-2.5 space-y-1.5 border-t border-[var(--surface-border-soft)] pt-2.5">
         {entries.map((entry) => (
           <button
             key={`${entry.target}-${entry.taskId}`}
+            type="button"
             onClick={() => onOpenDiff(entry.taskId)}
             data-testid="turn-change-entry"
             data-target={entry.target}
-            className="flex w-full items-center gap-3 rounded-xl border border-[#1e293b] bg-[#05070d] px-3 py-2 text-left transition-colors hover:border-[#2563eb]/35 hover:bg-[#09111f]"
+            className="flex w-full items-center gap-3 rounded-lg border border-[var(--surface-border-soft)] bg-[var(--surface-2)] px-3 py-1.5 text-left transition-colors hover:border-[var(--surface-border)] hover:bg-[var(--surface-3)]"
           >
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[13px] font-medium text-[#dbeafe]">{entry.displayTarget}</span>
-              <span className="block truncate text-[11px] text-[#64748b]">{entry.target}</span>
+              <span className="block truncate text-[12.5px] font-medium text-[var(--surface-text-strong)]">{entry.displayTarget}</span>
+              <span className="block truncate text-[11px] text-[var(--surface-text-subtle)]">{entry.target}</span>
             </span>
             {entry.editCount > 1 && (
-              <span className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-2 py-0.5 text-[10px] text-[#cbd5e1]">
+              <span className="shrink-0 rounded-full border border-[var(--surface-border)] bg-[var(--surface-1)] px-2 py-0.5 text-[10px] text-[var(--surface-text-muted)]">
                 {language === "zh" ? `${entry.editCount} 次编辑` : `${entry.editCount} edits`}
               </span>
             )}
@@ -1915,12 +1961,20 @@ function TurnActivityDisclosure({
   language,
   chatFontSize,
   renderItem,
+  elapsedSeconds = 0,
+  changedFileCount = 0,
+  validationSummary = null,
+  turnStatus,
 }: {
   model: ReturnType<typeof buildLiveTurnProcessTimelineModel>;
   variant: "live" | "archive";
   language: "zh" | "en";
   chatFontSize: number;
   renderItem: (item: any) => React.ReactNode;
+  elapsedSeconds?: number;
+  changedFileCount?: number;
+  validationSummary?: { passed: number; failed: number } | null;
+  turnStatus?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const detailsId = useId();
@@ -1939,9 +1993,46 @@ function TurnActivityDisclosure({
     blockedCount > 0 && (language === "zh" ? `受阻 ${blockedCount}` : `${blockedCount} blocked`),
     notRunCount > 0 && (language === "zh" ? `未执行 ${notRunCount}` : `${notRunCount} not run`),
   ].filter(Boolean).join(" · ");
-  const activityCount = language === "zh"
-    ? `${model.stepCount} 项活动`
-    : `${model.stepCount} activit${model.stepCount === 1 ? "y" : "ies"}`;
+  const roundedElapsed = Math.max(0, Math.round(Number(elapsedSeconds) || 0));
+  const elapsedText = roundedElapsed >= 60
+    ? `${Math.floor(roundedElapsed / 60)}m ${roundedElapsed % 60}s`
+    : roundedElapsed > 0
+      ? `${roundedElapsed}s`
+      : "";
+  const validationText = validationSummary && (validationSummary.passed > 0 || validationSummary.failed > 0)
+    ? validationSummary.failed > 0
+      ? (language === "zh" ? "验证未通过" : "Checks failed")
+      : (language === "zh" ? "验证通过" : "Verified")
+    : "";
+  const isRunningState =
+    currentStep?.status === "running" ||
+    (isLive && (turnStatus === "executing" || turnStatus === "planning"));
+  const hasFailedState =
+    failedCount > 0 ||
+    (validationSummary?.failed || 0) > 0 ||
+    turnStatus === "error" ||
+    turnStatus === "failed";
+  const hasWarningState =
+    blockedCount > 0 ||
+    turnStatus === "stopped_no_action" ||
+    turnStatus === "paused";
+  const statusDotClass = isRunningState
+    ? "bg-[var(--accent)] animate-pulse"
+    : hasFailedState
+      ? "bg-[#f87171]"
+      : hasWarningState
+        ? "bg-[#fbbf24]"
+        : "bg-[#10b981]";
+  const archiveSummaryParts = [
+    language === "zh"
+      ? `已执行 ${model.stepCount} 步`
+      : `${model.stepCount} step${model.stepCount === 1 ? "" : "s"}`,
+    changedFileCount > 0
+      ? (language === "zh" ? `修改 ${changedFileCount} 个文件` : `${changedFileCount} file${changedFileCount === 1 ? "" : "s"} changed`)
+      : "",
+    validationText,
+    elapsedText,
+  ].filter(Boolean).join(" · ");
   const label = language === "zh" ? "本轮活动" : "Turn activity";
 
   return (
@@ -1957,17 +2048,25 @@ function TurnActivityDisclosure({
         aria-expanded={expanded}
         aria-controls={detailsId}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-[12px] text-[var(--surface-text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--surface-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
+        className="flex w-full min-w-0 items-center gap-2 rounded-xl border border-[var(--surface-border-soft)] bg-[var(--surface-1)] px-3 py-1.5 text-left text-[12px] text-[var(--surface-text-muted)] transition-colors hover:border-[var(--surface-border)] hover:bg-[var(--surface-2)] hover:text-[var(--surface-text)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--accent)]"
       >
         {expanded
           ? <IconChevronDown aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
           : <IconChevronRight aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />}
-        <span className="shrink-0">{label}</span>
-        <span className="min-w-0 flex-1 truncate" title={summary}>
-          {summary ? renderCompactMarkdownInline(summary, "turn-activity-summary") : activityCount}
+        <span aria-hidden="true" className={`h-1.5 w-1.5 shrink-0 rounded-full ${statusDotClass}`} />
+        <span className="shrink-0 font-medium text-[var(--surface-text)]">{label}</span>
+        <span className="min-w-0 flex-1 truncate" title={summary || archiveSummaryParts}>
+          {isLive && summary
+            ? (
+                <>
+                  {renderCompactMarkdownInline(summary, "turn-activity-summary")}
+                  {elapsedText && <span className="text-[var(--surface-text-subtle)]"> · {elapsedText}</span>}
+                </>
+              )
+            : archiveSummaryParts}
         </span>
         {issues && (
-          <span data-testid="turn-activity-issues" className="min-w-0 max-w-[50%] truncate font-medium text-[var(--surface-text-strong)]" title={issues}>
+          <span data-testid="turn-activity-issues" className="min-w-0 max-w-[50%] shrink-0 truncate font-medium text-[var(--surface-text-strong)]" title={issues}>
             {issues}
           </span>
         )}
@@ -2117,22 +2216,37 @@ function AgentContentBlock({
     );
   }
 
+  const isAssistantUpdate = block.visibility === "assistant_update";
+
   return (
     <div
       data-testid={
         block.visibility === "assistant_final"
           ? "assistant-final"
-          : block.visibility === "assistant_update"
+          : isAssistantUpdate
             ? "assistant-update"
             : undefined
       }
       data-turn-id={block.turnId || undefined}
-      className="mt-4 flex w-full min-w-0 items-start justify-start gap-3"
+      className={`${isAssistantUpdate ? "mt-3" : "mt-4"} flex w-full min-w-0 items-start justify-start gap-3`}
     >
-      <div className="mt-1 flex-shrink-0">
-        <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
+      <div className="mt-1 flex w-6 flex-shrink-0 items-center justify-center">
+        <IconLogoM
+          className={
+            isAssistantUpdate
+              ? "theme-text h-5 w-5 opacity-85"
+              : "theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]"
+          }
+        />
       </div>
-      <div className="chat-agent-content my-1 min-w-0 flex-1 px-2 py-1 text-[#e4e4e7]" style={{ fontSize: `${chatFontSize}px` }}>
+      <div
+        className={`chat-agent-content min-w-0 flex-1 px-2 ${
+          isAssistantUpdate
+            ? "my-0.5 py-0.5 text-[var(--surface-text-muted)]"
+            : "my-1 py-1 text-[#e4e4e7]"
+        }`}
+        style={{ fontSize: `${chatFontSize}px` }}
+      >
         {isArchivedAfterChoice && (
           <div data-testid="archived-choice-feedback-expanded" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#27272a] bg-[#050507] px-3 py-2">
             <div className="min-w-0 flex flex-wrap items-center gap-2">
@@ -3512,8 +3626,35 @@ export default function ChatArea({
 
     if (block.type === "agent") {
       if (block.hiddenProcess && !block.streaming) return null;
+      const checkpointAggregate = block.turnId
+        ? normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate
+        : null;
+      const requestId = String(block.choiceRequest?.requestId || "").trim();
+      const isQuestionnaireAnchor = !!requestId && (
+        !!block.choiceRequest?.questionnaire ||
+        /^plan-questionnaire-\d+:/.test(requestId) ||
+        collectPausedQuestionnaireRequestIds(checkpointAggregate).has(requestId)
+      );
+      if (isQuestionnaireAnchor) {
+        const entry = buildUserQuestionHistory(checkpointAggregate).find(item => item.requestId === requestId);
+        if (!entry) return null;
+        return (
+          <div
+            key={`${block.id}-${index}`}
+            data-testid="user-question-answer-history"
+            className="qa-history-group"
+            style={{ fontSize: resolvedChatFontSize, lineHeight: 1.6 }}
+          >
+            <UserQuestionAnswerCard
+              entry={entry}
+              language={language}
+              chatFontSize={resolvedChatFontSize}
+            />
+          </div>
+        );
+      }
       const finalDraft = block.visibility === "assistant_final" && !block.streaming
-        ? resolvePlanDraftFromAggregate(normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[block.turnId])?.aggregate)
+        ? resolvePlanDraftFromAggregate(checkpointAggregate)
         : null;
       return (
           <AgentContentBlock
@@ -3576,6 +3717,21 @@ export default function ChatArea({
     const turn: ConversationTurn = entry.turn;
     const turnIsQueued = queuedTurnIds.has(turn.id);
     const blocks = entry.blocks;
+    const turnCheckpointAggregate = normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[turn.id])?.aggregate;
+    const questionHistoryEntries = buildUserQuestionHistory(turnCheckpointAggregate);
+    const questionHistoryByRequestId = new Map(questionHistoryEntries.map(item => [item.requestId, item]));
+    const pausedQuestionnaireRequestIds = collectPausedQuestionnaireRequestIds(turnCheckpointAggregate);
+    const isQuestionnaireAnchor = (block: any): boolean => {
+      if (!block || block.type !== "agent") return false;
+      const requestId = String(block.choiceRequest?.requestId || "").trim();
+      if (!requestId) return false;
+      return (
+        !!block.choiceRequest?.questionnaire ||
+        pausedQuestionnaireRequestIds.has(requestId) ||
+        questionHistoryByRequestId.has(requestId) ||
+        /^plan-questionnaire-\d+:/.test(requestId)
+      );
+    };
     const turnIntent = resolveConversationTurnIntent(turn);
     const displayTurnIntent = turn.displayIntent || turnIntent;
     const isChatIntent = turnIntent === "respond" || turnIntent === "discuss";
@@ -3642,6 +3798,7 @@ export default function ChatArea({
       .map((block, idx) => ({ block, idx }))
       .reverse()
       .find(({ block }) =>
+        !isQuestionnaireAnchor(block) &&
         !block.hiddenProcess &&
         block.visibility !== "user_progress" &&
         hasRenderableAgentBlock(block)
@@ -3662,6 +3819,7 @@ export default function ChatArea({
       .filter(({ block, idx }) => {
         if (idx === finalVisibleAgentIndex) return false;
         if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
+        if (isQuestionnaireAnchor(block)) return false;
         if (Array.isArray(block.options) && block.options.length > 0) return false;
         // Reviewed Plan text and model-authored assistant updates have an
         // explicit semantic identity. Runtime narration remains process-only;
@@ -3835,9 +3993,30 @@ export default function ChatArea({
       isPausedWithFinalConclusion;
 
 
+    const renderedQuestionCardIds = new Set<string>();
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
+        if (isQuestionnaireAnchor(item.block)) {
+          const requestId = String(item.block.choiceRequest?.requestId || "").trim();
+          const entry = requestId ? questionHistoryByRequestId.get(requestId) : undefined;
+          if (!entry || renderedQuestionCardIds.has(requestId)) return null;
+          renderedQuestionCardIds.add(requestId);
+          return (
+            <div
+              key={`${item.block.id}-${item.index}`}
+              data-testid="user-question-answer-history"
+              className="qa-history-group"
+              style={{ fontSize: resolvedChatFontSize, lineHeight: 1.6 }}
+            >
+              <UserQuestionAnswerCard
+                entry={entry}
+                language={language}
+                chatFontSize={resolvedChatFontSize}
+              />
+            </div>
+          );
+        }
         if (shouldSuppressSupersededPlanCandidate({
           block: item.block,
           hasReviewableArtifact: hasReviewablePlanArtifact,
@@ -4034,6 +4213,26 @@ export default function ChatArea({
       language === "en" ? 52 : 42,
       language === "en" ? "Turn choice" : "本轮选择",
     );
+    const turnValidations = turnCheckpointAggregate
+      ? turnCheckpointAggregate.events.filter(isRuntimeV2ValidationAttempt)
+      : [];
+    const turnValidationSummary = turnValidations.length > 0
+      ? {
+          passed: turnValidations.filter((event) => event.passed).length,
+          failed: turnValidations.filter((event) => !event.passed).length,
+        }
+      : null;
+    const turnRunWindow = resolveTurnRunTimeWindow({
+      events: Array.isArray(runtimeEvents) ? runtimeEvents : [],
+      turnId: turn.id,
+    });
+    const turnElapsedSeconds = deriveTurnElapsedSeconds({
+      window: turnRunWindow,
+      nowMs: Date.now(),
+      isActive: turn.id === currentTurnId && (isStreaming || turn.status === "executing" || turn.status === "planning"),
+      savedElapsedSeconds: turn.elapsedTime,
+      sessionElapsedSeconds: 0,
+    });
 
     return (
       <section
@@ -4079,11 +4278,6 @@ export default function ChatArea({
                   isLightThemeMode={isLightThemeMode}
                 />
               )}
-              {shouldShowTurnChanges && (
-                <span className="rounded-full border border-[rgba(37,99,235,0.25)] bg-[rgba(37,99,235,0.12)] px-2 py-0.5 text-[10px] text-[#93c5fd]">
-                  {language === "zh" ? `${turnChangeEntries.length} 个变更文件` : `${turnChangeEntries.length} changed file${turnChangeEntries.length > 1 ? "s" : ""}`}
-                </span>
-              )}
             </div>
             <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-3">
               <span className={`min-w-0 flex-1 break-words text-right text-[13px] font-semibold leading-5 ${turnTitleClass}`}>
@@ -4113,11 +4307,6 @@ export default function ChatArea({
 
         <div className={`${turnPresentation.showStateAnchor ? "mt-4 " : ""}space-y-4`}>
           {userBlock ? renderBlock(userBlock, blocks.indexOf(userBlock)) : null}
-          <UserQuestionAnswerHistory
-            aggregate={normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[turn.id])?.aggregate}
-            language={language}
-            chatFontSize={resolvedChatFontSize}
-          />
           {!turnPresentation.showStateAnchor && canToggleProcess && (
             <TurnProcessDisclosure
               collapsed={!isTurnExpanded}
@@ -4160,9 +4349,85 @@ export default function ChatArea({
                 language={language}
                 chatFontSize={resolvedTurnProcessFontSize}
                 renderItem={shouldArchiveCompletedProcess ? renderArchivedBlockItem : renderBlockItem}
+                elapsedSeconds={turnElapsedSeconds}
+                changedFileCount={turnChangeEntries.length}
+                validationSummary={turnValidationSummary}
+                turnStatus={turnPresentation.status}
               />
             </React.Fragment>
           )}
+
+          {!isTurnExpanded ? (
+            <React.Fragment key="collapsed-process-visible-messages">
+              {additionalVisibleUserBlocks.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
+              {publicAssistantUpdates.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
+              {questionHistoryEntries.length > 0 && (
+                <UserQuestionAnswerHistory
+                  entries={questionHistoryEntries}
+                  language={language}
+                  chatFontSize={resolvedChatFontSize}
+                />
+              )}
+              {finalVisibleAgentBlock
+                ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
+                : null}
+            </React.Fragment>
+          ) : shouldArchiveCompletedProcess ? (
+            <>
+              {questionHistoryEntries.length > 0 && (
+                <UserQuestionAnswerHistory
+                  entries={questionHistoryEntries}
+                  language={language}
+                  chatFontSize={resolvedChatFontSize}
+                />
+              )}
+              {finalVisibleAgentBlock ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex) : null}
+            </>
+          ) : (() => {
+            const liveRemainderItems = buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language);
+            const renderedAnchoredRequestIds = new Set(
+              liveRemainderItems
+                .filter((item: any) => item.kind === "block" && !isLiveProcessRenderItem(item) && isQuestionnaireAnchor(item.block))
+                .map((item: any) => String(item.block.choiceRequest?.requestId || "").trim())
+                .filter(Boolean),
+            );
+            const unanchoredQuestionEntries = questionHistoryEntries.filter(
+              item => !renderedAnchoredRequestIds.has(item.requestId),
+            );
+            const unanchoredNode = unanchoredQuestionEntries.length > 0 ? (
+              <UserQuestionAnswerHistory
+                key="unanchored-question-history"
+                entries={unanchoredQuestionEntries}
+                language={language}
+                chatFontSize={resolvedChatFontSize}
+              />
+            ) : null;
+            if (!unanchoredNode) {
+              return liveRemainderItems.map(renderTurnRemainderWithPhases);
+            }
+            let insertedUnanchored = false;
+            const nodes = liveRemainderItems.map((item: any) => {
+              const rendered = renderTurnRemainderWithPhases(item);
+              if (
+                !insertedUnanchored &&
+                finalVisibleAgentIndex >= 0 &&
+                item.kind === "block" &&
+                item.index === finalVisibleAgentIndex &&
+                rendered
+              ) {
+                insertedUnanchored = true;
+                return (
+                  <React.Fragment key={`unanchored-before-final-${turn.id}`}>
+                    {unanchoredNode}
+                    {rendered}
+                  </React.Fragment>
+                );
+              }
+              return rendered;
+            });
+            if (!insertedUnanchored) nodes.push(unanchoredNode);
+            return nodes;
+          })()}
 
           {shouldShowTurnChanges && (
             <TurnChangesCard
@@ -4172,20 +4437,9 @@ export default function ChatArea({
               language={language}
               onOpenDiff={openDiffForTask}
               chatFontSize={resolvedTurnProcessFontSize}
+              validationSummary={turnValidationSummary}
             />
           )}
-
-          {!isTurnExpanded ? (
-            <React.Fragment key="collapsed-process-visible-messages">
-              {additionalVisibleUserBlocks.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
-              {publicAssistantUpdates.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
-              {finalVisibleAgentBlock
-                ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
-                : null}
-            </React.Fragment>
-          ) : shouldArchiveCompletedProcess ? (
-            finalVisibleAgentBlock ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex) : null
-          ) : buildBlockRenderItems(blocks, true, enableCompletedToolGrouping, language).map(renderTurnRemainderWithPhases)}
           {isTurnExpanded && turnSubagentRuns.length > 0 && (
             <SubagentActivityNotice
               key="subagent-activity-notice"
