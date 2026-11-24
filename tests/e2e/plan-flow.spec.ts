@@ -13,7 +13,10 @@ test.beforeEach(async ({ page }) => {
       currentWindow: { label: "main" },
       currentWebview: { label: "main" },
     };
+    internals.transformCallback = () => 0;
+    internals.unregisterCallback = () => {};
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (["list_all_session_snapshots", "list_legacy_session_files", "list_project_sessions", "rebuild_project_sessions_index"].includes(cmd)) return [];
       if (cmd === "plugin:event|listen") return 1;
       if (cmd === "plugin:event|unlisten") return null;
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };

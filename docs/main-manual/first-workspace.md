@@ -12,7 +12,6 @@ sourceFeature: "Workspace sidebar、session list、Workspace Turn admission"
 
 工作区是 MAIN 可以读取、搜索和执行任务的项目文件夹。
 
-![左侧工作区区域用于添加项目，下面是聊天会话和常用入口。](assets/screenshots/main-workbench.png)
 
 ## 适用场景
 
@@ -34,7 +33,7 @@ sourceFeature: "Workspace sidebar、session list、Workspace Turn admission"
 4. 先发送只读任务，例如“阅读项目结构，不要修改文件”。
 5. 切换项目时，回到左侧工作区区域。
 
-普通任务发送后会先成为当前工作区会话中的一个 Turn，再进入 Chat、Plan 或 Fast 策略。即使只是提问，也会保存一个可恢复且最终有结论的回合。需要建立项目快速参考时可输入 `/init`；它先打开审阅预览，确认后更新根 `AGENTS.md`，不会创建模型 Turn。
+每次任务发送后先成为一个可恢复的 Turn，再进入问答、计划或执行策略。输入 `/规则` 可让 MAIN 调查项目、询问关键约束并生成根 `AGENTS.md` 草稿；编辑和审阅差异后才保存。
 
 ## 结果确认
 

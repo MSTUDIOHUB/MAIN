@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 const source = fs.readFileSync(
   path.join(process.cwd(), "scripts/run-real-omlx-plan-e2e.mjs"),
@@ -57,6 +58,8 @@ test("real OMLX spec fails closed unless parent and subagents share one explicit
   assert.match(specSource, /explicitSubagentModel !== models\[0\]/);
 });
 
+
+
 test("real OMLX validation requires caller-prepared workspaces and explicit evidence targets", () => {
   assert.match(source, /REAL_OMLX_WORKSPACE 必须是调用方预先复制好的非空工作区/);
   assert.match(source, /workspaceEntries\.length === 0/);
@@ -86,4 +89,29 @@ test("real OMLX E2E identity and acceptance are model-neutral and debug-tail ind
     structuralAssertionsSource,
     /### \(\?:已启动并行只读调查\|并行只读调查已汇合\|当前阶段：\)\/\.test[\s\S]*\)\)\.toBe\(true\)/,
   );
+});
+
+
+test("real OMLX collection retains every surviving production lane after feature retirement", () => {
+  const output = execFileSync(process.execPath, [
+    path.join(process.cwd(), "node_modules/playwright/cli.js"), "test",
+    "tests/e2e/real-omlx-plan-flow.spec.ts", "--list", "--reporter=json",
+  ], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024,
+    env: { ...process.env, MAIN_REAL_OMLX_E2E: "0", OMLX_MODELS: "e2e-placeholder-model" },
+  });
+  const titles = [];
+  const collect = suites => { for (const suite of suites || []) { titles.push(...(suite.specs || []).map(spec => spec.title)); collect(suite.suites); } };
+  collect(JSON.parse(output).suites);
+  for (const required of [
+    "repeated mutation rejections recover through validation",
+    "unexecuted Skills recover without replaying failed effects",
+    "pause recheck and stop preserve one Run",
+    "intent clarification pauses and resumes one Run",
+    "Unity Execute uses production tool boundaries",
+    "MAIN plan/approve/execute reaches one structural terminal outcome",
+    "Direct Edit repairs a failed finite validation",
+    "Snake Execute completes",
+    "Execute completes the MD Viewer incident",
+  ]) assert.equal(titles.filter(title => title.includes(required)).length, 1, required);
+  assert.equal(titles.some(title => title.includes("Goal Runtime")), false);
 });

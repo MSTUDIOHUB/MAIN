@@ -4,6 +4,10 @@ for (const theme of ["light", "dark", "black"]) {
  for (const clarification of [false, true]) {
   test(`durable ${clarification ? "clarification" : "execution choice"} restores from its ledger and dispatches the same Run in ${theme}`, async ({ page }, testInfo) => {
     await page.goto("/?e2eScenario=awaiting-choice");
+    await expect.poll(() => page.evaluate(async () => {
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      return useAppStore.getState().harnessRunMarker?.runId;
+    })).toBe("run-e2e-awaiting-choice");
     await page.evaluate(async ({ appearance, clarification }) => {
       const store = await import("/src/store/useAppStore.ts");
       const runtime = await import("/src/lib/runtime-v2/index.ts");
@@ -20,7 +24,7 @@ for (const theme of ["light", "dark", "black"]) {
         type, eventId: `blocker-event-${sequence}`, sequence: sequence++, at: Date.now() + sequence, ...fields });
       let aggregate = runtime.transition(null, event("turn.admitted", { turn, strategy: "execute", objective: "检查缺失条件并继续", constraints: [], acceptanceCriteria: ["条件可用"] }) as any);
       aggregate = runtime.transition(aggregate, event("run.started", { run, phase: "observing" }) as any);
-      aggregate = runtime.transition(aggregate, event("run.paused", { run, blocker: { requestId: "durable-blocker", reasonCode: clarification ? "intent_clarification" : "recovery_stalled",
+      aggregate = runtime.transition(aggregate, event("run.paused", { run, blocker: { requestId: "durable-blocker", reasonCode: clarification ? "intent_clarification" : "external_state_required",
         evidenceSequence: 1, message: clarification ? "请选择目标：staging 或 production。" : "当前需要的条件尚未满足，执行已暂停。", options: ["recheck", "stop"],
         ...(clarification ? { clarification: { kind: "target_ambiguity", field: "target", evidence: "staging or production", question: "请选择目标。", choices: ["staging", "production"] } } : {}) } }) as any);
       const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt });

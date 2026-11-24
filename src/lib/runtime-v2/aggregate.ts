@@ -5,6 +5,7 @@ import type {
   RuntimeV2NormalizedToolCall,
   RuntimeV2Objective,
   RuntimeV2Phase,
+  RuntimeV2PlanContinuation,
   RuntimeV2RecoveryBudget,
   RuntimeV2RunIdentity,
   RuntimeV2Strategy,
@@ -31,6 +32,9 @@ export interface TurnAggregateV1 {
   readonly schemaVersion: "turn-aggregate.v1";
   readonly turn: RuntimeV2TurnIdentity;
   readonly strategy: RuntimeV2Strategy;
+  readonly planPurpose?: "plan" | "rules";
+  readonly workspaceInstructionContext?: string;
+  readonly knowledgeContext?: import("../knowledgeReferences").KnowledgeContextPacket;
   readonly networkRead?: import("../networkRead").NetworkReadPolicy;
   /** Immutable user admission fact; absent legacy checkpoints mean optional. */
   readonly subagentRequirement?: "optional" | "required";
@@ -44,6 +48,7 @@ export interface TurnAggregateV1 {
    * are projections of this value, never inputs used to reconstruct it. */
   readonly sealedWorkPlan: SealedWorkPlanV1 | null;
   readonly planReviewCommit: RuntimeV2PlanReviewCommit | null;
+  readonly planContinuation?: RuntimeV2PlanContinuation;
   readonly scheduledCommands: readonly RuntimeV2Command[];
   /** Completed receipts make a cold recovery distinguish an unstarted effect
    * from a command that already consumed its bounded retry budget. */

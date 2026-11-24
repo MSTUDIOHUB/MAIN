@@ -41,6 +41,28 @@ export interface CompatibilityMessage {
   reasoning?: string;
 }
 
+/** Keep commentary before native calls in OpenAI Chat Completions history.
+ * Some compatible templates render a tool-call message's following results
+ * before its content. Separate that preamble so the result remains the latest
+ * semantic frontier. Only the wire copy changes; call IDs, results, reasoning
+ * and opaque call metadata remain on their original protocol messages. */
+export function normalizeOpenAiNativeToolPreambles(
+  messages: readonly Record<string, unknown>[],
+): Record<string, unknown>[] {
+  return messages.flatMap((message) => {
+    const content = message.content;
+    const hasContent = typeof content === "string"
+      ? content.length > 0
+      : Array.isArray(content) && content.length > 0;
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls) ||
+      message.tool_calls.length === 0 || !hasContent) return [message];
+    return [
+      { role: "assistant", content },
+      { ...message, content: "" },
+    ];
+  });
+}
+
 export const PROVIDER_COMPATIBILITY_TAG = "[PROVIDER_COMPATIBILITY_MODE]";
 
 export interface ProviderCompatibilityModeOptions {

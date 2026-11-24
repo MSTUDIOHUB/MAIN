@@ -1,4 +1,27 @@
 import { looksLongRunningShellCommand } from "./toolExecutionContract";
+import { isAbsoluteWorkspacePath } from "./workspacePaths";
+import { unityCommandArguments, unityValidationInvocation } from "./unityValidation";
+
+/** Give a reviewed command and its execution receipt the same workspace-local
+ * directory identity. The executor still resolves the real path and symlinks. */
+export function normalizeValidationWorkspaceCwd(value: unknown, workspace?: string): string | null {
+  const path = typeof value === "string" ? value.trim().replace(/\\/g, "/") : "";
+  const workspacePath = String(workspace || "").trim().replace(/\\/g, "/");
+  const root = workspacePath.replace(/\/+$/, "");
+  const windows = /^(?:[a-z]:\/|\/\/)/i.test(workspacePath);
+  const pathKey = windows ? path.toLowerCase() : path;
+  const rootKey = windows ? root.toLowerCase() : root;
+  let relative = path;
+  if (isAbsoluteWorkspacePath(path)) {
+    if (!isAbsoluteWorkspacePath(workspace || "")) return null;
+    if (pathKey === rootKey) return ".";
+    if (!pathKey.startsWith(`${rootKey}/`)) return null;
+    relative = path.slice(root.length + 1);
+  }
+  const parts = relative.split("/").filter(part => part !== "" && part !== ".");
+  if (parts.includes("..") || /[\u0000-\u001f]/.test(relative) || /^[a-z]:/i.test(relative)) return null;
+  return (windows ? parts.join("/").toLowerCase() : parts.join("/")) || ".";
+}
 
 /**
  * Provider-neutral validation primitives.  These records describe runtime
@@ -352,6 +375,21 @@ function looksLikeServiceSegment(raw: string): boolean {
     /\b(?:deno\s+(?:run\s+)?[^\n]*\bserve\b|cargo\s+run\b|electron\s+\.)/i.test(command);
 }
 
+/** An editor probe is useful during implementation but cannot stand in for a
+ * finite test. Suggest the existing recognized runner without broadening admission. */
+export function finiteValidationRepairHint(analysis: ValidationCommandAnalysis): string | undefined {
+  if (analysis.rejectionReason !== "unbounded_command_segment" || !analysis.segments.some(segment =>
+    segment.role === "unknown" && unityCommandArguments(stripShellDecorators(segment.command))?.[0]?.toLowerCase() === "command")) return;
+  return "Unity Editor probes do not supply a verdict. Bind PlayMode tests with a pass/fail result to all relevant implementation and scene steps. Use `unity test . --mode PlayMode` with a fresh NUnit report when the project is closed. For a connected Editor, use `unity command test run --project-path . --caller plugin --skill unity-cli --mode playmode --filter <suite> --async-tests --timeout 90 --format json --non-interactive`.";
+}
+
+export function unityValidationInvocations(command: string) {
+  return analyzeValidationCommand(command).segments.flatMap(segment => {
+    const invocation = unityValidationInvocation(stripShellDecorators(segment.command));
+    return segment.role === "validator" && invocation ? [invocation] : [];
+  });
+}
+
 function classifyFiniteSegment(
   raw: string,
 ): { capability: FiniteValidationCommandCapability | null; inlineMissingAssertion: boolean } {
@@ -359,6 +397,8 @@ function classifyFiniteSegment(
   if (!command || looksLikeServiceSegment(command)) {
     return { capability: null, inlineMissingAssertion: false };
   }
+  const unity = unityValidationInvocation(command);
+  if (unity) return { capability: unity.kind === "recompile" ? "typecheck" : "test", inlineMissingAssertion: false };
 
   const packageScript = command.match(
     /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?((?:test|build|lint|typecheck|type-check|check)(?::[A-Za-z0-9_.-]+)?)\b/i,

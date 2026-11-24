@@ -48,6 +48,8 @@ export interface SubmitSessionRuntimeFacadeInput<
   get: () => TState;
   set: (patchOrUpdater: Partial<TState> | ((state: TState) => Partial<TState>)) => void;
   runSessionKey: string;
+  /** Publish on behalf of the current exact owner without replacing its lease. */
+  borrowExistingRuntimeOwnership?: boolean;
   createRuntimeFromState: (state: Partial<TState>) => TRuntime;
   pickRuntimePatch: (source: SubmitSessionPatch<TState>) => Partial<TRuntime>;
   normalizePatch?: (patch: SubmitSessionPatch<TState>) => SubmitSessionPatch<TState>;
@@ -242,18 +244,21 @@ export function createSubmitSessionRuntimeFacade<
 >(
   params: SubmitSessionRuntimeFacadeInput<TState, TRuntime>,
 ): SubmitSessionRuntimeFacade<TState, TRuntime> {
-  let seeded = false;
-  const runtimeOwnerToken = Object.freeze({
-    sessionKey: params.runSessionKey,
-    sessionGeneration: resolveSubmitSessionGeneration(params.get(), params.runSessionKey),
-  });
+  const borrowed = params.borrowExistingRuntimeOwnership === true;
+  let seeded = borrowed;
+  const initialState = params.get();
+  const initialRuntime = initialState.runtimeBySessionKey[params.runSessionKey] as RuntimeWithSubmitOwner | undefined;
+  const sessionGeneration = resolveSubmitSessionGeneration(initialState, params.runSessionKey);
+  const existingOwner = borrowed ? initialRuntime?.[SUBMIT_SESSION_RUNTIME_OWNER] : undefined;
+  const runtimeOwnerToken = existingOwner || Object.freeze({ sessionKey: params.runSessionKey, sessionGeneration });
+  const expectedStamp = borrowed ? existingOwner : runtimeOwnerToken;
   const stampOwnedRuntime = (runtime: TRuntime): TRuntime => ({
     ...runtime,
-    [SUBMIT_SESSION_RUNTIME_OWNER]: runtimeOwnerToken,
+    ...(expectedStamp ? { [SUBMIT_SESSION_RUNTIME_OWNER]: expectedStamp } : {}),
   });
   const isOwnedRuntime = (runtime: TRuntime | null | undefined): boolean =>
     !!runtime &&
-    (runtime as RuntimeWithSubmitOwner)[SUBMIT_SESSION_RUNTIME_OWNER] === runtimeOwnerToken;
+    (runtime as RuntimeWithSubmitOwner)[SUBMIT_SESSION_RUNTIME_OWNER] === expectedStamp;
   let lastKnownOwnerRuntime =
     params.get().runtimeBySessionKey[params.runSessionKey] ||
     params.createRuntimeFromState(params.get());
@@ -261,9 +266,9 @@ export function createSubmitSessionRuntimeFacade<
   const hasRuntimeEntry = (state: TState): boolean =>
     Object.prototype.hasOwnProperty.call(state.runtimeBySessionKey, params.runSessionKey);
   const hasOwnedRuntimeEntry = (state: TState): boolean =>
-    hasRuntimeEntry(state) && (
-      !seeded || isOwnedRuntime(state.runtimeBySessionKey[params.runSessionKey])
-    );
+    hasRuntimeEntry(state) &&
+    (!borrowed || resolveSubmitSessionGeneration(state, params.runSessionKey) === sessionGeneration) &&
+    (!seeded || isOwnedRuntime(state.runtimeBySessionKey[params.runSessionKey]));
   const getRuntime = (state: TState): TRuntime => {
     const owned = state.runtimeBySessionKey[params.runSessionKey];
     if (owned && (!seeded || isOwnedRuntime(owned))) {
@@ -283,6 +288,7 @@ export function createSubmitSessionRuntimeFacade<
     ) === params.runSessionKey;
 
   const seedSessionRuntime = () => {
+    if (borrowed) return;
     params.set((state) => {
       const runtime = stampOwnedRuntime(params.createRuntimeFromState(state));
       lastKnownOwnerRuntime = runtime;
@@ -368,7 +374,7 @@ export function createSubmitSessionRuntimeFacade<
 
     params.set((latest) => {
       const existing = latest.runtimeBySessionKey[params.runSessionKey];
-      if (!existing || (seeded && !isOwnedRuntime(existing))) {
+      if (!existing || (seeded && !hasOwnedRuntimeEntry(latest))) {
         result = { published: false, disposition: "ownership_lost" };
         return {} as Partial<TState>;
       }

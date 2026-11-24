@@ -27,6 +27,8 @@ export interface AgentMessage {
   content: string | ContentPart[];
   /** Runtime-only Turn owner for exact multimodal transport receipts. */
   runtimeTurnId?: string;
+  /** Identity for one user guidance item materialized from the Run ledger. */
+  runtimeGuidanceId?: string;
   runtimeVisualImageParts?: number;
   runtimeVisualPayloadDigest?: string;
   tool_calls?: ToolCallInMessage[];

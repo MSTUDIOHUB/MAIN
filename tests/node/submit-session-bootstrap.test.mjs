@@ -86,6 +86,15 @@ function createHarness(state) {
   };
 }
 
+test("a new global slot receives a canonical epoch before its first Run", () => {
+  const state = createState({ currentWorkspace: "", currentSessionId: null, sessionsByWorkspace: {} });
+  const harness = createHarness(state);
+  const decision = applySubmitSessionBootstrap({ state, set: harness.set, updateSession: harness.updateSession, autoSessionNowMs: 3000, commandIssuedAtMs: 3001 });
+  assert.equal(typeof decision.autoSession.planLifecycleEpoch, "string");
+  assert.ok(decision.autoSession.planLifecycleEpoch.length > 0);
+  assert.equal(state.sessionsByWorkspace[decision.runScopeKey][0].planLifecycleEpoch, decision.autoSession.planLifecycleEpoch);
+});
+
 test("submit session bootstrap creates an auto session and touches the run session", () => {
   const state = createState();
   const harness = createHarness(state);

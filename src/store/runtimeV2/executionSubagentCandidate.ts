@@ -61,6 +61,7 @@ export function runtimeV2ModelSelectedSubagentCandidate(
       : {};
   const sourceToolCallId =
     boundedArgument(command.payload.toolCallId, 256);
+  const proactiveKey = boundedArgument(command.payload.proactiveKey, 64);
   const taskKey =
     boundedArgument(args.task_key, 256) ||
     sourceToolCallId ||
@@ -115,6 +116,9 @@ export function runtimeV2ModelSelectedSubagentCandidate(
       "explore, review, and validate subagents must remain read-only.",
     );
   }
+  if (proactiveKey && (sourceToolCallId || writeJob || !/^[a-f0-9]{64}$/.test(proactiveKey))) {
+    throw new Error("Runtime-owned delegation requires a scoped read-only candidate and its own dispatch identity.");
+  }
   const explicitlyAllowedScope = commaSeparatedPaths(args.allowed_paths);
   const requiredScope = commaSeparatedPaths(args.required_paths);
   if (explicitlyAllowedScope.invalid || requiredScope.invalid) {
@@ -152,6 +156,7 @@ export function runtimeV2ModelSelectedSubagentCandidate(
   }
   return {
     sourceToolCallId,
+    ...(proactiveKey ? { proactiveKey } : {}),
     scopeKey: taskKey,
     taskKind: taskKind as "explore" | "review" | "validate" | "implement",
     accessMode: accessMode as "read" | "write",

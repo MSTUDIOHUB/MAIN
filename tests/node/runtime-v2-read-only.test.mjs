@@ -136,6 +136,7 @@ function harness(providerResults, options = {}) {
 
 const progress = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/readOnlyProgress.ts"));
 const history = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/readOnlyHistory.ts"));
+const providerHistory = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderHistory.ts"));
 const types = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionTypes.ts"));
 const network = loadTs(path.join(workspaceRoot, "src/lib/networkRead.ts"));
 const token = loadTs(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
@@ -308,6 +309,17 @@ test("network permission is frozen and absent/invalid legacy snapshots stay disa
   assert.equal(network.normalizeNetworkRead({ enabled: true, provider: "invalid" }).enabled, false);
 });
 
+test("new web selections default to Yahoo while explicit providers and offline restores retain their scope", () => {
+  assert.equal(network.DEFAULT_WEB_SEARCH_PROVIDER, "yahoo");
+  assert.deepEqual(network.captureNetworkRead({ webSearchEnabled: true }), { enabled: true, provider: "yahoo" });
+  for (const provider of ["quark", "yahoo", "duckduckgo", "bing", "baidu"]) {
+    assert.deepEqual(network.normalizeNetworkRead({ enabled: true, provider }), { enabled: true, provider });
+    assert.deepEqual(network.captureNetworkRead({ webSearchEnabled: false, webSearchProvider: provider }), { enabled: false, provider });
+  }
+  assert.deepEqual(network.normalizeNetworkRead(undefined), { enabled: false, provider: "yahoo" });
+  assert.deepEqual(network.normalizeNetworkRead({ enabled: true, provider: "invalid" }), { enabled: false, provider: "yahoo" });
+});
+
 test("search version ignores query spelling, result order and tracking URLs but keeps changed facts", () => {
   const a = resultData("one");
   const b = resultData("two", "same fact", "https://example.com/source?utm_source=tracking#top");
@@ -453,6 +465,41 @@ test("Chat tools use the snapshot, reject workspace tools, and conclude has an e
   state.webSearchEnabled = true;
   const legacy = { ...input, context: { ...input.context, networkRead: undefined }, live: types.createRuntimeV2LiveExecutionState() };
   assert.equal(auth.providerToolDefinitionsForCommand(legacy, { payload: { mode: "chat" } }).some((item) => item.function.name === "web_search"), false);
+});
+
+test("enabled Chat and analyze require source checks for current facts without forcing ordinary chat to search", () => {
+  const question = "请分析今天上午的股票和基金行情。";
+  for (const workspace of ["", "/fixture"]) {
+    const state = {
+      webSearchEnabled: false,
+      conversationTurns: [{ id: turn.turnId, userPrompt: question }],
+      agentMessages: [
+        { role: "user", content: "能查询实时行情吗？" },
+        { role: "assistant", content: "我无法获取实时行情。" },
+        { role: "user", content: question, runtimeTurnId: turn.turnId },
+      ],
+    };
+    const input = {
+      get: () => state,
+      context: { runtimeRunIntent: "analyze", runWorkspace: workspace, networkRead: enabled, turnId: turn.turnId, phaseLanguage: "zh" },
+      live: types.createRuntimeV2LiveExecutionState(),
+    };
+    const messages = providerHistory.providerHistory(input.live, input).messages;
+    const instruction = messages[0].content;
+    assert.match(instruction, /For explicit web requests or current\/time-sensitive external facts, use web_search or web_fetch before answering/);
+    assert.match(instruction, /Check actual results before claiming information is unavailable/);
+    assert.match(instruction, /cite source URLs and dates/);
+    assert.match(instruction, /Ordinary conversation does not require a search/);
+    assert.match(instruction, /Search provider: bing/);
+    assert.equal(messages.at(-1).content, question);
+    assert.ok(messages.some((message) => message.content === "我无法获取实时行情。"), "prior assistant claims remain history, not capability facts");
+
+    state.webSearchEnabled = true;
+    const offline = { ...input, context: { ...input.context, networkRead: undefined }, live: types.createRuntimeV2LiveExecutionState() };
+    const offlineInstruction = providerHistory.providerHistory(offline.live, offline).messages[0].content;
+    assert.match(offlineInstruction, /Network access is disabled for this Turn/);
+    assert.doesNotMatch(offlineInstruction, /use web_search or web_fetch before answering/);
+  }
 });
 
 test("terminal recovery closes every durable interruption boundary exactly once", async () => {

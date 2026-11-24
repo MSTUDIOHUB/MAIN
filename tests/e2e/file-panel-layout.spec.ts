@@ -30,6 +30,10 @@ test.beforeEach(async ({ page }) => {
     };
     const openExternalCalls: string[] = [];
     const openExternalFailures: Record<string, string> = {};
+    const plansPath = `${workspace}/.MAIN/plans`;
+    const planName = "plan-248825707b4d324172618f22";
+    const planPath = `${plansPath}/${planName}`;
+    let finishPlanCleanup: ((succeed: boolean) => void) | undefined;
 
     const sortNodes = (nodes: Array<{ name: string; path: string; is_dir: boolean }>) =>
       nodes.sort((a, b) => {
@@ -38,6 +42,7 @@ test.beforeEach(async ({ page }) => {
         return a.name.localeCompare(b.name);
       });
 
+    const deleteCalls: any[] = [];
     const removeNode = (path: string) => {
       for (const nodes of [rootNodes, ...Object.values(childNodes)]) {
         const index = nodes.findIndex((node) => node.path === path);
@@ -46,6 +51,7 @@ test.beforeEach(async ({ page }) => {
     };
 
     (window as any).__FILE_PANEL_TEST__ = {
+      deleteCalls,
       addRootFile(name: string, content = "generated\n") {
         const path = `${workspace}/${name}`;
         files[path] = content;
@@ -69,6 +75,20 @@ test.beforeEach(async ({ page }) => {
       },
       failExternalOpen(path: string, message = "mock open failed") {
         openExternalFailures[path] = message;
+      },
+      addPlanDocument() {
+        rootNodes.push({ name: ".MAIN", path: `${workspace}/.MAIN`, is_dir: true });
+        childNodes[`${workspace}/.MAIN`] = [{ name: "plans", path: plansPath, is_dir: true }];
+        childNodes[plansPath] = [
+          { name: planName, path: planPath, is_dir: true },
+          { name: "notes.md", path: `${plansPath}/notes.md`, is_dir: false },
+        ];
+        childNodes[planPath] = ["document.json", "rev-1.json", "rev-1.md"].map((name) => ({
+          name, path: `${planPath}/${name}`, is_dir: false,
+        }));
+      },
+      finishPlanCleanup(succeed: boolean) {
+        finishPlanCleanup?.(succeed);
       },
     };
 
@@ -105,13 +125,28 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "get_workspace_root") return workspace;
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? workspace);
-      if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return [];
+      if (["list_project_sessions", "rebuild_project_sessions_index", "list_all_session_snapshots", "list_legacy_session_files"].includes(cmd)) return [];
+      if (cmd === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
       if (cmd === "save_project_session") return args?.session ?? {};
       if (cmd === "load_project_session") return {};
       if (cmd === "list_directory") {
         const path = String(args?.path ?? workspace);
         if (path === workspace) return [...rootNodes];
         return [...(childNodes[path] || [])];
+      }
+      if (cmd === "delete_plan_files") {
+        if (args?.workspace !== workspace) throw new Error("plan cleanup used the wrong workspace");
+        deleteCalls.push(JSON.parse(JSON.stringify(args)));
+        const succeed = await new Promise<boolean>((resolve) => { finishPlanCleanup = resolve; });
+        finishPlanCleanup = undefined;
+        if (!succeed) throw new Error("mock plan cleanup failed");
+        const protectedTurnIds: string[] = Array.isArray(args?.protectedTurnIds) ? args.protectedTurnIds : [];
+        if (protectedTurnIds.includes("turn-executing-plan")) {
+          return { removedDocumentIds: [], removedLegacyFiles: 0 };
+        }
+        removeNode(planPath);
+        delete childNodes[planPath];
+        return { removedDocumentIds: [planName], removedLegacyFiles: 0 };
       }
       if (cmd === "read_file") {
         const path = String(args?.path ?? "");
@@ -305,6 +340,44 @@ test("file tree refreshes automatically after files are created and deleted", as
   await expect(page.getByText("generated-notes.md")).toHaveCount(0, { timeout: 5000 });
 });
 
+test("file panel can retry plan cleanup and refreshes the expanded plan directory", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.addPlanDocument());
+  await page.getByRole("button", { name: "文件", exact: true }).click();
+  const panel = page.getByTestId("file-panel");
+  await panel.getByRole("button", { name: ".MAIN", exact: true }).click();
+  await panel.getByRole("button", { name: "plans", exact: true }).click();
+  const plan = panel.getByRole("button", { name: "plan-248825707b4d324172618f22", exact: true });
+  await plan.click();
+  await expect(panel.getByRole("button", { name: "rev-1.md", exact: true })).toBeVisible();
+
+  const cleanup = panel.getByTestId("workspace-clear-plan-files-button");
+  await cleanup.click();
+  await expect(cleanup).toBeDisabled();
+  await expect(cleanup).toHaveText("正在清理计划文件…");
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.finishPlanCleanup(false));
+  const alert = panel.getByRole("alert");
+  await expect(alert).toHaveText("清理计划文件失败，请重试。");
+  await expect(cleanup).toBeEnabled();
+  await expect(plan).toBeVisible();
+
+  for (const themeMode of ["light", "dark", "black"] as const) {
+    await page.evaluate((mode) => (window as any).__CODELY_E2E__.setThemeMode(mode), themeMode);
+    await expect(page.locator(`[data-theme="${themeMode}"]`).first()).toBeAttached();
+    await expect(alert).toBeInViewport();
+    await expect(alert).toHaveCSS("color", themeMode === "light" ? "rgb(190, 18, 60)" : "rgb(244, 135, 113)");
+    await panel.screenshot({ animations: "disabled", path: testInfo.outputPath(`plan-cleanup-${themeMode}.png`) });
+  }
+
+  await cleanup.click();
+  await expect(cleanup).toBeDisabled();
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.finishPlanCleanup(true));
+  await expect(cleanup).toBeEnabled();
+  await expect(alert).toHaveCount(0);
+  await expect(plan).toHaveCount(0);
+  await expect(panel.getByRole("button", { name: "notes.md", exact: true })).toBeVisible();
+});
+
 test("selected deleted file shows an error and can return to tree", async ({ page }) => {
   await page.goto("/?e2eScenario=diff-reload-summary");
   await page.locator('button[aria-label="文件"]').click();
@@ -347,4 +420,68 @@ test("file viewer wrap switch supports Space and Enter while changing long-line 
   await expect(content).toHaveCSS("white-space", "pre");
   await expect(code).toHaveCSS("white-space", "pre");
   await expect.poll(async () => (await content.boundingBox())!.height).toBeLessThanOrEqual(unwrappedHeight + 1);
+});
+
+test("paused unapproved plan turns do not block plan file cleanup while actively executing turns show notice", async ({ page }) => {
+  await page.goto("/?e2eScenario=diff-reload-summary");
+  await page.evaluate(async () => {
+    const store = await import("/src/store/useAppStore.ts");
+    const state = store.useAppStore.getState();
+    (window as any).__FILE_PANEL_TEST__.addPlanDocument();
+    store.useAppStore.setState({
+      isGenerating: false,
+      activeActionRequest: null,
+      conversationTurns: [{
+        id: "turn-paused-review",
+        userPrompt: "规划 MFramework",
+        status: "paused",
+        planDocument: {
+          kind: "plan",
+          documentId: "plan-248825707b4d324172618f22",
+        },
+        runtimeOutcome: {
+          status: "paused",
+          pauseKind: "action_required",
+          reason: "runtime_v2_plan_review_required",
+        },
+      }] as any,
+    });
+    expectTruthy(state.currentWorkspace);
+    function expectTruthy(v: unknown) { if (!v) throw new Error("missing workspace"); }
+  });
+
+  await page.getByRole("button", { name: "文件", exact: true }).click();
+  const panel = page.getByTestId("file-panel");
+  await panel.getByRole("button", { name: ".MAIN", exact: true }).click();
+  await panel.getByRole("button", { name: "plans", exact: true }).click();
+  const plan = panel.getByRole("button", { name: "plan-248825707b4d324172618f22", exact: true });
+  await expect(plan).toBeVisible();
+
+  const cleanup = panel.getByTestId("workspace-clear-plan-files-button");
+  await cleanup.click();
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.finishPlanCleanup(true));
+  await expect(plan).toHaveCount(0);
+  const calls = await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.deleteCalls);
+  expect(calls).toHaveLength(1);
+  expect(calls[0].protectedTurnIds).toBeUndefined();
+
+  await page.evaluate(async () => {
+    const store = await import("/src/store/useAppStore.ts");
+    (window as any).__FILE_PANEL_TEST__.addPlanDocument();
+    store.useAppStore.setState({
+      isGenerating: true,
+      currentTurnId: "turn-executing-plan",
+      conversationTurns: [{
+        id: "turn-executing-plan",
+        userPrompt: "执行计划",
+        status: "executing",
+        planDocument: { kind: "plan", documentId: "plan-248825707b4d324172618f22" },
+      }] as any,
+    });
+  });
+  await panel.getByRole("button", { name: "刷新", exact: true }).click();
+  await expect(plan).toBeVisible();
+  await cleanup.click();
+  await page.evaluate(() => (window as any).__FILE_PANEL_TEST__.finishPlanCleanup(true));
+  await expect(panel.getByTestId("workspace-clear-plan-files-notice")).toHaveText("当前有正在执行的计划任务，对应计划文件已跳过清理。");
 });

@@ -189,7 +189,6 @@ export interface SpawnSubagentRequest {
   accessMode?: CollaborationAccessMode;
   dependsOn?: string;
   independentReviewOf?: string;
-  goalSliceId?: string;
 }
 
 export type DelegationRuntimePhase =
@@ -473,6 +472,7 @@ export interface SubagentCapacityPolicy {
   maxTotalRequests: number;
   /** Highest simultaneous first-token overlap confirmed for this lane. */
   confirmedTotalRequests: number;
+  confirmedOverlappingChildren: number;
   capacitySource: "configured" | "observed" | "probing";
   /** Whether parent and child provider requests can actually overlap. */
   modelRequestMode: "parallel" | "serialized";
@@ -776,6 +776,7 @@ export function resolveSubagentCapacityPolicy(
       model: "Unknown",
       maxTotalRequests: 1,
       confirmedTotalRequests: 0,
+      confirmedOverlappingChildren: 0,
       capacitySource: "probing",
       modelRequestMode: "serialized",
       maxActiveRequests: 0,
@@ -793,6 +794,7 @@ export function resolveSubagentCapacityPolicy(
     model: configured.model,
     maxTotalRequests: observed.maxActiveRequests,
     confirmedTotalRequests: observed.maxConfirmedActiveRequests,
+    confirmedOverlappingChildren: observed.maxConfirmedOverlappingChildren,
     capacitySource: observed.configured
       ? "configured"
       : observed.maxConfirmedActiveRequests > 1
@@ -2543,7 +2545,7 @@ export function reportSubagentCapacityFailure(
   const message = error instanceof Error ? error.message : String(error || "");
   const shouldDegrade = /SUBAGENT_MEMORY_PRESSURE_DEGRADED|\b(?:oom|out of memory|memory allocation|429|524)\b|connection reset|socket hang up|gateway timeout|no visible progress|stream.*timeout/i.test(message);
   if (!shouldDegrade) return false;
-  degradedUntilByLane.set(policy.laneKey, Date.now() + 5 * 60_000);
+  degradedUntilByLane.set(policy.laneKey, Date.now() + 16_000);
   const lane = capacityLanes.get(policy.laneKey);
   if (lane) {
     lane.limit = 1;

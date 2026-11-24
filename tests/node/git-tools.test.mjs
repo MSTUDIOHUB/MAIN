@@ -38,8 +38,10 @@ const projectSessionMutationCoordinator = await loadCommonJs(
   { "./keyedAsyncQueue": keyedAsyncQueue },
 );
 
+const loadTs = createTsModuleLoader();
 const ipc = await loadCommonJs("src/lib/ipc.ts", {
-  "./runtime-v2/checkpoint": createTsModuleLoader()("src/lib/runtime-v2/checkpoint.ts"),
+  "./runtime-v2/checkpoint": loadTs("src/lib/runtime-v2/checkpoint.ts"),
+  "./runtime-v2/checkpointMerge": loadTs("src/lib/runtime-v2/checkpointMerge.ts"),
   "@tauri-apps/api/core": {
     invoke: async (command, args) => {
       invokeState.calls.push({ command, args });

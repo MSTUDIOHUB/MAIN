@@ -154,18 +154,26 @@ function parentContextCapacity(
     : DEFAULT_PARENT_CONTEXT_CAPSULE_CHARS;
 }
 
-function activeAuthority(aggregate: TurnAggregateV1): unknown {
+function activeAuthority(aggregate: TurnAggregateV1, job: RuntimeV2SubagentJob): unknown {
   if (
     aggregate.workPlan?.status === "approved" &&
     aggregate.sealedWorkPlan
   ) {
+    const plan = aggregate.sealedWorkPlan;
+    const steps = job.proactiveKey
+      ? plan.draft.steps.filter(step => step.targets.some(target => job.allowedPaths.some(path => pathsOverlap(target, path))))
+      : plan.draft.steps;
     return {
       kind: "approved_work_plan",
-      id: aggregate.sealedWorkPlan.id,
-      revision: aggregate.sealedWorkPlan.revision,
-      objective: aggregate.sealedWorkPlan.draft.objective,
-      steps: aggregate.sealedWorkPlan.draft.steps,
-      validations: aggregate.sealedWorkPlan.draft.validations,
+      id: plan.id,
+      revision: plan.revision,
+      digest: plan.digest,
+      objective: plan.draft.objective,
+      steps,
+      validations: job.proactiveKey
+        ? plan.draft.validations.filter(validation => validation.required && (job.taskKind === "validate" ||
+          validation.stepIndexes.some(index => steps.includes(plan.draft.steps[index]))))
+        : plan.draft.validations,
     };
   }
   return null;
@@ -198,7 +206,7 @@ export function buildRuntimeV2SubagentContextCapsule(input: {
     ...canonicalContextAnchors(input.messages, isProjectBaselineForWorkspace(
       input.projectBaselineContext,
       input.workspace || "",
-    )),
+    )).filter(entry => !input.job.proactiveKey || entry.source !== "plan"),
     ...canonicalSourceContext({
       messages: input.messages,
       effectFacts: input.effectFacts,
@@ -217,7 +225,7 @@ export function buildRuntimeV2SubagentContextCapsule(input: {
       }),
     ),
     lifecyclePhase: aggregate.phase,
-    authority: activeAuthority(aggregate),
+    authority: activeAuthority(aggregate, input.job),
     parentEvidenceCatalog: allowedEvidence.slice(-32).map((evidence) => ({
       id: evidence.id,
       kind: evidence.kind,

@@ -8,14 +8,15 @@ import type { HarnessRunMarker } from "./harnessCrashTelemetry";
 import { isHarnessMarkerOwnedByPlanExecution } from "./planExecutionOwnership";
 import type { PlanLifecycleState } from "./planLifecycle";
 import { isPerCallOnlyToolRisk, type ToolRiskLevel } from "./toolCapabilities";
+import { normalizeUserQuestionnaire, sameUserQuestionnaire, validateUserChoiceAnswer, type UserQuestionnaire, type UserChoiceAnswer } from "./userQuestions";
+import { normalizePlanDocumentRef, type PlanDocumentRef } from "./planDocuments";
 
 export const ACTION_REQUEST_SCHEMA_VERSION = 1 as const;
 
 export type ActionRequestKind =
   | "tool_permission"
   | "plan_review"
-  | "user_choice"
-  | "goal_confirmation";
+  | "user_choice";
 
 export type ActionRequestStatus = "pending" | "resolved" | "cancelled" | "stale";
 
@@ -80,27 +81,21 @@ export interface PlanReviewActionRequest extends ActionRequestBase {
   planRevision: number;
   artifactHash: string;
   artifactPaths: string[];
+  readonly documentRef?: PlanDocumentRef;
 }
 
 export interface UserChoiceActionRequest extends ActionRequestBase {
   kind: "user_choice";
+  readonly questionnaire?: UserQuestionnaire;
   executionBlocker?: { readonly sessionEpoch: string };
   optionValues: string[];
   allowCustomReply: boolean;
 }
 
-export interface GoalConfirmationActionRequest extends ActionRequestBase {
-  kind: "goal_confirmation";
-  goalId: string;
-  goalRevision: number;
-  reason: string;
-}
-
 export type ActionRequest =
   | ToolPermissionActionRequest
   | PlanReviewActionRequest
-  | UserChoiceActionRequest
-  | GoalConfirmationActionRequest;
+  | UserChoiceActionRequest;
 
 /**
  * Immutable identity captured by a permission control when it is rendered.
@@ -116,96 +111,13 @@ export type ToolPermissionResolutionIdentity = Pick<
 /** Durable identity stored with an awaiting-choice assistant block. */
 export type UserChoiceResolutionIdentity = Pick<
   UserChoiceActionRequest,
-  "sessionKey" | "turnId" | "runId" | "requestId" | "parentRunId" | "optionValues" | "allowCustomReply" | "status" | "executionBlocker"
+  "sessionKey" | "turnId" | "runId" | "requestId" | "parentRunId" | "optionValues" | "allowCustomReply" | "status" | "executionBlocker" | "questionnaire"
 >;
 
 export type PlanReviewResolutionIdentity = Pick<
   PlanReviewActionRequest,
-  "sessionKey" | "sessionEpoch" | "turnId" | "runId" | "parentRunId" | "requestId" | "planRevision" | "artifactHash"
+  "sessionKey" | "sessionEpoch" | "turnId" | "runId" | "parentRunId" | "requestId" | "planRevision" | "artifactHash" | "documentRef"
 >;
-
-export type GoalConfirmationResolutionIdentity = Pick<
-  GoalConfirmationActionRequest,
-  "sessionKey" | "turnId" | "runId" | "requestId" | "goalId" | "goalRevision"
->;
-
-/** Identity captured by a Goal control. A request id is present only while the
- * Goal is stopped at an explicit confirmation boundary. */
-export interface GoalControlIdentity {
-  goalId: string;
-  goalRevision: number;
-  requestId?: string;
-}
-
-export function isCurrentGoalControlResolution(input: {
-  request: ActionRequest | null | undefined;
-  identity: GoalControlIdentity | null | undefined;
-  goalId: string | null | undefined;
-  goalRevision: number;
-  runOwner?: {
-    status?: string | null;
-    sessionKey?: string | null;
-    turnId?: string | null;
-    runId?: string | null;
-    activeRunId?: string | null;
-  } | null;
-}): boolean {
-  const identity = input.identity;
-  if (!identity || !input.goalId) return false;
-  if (identity.goalId !== input.goalId || identity.goalRevision !== input.goalRevision) return false;
-
-  const pendingRequest = input.request?.status === "pending" ? input.request : null;
-  if (!pendingRequest) return !identity.requestId;
-  if (pendingRequest.kind !== "goal_confirmation") return false;
-  const pendingGoalConfirmation = pendingRequest;
-  if (
-    pendingGoalConfirmation.goalId !== input.goalId ||
-    pendingGoalConfirmation.goalRevision !== input.goalRevision
-  ) {
-    return false;
-  }
-  const confirmation = pendingGoalConfirmation;
-
-  return identity.requestId === confirmation.requestId &&
-    input.runOwner?.status === "paused" &&
-    input.runOwner.sessionKey === confirmation.sessionKey &&
-    input.runOwner.turnId === confirmation.turnId &&
-    (input.runOwner.activeRunId || input.runOwner.runId) === confirmation.runId;
-}
-
-/** Pause and clear are administrative Goal controls rather than resolutions of
- * a pending permission/choice. They still bind the exact Goal revision, and a
- * request id (when captured) must match the current Goal confirmation. */
-export function isCurrentGoalAdministrativeControl(input: {
-  request: ActionRequest | null | undefined;
-  identity: GoalControlIdentity | null | undefined;
-  goalId: string | null | undefined;
-  goalRevision: number;
-}): boolean {
-  const identity = input.identity;
-  if (!identity || !input.goalId) return false;
-  if (identity.goalId !== input.goalId || identity.goalRevision !== input.goalRevision) return false;
-  const confirmation = input.request?.kind === "goal_confirmation" &&
-    input.request.status === "pending" &&
-    input.request.goalId === input.goalId &&
-    input.request.goalRevision === input.goalRevision
-      ? input.request
-      : null;
-  if (!confirmation) return !identity.requestId;
-  return confirmation.requestId === identity.requestId;
-}
-
-export function clearGoalConfirmationActionRequest(
-  request: ActionRequest | null | undefined,
-  goalId: string,
-  goalRevision: number,
-): ActionRequest | null {
-  return request?.kind === "goal_confirmation" &&
-    request.goalId === goalId &&
-    request.goalRevision === goalRevision
-    ? null
-    : request || null;
-}
 
 export function toUserChoiceResolutionIdentity(
   request: UserChoiceActionRequest,
@@ -219,6 +131,7 @@ export function toUserChoiceResolutionIdentity(
     optionValues: [...request.optionValues],
     allowCustomReply: request.allowCustomReply,
     status: request.status,
+    ...(request.questionnaire ? { questionnaire: structuredClone(request.questionnaire) } : {}),
     ...(request.executionBlocker ? { executionBlocker: request.executionBlocker } : {}),
   };
 }
@@ -235,6 +148,7 @@ export function isExactUserChoiceResolutionIdentity(
     current.requestId === submitted.requestId &&
     (current.parentRunId || null) === (submitted.parentRunId || null) &&
     current.allowCustomReply === submitted.allowCustomReply &&
+    sameUserQuestionnaire(current.questionnaire, submitted.questionnaire) &&
     current.optionValues.length === submitted.optionValues.length &&
     current.optionValues.every((value, index) =>
       normalizeNonEmptyString(value) === normalizeNonEmptyString(submitted.optionValues[index])
@@ -251,6 +165,7 @@ export function isMatchingUserChoiceResolution(input: {
   const identity = input.identity;
   const optionValue = normalizeNonEmptyString(input.optionValue);
   return !!identity &&
+    !identity.questionnaire &&
     identity.status === "pending" &&
     identity.sessionKey === input.sessionKey &&
     identity.turnId === input.turnId &&
@@ -260,6 +175,15 @@ export function isMatchingUserChoiceResolution(input: {
     (input.isCustomReply === true
       ? identity.allowCustomReply === true
       : identity.optionValues.some((value) => normalizeNonEmptyString(value) === optionValue));
+}
+
+export function isMatchingStructuredUserChoiceResolution(input: {
+  current: UserChoiceResolutionIdentity | null | undefined;
+  submitted: UserChoiceResolutionIdentity | null | undefined;
+  answer: UserChoiceAnswer;
+}): boolean {
+  return isExactUserChoiceResolutionIdentity(input.current, input.submitted) &&
+    !!input.current?.questionnaire && validateUserChoiceAnswer(input.current.questionnaire, input.answer, input.current.requestId).ok;
 }
 
 function normalizeNonEmptyString(value: unknown): string {
@@ -310,8 +234,11 @@ export function buildPlanReviewActionRequest(input: {
   planRevision: number;
   artifactHash: string;
   artifactPaths: string[];
+  documentRef?: PlanDocumentRef;
   now?: number;
 }): PlanReviewActionRequest {
+  const documentRef = input.documentRef ? normalizePlanDocumentRef(input.documentRef) : null;
+  if (input.documentRef && (!documentRef || documentRef.owner.sessionKey !== input.sessionKey || documentRef.owner.turnId !== input.turnId || (input.sessionEpoch && documentRef.owner.sessionEpoch !== input.sessionEpoch))) throw new Error("INVALID_PLAN_DOCUMENT_OWNER");
   return {
     ...buildBaseActionRequest({ ...input, kind: "plan_review" }),
     kind: "plan_review",
@@ -321,6 +248,7 @@ export function buildPlanReviewActionRequest(input: {
     planRevision: Math.max(1, Number(input.planRevision) || 1),
     artifactHash: input.artifactHash,
     artifactPaths: [...input.artifactPaths],
+    ...(documentRef ? { documentRef } : {}),
   };
 }
 
@@ -331,34 +259,18 @@ export function buildUserChoiceActionRequest(input: {
   parentRunId?: string | null;
   title: string;
   optionValues: string[];
+  questionnaire?: UserQuestionnaire;
   allowCustomReply?: boolean;
   now?: number;
 }): UserChoiceActionRequest {
+  const questionnaire = input.questionnaire ? normalizeUserQuestionnaire(input.questionnaire) : null;
+  if (input.questionnaire && !questionnaire) throw new Error("INVALID_USER_QUESTIONNAIRE");
   return {
     ...buildBaseActionRequest({ ...input, kind: "user_choice" }),
     kind: "user_choice",
     optionValues: input.optionValues.map(normalizeNonEmptyString).filter(Boolean),
+    ...(questionnaire ? { questionnaire } : {}),
     allowCustomReply: input.allowCustomReply === true,
-  };
-}
-
-export function buildGoalConfirmationActionRequest(input: {
-  sessionKey: string;
-  turnId: string;
-  runId: string;
-  parentRunId?: string | null;
-  title: string;
-  goalId: string;
-  goalRevision: number;
-  reason: string;
-  now?: number;
-}): GoalConfirmationActionRequest {
-  return {
-    ...buildBaseActionRequest({ ...input, kind: "goal_confirmation" }),
-    kind: "goal_confirmation",
-    goalId: input.goalId,
-    goalRevision: Math.max(1, Number(input.goalRevision) || 1),
-    reason: normalizeNonEmptyString(input.reason) || "periodic_confirmation",
   };
 }
 
@@ -530,7 +442,7 @@ export function resolveActionRequest(
 
 /**
  * The global permission capsule is deliberately narrower than the set of all
- * checkpoints. Plan review, reply choices and Goal confirmations have their own
+ * checkpoints. Plan review, reply choices and User confirmations have their own
  * workflow-specific UI and must never be projected as a tool permission.
  */
 export function shouldRenderPermissionCapsule(input: {
@@ -566,8 +478,7 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
   if (
     kind !== "tool_permission" &&
     kind !== "plan_review" &&
-    kind !== "user_choice" &&
-    kind !== "goal_confirmation"
+    kind !== "user_choice"
   ) {
     return null;
   }
@@ -622,6 +533,8 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
     };
   }
   if (kind === "plan_review") {
+    const documentRef = record.documentRef === undefined ? undefined : normalizePlanDocumentRef(record.documentRef);
+    if (record.documentRef !== undefined && (!documentRef || documentRef.owner.sessionKey !== sessionKey || documentRef.owner.turnId !== turnId || (record.sessionEpoch && documentRef.owner.sessionEpoch !== record.sessionEpoch))) return null;
     const artifactHash = normalizeNonEmptyString(record.artifactHash);
     if (!artifactHash) return null;
     return {
@@ -632,15 +545,19 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
         : {}),
       planRevision: Math.max(1, Number(record.planRevision) || 1),
       artifactHash,
+      ...(documentRef ? { documentRef } : {}),
       artifactPaths: Array.isArray(record.artifactPaths)
         ? record.artifactPaths.map(normalizeNonEmptyString).filter(Boolean)
         : [],
     };
   }
   if (kind === "user_choice") {
+    const questionnaire = record.questionnaire === undefined ? undefined : normalizeUserQuestionnaire(record.questionnaire);
+    if (record.questionnaire !== undefined && !questionnaire) return null;
     return {
       ...base,
       kind,
+      ...(questionnaire ? { questionnaire } : {}),
       ...(record.executionBlocker && typeof record.executionBlocker === "object" && typeof (record.executionBlocker as any).sessionEpoch === "string"
         ? { executionBlocker: { sessionEpoch: (record.executionBlocker as any).sessionEpoch } } : {}),
       optionValues: Array.isArray(record.optionValues)
@@ -649,13 +566,5 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
       allowCustomReply: record.allowCustomReply === true,
     };
   }
-  const goalId = normalizeNonEmptyString(record.goalId);
-  if (!goalId) return null;
-  return {
-    ...base,
-    kind,
-    goalId,
-    goalRevision: Math.max(1, Number(record.goalRevision) || 1),
-    reason: normalizeNonEmptyString(record.reason) || "periodic_confirmation",
-  };
+  return null;
 }

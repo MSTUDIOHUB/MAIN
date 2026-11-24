@@ -5,6 +5,7 @@ import path from "node:path";
 import ts from "typescript";
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 
 const cache = new Map();
 function loadTs(file) {
@@ -36,6 +37,44 @@ const tool = (name, source) => ({
 });
 const snapshot = (overrides = {}) => mcp.resolveWorkspaceMcpView({
   workspace: "/a", manualServers: [], manualTools: [], manualToolServerMap: {}, ...overrides,
+});
+
+test("Unity observations require the exact project and version and select it before calling the fixed read action", async () => {
+  const client = loadTs("src/lib/mcpClient.ts");
+  client.__clearMcpDiscoveryFailureCacheForTests();
+  const configured = server("editor");
+  const hash = createHash("sha1").update("/a/Assets").digest("hex").slice(0, 16);
+  const instance = { id: `a@${hash}`, hash, unity_version: "2022.3.62t16" };
+  const calls = [];
+  client.__setMcpInvokeForTests(async (_command, payload) => {
+    const request = JSON.parse(payload.body);
+    calls.push(request);
+    let result = {};
+    if (request.method === "initialize") result = { serverInfo: { name: "mcp-for-unity-server" } };
+    if (request.method === "tools/list") result = { tools: ["set_active_instance", "manage_scene", "read_console"].map(name => ({ name, inputSchema: {} })) };
+    if (request.method === "resources/read") result = { contents: [{ text: JSON.stringify({ success: true, instances: [instance] }) }] };
+    if (request.params?.name === "set_active_instance") result = { structuredContent: { success: true, data: { instance: instance.id } } };
+    if (request.params?.name === "read_console") result = { content: [{ text: "fixture diagnostics" }] };
+    return { status: 200, ok: true, body: JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) };
+  });
+  try {
+    const found = await client.discoverAllMcpTools([configured]);
+    const view = snapshot({ manualServers: [configured], manualTools: found.tools, manualToolServerMap: found.toolServerMap });
+    assert.deepEqual((await mcp.bindWorkspaceUnityMcpView(view, "6000.0.1f1")).mcpDiscoveredTools, []);
+    const bound = await mcp.bindWorkspaceUnityMcpView(view, instance.unity_version);
+    assert.deepEqual(mcp.unityMcpObservationTools(bound).map(tool => tool.function.name), ["unity_mcp_scene", "unity_mcp_console"]);
+    assert.ok(!bound.mcpDiscoveredTools.some(tool => tool.name === "set_active_instance"));
+    await assert.rejects(mcp.executeUnityMcpObservation({ snapshot: bound, workspace: "/b", name: "unity_mcp_console", args: {} }), /SCOPE_MISMATCH/);
+    await assert.rejects(mcp.executeUnityMcpObservation({ snapshot: bound, workspace: "/a", name: "unity_mcp_console", args: { action: "clear" } }), /SCOPE_MISMATCH/);
+    const result = await mcp.executeUnityMcpObservation({ snapshot: bound, workspace: "/a", name: "unity_mcp_console", args: {} });
+    assert.equal(result, "fixture diagnostics");
+    assert.deepEqual(calls.filter(call => call.method === "tools/call").map(call => call.params), [
+      { name: "set_active_instance", arguments: { instance: instance.id } },
+      { name: "read_console", arguments: { action: "get", types: ["error", "warning"], count: 25, format: "json" } },
+    ]);
+  } finally {
+    client.__setMcpInvokeForTests(null);
+  }
 });
 
 test("workspace normalization preserves filesystem roots", () => {

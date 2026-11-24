@@ -51,10 +51,11 @@ function fixture() {
 function canonical(f, receipt) {
   let sequence = 0;
   const event = (type, fields) => ({ schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: `e${sequence}`, sequence: sequence++, at: sequence, type, ...fields });
-  let aggregate = runtime.transition(null, event("turn.admitted", { turn: f.turn, strategy: "execute", objective: "Implement the requested artifact.", constraints: [], acceptanceCriteria: ["Requested artifact exists."] }));
+  const strategy = f.command.phase === "planning" ? "plan" : "execute";
+  let aggregate = runtime.transition(null, event("turn.admitted", { turn: f.turn, strategy, objective: "Implement the requested artifact.", constraints: [], acceptanceCriteria: ["Requested artifact exists."] }));
   const add = (type, fields) => { aggregate = runtime.transition(aggregate, event(type, fields)); };
-  add("run.started", { run: f.run, phase: "observing" });
-  const providerCommand = { ...f.command, kind: "request_model", idempotencyKey: "provider", payload: { mode: "execute" } };
+  add("run.started", { run: f.run, phase: f.command.phase });
+  const providerCommand = { ...f.command, kind: "request_model", idempotencyKey: "provider", payload: { mode: strategy } };
   add("command.scheduled", { run: f.run, command: providerCommand });
   add("provider.responded", { run: f.run, idempotencyKey: "provider", result: { visibleText: "Read the relevant workflow.", toolCalls: [f.call], diagnostics: [] } });
   add("command.scheduled", { run: f.run, command: f.command });
@@ -101,7 +102,21 @@ test("Skill-only JSON checkpoint restore preserves exact pairs through pressure 
   assert.equal(transcript.runtimeV2TranscriptSkillGuidanceWindows(bounded).length, 1);
 });
 
-test("legacy prefixes, errors, different owners and terminal Runs cannot become recovered guidance", async () => {
+test("Execute restores same-owner Plan Skill guidance as the original typed receipt", async () => {
+  const f = fixture();
+  const receipt = await createRuntimeV2ToolPort(f.ports).execute({ command: f.command, signal: new AbortController().signal });
+  f.command.phase = "planning";
+  const planReceipt = { ...receipt, modelContent: `[E14] s:76d7f9e6\n${receipt.modelContent}` };
+  const aggregate = coldCheckpoint(canonical(f, planReceipt).aggregate);
+  const live = createRuntimeV2LiveExecutionState();
+  history().restoreRuntimeV2SkillHistory(live, aggregate, f.run);
+  assert.equal(live.messages[1]?.content, receipt.modelContent);
+  assert.equal(transcript.runtimeV2TranscriptSkillGuidanceWindows(live.messages).length, 1);
+  assert.deepEqual(live.latestProviderRequestSourceCoverage, []);
+  assert.equal(live.authorization, null);
+});
+
+test("untrusted prefixes, errors, different owners and terminal Runs cannot become recovered guidance", async () => {
   const f = fixture();
   const receipt = await createRuntimeV2ToolPort(f.ports).execute({ command: f.command, signal: new AbortController().signal });
   const aggregate = coldCheckpoint(canonical(f, receipt).aggregate);
@@ -118,6 +133,7 @@ test("legacy prefixes, errors, different owners and terminal Runs cannot become 
     (e) => { const { modelContent, ...legacy } = e; return legacy; },
     (e) => ({ ...e, status: "failed" }),
     (e) => ({ ...e, modelContent: e.presentation.message }),
+    (e) => ({ ...e, modelContent: `[E1] unrelated\n${e.modelContent}` }),
     (e) => ({ ...e, run: { ...e.run, attemptId: "other-attempt" } }),
   ]) {
     assert.deepEqual(restore({ ...aggregate, events: aggregate.events.map((e) => e.type === "tool.completed" ? rewrite(e) : e) }).messages, []);

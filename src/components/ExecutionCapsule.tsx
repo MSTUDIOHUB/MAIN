@@ -9,6 +9,9 @@ import {
   simplifyOperationProposalReplyOptions,
 } from "../lib/replyOptions";
 import type { TurnPresentationModel } from "../lib/turnPresentation";
+import { UserQuestionnaireForm } from "./UserQuestionnaireForm";
+import type { UserChoiceAnswer } from "../lib/userQuestions";
+import { toUserChoiceResolutionIdentity, type UserChoiceActionRequest, type UserChoiceResolutionIdentity } from "../lib/actionRequest";
 import {
   requiresPerCallToolPermissionApproval,
   type ToolPermissionActionRequest,
@@ -45,6 +48,8 @@ interface ExecutionCapsuleProps {
   progressMode?: "plan" | "execution";
   isAwaitingChoice?: boolean;
   replyOptions?: ReplyOption[];
+  choiceRequest?: UserChoiceActionRequest | null;
+  onSubmitChoiceAnswer?: (answer: UserChoiceAnswer, identity: UserChoiceResolutionIdentity) => void | Promise<unknown>;
   allowCustomReply?: boolean;
   pendingRunDecision?: PendingRunDecision | null;
   activeDiffTask?: any;
@@ -165,6 +170,8 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   progressMode,
   isAwaitingChoice = false,
   replyOptions = [],
+  choiceRequest,
+  onSubmitChoiceAnswer,
   allowCustomReply = false,
   pendingRunDecision = null,
   activeDiffTask,
@@ -324,7 +331,8 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const hasApprovalActionOptions = approvalActionOptions.length > 0;
 
   // region: ExecutionCapsule 展开时机
-  const hasReplyOptions = hasRealChoiceOptions || hasApprovalActionOptions;
+  const hasStructuredQuestions = !!choiceRequest?.questionnaire;
+  const hasReplyOptions = hasRealChoiceOptions || hasApprovalActionOptions || hasStructuredQuestions;
   const hasPendingRunDecision = !!pendingRunDecision;
   const reviewTaskCandidate = pendingToolReview || activeDiffTask;
   const activeReviewTask = permissionIdentity &&
@@ -692,9 +700,13 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
             )}
 
             {showAwaitingChoice && !choiceOptionsCollapsed && (
-              <div data-testid="execution-capsule-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
+              <div data-testid="execution-capsule-awaiting-choice" className={`mt-3 rounded-2xl border p-3 text-left ${surface}`}>
                 <div className="flex min-w-0 items-start justify-between gap-3">
-                  <div className={`min-w-0 font-medium ${primaryText}`} style={choiceTextStyle}>{copy.chooseToContinue}</div>
+                  <div className={`min-w-0 font-medium ${primaryText}`} style={choiceTextStyle}>
+                    {hasStructuredQuestions
+                      ? (choiceRequest?.questionnaire?.title || (language === "zh" ? "确认问题" : "Confirm the details"))
+                      : copy.chooseToContinue}
+                  </div>
                   <button
                     type="button"
                     data-testid="execution-capsule-collapse-options"
@@ -705,17 +717,19 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                     {copy.collapseOptions}
                   </button>
                 </div>
-                <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
-                  {canApprovePlan
-                    ? language === "zh"
-                      ? "计划已经准备就绪。开始执行，或在下方说明需要调整的内容。"
-                      : "The plan is ready. Start execution, or describe the changes you want below."
-                    : hasRealChoiceOptions
-                    ? copy.choicePrompt
-                    : hasApprovalActionOptions
-                    ? copy.approvalActionsHint
-                    : copy.choiceHint}
-                </div>
+                {!hasStructuredQuestions && (
+                  <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
+                    {canApprovePlan
+                      ? language === "zh"
+                        ? "计划已经准备就绪。开始执行，或在下方说明需要调整的内容。"
+                        : "The plan is ready. Start execution, or describe the changes you want below."
+                      : hasRealChoiceOptions
+                      ? copy.choicePrompt
+                      : hasApprovalActionOptions
+                      ? copy.approvalActionsHint
+                      : copy.choiceHint}
+                  </div>
+                )}
                 {canApprovePlan && (
                   <div className="mt-2 flex flex-col gap-2">
                     <div className="space-y-2">
@@ -775,7 +789,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                     </button>
                   </div>
                 )}
-                {!canApprovePlan && hasReplyOptions && (
+                {!canApprovePlan && hasStructuredQuestions && choiceRequest && (
+                  <div className="mt-2.5"><UserQuestionnaireForm key={JSON.stringify(toUserChoiceResolutionIdentity(choiceRequest))} request={choiceRequest} language={language} hideTitle disabled={!onSubmitChoiceAnswer}
+                    onSubmit={(answer, identity) => onSubmitChoiceAnswer?.(answer, identity)} onCancel={onCancelTurn} /></div>
+                )}
+                {!canApprovePlan && hasReplyOptions && !hasStructuredQuestions && (
                   <div className="mt-3 flex flex-col gap-3">
                     {hasRealChoiceOptions && (
                       tabGroups ? (

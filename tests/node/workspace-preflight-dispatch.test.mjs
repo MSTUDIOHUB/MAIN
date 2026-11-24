@@ -756,6 +756,27 @@ test("a natural continuation is semantically classified before it can inherit a 
   } finally { harness.cleanup(); }
 });
 
+test("a read-only operate semantic result reaches the actual Store's Analyze workflow without execution authority", async () => {
+  const harness = createHarness("operate-read-only-capabilities");
+  try {
+    const receipt = await harness.accept("Inspect the selected guidance and source, then report their confirmed marker. Do not write files or run commands.");
+    const result = semanticResult("operate", ["workspace_read"], "report", ["workspace_write", "command"]);
+    harness.resolveRaw(0, { content: JSON.stringify(result), toolCalls: [], finishReason: "stop" });
+    await waitFor(() => harness.workflows.length === 1);
+    assert.equal(harness.requests.length, 1);
+    assert.equal(harness.workflows.length, 1);
+    const workflow = harness.workflows[0];
+    assert.equal(workflow.turnId, receipt.turnId);
+    assert.equal(workflow.effectiveRunIntent, "analyze");
+    assert.deepEqual(workflow.options.semanticIntent, result.semantic);
+    assert.equal(workflow.effectiveCommandDirective.kind, "none");
+    assert.equal(workflow.effectiveCommandDirective.requiresApproval, false);
+    assert.equal(workflow.options.executionConsentGranted, undefined);
+    assert.equal(harness.store.getState().pendingRunDecision, null);
+    assert.equal(harness.store.getState().activeActionRequest, null);
+  } finally { harness.cleanup(); }
+});
+
 for (const completion of ["valid", "invalid", "transport-error"]) {
 test(`a late semantic ${completion} cannot adopt a replacement controller with the same Turn id`, async () => {
   const harness = createHarness(`semantic-same-turn-replacement-${completion}`);

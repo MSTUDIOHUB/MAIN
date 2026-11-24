@@ -1,14 +1,20 @@
+import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { estimateMessagesTokens, estimateTokens } from "../../lib/contextTrim";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2/aggregate";
 import { appendRuntimeV2AssistantToolCallHistory, appendRuntimeV2ProviderFeedbackHistory, appendRuntimeV2ToolResultHistory, upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 import type { RuntimeV2LiveExecutionState } from "./executionTypes";
 import { runtimeV2ClarificationMessage } from "./clarificationHistory";
+import { projectPlanSkillGuidance } from "./planSkillGuidance";
 
 /** A replay adapter, not another history owner. No new evidence is minted. */
 export function restoreReadOnlyHistory(live: RuntimeV2LiveExecutionState, aggregate: TurnAggregateV1): void {
   const commands = new Map(aggregate.events.flatMap((event) => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
+  const hasGuidance = aggregate.events.some(event => event.type === "guidance.admitted");
   for (const event of aggregate.events) {
+    if (hasGuidance && event.type === "command.scheduled" && event.command.kind === "request_model") {
+      appendRuntimeV2GuidanceHistory(live.messages, aggregate, event.run, event.command.idempotencyKey);
+    }
     const reply = runtimeV2ClarificationMessage(event);
     if (reply) live.messages.push(reply);
     if (event.type === "provider.responded") {
@@ -46,10 +52,14 @@ function referenceDuplicateWebReceipts(messages: readonly AgentMessage[]): Agent
 export function boundReadOnlyHistory(messages: readonly AgentMessage[], input: {
   contextLimit: number; reservedOutputTokens: number; tools?: readonly unknown[];
   preserveUserMessages?: boolean;
+  compactSkillGuidance?: boolean;
 }): AgentMessage[] {
   const budget = Math.max(0, input.contextLimit - input.reservedOutputTokens - estimateTokens(JSON.stringify(input.tools || [])));
   let result = messages.map((message) => ({ ...message }));
-  const projection = () => referenceDuplicateWebReceipts(result);
+  const projection = () => {
+    const receipts = referenceDuplicateWebReceipts(result);
+    return input.compactSkillGuidance ? projectPlanSkillGuidance(receipts) : receipts;
+  };
   const fits = () => estimateMessagesTokens(projection()) <= budget;
   if (fits()) return projection();
   const groups: AgentMessage[][] = [];

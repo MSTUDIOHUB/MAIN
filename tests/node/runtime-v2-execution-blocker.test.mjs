@@ -4,7 +4,7 @@ import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 
 const load = createTsModuleLoader();
 const runtime = load("src/lib/runtime-v2/index.ts");
-const { resolveRuntimeV2ExecutionBlocker: resolve, deriveRuntimeV2ExecutionBlocker: derive,
+const { resolveRuntimeV2ExecutionBlocker: resolve,
   projectRuntimeV2ExecutionBlocker: project } = load("src/store/runtimeV2/executionBlocker.ts");
 const { installRuntimeV2ExecutionDecisionReplay: installReplay } = load("src/store/runtimeV2/executionDecisionReplay.ts");
 const { toUserChoiceResolutionIdentity } = load("src/lib/actionRequest.ts");
@@ -109,20 +109,6 @@ test("cold ledger restore replays an already committed decision exactly once", a
   unsubscribe();
 });
 
-test("a cycle pauses only when the exact rejection was visible to the model", () => {
-  const f = fixture();
-  const aggregate = f.get().runtimeV2Checkpoints.turn.aggregate;
-  const receipt = { call: { id: "call", name: "read_skill", arguments: {} }, actionIdentity: "hash", status: "rejected", reasonCode: "tool_surface_rejected", feedback: "INTERNAL_CODE", priorFeedbackObserved: false };
-  const response = { type: "provider.responded", sequence: 9, result: { actionReceipts: [receipt] } };
-  const state = { ...aggregate, events: [...aggregate.events, response] };
-  assert.equal(derive(state, "choice-2", "zh"), null);
-  receipt.priorFeedbackObserved = true;
-  const blocker = derive(state, "choice-2", "zh");
-  assert.equal(blocker.reasonCode, "rejected_action_cycle");
-  assert.deepEqual(blocker.options, ["recheck", "stop"]);
-  assert.doesNotMatch(blocker.message, /INTERNAL_CODE/);
-});
-
 test("recheck can reopen a pre-execution denial but cannot replay a command that already ran and failed", () => {
   const { deriveRuntimeV2ProviderEffectFacts: facts } = load("src/store/runtimeV2/executionProviderEffectFacts.ts");
   const { runtimeV2ProviderToolCallIdentity } = load("src/store/runtimeV2/providerToolSurface.ts");
@@ -137,4 +123,20 @@ test("recheck can reopen a pre-execution denial but cannot replay a command that
     ] };
     assert.equal(facts(aggregate).rejectedActionIdentities.has(identity), shouldStayClosed);
   }
+});
+
+test("createRuntimeV2ExecutionBlockerView does not duplicate title when blocker message matches title", () => {
+  const event = (state, type, fields) => ({ schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, type,
+    eventId: `${type}:${state?.nextSequence || 0}`, sequence: state?.nextSequence || 0, at: (state?.updatedAt || 0) + 1, ...fields });
+  let aggregate = runtime.transition(null, event(null, "turn.admitted", { turn, strategy: "plan", planPurpose: "plan", objective: "Design MFramework", constraints: [], acceptanceCriteria: ["Works"] }));
+  aggregate = runtime.transition(aggregate, event(aggregate, "run.started", { run, phase: "planning" }));
+  aggregate = runtime.transition(aggregate, event(aggregate, "run.paused", { run, blocker: { requestId: "plan-questionnaire-1", reasonCode: "user_questionnaire", evidenceSequence: 1,
+    message: "MFramework 框架设计关键决策", options: ["recheck", "stop"],
+    questionnaire: { revision: 1, purpose: "plan_confirmation", title: "MFramework 框架设计关键决策", questions: [
+      { id: "q1", prompt: "Choose", selectionMode: "single", options: [{ id: "a", label: "A" }] },
+    ] } } }));
+  const { createRuntimeV2ExecutionBlockerView } = load("src/store/runtimeV2/executionBlocker.ts");
+  const view = createRuntimeV2ExecutionBlockerView(aggregate, "zh", 7);
+  assert.ok(view);
+  assert.equal(view.block.content, "MFramework 框架设计关键决策");
 });

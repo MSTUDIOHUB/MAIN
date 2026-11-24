@@ -6,6 +6,7 @@
 import type { Skill } from "./appTypes";
 import type { MCPTool } from "./mcpClient";
 import { TOOL_SEARCH_DEFINITION } from "./toolSearch";
+import { DEFAULT_WEB_SEARCH_PROVIDER, WEB_SEARCH_PROVIDERS } from "./networkRead";
 import {
   SUPPORTED_BROWSER_INTERACTION_ACTION_KINDS,
   SUPPORTED_DESKTOP_INTERACTION_ACTION_KINDS,
@@ -49,7 +50,7 @@ export const SUBMIT_PLAN_CANDIDATE_TOOL_NAME = "submit_plan_candidate";
 export const RUN_COMMAND_SHELL_CONTRACT = [
   "This tool uses a restricted shell parser. Use literal arguments and the cwd field instead of cd.",
   "Shell variable expansion, command substitution, nested shells, and unquoted line breaks are rejected; quoted multiline code or data may be passed as one literal argument.",
-  "For batches, submit separate tool calls with literal paths and arguments.",
+  'Use glob_search, grep_search, or a quoted pattern with find -name instead of shell-expanded paths. Submit independent checks separately so a no-match exit cannot skip them.',
 ].join(" ");
 
 const PLAN_EXPECTED_SCALAR_SCHEMA = {
@@ -629,7 +630,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         type: "object",
         properties: {
           query: { type: "string", description: "搜索关键词或问题" },
-          provider: { type: "string", description: "可选搜索源：duckduckgo、bing、baidu。默认 duckduckgo" },
+          provider: { type: "string", description: `可选搜索源：${WEB_SEARCH_PROVIDERS.join("、")}。默认 ${DEFAULT_WEB_SEARCH_PROVIDER}` },
           max_results: { type: "number", description: "最多返回多少条结果，默认 5，最多 8" },
         },
         required: ["query"],
@@ -862,13 +863,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "knowledge_search",
-      description: "在 MAIN 全局知识库中检索已启用的资料库，返回与问题最相关的片段和 citation（知识库、文件名、页码/块号、chunk id、分数）。涉及 Unity/API 手册等已导入资料时，先用它获取证据，不要把整份文档读入上下文。",
+      description: "在用户本条消息用 # 选定的资料范围或当前工作区已启用的官方引擎代码手册（Unity 6 / 团结引擎 / UE6 Verse）内检索，返回正文片段和来源引用。支持本地索引、TOC 目录按需水合与受控官方站点联网兜底。",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "用户问题或要检索的关键词/概念" },
-          kb_ids: { type: "string", description: "可选，逗号分隔的知识库 ID；默认搜索当前界面启用的知识库" },
+          query: { type: "string", description: "用户问题或要检索的 API 类名/函数签名/概念" },
           limit: { type: "number", description: "最多返回多少个片段，默认 8，最多 16" },
+          allow_web_fallback: { type: "boolean", description: "仅当前轮已启用联网搜索时生效。设为 true 且本地与官方目录均未命中时，可使用搜索服务查找官方文档。" },
         },
         required: ["query"],
       },
@@ -878,12 +879,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "knowledge_get_excerpt",
-      description: "根据 knowledge_search 返回的 source_id 与 chunk_id 读取某个知识库片段的完整摘录。只在需要展开已命中的 citation 时使用。",
+      description: "读取当前消息已选资料范围内的片段摘录。可展开检索引用，或按 sourceOverview.nextChunkId 继续阅读同一资料；不能访问未选择的资料。",
       parameters: {
         type: "object",
         properties: {
-          source_id: { type: "string", description: "knowledge_search citation.sourceId" },
-          chunk_id: { type: "string", description: "knowledge_search citation.chunkId" },
+          source_id: { type: "string", description: "当前消息检索结果的 citation.sourceId" },
+          chunk_id: { type: "string", description: "当前消息检索结果的 citation.chunkId，或同一资料的 sourceOverview.nextChunkId" },
         },
         required: ["source_id", "chunk_id"],
       },

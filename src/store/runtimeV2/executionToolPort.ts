@@ -1,3 +1,7 @@
+import { knowledgeSearchTraceFields } from "../../lib/knowledgeReferences";
+import {
+  runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2KnowledgeMayFetch,
+} from "./executionCapabilityRestrictions";
 import { withRuntimeV2ModelReceipt, runtimeV2ToolModelContent } from "./readOnlyToolReceipt";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { getToolTarget } from "../../lib/toolTarget";
@@ -6,10 +10,11 @@ import {
   extractReadFileWindowMetadata,
 } from "../../lib/readFileWindow";
 import { executeTool, type ToolExecutionOptions } from "../../lib/toolExecutor";
+import { runUnityEditorOperation } from "../../lib/ipc";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
   isRuntimeV2LifecycleDeadlineError,
-  type RuntimeV2Command,
+  type RuntimeV2ExecutionValidationAuthority,
   type ToolPort,
 } from "../../lib/runtime-v2";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
@@ -17,7 +22,6 @@ import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
   aggregateForCurrentTurn,
   authorizationFor,
-  boundedToolContent,
   toolResultStatusForCompletion,
   nextEvidenceId,
   recordToolResultHistory,
@@ -26,15 +30,15 @@ import {
   toolCompletionFor,
   toolDefinitionExists,
   validateToolAgainstPhaseAndPlan,
-  upsertRuntimeV2ContextAnchor,
   type RuntimeV2ExecutionPortsInput,
 } from "./executionContext";
 import { resolveRuntimeV2SourceEvidenceVersion } from "./sourceEvidenceVersion";
 import {
   executeRuntimeV2ToolWithDeadline,
-  type RuntimeV2ToolDeadlineBoundary,
+  logRuntimeV2ToolDeadline,
 } from "./executionToolDeadline";
 import { prepareRuntimeV2Mutation } from "./executionMutationPreflight";
+import { collectRuntimeV2WorkspaceObservation } from "./executionObservation";
 import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerToolSurface";
@@ -46,113 +50,33 @@ import {
   parseRuntimeV2ExecutionContractArguments,
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
-import { recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
-import { runtimeV2AutomaticObservationDeferredReceipt, runtimeV2ToolPreExecutionReceipt, runtimeV2ToolAuthorizationRejectionReceipt } from "./executionToolGateReceipt";
-import { runtimeV2StructuredToolOutcome } from "./executionToolOutcome";
-
-function logRuntimeV2ToolDeadline(input: {
-  readonly ports: RuntimeV2ExecutionPortsInput;
-  readonly command: RuntimeV2Command;
-  readonly toolName: string;
-  readonly target: string | null;
-  readonly timeoutMs: number;
-  readonly boundary: RuntimeV2ToolDeadlineBoundary;
-}): void {
-  input.ports.logStoreEvent(
-    input.boundary === "lifecycle"
-      ? "runtime_v2_lifecycle_deadline_reached"
-      : "runtime_v2_tool_deadline_exceeded",
-    {
-      turnId: input.command.run.turnId,
-      runId: input.command.run.runId,
-      commandKind: input.command.kind,
-      toolName: input.toolName,
-      target: input.target,
-      timeoutMs: input.timeoutMs,
-      lifecycleDeadlineAt: input.boundary === "lifecycle"
-        ? input.ports.lifecycleDeadlineAt
-        : null,
-    },
-  );
-}
+import { boundUnityWorkspaceWriteVersions, recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
+import { continuedPlanDriftReceipt, projectValidationManifestDriftReceipt, runtimeV2ToolPreExecutionReceipt, runtimeV2ToolAuthorizationRejectionReceipt, unityPlayModePreExecutionReceipt } from "./executionToolGateReceipt";
+import { runtimeV2StructuredToolOutcome, unityValidationToolTimeoutMs } from "./executionToolOutcome";
+import { runtimeV2BoundEditorObservation, runtimeV2CatalogToolSource, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
+import { parseResultRecord } from "./executionEvidence";
+import { executeUnityCompilation } from "./executionUnityCompilation";
+import { UNITY_COMPILE_PROJECT_TOOL } from "../../lib/runtime-v2/unityCompilation";
+import { isRuntimeV2EditorDiagnosticRepair, runtimeV2EditorConsoleEvidence } from "../../lib/runtime-v2/editorConsoleEvidence";
+import { UNITY_MCP_CONSOLE_ARGS, UNITY_MCP_REPAIR_CONSOLE_ARGS } from "../../lib/workspaceMcp";
 
 export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): ToolPort {
   return withRuntimeV2ModelReceipt(input, {
     async execute({ command, signal }) {
+      if (command.kind === "execute_tool" && command.payload.toolName === UNITY_COMPILE_PROJECT_TOOL &&
+          command.payload.runtimeOwnedUnityCompile === true) {
+        return executeUnityCompilation(input, command, signal);
+      }
+      const activity = (toolName: string, target: string) => ({
+        run: command.run,
+        commandKey: command.idempotencyKey,
+        signal,
+        toolName,
+        target,
+        validation: command.kind === "execute_validation",
+      });
       if (command.kind === "collect_observation") {
-        const deferred = runtimeV2AutomaticObservationDeferredReceipt(input, command);
-        if (deferred) return deferred;
-        input.logStoreEvent("runtime_v2_tool_execution_started", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName: "get_project_skeleton",
-          target: input.context.runWorkspace || "workspace",
-        });
-        try {
-          const overview = boundedToolContent(
-            await executeRuntimeV2ToolWithDeadline({
-              toolName: "get_project_skeleton",
-              lifecycleDeadlineAt: input.lifecycleDeadlineAt,
-              now: input.now,
-              onTimeout: (timeoutMs, boundary) =>
-                logRuntimeV2ToolDeadline({
-                  ports: input,
-                  command,
-                  toolName: "get_project_skeleton",
-                  target: input.context.runWorkspace || "workspace",
-                  timeoutMs,
-                  boundary,
-                }),
-              task: () => executeTool(
-                "get_project_skeleton",
-                {},
-                input.context.runWorkspace || "",
-                input.context.runSessionKey,
-                {
-                  toolCatalog: authorizationFor(input).toolCatalog,
-                  skillCatalog: input.context.skillCatalog,
-                },
-              ),
-            }),
-            12_000,
-          );
-          const evidenceId = nextEvidenceId(input.live);
-          upsertRuntimeV2ContextAnchor(input.live, {
-            key: "workspace-overview",
-            content: overview,
-          });
-          input.logStoreEvent("runtime_v2_tool_execution_completed", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            commandKind: command.kind,
-            toolName: "get_project_skeleton",
-            target: input.context.runWorkspace || "workspace",
-            status: "succeeded",
-          });
-          return {
-            type: "observation.recorded",
-            ...(isReadOnlyContext(input) ? { modelContent: overview } : {}),
-            run: command.run,
-            evidence: {
-              id: evidenceId,
-              kind: "source",
-              target: input.context.runWorkspace || "workspace",
-              version: null,
-            },
-          };
-        } catch (error) {
-          if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
-          input.logStoreEvent("runtime_v2_tool_execution_failed", {
-            turnId: command.run.turnId,
-            runId: command.run.runId,
-            commandKind: command.kind,
-            toolName: "get_project_skeleton",
-            target: input.context.runWorkspace || "workspace",
-            error: error instanceof Error ? error.message : String(error),
-          });
-          throw error;
-        }
+        return collectRuntimeV2WorkspaceObservation(input, command, signal);
       }
       if (command.kind !== "execute_tool" && command.kind !== "execute_validation") {
         throw new Error(`Unsupported Runtime v2 tool command: ${command.kind}`);
@@ -248,6 +172,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         runtimeV2ToolAuthorizationRejectionReceipt({ ports: input, command, toolName, args, target, failureContextTarget, rejection });
       const phaseAndPlan = validateToolAgainstPhaseAndPlan({ ports: input, command, toolName, args, target });
       if (!phaseAndPlan.allowed) return phaseAndPlanRejection(phaseAndPlan);
+      const unityBlocked = unityPlayModePreExecutionReceipt({ ports: input, command, toolName, args, target });
+      if (unityBlocked) return unityBlocked;
       const authorizationResolution =
         await resolveRuntimeV2ToolAuthorization({
           ports: input,
@@ -309,10 +235,29 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
       try {
         let diffPreview;
         const toolExecutionOptions: ToolExecutionOptions = {
-          ...(isReadOnlyContext(input) ? { networkRead: readOnlyNetworkPolicy(input) } : {}),
+          networkRead: readOnlyNetworkPolicy(input),
           toolCatalog: authorizationFor(input).toolCatalog,
+          ...(toolName === "tool_search" ? { availableToolNames: new Set(
+            Object.values(authorizationFor(input).capabilityRegistry.tools)
+              .filter(tool => tool.enabled && !runtimeV2ToolCapabilityRestriction(input, tool.name) &&
+                (!isReadOnlyContext(input) || !["workspace_write", "external_write", "shell", "desktop_control", "browser_control", "destructive"].includes(tool.risk)))
+              .map(tool => tool.name),
+          ) } : {}),
+          workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
+          ...(toolName === "unity_mcp_console" && isRuntimeV2EditorDiagnosticRepair(aggregateForCurrentTurn(input)) ? { unityConsoleRepairScope: true } : {}),
           skillCatalog: input.context.skillCatalog,
+          knowledgeReferences: input.context.knowledgeContext?.references || [],
+          ...(toolName === "knowledge_search" ? {
+            knowledgeLookup: {
+              allowOfficialDocuments: runtimeV2KnowledgeMayFetch(
+                runtimeV2CapabilityRestrictions(input),
+                runtimeV2ApprovalRequiredCapabilities(input),
+              ),
+              signal,
+            },
+          } : {}),
           allowExternalLocalRead: authorization.allowExternalLocalRead,
+          ...(toolName === "unity_create_scene" ? { unitySceneAuthority: { signal, lifecycleDeadlineAt: input.lifecycleDeadlineAt } } : {}),
           ...(authorization.shellPermissionApproval
             ? { shellPermissionApproval: authorization.shellPermissionApproval }
             : {}),
@@ -338,9 +283,18 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           }
           diffPreview = preparation.diffPreview;
         }
+        const drift = await continuedPlanDriftReceipt({ ports: input, command, toolName, args, target, signal });
+        if (drift) return drift;
+        if (command.payload.projectValidationManifestVersion) {
+          const manifestDrift = await projectValidationManifestDriftReceipt({ ports: input, command, toolName, args, target, signal });
+          if (manifestDrift) return manifestDrift;
+        }
+        const unityTimeout = unityValidationToolTimeoutMs(toolName, args);
+        const managedEditorTest = command.kind === "execute_validation" &&
+          (command.payload.validationAuthority as RuntimeV2ExecutionValidationAuthority | undefined)?.useProjectEditor === true;
         const executionArgs = runtimeV2ContextBoundToolArguments(
           toolName,
-          args,
+          unityTimeout ? { ...args, timeout_ms: unityTimeout } : args,
           input.context.runtimeContextBudget,
           { parallelReadCount },
         );
@@ -350,6 +304,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 aggregateForCurrentTurn(input),
               )
             : null;
+        const ioStartedAt = input.now();
+        let verifiedMcpWriteVersions: readonly { target: string; version: string }[] = [];
         const rawOutput =
           toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
             ? JSON.stringify({
@@ -362,6 +318,8 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               })
             : await executeRuntimeV2ToolWithDeadline({
                 toolName,
+                toolTimeoutMs: unityTimeout ? unityTimeout + 3_000 : undefined,
+                activity: activity(toolName, target),
                 lifecycleDeadlineAt: input.lifecycleDeadlineAt,
                 now: input.now,
                 onTimeout: (timeoutMs, boundary) =>
@@ -373,14 +331,26 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                     timeoutMs,
                     boundary,
                   }),
-                task: () => executeTool(
-                  toolName,
-                  executionArgs,
-                  input.context.runWorkspace || "",
-                  input.context.runSessionKey,
-                  toolExecutionOptions,
-                ),
+                task: async () => {
+                  if (managedEditorTest) return runUnityEditorOperation("unity_test_project", {
+                    workspace: input.context.runWorkspace || "",
+                    approvedCommand: String(executionArgs.command || ""),
+                    permissionApproval: authorization.shellPermissionApproval,
+                  }, signal, Math.min(Date.now() + 300_000, input.lifecycleDeadlineAt ?? Infinity));
+                  const verifyWrite = await boundUnityWorkspaceWriteVersions(input, toolName, executionArgs, target);
+                  signal.throwIfAborted();
+                  const result = await executeTool(toolName, executionArgs, input.context.runWorkspace || "", input.context.runSessionKey, toolExecutionOptions);
+                  if (verifyWrite && parseResultRecord(result)?.success === true) verifiedMcpWriteVersions = await verifyWrite();
+                  return result;
+                },
               });
+        if (toolName === "knowledge_search") {
+          const trace = knowledgeSearchTraceFields(rawOutput);
+          if (trace) input.logStoreEvent("runtime_v2_knowledge_retrieved", {
+            sessionKey: command.run.sessionKey, turnId: command.run.turnId, runId: command.run.runId,
+            commandKey: command.idempotencyKey, ...trace,
+          });
+        }
         const sourceVersion = RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName)
           ? await resolveRuntimeV2SourceEvidenceVersion({
               toolName,
@@ -388,6 +358,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               output: rawOutput,
               readExactFile: () => executeRuntimeV2ToolWithDeadline({
                 toolName: "read_file",
+                activity: activity("read_file", target),
                 lifecycleDeadlineAt: input.lifecycleDeadlineAt,
                 now: input.now,
                 onTimeout: (timeoutMs, boundary) =>
@@ -416,22 +387,41 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               sourceVersion || "",
             )
           : rawOutput;
-        const output = runtimeV2ToolModelContent(input, toolName, receiptOutput, { parallelReadCount });
-        const outcome = runtimeV2StructuredToolOutcome(toolName, rawOutput);
+        const editorObservation = runtimeV2BoundEditorObservation(input, toolName, args);
+        const mcp = runtimeV2CatalogToolSource(authorizationFor(input), toolName) === "mcp" || !!editorObservation;
+        const mcpResult = mcp ? parseResultRecord(rawOutput) : null;
+        const outcome = mcp && (mcpResult?.success === false || !String(rawOutput || "").trim() || String(rawOutput).trim() === "{}")
+          ? { status: "failed" as const, failureKind: "execution_failed" as const, failureReasonCode: "mcp_result_unverified" }
+          : runtimeV2StructuredToolOutcome(toolName, rawOutput, args, command.payload.validationAuthority);
+        const content = runtimeV2ToolModelContent(input, toolName, receiptOutput, { parallelReadCount });
+        const output = outcome.failureReasonCode === "unity_validation_verdict_unverified"
+          ? `The project Editor did not return a verified compilation or test result.\n${content}` : content;
         let completion = toolCompletionFor(
           input,
           command,
           toolName,
           args,
           target,
-          receiptOutput,
+          outcome.failureReasonCode === "unity_validation_verdict_unverified" ? output : receiptOutput,
           outcome.status,
           outcome.failureKind,
           sourceVersion,
           diffPreview,
           outcome.failureReasonCode,
         );
-        if (completion.type === "tool.completed" && completion.status === "succeeded" && toolExecutionOptions.writeFileTarget) {
+        if (completion.type === "tool.completed" && completion.status === "succeeded" && verifiedMcpWriteVersions.length > 0) {
+          completion = { ...completion, effectKind: "workspace_change", evidence: verifiedMcpWriteVersions.map(item => ({
+            id: nextEvidenceId(input.live), kind: "mutation", ...item,
+          })) };
+        }
+        if (completion.type === "tool.completed" && completion.status === "succeeded" && editorObservation?.kind === "console") {
+          const editorConsole = runtimeV2EditorConsoleEvidence({ workspace: input.context.runWorkspace || "",
+            binding: editorObservation.binding, args: toolName === "unity_mcp_console"
+              ? toolExecutionOptions.unityConsoleRepairScope ? UNITY_MCP_REPAIR_CONSOLE_ARGS : UNITY_MCP_CONSOLE_ARGS : args, result: mcpResult });
+          if (editorConsole) completion = { ...completion, editorConsole };
+        }
+        if (completion.type === "tool.completed" && completion.effectKind === "workspace_change" &&
+            completion.status === "succeeded" && toolExecutionOptions.writeFileTarget) {
           completion = {
             ...completion,
             mutationRequests: [{
@@ -441,10 +431,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           };
         }
         const semanticStatus = toolResultStatusForCompletion(completion);
+        const effectKind = completion.type === "tool.completed" ? completion.effectKind : undefined;
         const effectCommitted = recordRuntimeV2CommittedToolEffect({
           ports: input,
-          toolName,
-          args,
+          effectKind,
           status: semanticStatus,
         });
         if (completion.type === "validation.completed") {
@@ -463,11 +453,14 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           runId: command.run.runId,
           commandKind: command.kind,
           toolName,
-          target: target || null,
+          commandKey: command.idempotencyKey,
+          sessionKey: command.run.sessionKey,
+          target: toolName === "knowledge_search" || toolName === "run_command" ? null : target || null,
           status: semanticStatus,
-          mutationCommitted:
-            semanticStatus === "succeeded" &&
-            isWorkspaceMutationToolName(toolName),
+          ioElapsedMs: input.now() - ioStartedAt,
+          effectKind: effectKind ?? null,
+          editorDiagnosticCount: completion.type === "tool.completed" ? completion.editorConsole?.diagnostics.length ?? null : null,
+          mutationCommitted: effectCommitted && effectKind === "workspace_change",
           effectCommitted,
           validationPassed: completion.type === "validation.completed" ? completion.passed : null,
           executionContractRevision:
@@ -489,6 +482,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           skillId: String(args.skill_id || ""),
           turnId: command.run.turnId,
           runId: command.run.runId,
+          sessionKey: command.run.sessionKey, commandKey: command.idempotencyKey,
           logStoreEvent: input.logStoreEvent,
         });
         return completion;
@@ -509,8 +503,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           runId: command.run.runId,
           commandKind: command.kind,
           toolName,
-          target: target || null,
-          error: error instanceof Error ? error.message : String(error),
+          commandKey: command.idempotencyKey,
+          sessionKey: command.run.sessionKey,
+          target: /^(?:run_command|knowledge_search|web_search|web_fetch)$/.test(toolName) ? null : target || null,
+          errorType: error instanceof Error ? error.name : typeof error,
         });
         return toolCompletionFor(
           input,

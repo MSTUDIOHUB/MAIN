@@ -31,6 +31,8 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   apply_patch: { zh: "应用补丁", en: "Apply patch" },
   execute_command: { zh: "执行命令", en: "Run command" },
   run_command: { zh: "运行命令", en: "Run command" },
+  unity_compile_project: { zh: "检查引擎编译", en: "Check Editor compilation" },
+  unity_import_shader: { zh: "检查 Shader 导入", en: "Check Shader import" },
   browser_evaluate: { zh: "浏览器验证", en: "Validate in browser" },
   computer_use: { zh: "控制桌面应用", en: "Control desktop app" },
   send_pty_input: { zh: "发送终端输入", en: "Send terminal input" },
@@ -167,7 +169,7 @@ export function deriveToolPhase(input: {
   if (DISCOVERY_TOOLS.has(toolName)) return "discover";
   if (INSPECTION_TOOLS.has(toolName)) return "inspect";
   if (EDIT_TOOLS.has(toolName)) return "edit";
-  if (toolName === "browser_evaluate" || toolName === "computer_use") return "verify";
+  if (toolName === "browser_evaluate" || toolName === "computer_use" || toolName === "unity_compile_project" || toolName === "unity_import_shader") return "verify";
   if (COMMAND_TOOLS.has(toolName)) {
     const target = String(input.target || "");
     return VERIFY_COMMAND_RE.test(target) ? "verify" : "command";

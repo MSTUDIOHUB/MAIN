@@ -67,7 +67,12 @@ import {
 } from "../lib/cloudServers";
 import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
 import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
+import {
+  LOCAL_CONCURRENCY_HARD_CEILING,
+  estimateLocalConcurrencyFromMemory,
+} from "../lib/localConcurrencyEstimate";
 import ToggleSwitch from "./ToggleSwitch";
+import ManagedProjectRulesSettings from "./ManagedProjectRulesSettings";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
@@ -1681,6 +1686,7 @@ export default function SettingsModal({
   const [cloudSaveMsg, setCloudSaveMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [localFetchMsg, setLocalFetchMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [systemMemory, setSystemMemory] = useState<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number } | null>(null);
+  const [systemMemoryLoading, setSystemMemoryLoading] = useState(false);
   const [draftAppIconVariant, setDraftAppIconVariant] = useState<AppIconVariant>(() => normalizeAppIconVariant(config.appIconVariant));
   const [appIconApplyMsg, setAppIconApplyMsg] = useState<{ text: string; type: 'warning' } | null>(null);
   const [isApplyingAppIcon, setIsApplyingAppIcon] = useState(false);
@@ -1803,13 +1809,23 @@ export default function SettingsModal({
     return () => clearTimeout(timer);
   }, [localFetchMsg]);
 
-  // Fetch system memory whenever settings opens, so the slider reflects memory left after the model loads.
+  // Fetch system memory whenever settings opens or the context tab becomes active, so estimates reflect current memory.
   useEffect(() => {
     if (!isOpen) return;
+    let cancelled = false;
+    setSystemMemoryLoading(true);
     invoke<{ total_gb: number; available_gb: number; total_bytes?: number; available_bytes?: number }>("get_system_memory")
-      .then(setSystemMemory)
-      .catch(() => { });
-  }, [isOpen]);
+      .then((memory) => {
+        if (!cancelled) setSystemMemory(memory);
+      })
+      .catch(() => { })
+      .finally(() => {
+        if (!cancelled) setSystemMemoryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, settingsTab === "context"]);
 
   const handleProviderChange = (e) => {
     if (!canChangeCurrentModel) return;
@@ -2989,6 +3005,90 @@ export default function SettingsModal({
     setConfig({ ...config, local: { ...config.local, contextLimit: contextMax } });
   }, [config, contextMax, setConfig, systemMemory]);
 
+  const totalMemoryBytes =
+    systemMemory?.total_bytes ??
+    (systemMemory?.total_gb ? systemMemory.total_gb * 1024 ** 3 : null);
+  const availableMemoryBytes =
+    systemMemory?.available_bytes ??
+    (systemMemory?.available_gb ? systemMemory.available_gb * 1024 ** 3 : null);
+  const concurrencyEstimate = estimateLocalConcurrencyFromMemory({
+    totalBytes: totalMemoryBytes,
+    availableBytes: availableMemoryBytes,
+    contextLimit: displayedContextLimit,
+    configuredMaxActiveRequests: config.local.maxActiveRequests,
+  });
+  const autoConcurrencyEstimate = estimateLocalConcurrencyFromMemory({
+    totalBytes: totalMemoryBytes,
+    availableBytes: availableMemoryBytes,
+    contextLimit: displayedContextLimit,
+    configuredMaxActiveRequests: null,
+  });
+  const configuredConcurrencyValue = config.local?.maxActiveRequests;
+  const localConcurrencySelectValue =
+    typeof configuredConcurrencyValue === "number" &&
+    Number.isSafeInteger(configuredConcurrencyValue) &&
+    configuredConcurrencyValue > 0
+      ? String(Math.min(LOCAL_CONCURRENCY_HARD_CEILING, configuredConcurrencyValue))
+      : "";
+  const localConcurrencyManualTotals = Array.from(
+    { length: LOCAL_CONCURRENCY_HARD_CEILING - 1 },
+    (_, index) => index + 2,
+  );
+  const formatSubagentUnit = (count: number) => (count === 1 ? "subagent" : "subagents");
+  const systemMemoryText =
+    concurrencyEstimate.availableGb !== null && concurrencyEstimate.totalGb !== null
+      ? language === "zh"
+        ? `可用 ${concurrencyEstimate.availableGb.toFixed(1)} GB / 总计 ${concurrencyEstimate.totalGb.toFixed(1)} GB`
+        : `${concurrencyEstimate.availableGb.toFixed(1)} GB avail / ${concurrencyEstimate.totalGb.toFixed(1)} GB total`
+      : concurrencyEstimate.availableGb !== null
+        ? language === "zh"
+          ? `可用 ${concurrencyEstimate.availableGb.toFixed(1)} GB`
+          : `${concurrencyEstimate.availableGb.toFixed(1)} GB avail`
+        : systemMemoryLoading
+          ? language === "zh"
+            ? "正在检测系统内存..."
+            : "Detecting system memory..."
+          : language === "zh"
+            ? "暂未获取到系统内存（使用保守默认）"
+            : "System memory unavailable (using default)";
+  const concurrencyEstimateText =
+    concurrencyEstimate.source === "configured"
+      ? language === "zh"
+        ? `手动上限 ${concurrencyEstimate.recommendedSubagents} 个并发子智能体（总模型并发 ${concurrencyEstimate.totalRequestsLimit} 路，含主体 1 路）`
+        : `Manual cap: ${concurrencyEstimate.recommendedSubagents} concurrent ${formatSubagentUnit(concurrencyEstimate.recommendedSubagents)} (${concurrencyEstimate.totalRequestsLimit} total model requests, incl. parent)`
+      : language === "zh"
+        ? `预估可并行 ${concurrencyEstimate.recommendedSubagents} 个子智能体（总模型并发 ${concurrencyEstimate.totalRequestsLimit} 路，含主体 1 路）`
+        : `Est. ${concurrencyEstimate.recommendedSubagents} concurrent ${formatSubagentUnit(concurrencyEstimate.recommendedSubagents)} (${concurrencyEstimate.totalRequestsLimit} total model requests, incl. parent)`;
+  const memoryReserveGbText = (concurrencyEstimate.memoryReserveBytes / 1024 ** 3).toFixed(1);
+  const concurrencyNoteText =
+    concurrencyEstimate.source === "configured"
+      ? language === "zh"
+        ? `当前使用手动上限（自动模式按可用内存扣除 ${memoryReserveGbText} GB 安全余量后预估为 ${autoConcurrencyEstimate.recommendedSubagents} 个子智能体）；运行时仍会按实时内存压力动态调整。`
+        : `Manual cap active (auto mode estimates ${autoConcurrencyEstimate.recommendedSubagents} ${formatSubagentUnit(autoConcurrencyEstimate.recommendedSubagents)} from available memory minus a ${memoryReserveGbText} GB safety reserve); runtime memory-pressure adaptation still applies.`
+      : concurrencyEstimate.source === "memory"
+        ? language === "zh"
+          ? `基于可用内存扣除安全余量（${memoryReserveGbText} GB）估算，并在运行时随实际内存压力动态自适应调整。`
+          : `Based on available memory minus a ${memoryReserveGbText} GB safety reserve, dynamically adapting at runtime.`
+        : language === "zh"
+          ? "暂未获取到实时系统内存，当前按保守默认值估算；运行时仍会根据内存与负载动态调整。"
+          : "Live memory size unavailable; using a conservative fallback that dynamically adapts at runtime.";
+  const handleLocalConcurrencyChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    if (isModelRuntimeLocked) return;
+    const rawValue = e.target.value;
+    const parsed = rawValue === "" ? undefined : Number(rawValue);
+    const nextMaxActiveRequests =
+      parsed !== undefined && Number.isSafeInteger(parsed) && parsed > 0
+        ? Math.min(LOCAL_CONCURRENCY_HARD_CEILING, parsed)
+        : undefined;
+    setConfig((prev: any) => ({
+      ...prev,
+      local: {
+        ...(prev.local || {}),
+        maxActiveRequests: nextMaxActiveRequests,
+      },
+    }));
+  };
+
   // ── Context tab content (shared component) ──
   const contextTabContent = (
     <div className="space-y-6">
@@ -3029,6 +3129,85 @@ export default function SettingsModal({
             <div className="text-[12px] font-semibold text-[#34d399]">
               {language === "zh" ? "无需手动配置" : "Zero Config Active"}
             </div>
+          </div>
+        </div>
+
+        <div className="border-b border-[#18181b] pb-4 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <span className="text-[10px] uppercase font-bold tracking-wider text-[#71717a]">
+                {language === "zh" ? "当前系统内存" : "System Memory"}
+              </span>
+              <div data-testid="context-system-memory" className="font-mono text-[14px] font-semibold text-[#f4f4f5] mt-1">
+                {systemMemoryText}
+              </div>
+            </div>
+            <div className="md:text-right">
+              <span className="text-[10px] uppercase font-bold tracking-wider text-[#71717a]">
+                {language === "zh" ? "本地子智能体并发估算" : "Estimated Subagent Concurrency"}
+              </span>
+              <div data-testid="context-concurrency-estimate" className="text-[13px] font-semibold text-[#e4e4e7] mt-1">
+                {concurrencyEstimateText}
+              </div>
+            </div>
+          </div>
+          <p className="text-[11px] text-[#71717a] leading-relaxed">
+            {concurrencyNoteText}
+          </p>
+
+          <div className="rounded-lg border border-[#27272a] bg-[#121215] p-3.5 space-y-2.5">
+            <div>
+              <label htmlFor="local-concurrency-select" className="block text-[12px] font-bold text-[#e4e4e7]">
+                {language === "zh" ? "本地并发子智能体上限（可选覆盖）" : "Local Concurrent Subagents Override"}
+              </label>
+              <p className="mt-0.5 text-[11px] text-[#a1a1aa]">
+                {language === "zh"
+                  ? "默认根据可用内存自动决定；如需手动限制本地推理并发，可在此指定上限。"
+                  : "Automatically managed from available memory by default; optionally pick a fixed ceiling."}
+              </p>
+            </div>
+            <select
+              id="local-concurrency-select"
+              data-testid="local-concurrency-select"
+              value={localConcurrencySelectValue}
+              disabled={isModelRuntimeLocked}
+              title={isModelRuntimeLocked ? modelRuntimeLockText : undefined}
+              onChange={handleLocalConcurrencyChange}
+              className={settingsSelectClass}
+            >
+              <option value="">
+                {language === "zh"
+                  ? `自动（推荐，当前预估 ${autoConcurrencyEstimate.recommendedSubagents} 个子智能体）`
+                  : `Auto (Recommended, est. ${autoConcurrencyEstimate.recommendedSubagents} ${formatSubagentUnit(autoConcurrencyEstimate.recommendedSubagents)})`}
+              </option>
+              <option value="1">
+                {language === "zh"
+                  ? "仅串行（0 个并发子智能体 / 总并发 1）"
+                  : "Serialized only (0 concurrent subagents / 1 total)"}
+              </option>
+              {localConcurrencyManualTotals.map((total) => {
+                const concurrentSubagents = total - 1;
+                return (
+                  <option key={total} value={String(total)}>
+                    {language === "zh"
+                      ? `最多 ${concurrentSubagents} 个并发子智能体（总并发 ${total}）`
+                      : `Up to ${concurrentSubagents} concurrent ${formatSubagentUnit(concurrentSubagents)} (${total} total)`}
+                  </option>
+                );
+              })}
+            </select>
+            {isModelRuntimeLocked && (
+              <p data-testid="context-concurrency-lock-notice" className="rounded-md border border-[#3f2f1f] bg-[#18110a] px-3 py-2 text-[11.5px] text-[#fbbf24]">
+                {modelRuntimeLockText}
+              </p>
+            )}
+            {config.activeProfile === "cloud" && (
+              <p data-testid="context-concurrency-cloud-note" className="text-[11px] text-[#a1a1aa]">
+                {language === "zh"
+                  ? "提示：当前活跃配置为 Cloud，此并发设置仅在使用 Local 本地模型时生效。"
+                  : "Note: Cloud profile is active; this concurrency setting applies only to the Local profile."}
+              </p>
+            )}
           </div>
         </div>
 
@@ -3096,6 +3275,7 @@ export default function SettingsModal({
             {settingsTab === 'general' && (
               <div className="space-y-5">
                 <div className="flex items-center justify-between"><h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.general}</h3></div>
+                <ManagedProjectRulesSettings language={language} themeMode={config.themeMode || "dark"} busy={isModelRuntimeLocked} />
                 <div className={settingsSectionRowClass}>
                   <div>
                     <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.displayLanguage}</label>

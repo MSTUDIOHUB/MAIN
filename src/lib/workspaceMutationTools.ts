@@ -3,6 +3,8 @@ import {
   parseApplyPatch,
 } from "./applyPatchTool";
 
+export const UNITY_CREATE_SCENE_TOOL = "unity_create_scene";
+
 /**
  * Tools that can durably mutate files in the active workspace.
  *
@@ -15,6 +17,7 @@ export const BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES = new Set([
   "replace_in_file",
   "apply_patch",
   "delete_workspace_path",
+  UNITY_CREATE_SCENE_TOOL,
 ]);
 
 export const EXTERNAL_WORKSPACE_MUTATION_TOOL_NAMES = new Set([
@@ -174,7 +177,7 @@ export function resolveWorkspaceMutationRequests(
     );
   }
   const operation: WorkspaceMutationOperation | null =
-    name === "write_file" || name === "create_script"
+    name === "write_file" || name === "create_script" || name === UNITY_CREATE_SCENE_TOOL
       ? "create"
       : name === "replace_in_file" ||
           name === "apply_text_edits" ||
@@ -223,6 +226,7 @@ export function resolveWorkspaceMutationCreateOnlyTargets(
   if (name === "apply_patch") {
     return extractApplyPatchCreationTargets(String(args.patch || ""));
   }
+  if (name === UNITY_CREATE_SCENE_TOOL) return resolveWorkspaceMutationTargets(name, args);
   return [];
 }
 

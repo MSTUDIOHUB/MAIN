@@ -100,7 +100,7 @@ export interface TurnRuntimeCheckpointExpectedOwner {
   turnId?: string | null;
 }
 
-const TURN_STRATEGIES = new Set<TurnStrategy>(["chat", "plan", "execute", "goal"]);
+const TURN_STRATEGIES = new Set<TurnStrategy>(["chat", "plan", "execute"]);
 const RUN_PHASES = new Set<TurnRunPhase>([
   "admitted",
   "preparing",

@@ -1,4 +1,4 @@
-import { isChatContext, isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { isChatContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import {
   getLocalFileReadPathForToolCall,
   isLocalFileReadApproved,
@@ -20,6 +20,7 @@ import { normalizeWorkspacePathIdentity } from "../../lib/workspacePaths";
 import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
 import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
+  approvedRuntimeV2PlanContinuation,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
@@ -56,6 +57,7 @@ import {
 } from "./executionAuthorizationContext";
 import {
   validateToolAgainstApprovedPlan,
+  isApprovedUnityCorrection,
   type RuntimeV2PlanToolAuthorizationResult,
 } from "./executionPlanAuthorization";
 
@@ -108,13 +110,18 @@ export function validateToolAgainstPhaseAndPlan(input: {
     input.args,
     {
       workspace: input.ports.context.runWorkspace,
+      workspaceMcpSnapshot: input.ports.context.workspaceMcpSnapshot,
       approvedLocalFileReadPaths:
         input.ports.get()?.approvedLocalFileReadPaths,
     },
   );
   if (
+    ["knowledge_search", "knowledge_get_excerpt"].includes(input.toolName) &&
+    (!input.ports.context.knowledgeContext?.references.length || ["stale", "error"].includes(input.ports.context.knowledgeContext.state))
+  ) return { allowed: false, reason: "本条消息没有可用的已选择资料范围。", failureKind: "not_authorized", reasonCode: "knowledge_scope_required" };
+  if (
     (aggregate?.strategy === "chat" || isChatContext(input.ports)) &&
-    (catalogSource !== "built_in" || !["load_skill", "tool_search", "web_search", "web_fetch"].includes(input.toolName) || input.command.kind === "execute_validation")
+    (catalogSource !== "built_in" || !["load_skill", "tool_search", "web_search", "web_fetch", "knowledge_search", "knowledge_get_excerpt"].includes(input.toolName) || input.command.kind === "execute_validation")
   ) {
     return { allowed: false, reason: "Chat 仅允许已接纳的 Skill 与网络读取。", failureKind: "not_authorized", reasonCode: "chat_read_only_authority" };
   }
@@ -196,7 +203,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
     aggregate?.strategy === "analyze" &&
     (
       (
-        !isRuntimeV2ReadOnlyToolName(input.toolName) &&
+        !(catalogSource === "built_in" && isRuntimeV2ReadOnlyToolName(input.toolName)) &&
         !(
           catalogSource === "mcp" &&
           isRuntimeV2ObservationRisk(catalogRisk)
@@ -255,14 +262,14 @@ export function validateToolAgainstPhaseAndPlan(input: {
       };
     }
   }
-  const leaseRejection = () => {
+  const leaseRejection = (requireApprovedPlanSource = false) => {
     // write_file is creation-capable, not create-only. Its operation and lease
     // requirement cannot be decided until trusted preflight observes the target.
     if (input.toolName === "write_file" && !input.writeFileTarget) return null;
     const lease = validateRuntimeV2MutationLease({
       ports: input.ports, toolCallId: String(input.command.payload.toolCallId || ""),
       toolName: input.toolName, args: input.args, target: input.target,
-      writeFileTarget: input.writeFileTarget,
+      writeFileTarget: input.writeFileTarget, requireApprovedPlanSource,
     });
     if (!lease || lease.allowed) return null;
     return {
@@ -280,6 +287,11 @@ export function validateToolAgainstPhaseAndPlan(input: {
   if (input.toolName === "write_file" && input.writeFileTarget) {
     const rejected = leaseRejection();
     if (rejected) return rejected;
+  }
+  if (input.toolName === "unity_create_scene") {
+    if (aggregate?.strategy === "plan") return validateToolAgainstApprovedPlan({ ...input, aggregate });
+    return { allowed: false, reason: "Unity scene authoring requires an approved WorkPlan.",
+      failureKind: "not_authorized", reasonCode: "approved_plan_unity_scene_scope" };
   }
   if (aggregate?.strategy !== "plan") {
     if (input.command.kind === "execute_tool" && isWorkspaceMutationToolName(input.toolName)) {
@@ -312,13 +324,22 @@ export function validateToolAgainstPhaseAndPlan(input: {
     }
     return { allowed: true, reason: null, failureKind: null, reasonCode: null };
   }
-  return validateToolAgainstApprovedPlan({ ...input, aggregate });
+  const plan = validateToolAgainstApprovedPlan({ ...input, aggregate });
+  if (!plan.allowed) return plan;
+  if (input.command.kind === "execute_tool" && isWorkspaceMutationToolName(input.toolName) &&
+      resolveWorkspaceMutationRequests(input.toolName, input.args, input.target)
+        .some(request => request.operation === "modify" && isApprovedUnityCorrection(aggregate, request.target))) {
+    const rejected = leaseRejection(true);
+    if (rejected) return rejected;
+  }
+  return plan;
 }
 
 export async function authorizeToolForCurrentTurn(
   input: RuntimeV2ExecutionPortsInput,
   name: string,
   args: Record<string, unknown>,
+  scopedCall?: { readonly command: RuntimeV2Command; readonly target: string },
 ): Promise<RuntimeV2ToolAuthorizationResult> {
   const state = input.get();
   const authorization = authorizationFor(input);
@@ -360,6 +381,7 @@ export async function authorizeToolForCurrentTurn(
         args,
         {
           workspace: input.context.runWorkspace,
+          workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
           approvedLocalFileReadPaths: state.approvedLocalFileReadPaths,
         },
       );
@@ -387,7 +409,7 @@ export async function authorizeToolForCurrentTurn(
   } : null;
   if (risk === "external_read") {
     const networkTool = catalogResolution.entry.source === "built_in" && (exposedName === "web_search" || exposedName === "web_fetch");
-    if (networkTool && (isReadOnlyContext(input) ? !readOnlyNetworkPolicy(input).enabled : state.webSearchEnabled !== true)) {
+    if (networkTool && !readOnlyNetworkPolicy(input).enabled) {
       return { allowed: false, reason: "当前会话未启用网络访问。", allowExternalLocalRead: false };
     }
   }
@@ -422,7 +444,15 @@ export async function authorizeToolForCurrentTurn(
         };
   }
   const consent = state.currentTurnExecutionConsent;
-  const hasConsent = consent?.turnId === input.context.turnId && consent.granted === true;
+  const aggregate = scopedCall ? aggregateForCurrentTurn(input) : null;
+  const continuedConsent = scopedCall && aggregate?.strategy === "plan" &&
+    scopedCall.command.run.turnId === aggregate.turn.turnId && scopedCall.command.run.runId === aggregate.run?.identity.runId &&
+    catalogResolution.entry.source === "built_in" &&
+    ((risk === "workspace_write" && isWorkspaceMutationToolName(exposedName)) ||
+      (risk === "shell" && exposedName === "run_command" && scopedCall.command.kind === "execute_validation")) &&
+    approvedRuntimeV2PlanContinuation(aggregate.events) &&
+    validateToolAgainstApprovedPlan({ ports: input, aggregate, command: scopedCall.command, toolName: exposedName, args, target: scopedCall.target }).allowed;
+  const hasConsent = (consent?.turnId === input.context.turnId && consent.granted === true) || Boolean(continuedConsent);
   // A dangerous shell command is classified as destructive, but still needs
   // the shell guard's exact decision/approval packet at the execution boundary.
   if (shellCommand) {
@@ -437,6 +467,7 @@ export async function authorizeToolForCurrentTurn(
         allowed: false,
         reason: shell.error || shell.decision?.reviewReason || "该 Shell 命令已被权限策略拒绝。",
         allowExternalLocalRead: false,
+        ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}),
       };
     }
     if (manualReview) return { ...manualReview, ...(shell.decision ? { shellPermissionDecision: shell.decision } : {}) };

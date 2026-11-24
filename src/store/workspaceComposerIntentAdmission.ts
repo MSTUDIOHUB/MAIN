@@ -16,6 +16,7 @@ import {
   type SubagentDelegationPreference,
 } from "../lib/turnIntake";
 import type { WorkspaceJsonObject } from "../lib/workspaceInstruction";
+import { parseProjectInitCommand } from "../lib/projectInit";
 
 /**
  * Immutable UI facts captured by the exact Composer submit event. They must
@@ -36,6 +37,7 @@ export interface WorkspaceComposerIntentAdmissionInput {
 export interface WorkspaceComposerSubmissionPayloadSnapshot {
   readonly contextMentions: readonly string[];
   readonly attachedFiles: readonly AttachedFile[];
+  readonly knowledgeReferences?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
 }
 
 export interface WorkspaceComposerInstructionAdmissionInput<TAcceptance> {
@@ -50,6 +52,7 @@ export interface WorkspaceComposerInstructionAdmissionInput<TAcceptance> {
     images?: string[];
     contextMentions: string[];
     attachedFiles: AttachedFile[];
+    knowledgeReferences?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
     source: "composer";
     dispatchHints?: WorkspaceJsonObject;
   }) => Promise<TAcceptance>;
@@ -68,6 +71,10 @@ export function buildWorkspaceComposerIntentDispatchHints(
   const subagentPreference = normalizeSubagentDelegationPreference(
     input.snapshot.subagentPreference,
   );
+  if (parseProjectInitCommand(input.text)) return {
+    subagentPreference, explicitIntent: "plan", planPurpose: "rules",
+    turnTitle: input.language === "en" ? "Write project rules" : "编写项目规则",
+  };
   const mainDebugShortcut = mainModeKey === "main_mode"
     ? parseMainDebugShortcut(input.text)
     : null;
@@ -82,9 +89,7 @@ export function buildWorkspaceComposerIntentDispatchHints(
     )
       ? input.snapshot.lockedComposerIntent
       : null;
-  const modeIntent: ResolvedRunIntent | null = mainModeKey === "image_studio"
-    ? "image_studio"
-    : null;
+  const modeIntent: ResolvedRunIntent | null = null;
   const resolvedIntent: ResolvedRunIntent | null = mainDebugShortcut
     ? "plan"
     : lockedComposerIntent || mainIntentShortcut?.intent || modeIntent;
@@ -111,7 +116,7 @@ export function buildWorkspaceComposerIntentDispatchHints(
 
   return {
     subagentPreference,
-    ...(mainModeKey === "main_mode" && !mainDebugShortcut && resolvedIntent !== "goal" && resolvedIntent !== "image_studio"
+    ...(mainModeKey === "main_mode" && !mainDebugShortcut
       ? { explicitIntent: resolvedIntent }
       : { resolvedIntent, runtimeIntentOverride: resolvedIntent, skipIntentResolution: true }),
     turnTitle,
@@ -139,6 +144,7 @@ export function acceptWorkspaceComposerInstruction<TAcceptance>(
     ...(input.images?.length ? { images: [...input.images] } : {}),
     contextMentions: [...input.payloadSnapshot.contextMentions],
     attachedFiles: input.payloadSnapshot.attachedFiles.map((file) => ({ ...file })),
+    knowledgeReferences: (input.payloadSnapshot.knowledgeReferences || []).map(reference => ({ ...reference })),
     source: "composer",
     ...(dispatchHints ? { dispatchHints } : {}),
   });

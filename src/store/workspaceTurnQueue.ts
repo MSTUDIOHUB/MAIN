@@ -1,4 +1,5 @@
 import { normalizeNetworkRead } from "../lib/networkRead";
+import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
 import {
   WORKSPACE_INSTRUCTION_SCHEMA_VERSION,
   WORKSPACE_INSTRUCTION_SOURCES,
@@ -68,6 +69,9 @@ export type WorkspaceTurnQueueCommand =
       /** Remove the exact claimed head only after its exact Turn became terminal. */
       readonly type: "remove";
       readonly terminalOwner: WorkspaceTurnTerminalOwner;
+    })
+  | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueEntryIdentity & {
+      readonly type: "promote_to_guidance";
     })
   | (WorkspaceTurnQueueCommandBase & WorkspaceTurnQueueEntryIdentity & {
       /** Persistence failed; discard only the exact still-persisting entry. */
@@ -244,7 +248,8 @@ function normalizeInstructionPayload(value: unknown): WorkspaceInstructionPayloa
   const images = normalizeOptionalStringArray(value.images);
   const contextMentions = normalizeOptionalStringArray(value.contextMentions);
   const attachedFiles = normalizeOptionalAttachments(value.attachedFiles);
-  if (!images || !contextMentions || !attachedFiles) return null;
+  const knowledgeReferences = normalizeKnowledgeReferences(value.knowledgeReferences);
+  if (!images || !contextMentions || !attachedFiles || !knowledgeReferences) return null;
   const dispatchHints = value.dispatchHints === undefined
     ? undefined
     : normalizeJsonObject(value.dispatchHints);
@@ -253,13 +258,14 @@ function normalizeInstructionPayload(value: unknown): WorkspaceInstructionPayloa
     !value.text.trim() &&
     images.length === 0 &&
     contextMentions.length === 0 &&
-    attachedFiles.length === 0
+    attachedFiles.length === 0 && knowledgeReferences.length === 0
   ) return null;
   return Object.freeze({
     text: value.text,
     ...(images.length > 0 ? { images } : {}),
     ...(contextMentions.length > 0 ? { contextMentions } : {}),
     ...(attachedFiles.length > 0 ? { attachedFiles } : {}),
+    ...(knowledgeReferences.length > 0 ? { knowledgeReferences } : {}),
     ...(dispatchHints ? { dispatchHints } : {}),
   });
 }
@@ -659,11 +665,12 @@ export function reduceWorkspaceTurnQueue(
       ) return rejected(state, "terminal_owner_mismatch", head);
       return applied(state, command.at, Object.freeze(state.entries.slice(1)), head);
     }
+    case "promote_to_guidance":
     case "rollback": {
       const index = state.entries.findIndex((entry) => entryIdentityMatches(entry, command));
       if (index < 0) return rejected(state, "entry_not_found");
       const entry = state.entries[index];
-      if (entry.status !== "persisting") {
+      if (entry.status !== (command.type === "promote_to_guidance" ? "queued" : "persisting")) {
         return rejected(state, "entry_state_conflict", entry);
       }
       return applied(

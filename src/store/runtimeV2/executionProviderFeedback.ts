@@ -69,7 +69,15 @@ export function runtimeV2RepeatedActionFeedback(
   ];
   const targets = boundedRejectedMutationTargets(input);
   if (input.failureDetail) lines.push(`Original failure: ${input.failureDetail.slice(0, 800)}`);
-  if (!completed && targets.length > 0) {
+  if (completed && targets.length > 0) {
+    lines.push(
+      `targets: ${JSON.stringify(targets)}`,
+      "effect: none",
+      "The matching mutation already has a committed result. This repeated request made no new change; reuse that committed result.",
+      "next: complete any still-required validation against the latest committed workspace version, or continue another authorized action required by the objective. Do not create another patch merely to replace this rejected duplicate.",
+      "A committed mutation does not by itself prove that validation or the objective is complete.",
+    );
+  } else if (!completed && targets.length > 0) {
     const visibleTargets = new Set(
       (input.visibleSourceTargets || [])
         .map((target) =>
@@ -108,18 +116,34 @@ export function buildRuntimeV2RepeatedActionReceipts(input: {
   nextId: () => string;
 }): NonNullable<RuntimeV2NormalizedProviderResult["actionReceipts"]> {
   const commands = new Map(input.aggregate?.events.flatMap(event => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []) || []);
+  // A rejection reflection is not a new execution result. Resolve the exact
+  // effect from the canonical ledger at the current mutation boundary, so an
+  // already-completed patch cannot turn into failed-patch recovery merely
+  // because its first duplicate was itself rejected. A newer parent or child
+  // mutation closes this provenance just as it closes source/write leases.
+  const currentMutation = [...(input.aggregate?.events || [])].reverse().find(event =>
+    ((event.type === "tool.completed" && event.status === "succeeded") ||
+      (event.type === "subagent.completed" && event.status === "completed")) &&
+    event.evidence.some(evidence => evidence.kind === "mutation"));
   return input.calls.map(call => {
     const actionIdentity = runtimeV2ProviderToolCallIdentity(call);
-    const failure = [...(input.aggregate?.events || [])].reverse().find(event => {
+    const committedCommand = isWorkspaceMutationToolName(call.name) && currentMutation?.type === "tool.completed"
+      ? commands.get(currentMutation.idempotencyKey) : undefined;
+    const alreadyCommitted = committedCommand && runtimeV2ProviderToolCallIdentity({
+      name: String(committedCommand.payload.toolName),
+      arguments: committedCommand.payload.arguments as Record<string, unknown> || {},
+    }) === actionIdentity;
+    const reason = alreadyCommitted ? "already_completed" : input.reason;
+    const failure = reason === "already_completed" ? undefined : [...(input.aggregate?.events || [])].reverse().find(event => {
       if (event.type !== "tool.completed" || event.status === "succeeded") return false;
       const command = commands.get(event.idempotencyKey);
       return command && runtimeV2ProviderToolCallIdentity({ name: String(command.payload.toolName), arguments: command.payload.arguments as Record<string, unknown> || {} }) === actionIdentity;
     });
-    const feedback = runtimeV2RepeatedActionFeedback({ ...input, call,
+    const feedback = runtimeV2RepeatedActionFeedback({ ...input, call, reason,
       failureDetail: failure?.type === "tool.completed" ? `${failure.status}: ${failure.failureReasonCode || failure.failureKind}: ${failure.presentation?.message || ""}` : undefined });
     return { call: { ...call, id: input.nextId(), arguments: isWorkspaceMutationToolName(call.name)
       ? { runtime_v2_rejected_action: actionIdentity, effect: "none" } : call.arguments },
-      actionIdentity, status: "rejected", reasonCode: input.reason, feedback,
+      actionIdentity, status: "rejected", reasonCode: reason, feedback,
       priorFeedbackObserved: input.observed?.has(actionIdentity) === true };
   });
 }

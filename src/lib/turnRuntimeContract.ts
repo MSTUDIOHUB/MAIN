@@ -8,7 +8,7 @@
 
 export const TURN_RUNTIME_CONTRACT_SCHEMA_VERSION = 1 as const;
 
-export type TurnStrategy = "chat" | "plan" | "execute" | "goal";
+export type TurnStrategy = "chat" | "plan" | "execute";
 
 export type TurnCompletionResultKind =
   | "success"
@@ -208,7 +208,7 @@ export type TurnRuntimeTransitionResult =
       readonly reason: TurnRuntimeTransitionRejection;
     };
 
-const TURN_STRATEGIES = new Set<TurnStrategy>(["chat", "plan", "execute", "goal"]);
+const TURN_STRATEGIES = new Set<TurnStrategy>(["chat", "plan", "execute"]);
 const START_PHASES = new Set<TurnRunPhase>([
   "preparing",
   "investigating",

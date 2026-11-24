@@ -73,12 +73,17 @@ export default function MainOnboardingPanel({
           {
             label: "Commands",
             title: "/ Slash commands",
-            description: "Type / to browse workflows and output styles. /init opens a reviewable AGENTS.md setup; /init --refresh opens a rebuild preview and writes only after confirmation.",
+            description: "Use /plan to investigate, confirm choices, and save a plan. Use /rules to draft and review AGENTS.md before saving.",
           },
           {
             label: "Context",
             title: "@ Reference files",
             description: "Type @ or use the @ button to add exact workspace files. Use + to attach files that are outside the current workspace.",
+          },
+          {
+            label: "Knowledge",
+            title: "# Select reference material",
+            description: "Select whole libraries or individual documents with #. MAIN searches the selection for this message; the next message starts without a selection.",
           },
           {
             label: "Skills",
@@ -107,12 +112,17 @@ export default function MainOnboardingPanel({
           {
             label: "命令",
             title: "/ 斜杠命令",
-            description: "输入 / 可浏览工作流与输出方式；/init 会打开可审阅的 AGENTS.md 初始化预览，/init --refresh 会打开重建预览，确认后才写入。",
+            description: "使用 /计划 调查需求、确认选择并保存计划文档；使用 /规则 起草 AGENTS.md，编辑和审阅后再保存。",
           },
           {
             label: "上下文",
             title: "@ 引用文件",
             description: "输入 @ 或点击 @ 按钮可精确引用工作区文件；使用 + 可以附加当前工作区之外的文件。",
+          },
+          {
+            label: "知识库",
+            title: "# 选择参考资料",
+            description: "输入 # 可多选整库或单篇资料。MAIN 只检索本条消息选择的资料，下一条消息默认不选择资料。",
           },
           {
             label: "技能",

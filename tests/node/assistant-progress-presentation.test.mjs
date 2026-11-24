@@ -117,3 +117,17 @@ test("active lifecycle fallback is conversational without exposing hidden reason
   );
   assert.equal(buildCapsulePhaseGuidance("completed", "zh"), "");
 });
+
+test("ChatArea stage checkpoint preserves up to 3 complete findings within the expanded 900-char budget", () => {
+  const modelOutput = [
+    "已确认问题 1 的根因在于输入检测未剥离技术标识符，导致中文混排指令被误判成英文。",
+    "已定位到问题 2：收尾提示使用了纯英文模板，诱使模型在最后阶段切换语言。",
+    "验证结果：补充自动纠偏重试后，中英文回归用例全部通过。",
+  ].join("\n");
+
+  const checkpoint = buildAssistantStageCheckpoint(modelOutput, "zh");
+  assert.match(checkpoint, /问题 1/);
+  assert.match(checkpoint, /问题 2/);
+  assert.match(checkpoint, /验证结果/);
+  assert.ok(checkpoint.length <= 900);
+});

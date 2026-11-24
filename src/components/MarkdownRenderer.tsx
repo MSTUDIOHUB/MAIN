@@ -30,7 +30,6 @@ const LANG_MAP: Record<string, string> = {
   html: "html",
 };
 
-const DIAGRAM_LANGS = new Set(["mermaid", "plantuml", "puml", "uml", "dot", "graphviz"]);
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 
 function resolveLanguage(lang?: string): string {
@@ -56,121 +55,6 @@ function slugify(value: string): string {
     .replace(/[`~!@#$%^&*()+=[\]{};:'",.<>/?\\|]+/g, "")
     .replace(/\s+/g, "-")
     .slice(0, 80);
-}
-
-function getLanguageTone(language: string, isDiagram: boolean, themeMode: "light" | "dark" | "black" = "dark") {
-  const normalized = language.toLowerCase();
-  const isLightTheme = themeMode === "light";
-
-  if (isDiagram || normalized === "mermaid") {
-    return isLightTheme
-      ? {
-          badgeBorder: "rgba(37,99,235,0.28)",
-          badgeBackground: "rgba(219,234,254,0.82)",
-          badgeText: "#1d4ed8",
-          headerBackground: "linear-gradient(90deg, rgba(219,234,254,0.9), rgba(240,249,255,0.72))",
-        }
-      : {
-          badgeBorder: "rgba(96,165,250,0.28)",
-          badgeBackground: "rgba(96,165,250,0.12)",
-          badgeText: "#93c5fd",
-          headerBackground: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(14,165,233,0.08))",
-        };
-  }
-
-  switch (normalized) {
-    case "typescript":
-    case "tsx":
-      return {
-        badgeBorder: "rgba(59,130,246,0.28)",
-        badgeBackground: "rgba(59,130,246,0.12)",
-        badgeText: "#93c5fd",
-        headerBackground: "linear-gradient(90deg, rgba(59,130,246,0.16), rgba(14,165,233,0.06))",
-      };
-    case "javascript":
-    case "jsx":
-      return {
-        badgeBorder: "rgba(251,191,36,0.28)",
-        badgeBackground: "rgba(251,191,36,0.12)",
-        badgeText: "#fcd34d",
-        headerBackground: "linear-gradient(90deg, rgba(245,158,11,0.14), rgba(234,179,8,0.06))",
-      };
-    case "python":
-      return {
-        badgeBorder: "rgba(250,204,21,0.28)",
-        badgeBackground: "rgba(37,99,235,0.12)",
-        badgeText: "#fde68a",
-        headerBackground: "linear-gradient(90deg, rgba(37,99,235,0.16), rgba(250,204,21,0.06))",
-      };
-    case "csharp":
-      return {
-        badgeBorder: "rgba(168,85,247,0.28)",
-        badgeBackground: "rgba(168,85,247,0.12)",
-        badgeText: "#d8b4fe",
-        headerBackground: "linear-gradient(90deg, rgba(124,58,237,0.16), rgba(139,92,246,0.06))",
-      };
-    case "rust":
-      return {
-        badgeBorder: "rgba(251,146,60,0.28)",
-        badgeBackground: "rgba(251,146,60,0.12)",
-        badgeText: "#fdba74",
-        headerBackground: "linear-gradient(90deg, rgba(234,88,12,0.14), rgba(251,146,60,0.06))",
-      };
-    case "bash":
-    case "shell":
-      return {
-        badgeBorder: "rgba(52,211,153,0.28)",
-        badgeBackground: "rgba(52,211,153,0.12)",
-        badgeText: "#86efac",
-        headerBackground: "linear-gradient(90deg, rgba(16,185,129,0.14), rgba(34,197,94,0.06))",
-      };
-    case "json":
-    case "yaml":
-    case "toml":
-      return {
-        badgeBorder: "rgba(45,212,191,0.28)",
-        badgeBackground: "rgba(45,212,191,0.12)",
-        badgeText: "#99f6e4",
-        headerBackground: "linear-gradient(90deg, rgba(20,184,166,0.14), rgba(45,212,191,0.06))",
-      };
-    case "css":
-    case "scss":
-      return {
-        badgeBorder: "rgba(244,114,182,0.28)",
-        badgeBackground: "rgba(244,114,182,0.12)",
-        badgeText: "#f9a8d4",
-        headerBackground: "linear-gradient(90deg, rgba(236,72,153,0.14), rgba(244,114,182,0.06))",
-      };
-    case "html":
-    case "svg":
-      return {
-        badgeBorder: "rgba(45,212,191,0.28)",
-        badgeBackground: "rgba(45,212,191,0.12)",
-        badgeText: "#99f6e4",
-        headerBackground: "linear-gradient(90deg, rgba(20,184,166,0.14), rgba(59,130,246,0.06))",
-      };
-    case "math":
-      return {
-        badgeBorder: "rgba(251,191,36,0.28)",
-        badgeBackground: "rgba(251,191,36,0.12)",
-        badgeText: "#fde68a",
-        headerBackground: "linear-gradient(90deg, rgba(245,158,11,0.14), rgba(251,191,36,0.05))",
-      };
-    case "markdown":
-      return {
-        badgeBorder: "rgba(161,161,170,0.28)",
-        badgeBackground: "rgba(161,161,170,0.1)",
-        badgeText: "#d4d4d8",
-        headerBackground: "linear-gradient(90deg, rgba(113,113,122,0.16), rgba(82,82,91,0.06))",
-      };
-    default:
-      return {
-        badgeBorder: "color-mix(in srgb, var(--accent-light) 30%, transparent)",
-        badgeBackground: "var(--accent-subtle)",
-        badgeText: "var(--accent-light)",
-        headerBackground: "linear-gradient(90deg, color-mix(in srgb, var(--accent) 12%, transparent), color-mix(in srgb, var(--accent-light) 4%, transparent))",
-      };
-  }
 }
 
 function MathInline({ value, baseFontSize }: { value: string; baseFontSize: number }) {
@@ -255,7 +139,6 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
   const language = match ? match[1].toLowerCase() : "";
   const codeStr = String(children).replace(/\n$/, "");
   const resolvedLang = resolveLanguage(language);
-  const isDiagram = DIAGRAM_LANGS.has(resolvedLang);
   const isMermaid = resolvedLang === "mermaid";
   const isMath = resolvedLang === "math";
   const isHtmlPreviewable = resolvedLang === "html" || resolvedLang === "svg";
@@ -264,7 +147,10 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
   const isCompactPlainText = isPlainText && !codeStr.includes("\n") && plainTextDisplay.length <= 80;
   const lineCount = codeStr.split(/\r?\n/).length;
   const canCollapseCode = lineCount > 18 || codeStr.length > 2400;
-  const tone = getLanguageTone(resolvedLang || "text", isDiagram, themeMode);
+  const codeBlockWrapperClass = "group/code my-3 overflow-hidden rounded-xl border";
+  const slimHeaderClass = "flex items-center justify-between gap-2 border-b px-3 py-1.5";
+  const actionGroupClass = "flex flex-wrap items-center justify-end gap-1 opacity-75 transition-opacity group-hover/code:opacity-100 focus-within:opacity-100";
+  const ghostActionButtonClass = "rounded-md px-1.5 py-0.5 text-[11px] leading-4 text-[var(--surface-text-subtle)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--surface-text-strong)]";
   const expandedTone = isLightTheme
     ? {
         overlay: "rgba(15,23,42,0.24)",
@@ -365,24 +251,29 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
   if (isPlainText) {
     return (
       <div
-        className="my-4 overflow-hidden rounded-2xl border"
+        className={codeBlockWrapperClass}
         style={{ borderColor: codeSurfaceTone.border, backgroundColor: codeSurfaceTone.background }}
       >
-        <div className="flex items-center justify-end gap-2 border-b border-[#1f1f23] px-4 py-2">
-          {canCollapseCode && (
-            <button onClick={() => setIsCodeExpanded((value) => !value)} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
-              {isCodeExpanded ? copy.collapse : copy.expand}
+        <div
+          className={`${slimHeaderClass} justify-end`}
+          style={{ borderColor: codeSurfaceTone.border }}
+        >
+          <div className={actionGroupClass}>
+            {canCollapseCode && (
+              <button type="button" onClick={() => setIsCodeExpanded((value) => !value)} className={ghostActionButtonClass}>
+                {isCodeExpanded ? copy.collapse : copy.expand}
+              </button>
+            )}
+            <button type="button" onClick={() => setIsWrapped((value) => !value)} className={ghostActionButtonClass}>
+              {isWrapped ? copy.unwrap : copy.wrap}
             </button>
-          )}
-          <button onClick={() => setIsWrapped((value) => !value)} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
-            {isWrapped ? copy.unwrap : copy.wrap}
-          </button>
-          <button onClick={handleCopy} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
-            {copied ? copy.copied : copy.copy}
-          </button>
+            <button type="button" onClick={handleCopy} className={ghostActionButtonClass}>
+              {copied ? copy.copied : copy.copy}
+            </button>
+          </div>
         </div>
         <pre
-          className="m-0 overflow-auto p-4 font-mono"
+          className="m-0 overflow-auto px-3.5 py-3 font-mono"
           style={{
             maxHeight: canCollapseCode && !isCodeExpanded ? 360 : undefined,
             whiteSpace: isWrapped ? "pre-wrap" : "pre",
@@ -401,7 +292,7 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
 
   const syntaxCustomStyle: React.CSSProperties = {
     margin: 0,
-    padding: "1rem",
+    padding: "0.75rem 0.9rem",
     maxHeight: canCollapseCode && !isCodeExpanded ? 420 : undefined,
     overflow: "auto",
     background: "transparent",
@@ -416,63 +307,63 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
   return (
     <>
       <div
-        className="my-4 overflow-hidden rounded-2xl border"
+        className={codeBlockWrapperClass}
         style={{
           borderColor: codeSurfaceTone.border,
           backgroundColor: codeSurfaceTone.background,
         }}
       >
-        <div className="flex items-center justify-between border-b border-[#1f1f23] px-4 py-2" style={{ background: tone.headerBackground }}>
-          <div className="flex min-w-0 items-center gap-2">
-            <span
-              className="rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em]"
-              style={{
-                borderColor: tone.badgeBorder,
-                backgroundColor: tone.badgeBackground,
-                color: tone.badgeText,
-              }}
-            >
+        <div
+          className={slimHeaderClass}
+          style={{ borderColor: codeSurfaceTone.border }}
+        >
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="font-mono text-[11px] leading-4 text-[var(--surface-text-subtle)]">
               {resolvedLang || "text"}
             </span>
             {isMermaid && (
-              <span className="text-[10px] uppercase tracking-[0.18em] text-[#cbd5e1]">{copy.diagram}</span>
+              <span className="text-[11px] leading-4 text-[var(--surface-text-subtle)]">· {copy.diagram}</span>
             )}
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-2">
+          <div className={actionGroupClass}>
             {isHtmlPreviewable && (
               <button
+                type="button"
                 onClick={() => setIsPreviewOpen(true)}
-                className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                className={ghostActionButtonClass}
               >
                 {copy.preview}
               </button>
             )}
             {canCollapseCode && (
               <button
+                type="button"
                 onClick={() => setIsCodeExpanded((value) => !value)}
-                className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                className={ghostActionButtonClass}
               >
                 {isCodeExpanded ? copy.collapse : copy.expand}
               </button>
             )}
             <button
+              type="button"
               onClick={() => setIsWrapped((value) => !value)}
-              className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+              className={ghostActionButtonClass}
             >
               {isWrapped ? copy.unwrap : copy.wrap}
             </button>
             {isMermaid && (
               <button
+                type="button"
                 onClick={() => setIsExpanded(true)}
-                className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                className={ghostActionButtonClass}
               >
-                <span className="inline-flex items-center gap-1.5">
-                  <IconExpand className="h-3.5 w-3.5" />
+                <span className="inline-flex items-center gap-1">
+                  <IconExpand className="h-3 w-3" />
                   {copy.expand}
                 </span>
               </button>
             )}
-            <button onClick={handleCopy} className="rounded-full border border-[#27272a] bg-[#09090b] px-3 py-1 text-[10px] text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]">
+            <button type="button" onClick={handleCopy} className={ghostActionButtonClass}>
               {copied ? copy.copied : copy.copy}
             </button>
           </div>
@@ -512,16 +403,9 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
             }}
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ borderColor: expandedTone.headerBorder, background: tone.headerBackground }}>
-              <div className="flex items-center gap-3">
-                <span
-                  className="rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em]"
-                  style={{
-                    borderColor: tone.badgeBorder,
-                    backgroundColor: tone.badgeBackground,
-                    color: tone.badgeText,
-                  }}
-                >
+            <div className="flex items-center justify-between border-b border-[#2c2c32] px-5 py-3" style={{ borderColor: expandedTone.headerBorder }}>
+              <div className="flex items-center gap-2.5">
+                <span className="font-mono text-[11px]" style={{ color: expandedTone.buttonText }}>
                   {resolvedLang || "text"}
                 </span>
                 <span className="text-[12px] text-[#d4d4d8]" style={{ color: expandedTone.titleText }}>{copy.expandedDiagram}</span>
@@ -571,12 +455,9 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
             }}
             onClick={(event) => event.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b px-5 py-3" style={{ borderColor: expandedTone.headerBorder, background: tone.headerBackground }}>
-              <div className="flex items-center gap-3">
-                <span
-                  className="rounded-full border px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em]"
-                  style={{ borderColor: tone.badgeBorder, backgroundColor: tone.badgeBackground, color: tone.badgeText }}
-                >
+            <div className="flex items-center justify-between border-b px-5 py-3" style={{ borderColor: expandedTone.headerBorder }}>
+              <div className="flex items-center gap-2.5">
+                <span className="font-mono text-[11px]" style={{ color: expandedTone.buttonText }}>
                   {resolvedLang}
                 </span>
                 <span className="text-[12px]" style={{ color: expandedTone.titleText }}>{copy.htmlPreview}</span>
@@ -653,8 +534,10 @@ function Heading({
     <div
       id={id}
       data-markdown-heading-level={level}
-      className={`group first:mt-0 text-[#f5f5f5] ${
-        compact ? "mt-4 mb-2 font-medium" : "mt-6 mb-3 font-semibold"
+      className={`group first:mt-0 ${
+        compact
+          ? "mt-3.5 mb-1.5 font-medium text-[var(--surface-text-strong)]"
+          : "mt-5 mb-2.5 font-semibold text-[#f5f5f5]"
       }`}
       style={{ fontSize: `${Math.round((sizes[level] || sizes[3]) * 10) / 10}px` }}
     >
@@ -764,15 +647,27 @@ const MarkdownRenderer = memo(function MarkdownRenderer({
     h4: ({ children }: any) => <Heading level={4} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
     h5: ({ children }: any) => <Heading level={5} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
     h6: ({ children }: any) => <Heading level={6} baseFontSize={baseFontSize} sourceId={sourceId} compact={compact}>{children}</Heading>,
-    p: ({ children }: any) => <p className="mb-3 whitespace-pre-wrap last:mb-0 text-[#d4d4d8]">{children}</p>,
+    p: ({ children }: any) => (
+      <p
+        className={`whitespace-pre-wrap last:mb-0 ${
+          compact ? "mb-2 text-[var(--surface-text-muted)]" : "mb-3 text-[#d4d4d8]"
+        }`}
+      >
+        {children}
+      </p>
+    ),
     a: ({ href, children }: any) => (
       <a href={href} target="_blank" rel="noopener noreferrer" className="theme-text underline underline-offset-4 transition-opacity hover:opacity-80" style={{ textDecorationColor: "var(--accent-subtle-border)" }}>
         {children}
       </a>
     ),
-    ul: ({ children }: any) => <ul className="mb-3 ml-5 list-disc space-y-1.5">{children}</ul>,
-    ol: ({ children }: any) => <ol className="mb-3 ml-5 list-decimal space-y-1.5">{children}</ol>,
-    li: ({ children }: any) => <li className="text-[#d4d4d8] marker:text-[#71717a]">{children}</li>,
+    ul: ({ children }: any) => <ul className={`ml-5 list-disc ${compact ? "mb-2 space-y-1" : "mb-3 space-y-1.5"}`}>{children}</ul>,
+    ol: ({ children }: any) => <ol className={`ml-5 list-decimal ${compact ? "mb-2 space-y-1" : "mb-3 space-y-1.5"}`}>{children}</ol>,
+    li: ({ children }: any) => (
+      <li className={`${compact ? "text-[var(--surface-text-muted)]" : "text-[#d4d4d8]"} marker:text-[#71717a]`}>
+        {children}
+      </li>
+    ),
     blockquote: ({ children }: any) => <Blockquote>{children}</Blockquote>,
     hr: () => <hr className="my-5 border-t border-[#27272a]" />,
     table: ({ children, node }: any) => (

@@ -1,302 +1,144 @@
 import { expect, test, type Page } from "@playwright/test";
 
-const WORKSPACE = "/tmp/e2e-composer-main-shortcuts";
-const TARGET_PATH = `${WORKSPACE}/AGENTS.md`;
-
+/** Admission uses the production Composer/Store path. The existing scenario
+ * holds the dispatcher in FIFO, so no provider or tool execution is mocked as
+ * successful. Editable review/save/owner/theme behavior lives in
+ * structured-plan-workflows.spec.ts; CAS safety lives in project-init Node/IPC
+ * and Rust tests rather than the retired deterministic directory refresh UI. */
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
-    if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
-      window.localStorage.clear();
-      window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
-    }
-
-    const workspace = "/tmp/e2e-composer-main-shortcuts";
-    const targetPath = `${workspace}/AGENTS.md`;
-    const harness = ((window as any).__PROJECT_INIT_E2E__ = {
-      content: null as string | null,
-      contentVersion: null as string | null,
-      inspectCalls: [] as Array<Record<string, unknown>>,
-      commitCalls: [] as Array<Record<string, unknown>>,
+    window.localStorage.clear();
+    const fixture = ((window as any).__WORKSPACE_ADMISSION_E2E__ = {
       savedSessions: [] as unknown[],
-      staleCommit: false,
+      nativeCalls: [] as string[],
+      holdNextSave: false,
+      releaseSave: null as (() => void) | null,
     });
-
-    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
-    internals.metadata ??= {
-      currentWindow: { label: "main" },
-      currentWebview: { label: "main" },
-    };
-    internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "plugin:event|listen") return 1;
-      if (cmd === "plugin:event|unlisten") return null;
-      if (cmd === "get_system_memory") {
-        return {
-          total_gb: 32,
-          available_gb: 24,
-          total_bytes: 32 * 1024 ** 3,
-          available_bytes: 24 * 1024 ** 3,
-        };
-      }
-      if (cmd === "save_project_session") {
-        harness.savedSessions.push(args?.session ?? null);
+    internals.metadata = { currentWindow: { label: "main" }, currentWebview: { label: "main" } };
+    internals.invoke = async (command: string, args?: Record<string, unknown>) => {
+      fixture.nativeCalls.push(command);
+      if (["start_chat_stream", "stream_chat", "proxy_request"].includes(command)) throw new Error("No model transport is allowed in this admission fixture");
+      if (command === "plugin:event|listen") return 1;
+      if (command === "get_system_memory") return { total_gb: 32, available_gb: 24 };
+      if (command === "save_project_session") {
+        fixture.savedSessions.push(args?.session ?? null);
+        if (fixture.holdNextSave) {
+          fixture.holdNextSave = false;
+          await new Promise<void>(resolve => { fixture.releaseSave = resolve; });
+        }
         return args?.session ?? null;
       }
-      if (cmd === "list_project_sessions") return [];
-      if (cmd === "canonicalize_workspace_path") return String(args?.path ?? workspace);
-      if (cmd === "get_git_status") {
-        return {
-          isRepo: false,
-          repoRoot: null,
-          branch: null,
-          changes: [],
-          staged: [],
-          unstaged: [],
-          untracked: [],
-        };
-      }
-      if (cmd === "list_directory" || cmd === "glob_search") return [];
-      if (cmd === "read_file") {
-        const path = String(args?.path ?? "");
-        if ((path === "AGENTS.md" || path === targetPath) && harness.content !== null) {
-          return harness.content;
-        }
-        throw new Error(`ENOENT: ${path}`);
-      }
-      if (cmd === "inspect_project_init_target") {
-        harness.inspectCalls.push({ ...(args || {}) });
-        return {
-          canonicalWorkspace: workspace,
-          targetPath,
-          exists: harness.content !== null,
-          content: harness.content ?? "",
-          contentVersion: harness.contentVersion,
-        };
-      }
-      if (cmd === "commit_project_init") {
-        harness.commitCalls.push({ ...(args || {}) });
-        if (harness.staleCommit) {
-          harness.staleCommit = false;
-          throw new Error("PROJECT_INIT_CONTENT_STALE: AGENTS.md changed after review");
-        }
-        const created = harness.content === null;
-        const nextContent = String(args?.content ?? "");
-        const unchanged = harness.content === nextContent;
-        harness.content = nextContent;
-        harness.contentVersion = `sha256-e2e-${harness.commitCalls.length}`;
-        return {
-          canonicalWorkspace: workspace,
-          targetPath,
-          created,
-          unchanged,
-          contentVersion: harness.contentVersion,
-        };
-      }
+      if (["list_project_sessions", "list_all_session_snapshots", "list_legacy_session_files"].includes(command)) return [];
+      if (command === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
+      if (command === "finalize_legacy_session_import") return 0;
       return null;
     };
   });
 });
 
-async function openReadyPreview(page: Page, command = "/init") {
-  const textarea = page.getByTestId("composer-textarea");
-  await textarea.fill(command);
-  await textarea.press("Enter");
-  await expect(page.getByTestId("project-init-review-dialog")).toBeVisible();
-  await expect(page.getByTestId("project-init-review-confirm")).toBeVisible();
-  await expect(page.getByTestId("project-init-review-confirm")).toBeEnabled();
+async function snapshot(page: Page) {
+  return page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
 }
 
-async function readInitCalls(page: Page) {
-  return page.evaluate(() => {
-    const harness = (window as any).__PROJECT_INIT_E2E__;
-    return {
-      inspectCalls: harness?.inspectCalls || [],
-      commitCalls: harness?.commitCalls || [],
-    };
-  });
+async function queuedRulesInstruction(page: Page, prompt: string) {
+  return page.evaluate(text => {
+    const saved = (window as any).__WORKSPACE_ADMISSION_E2E__.savedSessions;
+    const entry = [...saved].reverse().flatMap(session => session?.runtimeSnapshot?.workspaceTurnQueue?.entries || [])
+      .find(candidate => candidate.instruction?.payload?.text === text);
+    return entry ? {
+      text: entry.instruction.payload.text,
+      explicitIntent: entry.instruction.payload.dispatchHints.explicitIntent,
+      purpose: entry.instruction.payload.dispatchHints.planPurpose,
+      receiptId: entry.receipt.receiptId,
+      turnId: entry.receipt.turnId,
+    } : null;
+  }, prompt);
 }
 
-async function readRuntimeSnapshot(page: Page) {
-  return page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.() ?? null);
+async function expectNoImmediateInitWrite(page: Page) {
+  await expect(page.getByTestId("project-init-review-dialog")).toHaveCount(0);
+  expect(await snapshot(page)).toMatchObject({ workspaceContentVersion: 0, instructionSourcePaths: [] });
+  const calls = await page.evaluate(() => (window as any).__WORKSPACE_ADMISSION_E2E__.nativeCalls);
+  expect(calls.filter((command: string) => ["inspect_project_init_target", "commit_project_init", "save_plan_document", "start_chat_stream", "stream_chat", "proxy_request"].includes(command))).toEqual([]);
 }
 
-test("/init is the last workspace shortcut and remains visibly disabled without a workspace", async ({ page }) => {
+test("idle Enter admits one workspace Turn without showing it as backlog", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
+  const textarea = page.getByTestId("composer-textarea");
+  const prompt = "为当前项目拟定一个实现方案";
+  await textarea.fill(prompt);
+  await page.evaluate(() => { (window as any).__WORKSPACE_ADMISSION_E2E__.holdNextSave = true; });
+  await textarea.press("Enter");
+  await expect.poll(() => page.evaluate(() =>
+    typeof (window as any).__WORKSPACE_ADMISSION_E2E__.releaseSave,
+  )).toBe("function");
 
+  try {
+    await expect(page.getByTestId("user-message-content")).toHaveText([prompt]);
+    expect(await snapshot(page)).toMatchObject({ agentStatus: "idle", conversationTurnCount: 1, workspaceInstructionLedgerCount: 1, workspaceTurnQueueCount: 1 });
+    await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+  } finally {
+    await page.evaluate(() => (window as any).__WORKSPACE_ADMISSION_E2E__.releaseSave());
+  }
+
+  await expect(textarea).toHaveValue("");
+  await expect.poll(async () => (await snapshot(page)).providerDispatchAttemptCount).toBeGreaterThan(0);
+  expect(await snapshot(page)).toMatchObject({ conversationTurnCount: 1, workspaceInstructionLedgerCount: 1, workspaceTurnQueueCount: 1 });
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+});
+
+test("only Plan and Rules are public shortcuts; Rules is disabled outside a project", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
   const textarea = page.getByTestId("composer-textarea");
   await textarea.fill("/");
-  const shortcutIds = await page
-    .locator("[data-testid^='main-shortcut-item-']")
-    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid")));
-  expect(shortcutIds.at(-1)).toBe("main-shortcut-item-init");
-  await expect(page.getByText("工作区命令", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("main-shortcut-item-init")).toBeEnabled();
-  await expect(page.getByTestId("main-shortcut-item-init")).toContainText("生成／刷新项目说明");
-  await expect(page.getByTestId("main-shortcut-item-init")).toContainText("可选");
-
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.switchComposerSubmissionWorkspace?.(""));
-  await expect.poll(async () => (await readRuntimeSnapshot(page))?.currentWorkspace).toBe("");
-  await expect(page.getByTestId("main-shortcut-item-init")).toBeVisible();
-  await expect(page.getByTestId("main-shortcut-item-init")).toBeDisabled();
-  await expect(page.getByTestId("main-shortcut-item-init")).toHaveAttribute("aria-disabled", "true");
-  await expect(page.getByTestId("main-shortcut-item-init")).toContainText("请先打开工作区");
+  expect(await page.locator("[data-testid^='main-shortcut-item-']").evaluateAll(nodes => nodes.map(node => node.getAttribute("data-testid")))).toEqual(["main-shortcut-item-plan", "main-shortcut-item-rules"]);
+  const rules = page.getByTestId("main-shortcut-item-rules");
+  await expect(rules).toBeEnabled();
+  await expect(rules).toContainText("/规则");
+  await expect(rules).toContainText("调查项目、确认约束，审阅并保存 AGENTS.md。");
+  await expect(page.getByTestId("main-shortcut-item-init")).toHaveCount(0);
+  await page.evaluate(() => (window as any).__CODELY_E2E__.switchComposerSubmissionWorkspace(""));
+  await expect.poll(async () => (await snapshot(page)).currentWorkspace).toBe("");
+  await expect(rules).toBeDisabled();
+  await expect(rules).toHaveAttribute("aria-disabled", "true");
+  await expect(rules).toContainText("请先打开项目");
+  await expect(page.getByTestId("main-shortcut-item-plan")).toBeEnabled();
+  await textarea.fill("/init");
+  await textarea.press("Enter");
+  await expect(page.getByText("请先打开项目，再编写 AGENTS.md 规则。", { exact: true })).toBeVisible();
+  await expect(textarea).toHaveValue("/init");
+  expect(await snapshot(page)).toMatchObject({ conversationTurnCount: 0, workspaceInstructionLedgerCount: 0, workspaceTurnQueueCount: 0, providerDispatchAttemptCount: 0 });
+  const direct = await page.evaluate(async () => ({ admission: await (window as any).__CODELY_E2E__.admitProjectInitDirect(), started: (window as any).__CODELY_E2E__.sendProjectInitDirect() }));
+  expect(direct).toEqual({ admission: { accepted: false, reason: "workspace_required", retryable: false }, started: false });
+  await expectNoImmediateInitWrite(page);
 });
 
-test("direct Store admission cannot turn the reserved local command into a provider Turn", async ({ page }) => {
+for (const prompt of ["/init 保留人工约束，调查后再提出项目规则", "/init --refresh 保留人工规则并先确认修改范围"]) {
+  test(`hidden alias queues the Rules PlanPurpose without immediate refresh: ${prompt.split(" ").slice(0, 2).join(" ")}`, async ({ page }) => {
+    await page.goto("/?e2eScenario=composer-main-shortcuts");
+    const textarea = page.getByTestId("composer-textarea");
+    await textarea.fill("/init");
+    await expect(page.getByTestId("main-shortcut-item-init")).toHaveCount(0);
+    await textarea.fill(prompt);
+    await textarea.press("Enter");
+    await expect.poll(async () => (await snapshot(page)).workspaceTurnQueueCount).toBe(1);
+    const admitted = await queuedRulesInstruction(page, prompt);
+    expect(admitted).toMatchObject({ text: prompt, explicitIntent: "plan", purpose: "rules", receiptId: expect.any(String), turnId: expect.any(String) });
+    expect(await snapshot(page)).toMatchObject({ currentTurnIntent: "plan", currentTurnPrompt: prompt, conversationTurnCount: 1, workspaceInstructionLedgerCount: 1, workspaceTurnQueueCount: 1 });
+    await expect.poll(async () => (await snapshot(page)).providerDispatchAttemptCount).toBeGreaterThan(0);
+    await expect(textarea).toHaveValue("");
+    await expectNoImmediateInitWrite(page);
+  });
+}
+
+test("direct Store admission treats init as queued Rules intent rather than a privileged local write", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
-
-  const result = await page.evaluate(async () => ({
-    admission: await (window as any).__CODELY_E2E__?.admitProjectInitDirect?.(),
-    sendStarted: (window as any).__CODELY_E2E__?.sendProjectInitDirect?.(),
-  }));
-  expect(result).toEqual({
-    admission: {
-      accepted: false,
-      reason: "local_command_requires_composer",
-      retryable: false,
-    },
-    sendStarted: false,
-  });
-  expect(await readRuntimeSnapshot(page)).toMatchObject({
-    conversationTurnCount: 0,
-    workspaceInstructionLedgerCount: 0,
-    workspaceTurnQueueCount: 0,
-    providerDispatchAttemptCount: 0,
-  });
-});
-
-test("preview, Cancel, and Escape never create a Turn or commit a file", async ({ page }) => {
-  await page.goto("/?e2eScenario=composer-main-shortcuts");
-
-  await openReadyPreview(page);
-  await expect(page.getByRole("heading", { name: "生成／刷新项目说明", exact: true })).toBeVisible();
-  await expect(page.locator("#project-init-review-description")).toContainText("每轮都会自动读取项目基线");
-  await expect(page.locator("#project-init-review-description")).toContainText("只有确认后才写入");
-  await expect(page.locator("#project-init-review-description")).toContainText("/init --refresh");
-  await expect(page.getByTestId("project-init-review-cancel")).toBeFocused();
-  await expect(page.getByTestId("project-init-review-workspace")).toHaveText(WORKSPACE);
-  await expect(page.getByTestId("project-init-review-target")).toHaveText(TARGET_PATH);
-  await expect(page.getByTestId("project-init-review-diff")).toContainText("+++ ");
-
-  expect(await readInitCalls(page)).toMatchObject({ inspectCalls: [{}], commitCalls: [] });
-  expect(await readRuntimeSnapshot(page)).toMatchObject({
-    currentTurnPrompt: null,
-    conversationTurnCount: 0,
-    workspaceInstructionLedgerCount: 0,
-    workspaceTurnQueueCount: 0,
-    providerDispatchAttemptCount: 0,
-    workspaceContentVersion: 0,
-  });
-
-  await page.getByTestId("project-init-review-cancel").click();
-  await expect(page.getByTestId("project-init-review-dialog")).toHaveCount(0);
-  expect((await readInitCalls(page)).commitCalls).toHaveLength(0);
-
-  await openReadyPreview(page);
-  await page.keyboard.press("Escape");
-  await expect(page.getByTestId("project-init-review-dialog")).toHaveCount(0);
-  const callsAfterEscape = await readInitCalls(page);
-  expect(callsAfterEscape.inspectCalls).toHaveLength(2);
-  expect(callsAfterEscape.commitCalls).toHaveLength(0);
-  expect(await readRuntimeSnapshot(page)).toMatchObject({
-    conversationTurnCount: 0,
-    workspaceInstructionLedgerCount: 0,
-    providerDispatchAttemptCount: 0,
-    workspaceContentVersion: 0,
-  });
-});
-
-test("confirm is single-flight, performs one bound CAS write, and refreshes workspace instructions", async ({ page }) => {
-  await page.goto("/?e2eScenario=composer-main-shortcuts");
-  await openReadyPreview(page);
-
-  await page.getByTestId("project-init-review-confirm").evaluate((button) => {
-    (button as HTMLButtonElement).click();
-    (button as HTMLButtonElement).click();
-  });
-  await expect(page.getByTestId("project-init-review-success")).toBeVisible();
-  await expect.poll(async () => (await readInitCalls(page)).commitCalls.length).toBe(1);
-
-  const calls = await readInitCalls(page);
-  expect(calls.inspectCalls).toHaveLength(1);
-  expect(calls.commitCalls).toHaveLength(1);
-  expect(calls.commitCalls[0]).toMatchObject({
-    workspace: WORKSPACE,
-    expectedTargetPath: TARGET_PATH,
-    expectedBaseVersion: null,
-  });
-  const proposedContent = String(calls.commitCalls[0].content ?? "");
-  expect(proposedContent).toContain("<!-- MAIN:PROJECT_INIT:START v1 -->");
-  expect(proposedContent).toContain("<!-- MAIN:PROJECT_INIT:END -->");
-  expect(proposedContent).toContain("baseline-fingerprint: project-baseline-sha256-");
-  expect(proposedContent).not.toContain("…");
-
-  await expect.poll(async () => await readRuntimeSnapshot(page)).toMatchObject({
-    currentTurnPrompt: null,
-    conversationTurnCount: 0,
-    workspaceInstructionLedgerCount: 0,
-    workspaceTurnQueueCount: 0,
-    providerDispatchAttemptCount: 0,
-    workspaceContentVersion: 1,
-    instructionSourcePaths: expect.arrayContaining(["AGENTS.md"]),
-  });
-});
-
-test("a stale commit keeps the modal open and can regenerate a fresh preview", async ({ page }) => {
-  await page.goto("/?e2eScenario=composer-main-shortcuts");
-  await page.evaluate(() => {
-    (window as any).__PROJECT_INIT_E2E__.staleCommit = true;
-  });
-  await openReadyPreview(page);
-
-  await page.getByTestId("project-init-review-confirm").click();
-  await expect(page.getByTestId("project-init-review-dialog")).toBeVisible();
-  await expect(page.getByTestId("project-init-review-error")).toContainText("审阅后已被修改");
-  await expect(page.getByTestId("project-init-review-regenerate")).toBeVisible();
-  expect((await readInitCalls(page)).commitCalls).toHaveLength(1);
-  expect(await readRuntimeSnapshot(page)).toMatchObject({
-    workspaceContentVersion: 0,
-    instructionSourcePaths: [],
-  });
-
-  await page.getByTestId("project-init-review-regenerate").click();
-  await expect(page.getByTestId("project-init-review-confirm")).toBeEnabled();
-  const calls = await readInitCalls(page);
-  expect(calls.inspectCalls).toHaveLength(2);
-  expect(calls.commitCalls).toHaveLength(1);
-});
-
-test("switching workspaces invalidates an open preview without committing", async ({ page }) => {
-  await page.goto("/?e2eScenario=composer-main-shortcuts");
-  await openReadyPreview(page);
-
-  await page.evaluate(() => {
-    (window as any).__CODELY_E2E__?.switchComposerSubmissionWorkspace?.("/tmp/e2e-project-init-other");
-  });
-  await expect(page.getByTestId("project-init-review-dialog")).toHaveCount(0);
-  expect((await readInitCalls(page)).commitCalls).toHaveLength(0);
-  expect(await readRuntimeSnapshot(page)).toMatchObject({
-    currentWorkspace: "/tmp/e2e-project-init-other",
-    conversationTurnCount: 0,
-    workspaceInstructionLedgerCount: 0,
-    providerDispatchAttemptCount: 0,
-    workspaceContentVersion: 0,
-  });
-});
-
-test("the review dialog stays visible in light, dark, and black themes", async ({ page }) => {
-  await page.goto("/?e2eScenario=composer-main-shortcuts");
-  await openReadyPreview(page);
-
-  const dialog = page.getByTestId("project-init-review-dialog");
-  const modal = page.getByTestId("project-init-review-modal");
-  for (const themeMode of ["light", "dark", "black"] as const) {
-    await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), themeMode);
-    await expect(page.locator("html")).toHaveAttribute("data-theme", themeMode);
-    await expect(modal).toHaveAttribute("data-theme-mode", themeMode);
-    await expect(dialog).toBeVisible();
-    await expect(page.getByTestId("project-init-review-status")).toBeVisible();
-    await expect(page.getByTestId("project-init-review-diff")).toBeVisible();
-    await page.screenshot({ path: test.info().outputPath(`project-notes-${themeMode}.png`), fullPage: true });
-  }
+  const admission = await page.evaluate(() => (window as any).__CODELY_E2E__.admitProjectInitDirect());
+  expect(admission).toMatchObject({ accepted: true });
+  const admitted = await queuedRulesInstruction(page, "/init");
+  expect(admitted).toMatchObject({ text: "/init", explicitIntent: "plan", purpose: "rules", receiptId: expect.any(String), turnId: expect.any(String) });
+  expect(await snapshot(page)).toMatchObject({ currentTurnIntent: "plan", conversationTurnCount: 1, workspaceInstructionLedgerCount: 1, workspaceTurnQueueCount: 1 });
+  await expectNoImmediateInitWrite(page);
 });

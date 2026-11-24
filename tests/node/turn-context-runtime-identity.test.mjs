@@ -98,70 +98,9 @@ test("ordinary continuation wording does not reuse a logical turn without an exa
   }), true);
 });
 
-test("goal slice identities derive from the outer run and chain to the previous slice", () => {
-  const first = runIdentity.resolveRuntimeRunIdentity({
-    marker: { runId: "outer", sessionKey: "s", turnId: "t" },
-    sessionKey: "s",
-    turnId: "t",
-    fallbackRunId: "fallback",
-    goalSliceId: "slice-1",
-  });
-  assert.equal(first.runId, "outer:slice-1");
-  assert.equal(first.parentRunId, "outer");
 
-  const second = runIdentity.resolveRuntimeRunIdentity({
-    marker: {
-      runId: "outer",
-      sessionKey: "s",
-      turnId: "t",
-      lastGoalSliceRunId: "outer:slice-1",
-    },
-    sessionKey: "s",
-    turnId: "t",
-    fallbackRunId: "fallback",
-    goalSliceId: "slice-2",
-  });
-  assert.equal(second.runId, "outer:slice-2");
-  assert.equal(second.parentRunId, "outer:slice-1");
-  assert.equal(runIdentity.markerContinuesLogicalTurn({
-    marker: {
-      runId: "outer",
-      sessionKey: "s",
-      turnId: "t",
-      lastGoalSliceRunId: "outer:slice-1",
-    },
-    sessionKey: "s",
-    turnId: "t",
-    goalSliceId: "slice-2",
-  }), true);
-});
 
-test("canonical turn context keeps visible requests and choices but filters hidden plan and goal control prompts", () => {
-  const messages = [
-    { role: "user", content: "prior durable session request" },
-    { role: "assistant", content: "prior answer" },
-    {
-      role: "user",
-      content: "[turn_intake]\n[user_request]\n修复批准弹窗\n[/user_request]\n[/turn_intake]",
-    },
-    {
-      role: "user",
-      content: "用户批准并选择：批准并执行\n计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。",
-    },
-    {
-      role: "user",
-      content: '[goal_continuation goal_id="goal-1" index="2"]\nContinue the same persistent goal.\n[/goal_continuation]',
-    },
-  ];
-  const result = turnContext.collectCanonicalTurnUserContext({
-    messages,
-    turnStartMessageIndex: 2,
-  });
 
-  assert.deepEqual(result.texts, ["修复批准弹窗", "批准并执行"]);
-  assert.equal(result.filteredSyntheticMessages, 1);
-  assert.equal(messages.length, 5, "canonical extraction must not truncate durable context");
-});
 
 test("canonical turn context never promotes ContextState or wrapped hidden approval prompts", () => {
   const contextState = [
@@ -300,4 +239,32 @@ test("durable turn context keeps canonical messages and structured evidence with
   const serialized = durableTurnContext.serializeDurableTurnContextForModel(durable);
   assert.match(serialized, /\[durable_turn_context\]/);
   assert.doesNotMatch(serialized, /隐藏推理|raw patch output|large test output/);
+});
+
+
+test("canonical turn context keeps visible requests and choices but filters hidden plan and goal control prompts", () => {
+  const messages = [
+    { role: "user", content: "prior durable session request" },
+    { role: "assistant", content: "prior answer" },
+    {
+      role: "user",
+      content: "[turn_intake]\n[user_request]\n修复批准弹窗\n[/user_request]\n[/turn_intake]",
+    },
+    {
+      role: "user",
+      content: "用户批准并选择：批准并执行\n计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。",
+    },
+    {
+      role: "user",
+      content: '[goal_continuation goal_id="goal-1" index="2"]\nContinue the same persistent goal.\n[/goal_continuation]',
+    },
+  ];
+  const result = turnContext.collectCanonicalTurnUserContext({
+    messages,
+    turnStartMessageIndex: 2,
+  });
+
+  assert.deepEqual(result.texts, ["修复批准弹窗", "批准并执行"]);
+  assert.equal(result.filteredSyntheticMessages, 1);
+  assert.equal(messages.length, 5, "canonical extraction must not truncate durable context");
 });

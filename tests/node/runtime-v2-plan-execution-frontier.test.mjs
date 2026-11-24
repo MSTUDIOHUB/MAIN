@@ -51,6 +51,9 @@ const adapter = loadTs(
 const providerContext = loadTs(
   path.join(workspaceRoot, "src/store/runtimeV2/executionProviderContext.ts"),
 );
+const { projectRuntimeV2PlanProgress } = loadTs(
+  path.join(workspaceRoot, "src/lib/runtime-v2/planProgressPresentation.ts"),
+);
 const workspaceMutationTools = loadTs(
   path.join(workspaceRoot, "src/lib/workspaceMutationTools.ts"),
 );
@@ -272,6 +275,96 @@ function preferredValidation(state) {
   });
 }
 
+test("approved Unity authoring advances only the exact scene after its reviewed script", () => {
+  const planAuthorization = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionPlanAuthorization.ts"));
+  const script = "Assets/Bootstrap.cs";
+  const scene = "Assets/Scenes/Fixture.unity";
+  const plan = sealSnakePlan([script, scene].map((target, index) => ({
+    title: `Create ${target}`, operation: "create", targets: [target], basis: [],
+    change: "Create approved Unity fixture artifact.", expectedOutcome: "Fixture is ready.", dependsOn: index ? [0] : [],
+  })), [{ stepIndexes: [0, 1], kind: "finite_command", command: "unity test . --mode PlayMode", cwd: "/fixture",
+    expectedOutcome: "The fixture PlayMode test passes.", required: true }]);
+  let state = approvedAggregate(plan);
+  const command = { kind: "execute_tool", phase: "acting", run, payload: {}, idempotencyKey: "author-scene" };
+  const authorize = (path = scene, scriptPath = script) => planAuthorization.validateToolAgainstApprovedPlan({
+    aggregate: state, command, target: path, toolName: "unity_create_scene",
+    args: { path, script_path: scriptPath, root_name: "Bootstrap" },
+    ports: {
+      get: () => ({ runtimeV2Checkpoints: { [turn.turnId]: runtime.createRuntimeV2Checkpoint({
+        revision: state.nextSequence, aggregate: state, updatedAt: state.updatedAt,
+      }) } }),
+      context: { runWorkspace: turn.workspaceKey, turnId: turn.turnId },
+    },
+  });
+  assert.equal(authorize().allowed, false);
+  state = commitMutation(state, "create-script", script);
+  assert.equal(authorize().allowed, true);
+  assert.equal(authorize("Assets/Other.unity").allowed, false);
+  assert.equal(authorize(scene, "Assets/Other.cs").allowed, false);
+  state = commitMutation(state, "author-scene", scene, "scene-version", "unity_create_scene");
+  assert.deepEqual(runtime.deriveRuntimeV2PlanExecutionFrontier(state).completedStepIndexes, [0, 1]);
+  assert.equal(authorize().allowed, false, "create-only approval cannot overwrite the completed scene");
+  const scope = cwd => runtime.resolveRuntimeV2PlanValidationScope({ plan, aggregate: state,
+    toolName: "run_command", args: { command: "unity test . --mode PlayMode", cwd } });
+  assert.equal(scope(".").allowed, true, "a legacy absolute root is equivalent to the current tool cwd");
+  assert.equal(scope("/fixture-other").allowed, false);
+});
+
+test("a post-write compiler failure survives reload and drives only the scoped repair", () => {
+  const { deriveUnityCompilation, approvedPlanExecutionRepair } = loadTs(path.join(workspaceRoot, "src/lib/runtime-v2/unityCompilation.ts"));
+  const { isApprovedUnityCorrection } = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionPlanAuthorization.ts"));
+  const { unityPlayModePreExecutionReceipt, runtimeV2ToolAuthorizationRejectionReceipt } =
+    loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionToolGateReceipt.ts"));
+  const pathToTests = "Assets/Tests/BreakoutTests.cs";
+  const shell = "unity test . --mode PlayMode --filter BreakoutTests";
+  const plan = sealSnakePlan([{ title: "Write the PlayMode suite", operation: "create", targets: [pathToTests],
+    change: "Create the Unity test.", expectedOutcome: "The game can be tested.", basis: [], dependsOn: [] }],
+  [{ stepIndexes: [0], kind: "finite_command", command: shell, cwd: ".", expectedTestCases: 5, useProjectEditor: true,
+    expectedOutcome: "Five actual cases pass.", required: true }]);
+  let state = approvedAggregate(plan);
+  assert.deepEqual(runtime.decideNextCommands(state, { checkUnityCompilation: true }), []);
+  state = commitMutation(state, "create-tests", pathToTests);
+  const [compile] = runtime.decideNextCommands(state, { checkUnityCompilation: true });
+  assert.equal(compile.payload.mutationSequence, state.nextSequence - 1);
+  assert.equal(compile.payload.toolName, "unity_compile_project");
+  state = applyEvent(state, "command.scheduled", { run, command: compile });
+  state = applyEvent(state, "tool.completed", { run, idempotencyKey: compile.idempotencyKey, status: "failed", evidence: [],
+    modelContent: JSON.stringify({ status: "failed", editor: "connected", diagnostics: [
+      { file: pathToTests, line: 88, column: 10, code: "CS0246", message: "UnityTest could not be found" },
+    ] }),
+  });
+  assert.deepEqual(runtime.decideNextCommands(state, { checkUnityCompilation: true }), []);
+  assert.deepEqual(runtime.deriveRuntimeV2PlanExecutionCoverage(state).completedStepIndexes, [0]);
+  assert.equal(isApprovedUnityCorrection(state, pathToTests), true);
+  assert.equal(isApprovedUnityCorrection(state, "Assets/Elsewhere.cs"), false);
+  const checkpoint = () => runtime.createRuntimeV2Checkpoint({ revision: state.nextSequence, aggregate: state, updatedAt: state.updatedAt });
+  state = runtime.normalizeRuntimeV2Checkpoint(JSON.parse(JSON.stringify(
+    runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: checkpoint() })[turn.turnId]
+  ))).aggregate;
+  assert.equal(deriveUnityCompilation(state).receipt.result.diagnostics[0].line, 88);
+  const ports = { context: { turnId: turn.turnId, runWorkspace: turn.workspaceKey },
+    get: () => ({ runtimeV2Checkpoints: { [turn.turnId]: checkpoint() } }),
+    live: { evidenceCounter: 0, messages: [] }, logStoreEvent() {} };
+  const authority = runtime.runtimeV2PlanValidationAuthority({ plan, validationIndex: 0 });
+  assert.equal(authority.useProjectEditor, true);
+  const validation = { run, phase: state.phase, idempotencyKey: "proposed-test", kind: "execute_validation",
+    payload: { toolName: "run_command", validationAuthority: authority, arguments: { command: shell } } };
+  const blocked = unityPlayModePreExecutionReceipt({ ports, command: validation, toolName: "run_command", args: { command: shell }, target: shell });
+  assert.equal(blocked.failureKind, "not_executed");
+  assert.deepEqual(blocked.evidence, []);
+  const assembly = "Assets/Tests/BreakoutTests.asmdef";
+  const write = { run, phase: state.phase, idempotencyKey: "proposed-assembly", kind: "execute_tool",
+    payload: { toolName: "write_file", arguments: { path: assembly } } };
+  const rejection = runtimeV2ToolAuthorizationRejectionReceipt({ ports, command: write, toolName: "write_file",
+    args: { path: assembly }, target: assembly, failureContextTarget: assembly,
+    rejection: { allowed: false, reason: "Outside reviewed files", failureKind: "not_authorized", reasonCode: "approved_plan_write_file_operation_scope" } });
+  assert.equal(rejection.approvedPlanRepair.target, assembly);
+  state = applyEvent(state, "command.scheduled", { run, command: write });
+  state = applyEvent(state, "tool.completed", rejection);
+  assert.equal(approvedPlanExecutionRepair(state).kind, "compiler_scope");
+  assert.equal(runtime.deriveRuntimeV2PlanExecutionCoverage(state).allRequiredValidationsPassed, false);
+});
+
 function snakeSteps() {
   return [{
     title: "Implement snake.py",
@@ -308,6 +401,45 @@ function stepStatusProjection(frontier) {
     unsatisfiedDependencyIndexes: step.unsatisfiedDependencyIndexes,
   }));
 }
+
+test("Plan sidebar follows committed writes and retains progress after cancellation and reload", () => {
+  const plan = sealSnakePlan(snakeSteps());
+  let state = approvedAggregate(plan);
+  const panel = state.planReviewCommit.panel;
+  const before = projectRuntimeV2PlanProgress(state, panel);
+  assert.equal(before.completedCount, 0);
+  assert.deepEqual(before.steps.map((step) => step.status), ["ready", "dependency_blocked", "dependency_blocked"]);
+
+  state = commitMutation(state, "sidebar-write-snake", "snake.py");
+  const live = projectRuntimeV2PlanProgress(state, panel);
+  assert.equal(live.completedCount, 1);
+  assert.equal(live.totalCount, 3);
+  assert.deepEqual(live.steps.map((step) => step.status), ["applied", "ready", "dependency_blocked"]);
+  assert.equal(live.requiredValidations[0].status, "pending");
+  assert.equal(projectRuntimeV2PlanProgress(state, {
+    ...panel,
+    authority: { ...panel.authority, revision: panel.authority.revision + 1 },
+  }), null);
+
+  const outcome = {
+    resultKind: "canceled",
+    reason: "user_cancelled",
+    completedAt: state.updatedAt + 2,
+    finalProjectionId: "sidebar-canceled-final",
+  };
+  state = applyEvent(state, "run.aborted", { run, reason: outcome.reason });
+  state = applyEvent(state, "run.completed", { run, outcome });
+  const checkpoint = runtime.createRuntimeV2Checkpoint({
+    aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt,
+  });
+  const stored = runtime.serializeRuntimeV2CheckpointMap({ [turn.turnId]: checkpoint })[turn.turnId];
+  assert.equal(stored.aggregate, undefined);
+  assert.equal(runtime.normalizeRuntimeV2Checkpoint(stored, { ...turn, sessionEpoch: "new-epoch" }), null);
+
+  const restored = runtime.normalizeRuntimeV2Checkpoint(stored, turn).aggregate;
+  const restoredPanel = adapter.resolveRuntimeV2PlanReviewFromAggregate(restored).commit.panel;
+  assert.deepEqual(projectRuntimeV2PlanProgress(restored, restoredPanel), { ...live, status: "canceled" });
+});
 
 test("approved WorkPlan derives one dependency-ordered mutation frontier", () => {
   const plan = sealSnakePlan(snakeSteps());
@@ -486,6 +618,9 @@ test("required Plan validators advance in order and a failed validator opens bou
   assert.equal(preferredValidation(state), "python3 -m unittest -v");
 
   state = completePlanValidation(state, plan, 1, false);
+  const validationStatuses = () => projectRuntimeV2PlanProgress(state, state.planReviewCommit.panel)
+    .requiredValidations.map((validation) => validation.status);
+  assert.deepEqual(validationStatuses(), ["passed", "failed"]);
   const correction = runtime.deriveRuntimeV2PlanValidationCorrectionScope(
     state,
   );
@@ -512,10 +647,12 @@ test("required Plan validators advance in order and a failed validator opens bou
     "a correction creates a new mutation boundary and reopens both required validators",
   );
   assert.equal(preferredValidation(state), "python3 -m compileall -q .");
+  assert.deepEqual(validationStatuses(), ["pending", "pending"]);
   state = completePlanValidation(state, plan, 0, true);
   assert.equal(preferredValidation(state), "python3 -m unittest -v");
   state = completePlanValidation(state, plan, 1, true);
   assert.equal(preferredValidation(state), "");
+  assert.deepEqual(validationStatuses(), ["passed", "passed"]);
   assert.equal(
     runtime.deriveRuntimeV2PlanExecutionCoverage(state)
       .allRequiredValidationsPassed,
@@ -576,4 +713,42 @@ test("approved Plan operation checks consume canonical apply_patch effects", () 
     ],
     "a move cannot masquerade as two modify operations",
   );
+});
+
+test("approved execution dispatches independent validation prep and committed-code review as capacity permits", () => {
+  const { deriveProactiveCollaboration } = loadTs("src/store/runtimeV2/proactiveSubagents.ts");
+  const plan = sealSnakePlan(["game.py", "tests.py", "README.md"].map((path, index) => ({
+    title: `Create ${path}`, operation: "create", targets: [path], basis: [],
+    change: `Create ${path}`, expectedOutcome: `Completed ${path}`, dependsOn: index ? [index - 1] : [],
+  })));
+  let state = approvedAggregate(plan);
+  state = applyEvent(state, "phase.changed", { run, phase: "acting", reason: "implementation" });
+  state = applyEvent(state, "observation.recorded", {
+    run, evidence: { id: "toolchain", kind: "source", target: "pyproject.toml", version: "manifest-v1" },
+  });
+  const facts = { preference: "preferred", capacity: 2, requestMode: "parallel", workspace: "/fixture", now: 100,
+    baseline: { kind: "project_baseline_context", workspace: { canonicalPath: "/fixture" },
+      anchors: [{ path: "pyproject.toml", kind: "manifest" }] } };
+  const validationPrep = deriveProactiveCollaboration({ ...facts, state }).candidate;
+  assert.equal(validationPrep.taskKind, "validate");
+  assert.deepEqual(validationPrep.allowedPaths, ["pyproject.toml"]);
+  const { runtimeV2ChildTools } = loadTs("src/store/runtimeV2/executionSubagentPolicy.ts");
+  assert.equal(runtimeV2ChildTools(validationPrep).some(tool => tool.function.name === "run_command"), false);
+  const command = runtime.decideNextCommands(state, {
+    subagentPreference: "preferred", subagentRequestMode: "parallel", subagentCapacity: 2,
+    proactiveCollaboration: { candidate: validationPrep },
+  })[0];
+  state = applyEvent(state, "command.scheduled", { run, command });
+  const { jobs } = runtime.scheduleRuntimeV2Subagents({
+    parentRun: run, candidates: [validationPrep], maxActiveJobs: 2, requestedAt: 100, nextId: () => "prerequisites",
+  });
+  state = applyEvent(state, "subagents.scheduled", { run, maxActiveSubagents: 2, jobs });
+  state = applyEvent(state, "command.completed", { run, idempotencyKey: command.idempotencyKey, status: "succeeded" });
+
+  state = commitMutation(state, "write-game", "game.py");
+  const codeReview = deriveProactiveCollaboration({ ...facts, state }).candidate;
+  assert.equal(codeReview.taskKind, "review");
+  assert.deepEqual(codeReview.allowedPaths, ["game.py"]);
+  assert.notEqual(codeReview.proactiveKey, validationPrep.proactiveKey);
+  assert.deepEqual(deriveProactiveCollaboration({ ...facts, state, capacity: 1 }), { reason: "slots_in_use" });
 });

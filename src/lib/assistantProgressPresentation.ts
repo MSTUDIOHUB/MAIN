@@ -5,7 +5,7 @@ import type { CapsuleStatusKind } from "./turnPresentation";
 
 export type AssistantProgressLanguage = "zh" | "en";
 
-const MAX_CHECKPOINT_CHARS = 680;
+const MAX_CHECKPOINT_CHARS = 900;
 const MAX_GUIDANCE_CHARS = 220;
 const RAW_TOOL_NAME_RE = /\b(?:apply_patch|replace_in_file|write_file|read_file|grep_search|glob_search|run_command|execute_command|browser_evaluate|computer_use)\b/i;
 
@@ -115,7 +115,7 @@ export function buildAssistantStageCheckpoint(
     }
     selected.push(unit);
     seen.add(normalized);
-    if (selected.length >= 2) break;
+    if (selected.length >= 3) break;
   }
 
   if (selected.length === 0) {

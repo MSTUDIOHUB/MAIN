@@ -19,8 +19,6 @@ import {
 import type { GameEngine, PromptLanguageStrategy } from "./toolCapabilities";
 import type { ToolDefinition } from "./toolSchemas";
 import { buildWebResearchDateContext } from "./webResearchGuard";
-import type { GoalTurnContract } from "./goalState";
-
 /** Generated MAIN instructions should normally stay below this target. */
 export const SYSTEM_PROMPT_TARGET_CHARS = 12_000;
 /** Hard ceiling including injected workspace instructions and templates. */
@@ -28,7 +26,6 @@ export const SYSTEM_PROMPT_MAX_CHARS = 32_000;
 
 export const MAIN_MODE_PROMPTS: Record<MainModeKey, string> = {
   main_mode: "MAIN coordinates scoped analysis, implementation, validation, and reporting for the current user request.",
-  image_studio: "Image Studio belongs to the image runtime; do not enter the ordinary code-agent loop.",
 };
 
 export type GameEnginePromptContext = {
@@ -327,14 +324,6 @@ function buildIntentModule(input: {
     ]);
   }
 
-  if (intent === "goal") {
-    return makeSection("GOAL (AUTONOMOUS EXECUTION)", [
-      "The Goal runtime owns continuity, budget, checkpoints, pause/resume, and final completion state for the existing goal.",
-      "Continue safe in-scope work without asking for ordinary operation approval. Do not create a new goal or emit `approve_operation_once`.",
-      "Pause only for a genuine user-owned decision, external blocker, permission boundary, or exhausted runtime contract.",
-      "Report `GOAL_COMPLETION_CANDIDATE` only after every completion criterion has runtime evidence.",
-    ]);
-  }
 
   const approvalNeeded = contract.operationApprovalState !== "approved" && contract.mutationExpected;
   return makeSection(`TURN INTENT: ${intent.toUpperCase()}`, [
@@ -432,7 +421,7 @@ export function buildSystemPrompt(
   languageContract?: LanguageContract,
   toolProtocolProfile?: Omit<ToolProtocolCardProfile, "availableToolNames" | "workflowMode" | "language">,
   effectiveTurnContract?: EffectiveTurnContract,
-  goalTurnContract?: GoalTurnContract | null,
+
 ): string {
   const displayLanguage = languageContract?.displayLanguage === "en" ? "en" : "zh";
   const responseLanguage = languageContract?.resolvedResponseLanguage
@@ -530,9 +519,6 @@ export function buildSystemPrompt(
     sections.push(buildGameEngineMcpModule(gameEngineContext, mcpPriorityContext));
   }
 
-  if (intent === "goal" && goalTurnContract?.context) {
-    sections.push(makeSection("GOAL RUNTIME CONTRACT", [compactExternalContent(goalTurnContract.context, 5_000)]));
-  }
 
   sections.push(...buildInstructionSections(skills, workspace, resolvedInstructions));
   return joinWithinPromptBudget(sections);

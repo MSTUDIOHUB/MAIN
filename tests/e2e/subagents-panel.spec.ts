@@ -4,6 +4,16 @@ test.describe("subagent activity and right panel", () => {
   test.beforeEach(async ({ page }) => {
     await page.addInitScript(() => {
       window.localStorage.clear();
+      const internals = ((window as any).__TAURI_INTERNALS__ ??= {});
+      internals.metadata = { currentWindow: { label: "main" }, currentWebview: { label: "main" } };
+      internals.transformCallback = () => 0;
+      internals.unregisterCallback = () => {};
+      internals.invoke = async (command: string) => {
+        if (["list_all_session_snapshots", "list_legacy_session_files", "list_project_sessions", "rebuild_project_sessions_index"].includes(command)) return [];
+        if (command === "plugin:event|listen") return 1;
+        return null;
+      };
+      (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
     });
   });
 

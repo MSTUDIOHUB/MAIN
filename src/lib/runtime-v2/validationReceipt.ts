@@ -1,21 +1,14 @@
 import { workspacePathsReferToSameFile } from "../workspacePaths";
 import { sha256Hex } from "../sha256";
 import type {
-  RuntimeV2EvidenceReference,
   RuntimeV2ExecutionValidationAuthority,
   RuntimeV2Objective,
+  RuntimeV2ValidatedMutationVersion,
 } from "./contracts";
-
-/**
- * A mutation evidence id and ledger sequence together identify one durable
- * workspace version even when the editor cannot cheaply hash the final file.
- */
-export interface RuntimeV2ValidatedMutationVersion {
-  readonly target: string;
-  readonly mutationEvidenceId: string;
-  readonly mutationSequence: number;
-  readonly version: string | null;
-}
+import { approvedRuntimeV2PlanContinuation } from "./planContinuationBaseline";
+import { normalizeValidationWorkspaceCwd } from "../validationContract";
+import { isWorkspaceMutationToolCall } from "../workspaceMutationTools";
+import type { RuntimeV2Event } from "./events";
 
 export interface RuntimeV2ValidationBoundary {
   /** Latest mutation anywhere in the Turn when validation began. */
@@ -25,38 +18,47 @@ export interface RuntimeV2ValidationBoundary {
     readonly RuntimeV2ValidatedMutationVersion[];
 }
 
-interface RuntimeV2ValidationBoundaryEvent {
-  readonly sequence: number;
-  readonly type: string;
-  readonly status?: string;
-  readonly evidence?:
-    | RuntimeV2EvidenceReference
-    | readonly RuntimeV2EvidenceReference[];
-}
-
 interface RuntimeV2ValidationBoundaryAggregate {
-  readonly events: readonly RuntimeV2ValidationBoundaryEvent[];
+  readonly events: readonly RuntimeV2Event[];
 }
 
-function eventEvidence(
-  event: RuntimeV2ValidationBoundaryEvent,
-): readonly RuntimeV2EvidenceReference[] {
-  if (Array.isArray(event.evidence)) {
-    return event.evidence as readonly RuntimeV2EvidenceReference[];
+export function isRuntimeV2FileVersion(version: string | null): boolean {
+  return !!version && /^(?:(?:sha256-)?[a-f0-9]{64}|deleted(?::.+)?)$/.test(version);
+}
+
+type WorkspaceChangeReceipt = Extract<RuntimeV2Event, { type: "tool.completed" | "subagent.completed" }>;
+const mutationReceiptsByLedger = new WeakMap<readonly RuntimeV2Event[], readonly WorkspaceChangeReceipt[]>();
+
+/** Only a settled workspace write, or an admitted child writeback, contributes
+ * file changes. Old ledgers may have used `mutation` for unrelated MCP calls. */
+export function runtimeV2WorkspaceChangeReceipts(aggregate: RuntimeV2ValidationBoundaryAggregate): readonly WorkspaceChangeReceipt[] {
+  const cached = mutationReceiptsByLedger.get(aggregate.events);
+  if (cached) return cached;
+  const scheduledTools = new Set<string>();
+  const scheduledWrites = new Set<string>();
+  const receipts: WorkspaceChangeReceipt[] = [];
+  for (const event of aggregate.events) {
+    if (event.type === "command.scheduled" && event.command.kind === "execute_tool" && event.command.payload.runtimeOwnedPlanArtifact !== true) {
+      scheduledTools.add(event.command.idempotencyKey);
+      if (isWorkspaceMutationToolCall(String(event.command.payload.toolName || ""), event.command.payload.arguments as Record<string, unknown> || {})) {
+        scheduledWrites.add(event.command.idempotencyKey);
+      }
+    }
+    const parentWrite = event.type === "tool.completed" && event.status === "succeeded" &&
+      event.receiptOrigin !== "replayed" && scheduledTools.has(event.idempotencyKey) && (event.effectKind === "workspace_change" ||
+        event.effectKind === undefined && scheduledWrites.has(event.idempotencyKey));
+    if (!parentWrite && !(event.type === "subagent.completed" && event.status === "completed")) continue;
+    if (event.type === "tool.completed" && event.effectKind === "workspace_change" &&
+        event.evidence.some(evidence => evidence.kind === "mutation" && !isRuntimeV2FileVersion(evidence.version))) continue;
+    if (event.evidence.some(evidence => evidence.kind === "mutation")) receipts.push(event);
   }
-  return event.evidence ? [event.evidence as RuntimeV2EvidenceReference] : [];
+  mutationReceiptsByLedger.set(aggregate.events, receipts);
+  return receipts;
 }
 
-function mutationEvents(
-  aggregate: RuntimeV2ValidationBoundaryAggregate,
-): readonly RuntimeV2ValidationBoundaryEvent[] {
-  return aggregate.events.filter((event) =>
-    (
-      (event.type === "tool.completed" && event.status === "succeeded") ||
-      (event.type === "subagent.completed" && event.status === "completed")
-    ) &&
-    eventEvidence(event).some((evidence) => evidence.kind === "mutation")
-  );
+export function latestRuntimeV2WorkspaceChange(aggregate: RuntimeV2ValidationBoundaryAggregate): WorkspaceChangeReceipt | undefined {
+  const receipts = runtimeV2WorkspaceChangeReceipts(aggregate);
+  return receipts[receipts.length - 1];
 }
 
 function uniqueTargets(targets: readonly string[]): readonly string[] {
@@ -88,8 +90,8 @@ export function runtimeV2DirectExecuteMutationTargets(
   aggregate: RuntimeV2ValidationBoundaryAggregate,
 ): readonly string[] {
   return uniqueTargets(
-    mutationEvents(aggregate).flatMap((event) =>
-      eventEvidence(event)
+    runtimeV2WorkspaceChangeReceipts(aggregate).flatMap((event) =>
+      event.evidence
         .filter((evidence) => evidence.kind === "mutation")
         .map((evidence) => evidence.target)
     ),
@@ -155,12 +157,13 @@ export function deriveRuntimeV2ValidationBoundary(
   aggregate: RuntimeV2ValidationBoundaryAggregate,
   targetPaths: readonly string[],
 ): RuntimeV2ValidationBoundary {
-  const mutations = mutationEvents(aggregate);
+  const mutations = runtimeV2WorkspaceChangeReceipts(aggregate);
+  const baseline = approvedRuntimeV2PlanContinuation(aggregate.events);
   const validatedMutationVersions = uniqueTargets(targetPaths)
     .map((target): RuntimeV2ValidatedMutationVersion | null => {
       for (let index = mutations.length - 1; index >= 0; index -= 1) {
         const event = mutations[index]!;
-        const evidence = [...eventEvidence(event)].reverse().find((entry) =>
+        const evidence = [...event.evidence].reverse().find((entry) =>
           entry.kind === "mutation" &&
           workspacePathsReferToSameFile(entry.target, target)
         );
@@ -173,7 +176,16 @@ export function deriveRuntimeV2ValidationBoundary(
           };
         }
       }
-      return null;
+      const workspace = baseline?.continuation.source.turn.workspaceKey;
+      const path = normalizeValidationWorkspaceCwd(target, workspace);
+      const carried = path && baseline?.continuation.carriedTargets.find(item =>
+        normalizeValidationWorkspaceCwd(item.target, workspace) === path);
+      return carried && baseline ? {
+        target,
+        mutationEvidenceId: `continued:${baseline.continuation.source.turn.turnId}:${carried.receiptId}`,
+        mutationSequence: baseline.sequence,
+        version: carried.version,
+      } : null;
     })
     .filter(
       (entry): entry is RuntimeV2ValidatedMutationVersion => entry !== null,
@@ -181,7 +193,7 @@ export function deriveRuntimeV2ValidationBoundary(
   return {
     mutationBoundarySequence: mutations.reduce(
       (latest, event) => Math.max(latest, event.sequence),
-      0,
+      baseline?.sequence ?? 0,
     ),
     validatedMutationVersions,
   };

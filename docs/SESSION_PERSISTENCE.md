@@ -131,13 +131,13 @@ Rust CAS 只裁决“这是不是基于当前快照的写入”；TypeScript tra
 5. 如果保存已经成功、但 UI owner 在内存 `commit` 前切换，持久化的 `persisting` 条目仍算已接纳；下次精确 Session 恢复会把它协调为 `queued`，调用方不得重发并制造第二个 Turn。
 6. 保存失败时只回滚身份完全匹配且仍为 `persisting` 的条目。只要精确内存 owner 仍存在，就用 `run.completed(error)`、`turn.completed(error)` 和可见最终说明收口；不能生成应用级 `failed` 终态。
 
-Chat、Plan、Fast、模型型 Slash command 或模型是否需要工具都不能绕过这条接纳路径。`/init` 是提交前截获的本地审阅命令，不创建 Turn/Run，也不进入 Session；除此之外，工作区中每次模型提交都是 Turn。
+普通 MAIN 提交、`/计划`、`/规则` 及隐藏兼容别名 `/init` 都不能绕过这条接纳路径；是否需要工具也不改变提交身份。`/规则` 与 `/init` 在同一 Session 中接纳正常 Turn/Plan Run，调查、问答和版本化草稿均可持久化；根 `AGENTS.md` 仅在后续审阅确认时通过专用 CAS 更新。
 
 ### Queue 与 Guide 的持久化区别
 
 active Run 中点击 Queue 或按回车发送，走完整 Workspace Turn 接纳：新 instruction 获得自己的 receipt、`turnId`、用户块、标题与 FIFO 状态，因此可以跨当前 Run 的剩余时间和 Session 保存继续排队。
 
-Guide 不进入 `WorkspaceTurnQueueState`，不创建 receipt、用户块、标题或 Conversation Turn。它是 Session runtime snapshot 中绑定当前 `turnId` / Run owner 的一次性 `activeGuidance`，只能由 exact active Run 的下一次模型迭代消费；消费后清除。若它在 provider 请求进行中到达，终态提交必须先让出一次有界额外迭代；若终态已提交，Guide admission 失败且 Composer 输入保持可用。Guide 只接收文本，附件、图片和显式 Plan/Goal 意图必须 Queue 为新 Turn。持久化中两者必须保持不同 schema，不能在恢复时把 guidance 提升为 queued Turn，或把 queued instruction 注入当前 Run。
+Guide 不进入 `WorkspaceTurnQueueState`，不创建 receipt、用户块、标题或 Conversation Turn。它是 Session runtime snapshot 中绑定当前 `turnId` / Run owner 的一次性 `activeGuidance`，只能由 exact active Run 的下一次模型迭代消费；消费后清除。若它在 provider 请求进行中到达，终态提交必须先让出一次有界额外迭代；若终态已提交，Guide admission 失败且 Composer 输入保持可用。Guide 只接收文本，附件、图片和显式 Plan 意图必须 Queue 为新 Turn。持久化中两者必须保持不同 schema，不能在恢复时把 guidance 提升为 queued Turn，或把 queued instruction 注入当前 Run。
 
 旧版单槽 `queuedUserMessage` 只允许保留在无 Workspace 生命周期的 global chat 兼容边界。工作区恢复如果遇到该字段，必须把它迁移为具备 receipt、`turnId`、用户块、标题和 Conversation Turn 的 durable FIFO entry，或形成可见 error Turn；生产分发器不得再把它直接注入当前 Run，也不得与 `WorkspaceTurnQueueState` 重复计数。
 

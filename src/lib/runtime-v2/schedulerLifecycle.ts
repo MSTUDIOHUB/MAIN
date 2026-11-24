@@ -4,22 +4,46 @@ import type {
 } from "./contracts";
 import type { RuntimeV2EventDraft } from "./events";
 import type { SchedulerPort } from "./ports";
+import type { TurnAggregateV1 } from "./aggregate";
 
-function sourceToolCallId(command: RuntimeV2Command): string {
-  return typeof command.payload.toolCallId === "string"
-    ? command.payload.toolCallId
-    : "";
+export function runtimeV2JobMatchesSchedule(job: RuntimeV2SubagentJob, command: RuntimeV2Command): boolean {
+  if (job.parentRunId !== command.run.runId) return false;
+  if (typeof command.payload.proactiveKey === "string") return job.proactiveKey === command.payload.proactiveKey;
+  const callId = command.payload.toolCallId;
+  return typeof callId === "string" && callId ? job.sourceToolCallId === callId : !job.proactiveKey;
+}
+
+/** A resumed owner may reopen its existing read-only job with the original identity. */
+export function runtimeV2ProactiveSchedulesToRestore(state: TurnAggregateV1): RuntimeV2Command[] {
+  const scheduled = new Set(state.scheduledCommands.map(command => command.idempotencyKey));
+  return state.events.flatMap(event => event.type === "command.scheduled" && event.command.kind === "schedule_subagents" &&
+    typeof event.command.payload.proactiveKey === "string" && !scheduled.has(event.command.idempotencyKey) &&
+    state.subagents.some(job => (job.status === "queued" || job.status === "running") && runtimeV2JobMatchesSchedule(job, event.command))
+    ? [event.command] : []);
+}
+
+export async function restoreRuntimeV2ProactiveSchedules(input: {
+  readonly state: TurnAggregateV1;
+  readonly scheduler: SchedulerPort;
+  readonly signal: AbortSignal;
+  readonly commit: (event: RuntimeV2EventDraft) => Promise<unknown>;
+}): Promise<void> {
+  if (input.state.run?.status !== "running" || input.signal.aborted) return;
+  for (const command of runtimeV2ProactiveSchedulesToRestore(input.state)) {
+    const events = await input.scheduler.execute({
+      command, run: command.run, signal: input.signal, scheduledSubagents: input.state.subagents,
+    });
+    for (const event of Array.isArray(events) ? events : [events]) await input.commit(event);
+  }
 }
 
 function hasCommittedChildForCommand(
   command: RuntimeV2Command,
   jobs: readonly RuntimeV2SubagentJob[],
 ): boolean {
-  const sourceCallId = sourceToolCallId(command);
   return jobs.some((job) =>
-    job.parentRunId === command.run.runId &&
     (job.status === "queued" || job.status === "running") &&
-    (!sourceCallId || job.sourceToolCallId === sourceCallId)
+    runtimeV2JobMatchesSchedule(job, command)
   );
 }
 

@@ -4,14 +4,12 @@ export interface RunIdentityMarkerLike {
   sessionKey?: string | null;
   turnId?: string | null;
   turnStartMessageIndex?: number | null;
-  lastGoalSliceRunId?: string | null;
 }
 
 export interface RuntimeRunIdentity {
   runId: string;
   parentRunId: string | null;
   outerRunId: string;
-  goalSliceId?: string;
   source: "harness_marker" | "generated_fallback";
 }
 
@@ -34,11 +32,10 @@ export function markerContinuesLogicalTurn(input: {
   marker?: RunIdentityMarkerLike | null;
   sessionKey: string;
   turnId: string;
-  goalSliceId?: string | null;
 }): boolean {
   if (!markerBelongsToTurn(input.marker, input.sessionKey, input.turnId)) return false;
   if (nonEmptyString(input.marker?.parentRunId)) return true;
-  return !!nonEmptyString(input.goalSliceId) && !!nonEmptyString(input.marker?.lastGoalSliceRunId);
+  return false;
 }
 
 export function resolveSubmitRunLineage(input: {
@@ -84,7 +81,6 @@ export function resolveRuntimeRunIdentity(input: {
   sessionKey: string;
   turnId: string;
   fallbackRunId: string;
-  goalSliceId?: string | null;
 }): RuntimeRunIdentity {
   const markerMatches = markerBelongsToTurn(input.marker, input.sessionKey, input.turnId);
   const outerRunId = markerMatches
@@ -93,28 +89,10 @@ export function resolveRuntimeRunIdentity(input: {
   const baseParentRunId = markerMatches
     ? nonEmptyString(input.marker?.parentRunId)
     : null;
-  const goalSliceId = nonEmptyString(input.goalSliceId);
-
-  if (!goalSliceId) {
-    return {
-      runId: outerRunId,
-      parentRunId: baseParentRunId,
-      outerRunId,
-      source: markerMatches ? "harness_marker" : "generated_fallback",
-    };
-  }
-
-  const runId = `${outerRunId}:${goalSliceId}`;
-  const previousSliceRunId = markerMatches
-    ? nonEmptyString(input.marker?.lastGoalSliceRunId)
-    : null;
   return {
-    runId,
-    parentRunId: previousSliceRunId && previousSliceRunId !== runId
-      ? previousSliceRunId
-      : outerRunId,
+    runId: outerRunId,
+    parentRunId: baseParentRunId,
     outerRunId,
-    goalSliceId,
     source: markerMatches ? "harness_marker" : "generated_fallback",
   };
 }

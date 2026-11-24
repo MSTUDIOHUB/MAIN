@@ -191,9 +191,7 @@ export function reconcileRuntimeV2SubagentEvents(
       const implementation = job.taskKind === "implement" &&
         job.accessMode === "write";
       const title = phase === "request_opened"
-        ? implementation
-          ? language === "zh" ? "已启动范围互斥的实现任务" : "Scoped implementation started"
-          : language === "zh" ? "已启动只读调查" : "Read-only investigation started"
+        ? language === "zh" ? "子任务已交给模型调度" : "Child submitted to model scheduler"
         : phase === "first_token"
           ? implementation
             ? language === "zh" ? "正在形成暂存修改" : "Preparing staged mutation"
@@ -217,9 +215,9 @@ export function reconcileRuntimeV2SubagentEvents(
         parentRunId: job.parentRunId,
         timestampMs: runtimeEvent.telemetry.at,
         patch: {
-          status: phase === "closed" ? "summarizing" : "running",
+          status: phase === "closed" ? "summarizing" : phase === "request_opened" ? "starting" : "running",
           updatedAt: runtimeEvent.telemetry.at,
-          ...(phase === "request_opened"
+          ...(phase === "first_token"
             ? { startedAt: runtimeEvent.telemetry.at }
             : {}),
           progress: {

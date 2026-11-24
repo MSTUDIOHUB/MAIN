@@ -38,5 +38,11 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      # The regression fixtures import TypeScript modules directly in Node.
+      - name: Set up Node 24 for regression tests
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
       - name: Run Node regression suite
         run: npm run test:workflow-assets

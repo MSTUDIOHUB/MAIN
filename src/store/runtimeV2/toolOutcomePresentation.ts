@@ -1,4 +1,6 @@
 import type { RuntimeV2Event } from "../../lib/runtime-v2/events";
+import type { RuntimeV2ToolPresentation } from "../../lib/runtime-v2/contracts";
+import type { ToolDiffPreview } from "../../lib/toolDiff";
 import { isRuntimeV2UnexecutedToolReceipt } from "../../lib/runtime-v2/toolReceipt";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { buildToolResultPresentation } from "../../lib/toolResultPresentation";
@@ -40,4 +42,79 @@ export function runtimeV2ToolOutcomePresentation(completion: Completion, languag
   return { toolOutcome, message, diagnosticDetails, target: readableRead?.displayTarget,
     observationSummary: completion.type === "validation.completed" && !notExecuted
       ? presentation?.observationSummary || message : readableRead?.meta[0] || message } as const;
+}
+
+function compactDiffText(
+  value: string,
+  start: number,
+  end: number,
+): string {
+  const prefixOmitted = start > 0;
+  const suffixOmitted = end < value.length;
+  return [
+    prefixOmitted ? "[... earlier unchanged content omitted ...]\n" : "",
+    value.slice(start, end),
+    suffixOmitted ? "\n[... later unchanged content omitted ...]" : "",
+  ].join("");
+}
+
+export function boundedPresentationDiff(
+  preview: ToolDiffPreview | undefined,
+): RuntimeV2ToolPresentation["diff"] | undefined {
+  if (!preview) return undefined;
+  const oldText = String(preview.old || "");
+  const newText = String(preview.new || "");
+  const maxCombinedChars = 120_000;
+  if (oldText.length + newText.length <= maxCombinedChars) {
+    return {
+      old: oldText,
+      new: newText,
+      ...(preview.path ? { path: preview.path } : {}),
+      ...(typeof preview.existed === "boolean"
+        ? { existed: preview.existed }
+        : {}),
+      ...(typeof preview.fullFile === "boolean"
+        ? { fullFile: preview.fullFile }
+        : {}),
+    };
+  }
+  let commonPrefix = 0;
+  const maxPrefix = Math.min(oldText.length, newText.length);
+  while (
+    commonPrefix < maxPrefix &&
+    oldText.charCodeAt(commonPrefix) === newText.charCodeAt(commonPrefix)
+  ) {
+    commonPrefix += 1;
+  }
+  let commonSuffix = 0;
+  while (
+    commonSuffix < oldText.length - commonPrefix &&
+    commonSuffix < newText.length - commonPrefix &&
+    oldText.charCodeAt(oldText.length - 1 - commonSuffix) ===
+      newText.charCodeAt(newText.length - 1 - commonSuffix)
+  ) {
+    commonSuffix += 1;
+  }
+  const contextChars = 24_000;
+  const oldStart = Math.max(0, commonPrefix - contextChars);
+  const newStart = Math.max(0, commonPrefix - contextChars);
+  const oldEnd = Math.min(
+    oldText.length,
+    oldText.length - commonSuffix + contextChars,
+  );
+  const newEnd = Math.min(
+    newText.length,
+    newText.length - commonSuffix + contextChars,
+  );
+  return {
+    old: compactDiffText(oldText, oldStart, oldEnd),
+    new: compactDiffText(newText, newStart, newEnd),
+    ...(preview.path ? { path: preview.path } : {}),
+    ...(typeof preview.existed === "boolean"
+      ? { existed: preview.existed }
+      : {}),
+    ...(typeof preview.fullFile === "boolean"
+      ? { fullFile: preview.fullFile }
+      : {}),
+  };
 }

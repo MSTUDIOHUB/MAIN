@@ -8,6 +8,8 @@ import { deriveReadOnlyRecoveryWindow, latestReadOnlyAnswer } from "./readOnlyPr
 import { RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS } from "./lifecycle";
 
 export interface RuntimeV2ReadOnlyLoopInput {
+  readonly workspaceInstructionContext?: string;
+  readonly knowledgeContext?: import("../knowledgeReferences").KnowledgeContextPacket;
   readonly ports: RuntimeV2Ports;
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
@@ -39,7 +41,7 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
     turn: input.turn, run: input.run, strategy: input.strategy || "chat", objective: input.objective,
     capabilityRestrictions: input.capabilityRestrictions,
     approvalRequiredCapabilities: input.approvalRequiredCapabilities,
-    networkRead: input.networkRead, constraints: ["read_only", "no_external_side_effects"],
+    networkRead: input.networkRead, knowledgeContext: input.knowledgeContext, workspaceInstructionContext: input.workspaceInstructionContext, constraints: ["read_only", "no_external_side_effects"],
     acceptanceCriteria: ["current_complete_answer_without_unexecuted_actions"], initialPhase: input.collectWorkspace ? "preparing" : "observing",
   });
   const startedAt = controller.snapshot().aggregate?.events.find((event) => event.type === "run.started")?.at ?? input.now();
@@ -56,7 +58,8 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
     }
     if (state.strategy === "chat" && state.pendingToolCalls.some((call) =>
       !(call.name === "load_skill" && input.allowSkillLoad) &&
-      !(["web_search", "web_fetch"].includes(call.name) && input.networkRead?.enabled))) {
+      !(["web_search", "web_fetch"].includes(call.name) && input.networkRead?.enabled) &&
+      !(["knowledge_search", "knowledge_get_excerpt"].includes(call.name) && input.knowledgeContext?.references.length))) {
       await controller.driveOnce({ resultKind: "error", resultReason: "Chat 收到了未授权的工具动作。" });
       continue;
     }

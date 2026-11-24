@@ -6,12 +6,13 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
-import { countDistinctRuntimeV2EvidenceFacts } from "./evidenceFacts";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
+import { runtimeV2DirectExecuteMutationTargets } from "./validationReceipt";
+import { deriveUnityCompilation, deriveUnityShaderImport } from "./unityCompilation";
 
-function markdownCode(value: unknown): string {
+function markdownCode(value: unknown, language: "zh" | "en" = "zh"): string {
   const text = String(value || "").trim().replace(/`/g, "");
-  return text ? `\`${text}\`` : "当前工作区";
+  return text ? `\`${text}\`` : language === "en" ? "current workspace" : "当前工作区";
 }
 
 function workspaceRelativeTarget(value: unknown, workspaceKey = ""): string {
@@ -49,38 +50,8 @@ export function runtimeV2StructuredActionMarkdown(
   switch (command.kind) {
     case "collect_observation":
       return "正在收集与当前目标相关的上下文与证据。";
-    case "request_model": {
-      const mode = String(command.payload.mode || "");
-      const recoveryPressure =
-        command.payload.recoveryPressure &&
-          typeof command.payload.recoveryPressure === "object" &&
-          !Array.isArray(command.payload.recoveryPressure)
-          ? command.payload.recoveryPressure as Record<string, unknown>
-          : null;
-      if (recoveryPressure) {
-        const occurrence = Math.max(
-          1,
-          Math.floor(Number(recoveryPressure.occurrence) || 1),
-        );
-        return `上一个模型动作没有形成可执行进展，正在切换恢复策略（第 ${occurrence} 次）。`;
-      }
-      const labels: Record<string, string> = {
-        chat: "正在理解当前问题，并结合本轮对话上下文组织完整回复。",
-        analyze: "正在结合实际只读证据形成完整答复。",
-        observe: "正在根据已读证据判断根本原因。",
-        plan: "正在把已确认的事实整理成可审核的修复计划。",
-        execute: context?.strategy === "plan"
-          ? "正在依据已批准的计划选择下一项安全修改。"
-          : command.payload.executePolicy === "mutation_required"
-            ? "正在把已确认的证据转化为下一项执行修改。"
-            : command.payload.executePolicy ===
-                "source_reorientation_required"
-              ? "上一次修改目标不属于当前工作区，正在重新定位目标文件。"
-            : "正在确认实施方案所需的关键细节。",
-        validate: "正在根据验收条件检查当前实现。",
-      };
-      return labels[mode] || "正在根据当前证据决定下一步。";
-    }
+    case "request_model":
+      return "正在准备模型请求。";
     case "execute_tool": {
       const tool = String(command.payload.toolName || "").trim();
       const target = readTarget(command, context?.turn.workspaceKey);
@@ -107,21 +78,6 @@ export function runtimeV2StructuredActionMarkdown(
   }
 }
 
-function publicProviderCommentaryForCommand(
-  aggregate: TurnAggregateV1,
-  command: RuntimeV2Command | undefined,
-): string {
-  if (!command) return "";
-  const toolCallId = String(command.payload.toolCallId || "").trim();
-  if (!toolCallId) return "";
-  const response = [...aggregate.events].reverse().find((event) =>
-    event.type === "provider.responded" &&
-    event.result.toolCalls.some((call) => call.id === toolCallId)
-  );
-  if (!response || response.type !== "provider.responded") return "";
-  return visibleProviderCommentary(response.result);
-}
-
 function visibleProviderCommentary(
   result: Extract<
     RuntimeV2Event,
@@ -142,32 +98,19 @@ function visibleProviderCommentary(
   }
   if (/```|<tool(?:_use)?>|<runtime-v2-tools>/i.test(commentary)) return "";
   const compact = commentary.replace(/\s+/g, " ").trim();
-  if (compact.length <= 180) return compact;
-  const completeSentences = compact.match(/[^。！？!?]+[。！？!?]+/g) || [];
+  if (compact.length <= 420) return compact;
+  const completeSentences =
+    compact.match(/(?:[^。！？!?.]|\.(?=\S))+(?:[。！？!?]+|\.(?=\s|$))/g) || [];
   let selected = "";
   for (const sentence of completeSentences) {
-    if (`${selected}${sentence}`.length > 180) break;
+    if (`${selected}${sentence}`.length > 420) break;
     selected += sentence;
-    if (selected.length >= 80) break;
+    if (selected.length >= 260) break;
   }
   // Never cut a provider sentence in half or append synthetic ellipses. When
   // no concise complete public sentence exists, the structured action below
   // is more truthful than a clipped fragment.
   return selected.trim();
-}
-
-function currentProviderCommentary(aggregate: TurnAggregateV1): string {
-  const response = [...aggregate.events].reverse().find((event) =>
-    event.type === "provider.responded"
-  );
-  if (!response || response.type !== "provider.responded") return "";
-  const commentary = visibleProviderCommentary(response.result);
-  if (!commentary) return "";
-  if (response.result.toolCalls.length === 0) return commentary;
-  const pendingCallIds = new Set(aggregate.pendingToolCalls.map((call) => call.id));
-  return response.result.toolCalls.some((call) => pendingCallIds.has(call.id))
-    ? commentary
-    : "";
 }
 
 function phaseTitle(phase: TurnAggregateV1["phase"]): string {
@@ -184,15 +127,18 @@ function phaseTitle(phase: TurnAggregateV1["phase"]): string {
   return labels[phase];
 }
 
-function terminalTitle(resultKind: RuntimeV2ResultKind): string {
-  const labels: Record<RuntimeV2ResultKind, string> = {
-    success: "已完成",
-    partial: "已部分完成",
-    blocked: "需要继续处理",
-    error: "执行遇到错误",
-    canceled: "已取消",
+function terminalTitle(
+  resultKind: RuntimeV2ResultKind,
+  language: "zh" | "en" = "zh",
+): string {
+  const labels: Record<RuntimeV2ResultKind, { zh: string; en: string }> = {
+    success: { zh: "已完成", en: "Completed" },
+    partial: { zh: "已部分完成", en: "Partially completed" },
+    blocked: { zh: "需要继续处理", en: "Action needed" },
+    error: { zh: "执行遇到错误", en: "Execution failed" },
+    canceled: { zh: "已取消", en: "Canceled" },
   };
-  return labels[resultKind];
+  return labels[resultKind][language];
 }
 
 function projection(
@@ -212,27 +158,16 @@ function projection(
   };
 }
 
-/** Capsule shows one complete public sentence plus the current structured
- * action. Provider monologues and tool-envelope internals stay out of this
- * live surface; durable results remain in ChatArea and the timeline. */
+/** Durable phase projection for older consumers. The live UI reads the
+ * actual request and tool activity, while public commentary goes to ChatArea. */
 export function buildRuntimeV2CapsuleProjection(
   aggregate: TurnAggregateV1,
   id: string,
 ): RuntimeV2Projection {
   const current = aggregate.scheduledCommands[0];
-  const providerCommentary = currentProviderCommentary(aggregate);
-  const action = current
+  const markdown = current
     ? runtimeV2StructuredActionMarkdown(current, aggregate)
-    : providerCommentary
-      ? providerCommentary
-      : `正在${phaseTitle(aggregate.phase)}。`;
-  const commandCommentary = publicProviderCommentaryForCommand(
-    aggregate,
-    current,
-  );
-  const markdown = commandCommentary && commandCommentary !== action
-    ? `${commandCommentary}\n\n${action}`
-    : action;
+    : `正在${phaseTitle(aggregate.phase)}。`;
   return projection(
     aggregate,
     "capsule_live",
@@ -289,48 +224,75 @@ export function buildRuntimeV2FinalProjection(
   resultKind: RuntimeV2ResultKind,
   reason: string,
   finalMarkdown?: string,
+  language: "zh" | "en" = "zh",
 ): RuntimeV2Projection {
+  const trimmedFinal = finalMarkdown?.trim();
+  if (trimmedFinal) {
+    return projection(
+      aggregate,
+      "final",
+      id,
+      trimmedFinal,
+      "final",
+      `final:${resultKind}:${reason}`,
+    );
+  }
   if (aggregate.strategy === "chat" || aggregate.strategy === "analyze" || (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan)) {
     return projection(
       aggregate,
       "final",
       id,
-      finalMarkdown?.trim() || `### ${terminalTitle(resultKind)}\n\n${reason}`,
+      `### ${terminalTitle(resultKind, language)}\n\n${reason}`,
       "final",
       `final:${resultKind}:${reason}`,
     );
   }
-  const mutationTargets = [...new Set(aggregate.evidence
-    .filter((evidence) => evidence.kind === "mutation")
-    .map((evidence) => evidence.target)
-    .filter(Boolean))];
+  const mutationTargets = runtimeV2DirectExecuteMutationTargets(aggregate);
   const validations = aggregate.events.filter(
     isRuntimeV2ValidationAttempt,
   );
   const passedValidations = validations.filter((event) => event.passed).length;
   const failedValidations = validations.length - passedValidations;
-  const evidenceCount = countDistinctRuntimeV2EvidenceFacts(
-    aggregate.evidence,
-  );
-  const evidenceLine = evidenceCount > 0
-    ? `- 已保留 ${evidenceCount} 条证据。`
-    : "- 本轮没有可保留的证据。";
+  const isEn = language === "en";
   const mutationLine = mutationTargets.length > 0
-    ? `- 已修改：${mutationTargets.map(markdownCode).join("、")}。`
-    : "- 本轮没有已提交的文件修改。";
+    ? isEn
+      ? `- Modified: ${mutationTargets.map((t) => markdownCode(t, "en")).join(", ")}.`
+      : `- 已修改：${mutationTargets.map((t) => markdownCode(t, "zh")).join("、")}。`
+    : isEn
+      ? "- No committed file changes in this turn."
+      : "- 本轮没有已提交的文件修改。";
+  const manualChecks = validations.length === 0
+    ? (aggregate.sealedWorkPlan?.draft.validations || []).filter(validation => !validation.required)
+    : [];
   const validationLine = validations.length > 0
-    ? `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
-    : "- 本轮没有完成可确认的验证。";
+    ? isEn
+      ? `- Verification: ${passedValidations} passed, ${failedValidations} failed.`
+      : `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
+    : manualChecks.length > 0
+      ? isEn
+        ? `- Automated tests: not run (manual / external verification confirmed).\n- Manual / external verification checklist:\n${manualChecks.map(item => `  - ${item.expectedOutcome}`).join("\n")}`
+        : `- 自动测试：未运行（已按用户确认采用人工/外部验证）。\n- 待你人工/外部确认：\n${manualChecks.map(item => `  - ${item.expectedOutcome}`).join("\n")}`
+    : isEn
+      ? "- No confirmed verification run completed in this turn."
+      : "- 本轮没有完成可确认的验证。";
+  const editorChecks = [
+    [isEn ? "C# compilation" : "C# 编译", deriveUnityCompilation(aggregate)?.receipt],
+    [isEn ? "Shader import" : "Shader 导入", deriveUnityShaderImport(aggregate)?.receipt],
+  ] as const;
+  const editorLines = editorChecks.flatMap(([name, receipt]) => receipt && receipt.result.status !== "not_unity_project" ? [
+    isEn
+      ? `- ${name} ${receipt.result.status === "passed" ? "passed" : receipt.result.status === "failed" ? "has remaining errors" : "is pending verification"}.`
+      : `- ${name}${receipt.result.status === "passed" ? "通过" : receipt.result.status === "failed" ? "仍有错误" : "待验证"}。`,
+  ] : []);
   return projection(
     aggregate,
     "final",
     id,
     [
-      `### ${terminalTitle(resultKind)}`,
-      finalMarkdown?.trim(),
+      `### ${terminalTitle(resultKind, language)}`,
       mutationLine,
-      validationLine,
-      evidenceLine,
+      ...(validations.length > 0 || editorLines.length === 0 ? [validationLine] : []),
+      ...editorLines,
       /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
     ].filter(Boolean).join("\n\n"),
     "final",

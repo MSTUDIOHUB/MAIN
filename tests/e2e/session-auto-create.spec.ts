@@ -295,15 +295,15 @@ test("first real send creates and activates a project session", async ({ page })
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         return {
           runtimeTurns: snapshot?.currentSessionRuntimeTurns,
-          runtimeBlocks: snapshot?.currentSessionRuntimeBlocks,
-          messages: snapshot?.currentSessionMessages,
+          runtimeKinds: snapshot?.currentSessionRuntimeBlockKinds,
+          messageKinds: snapshot?.currentSessionMessageKinds,
         };
       }),
     )
     .toEqual({
       runtimeTurns: 1,
-      runtimeBlocks: 3,
-      messages: 3,
+      runtimeKinds: ["user", "agent:assistant_final"],
+      messageKinds: ["user", "agent:assistant_final"],
     });
 });
 

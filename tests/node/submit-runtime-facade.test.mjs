@@ -1776,3 +1776,28 @@ test("submit elapsed timer resumes from a persisted turn total", () => {
   assert.deepEqual(patches, [{ elapsedTime: 11 }]);
   assert.equal(timer.getElapsedSeconds(), 11);
 });
+
+test("borrowing a runtime owner publishes a Guide without replacing the active Run lease", () => {
+  const stateRef = { current: {
+    currentWorkspace: "/tmp/run", currentSessionId: 42,
+    sessionsByWorkspace: { "/tmp/run": [{ id: 42, planLifecycleEpoch: "current-epoch" }] },
+    runtimeBySessionKey: {}, currentTurnId: "active-turn", agentStatus: "running", elapsedTime: 1, taskFlow: [],
+  } };
+  const createFacade = (borrowExistingRuntimeOwnership = false) => createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current, set: patch => applySet(stateRef, patch), runSessionKey: "/tmp/run:42",
+    createRuntimeFromState, pickRuntimePatch, borrowExistingRuntimeOwnership,
+  });
+  const runner = createFacade();
+  runner.seedSessionRuntime();
+  const guide = createFacade(true);
+  guide.seedSessionRuntime();
+  assert.strictEqual(guide.getSessionRuntimeOwnerToken(), runner.getSessionRuntimeOwnerToken());
+  assert.equal(guide.publishOwnerScopedRuntimeProjection({
+    projectedState: { ...stateRef.current, elapsedTime: 5 }, scopeKey: "/tmp/run", sessionId: 42,
+    expectedRevisionToken: guide.getSessionRevisionToken(),
+  }).published, true);
+  assert.equal(runner.hasSessionRuntimeOwnership(), true);
+  assert.equal(runner.sessionGet().elapsedTime, 5);
+  stateRef.current.sessionsByWorkspace = { "/tmp/run": [{ id: 42, planLifecycleEpoch: "replacement-epoch" }] };
+  assert.equal(guide.hasSessionRuntimeOwnership(), false);
+});

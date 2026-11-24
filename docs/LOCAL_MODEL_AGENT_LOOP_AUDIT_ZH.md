@@ -6,7 +6,7 @@
 
 MAIN 应只有一套与模型和 Provider 无关的执行过程：Turn admission → 读取证据 → 选择结构化动作 → 权限与 schema 校验 → 执行副作用 → 有限验证 → 基于 ledger 收尾。模型能力可以影响选取动作的质量、迭代次数和最终结果，但不能改变权限、执行、验证和终态的定义。
 
-当前生产链已经基本满足这一方向。普通 MAIN、游戏开发和 MCP 工作都应进入同一 Runtime v2；Image Studio 仍是明确的非 Agent 图像渲染边界。原 Game Studio 的协议包、专用 slash、副作用 adapter 和独立 runner 不再保留。
+当前生产链已经基本满足这一方向。普通 MAIN、游戏开发和 MCP 工作都应进入同一 Runtime v2。原 Game Studio 的协议包、专用 slash、副作用 adapter 和独立 runner 不再保留。
 
 ## 已确认的生产所有权
 
@@ -14,7 +14,7 @@ MAIN 应只有一套与模型和 Provider 无关的执行过程：Turn admission
 - `submitRuntimeRunner` 只接受带 Runtime v2 标记的 Turn，并按不可变 runtime intent 选择 runner；不存在 legacy agent loop 回退。
 - Execute runner 负责真实循环；Controller 负责 decision → durable schedule → side effect 的顺序。
 - native tool call 和文本工具信封都会归一为相同的标准 action，再经过同一 schema、权限、执行和 ledger。
-- Plan、Execute、Goal、Chat/Workspace Read 使用不同的有限能力面，但共享同一 Runtime 契约，而不是按模型名称分叉逻辑。
+- Plan、Execute、Chat/Workspace Read 使用不同的有限能力面，但共享同一 Runtime 契约，而不是按模型名称分叉逻辑。
 
 ## 本轮修正的过程缺口
 

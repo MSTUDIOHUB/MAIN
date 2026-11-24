@@ -1,8 +1,9 @@
-import type {
-  RuntimeV2Projection,
-  RuntimeV2ProjectionAudience,
-  RuntimeV2RunIdentity,
-  TurnAggregateV1,
+import {
+  buildRuntimeV2FinalProjection,
+  type RuntimeV2Projection,
+  type RuntimeV2ProjectionAudience,
+  type RuntimeV2RunIdentity,
+  type TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import {
   getHarnessActionRunId,
@@ -50,22 +51,51 @@ export function localizedRuntimeV2FinalProjection(
   language: "zh" | "en",
 ): RuntimeV2Projection {
   if (
-    aggregate.terminalOutcome?.reason !==
-      "provider_transports_unavailable" &&
-    aggregate.terminalOutcome?.reason !== "provider_transport_exhausted"
+    aggregate.terminalOutcome?.reason ===
+      "provider_transports_unavailable" ||
+    aggregate.terminalOutcome?.reason === "provider_transport_exhausted"
   ) {
-    return projection;
+    const markdown = language === "en"
+      ? [
+          "### Execution failed",
+          "",
+          "The task did not finish because the configured model provider had no compatible request path available. No model response was accepted, and all committed evidence was preserved.",
+        ].join("\n")
+      : [
+          "### 执行失败",
+          "",
+          "当前模型服务没有可用的兼容请求通道，本轮没有接受任何模型回复；已经保留全部已提交证据。",
+        ].join("\n");
+    return { ...projection, markdown };
   }
-  const markdown = language === "en"
-    ? [
-        "### Execution failed",
-        "",
-        "The task did not finish because the configured model provider had no compatible request path available. No model response was accepted, and all committed evidence was preserved.",
-      ].join("\n")
-    : [
-        "### 执行失败",
-        "",
-        "当前模型服务没有可用的兼容请求通道，本轮没有接受任何模型回复；已经保留全部已提交证据。",
-      ].join("\n");
-  return { ...projection, markdown };
+  const outcome = aggregate.terminalOutcome;
+  const finalize = [...aggregate.events]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "command.scheduled" &&
+        event.command.kind === "finalize_turn",
+    );
+  const finalizedMarkdown =
+    finalize?.type === "command.scheduled"
+      ? String(finalize.command.payload.finalMarkdown || "").trim()
+      : "";
+  if (
+    language === "en" &&
+    outcome &&
+    !finalizedMarkdown &&
+    /^### (?:已完成|已部分完成|需要继续处理|执行遇到错误|已取消)\b/.test(
+      projection.markdown.trim(),
+    )
+  ) {
+    return buildRuntimeV2FinalProjection(
+      aggregate,
+      projection.id,
+      outcome.resultKind,
+      outcome.reason,
+      undefined,
+      "en",
+    );
+  }
+  return projection;
 }

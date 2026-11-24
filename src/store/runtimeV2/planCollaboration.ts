@@ -3,6 +3,7 @@ import {
   executeRuntimeV2SchedulerLifecycle,
   runtimeV2CollaborationPayload,
   runtimeV2SubagentStartHasRunway,
+  restoreRuntimeV2ProactiveSchedules,
   type RuntimeV2Command,
   type RuntimeV2DecisionInput,
   type RuntimeV2NormalizedProviderResult,
@@ -19,6 +20,8 @@ import {
 import { PlanLedger } from "./planLedger";
 import type { RuntimeV2PlanLog } from "./planEvidencePort";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
+import { deriveProactiveCollaboration } from "./proactiveSubagents";
+import { hasExecutablePlanChoice } from "./planQuestionTool";
 
 type PlanToolCall =
   RuntimeV2NormalizedProviderResult["toolCalls"][number];
@@ -34,7 +37,10 @@ export interface RuntimeV2PlanCollaboration {
     call: PlanToolCall,
     decision: RuntimeV2DecisionInput,
   ): Promise<boolean>;
-  joinActive(reason: string): Promise<boolean>;
+  restoreProactive(): Promise<void>;
+  advanceProactive(): Promise<boolean>;
+  joinForSubmission(): Promise<{ joined: boolean; resubmit: boolean }>;
+  joinActive(reason: string, cancelUnusedProactive?: boolean): Promise<boolean>;
   abortAndDrain(reason: string): Promise<boolean>;
   syncChildEvidence(): void;
   abortChildren(reason: string): void;
@@ -58,6 +64,7 @@ export function createRuntimeV2PlanCollaboration(input: {
   readonly evidence: WorkPlanRuntimeEvidence[];
   readonly evidenceContents: Map<string, string>;
   readonly deadlineAt: number;
+  readonly revisionTargetPaths?: readonly string[];
   readonly logStoreEvent: RuntimeV2PlanLog;
 }): RuntimeV2PlanCollaboration {
   const collaborationDeadlineAt = input.deadlineAt;
@@ -140,8 +147,9 @@ export function createRuntimeV2PlanCollaboration(input: {
 
   const executeSchedulerCommand = async (
     command: RuntimeV2Command,
+    alreadyScheduled = false,
   ): Promise<boolean> => {
-    await input.ledger.scheduleCommand(command);
+    if (!alreadyScheduled) await input.ledger.scheduleCommand(command);
     try {
       const events = await executeRuntimeV2SchedulerLifecycle({
         command,
@@ -175,7 +183,7 @@ export function createRuntimeV2PlanCollaboration(input: {
             : "failed",
         });
       }
-      await input.ledger.recordSoftSignal(input.run, "repeated_action");
+      if (!command.payload.proactiveKey) await input.ledger.recordSoftSignal(input.run, "repeated_action");
       input.logStoreEvent("runtime_v2_plan_collaboration_failed", {
         turnId: input.run.turnId,
         runId: input.run.runId,
@@ -214,6 +222,13 @@ export function createRuntimeV2PlanCollaboration(input: {
         subagentPreference: effectivePreference,
         subagentCapacity: subagentPolicy.maxActiveRequests,
         subagentRequestMode: subagentPolicy.modelRequestMode,
+        proactiveCollaboration: deriveProactiveCollaboration({ state: aggregate, preference: effectivePreference,
+          capacity: subagentPolicy.maxActiveRequests, requestMode: subagentPolicy.modelRequestMode,
+          baseline: input.runner.context.projectBaselineContext, workspace: input.runner.context.runWorkspace,
+          language: input.runner.context.phaseLanguage, lifecycleDeadlineAt: collaborationDeadlineAt,
+          revisionTargetPaths: input.revisionTargetPaths,
+          planningHasExecutableChoice: hasExecutablePlanChoice(aggregate), now: ports.now() }),
+        settledProactiveJobIds: [...live.childTelemetry].filter(([, telemetry]) => telemetry.closedAt !== null).map(([id]) => id),
       } as const;
       const requirementMet = aggregate.subagents.some((job) =>
         job.parentRunId === input.run.runId
@@ -254,7 +269,32 @@ export function createRuntimeV2PlanCollaboration(input: {
       }
       return executeSchedulerCommand(command);
     },
-    async joinActive(reason) {
+    async restoreProactive() {
+      const aggregate = input.ledger.snapshot();
+      if (aggregate?.run?.status !== "running" || input.runner.context.abortCtrl.signal.aborted) return;
+      await restoreRuntimeV2ProactiveSchedules({ state: aggregate, scheduler, signal: input.runner.context.abortCtrl.signal,
+        commit: event => input.ledger.appendProgress(event) });
+      for (const command of aggregate.scheduledCommands) {
+        if (command.kind === "schedule_subagents" && typeof command.payload.proactiveKey === "string") await executeSchedulerCommand(command, true);
+      }
+    },
+    async advanceProactive() {
+      const aggregate = input.ledger.snapshot();
+      if (!aggregate || input.runner.context.abortCtrl.signal.aborted ||
+          aggregate.pendingToolCalls.length || aggregate.scheduledCommands.length) return false;
+      const command = decideNextCommands(aggregate, collaboration.current().decision)[0];
+      if (!command || (command.kind !== "join_subagents" &&
+        !(command.kind === "schedule_subagents" && typeof command.payload.proactiveKey === "string"))) return false;
+      await executeSchedulerCommand(command);
+      return true;
+    },
+    async joinForSubmission() {
+      const jobs = activeChildJobs(input.ledger, input.run);
+      if (!jobs.length) return { joined: true, resubmit: false };
+      const joined = await collaboration.joinActive("plan_submission_requires_joined_children", true);
+      return { joined, resubmit: !joined || jobs.some(job => !job.proactiveKey) };
+    },
+    async joinActive(reason, cancelUnusedProactive = false) {
       const jobs = activeChildJobs(input.ledger, input.run);
       if (jobs.length === 0) return true;
       const command = await input.ledger.schedule(
@@ -264,6 +304,7 @@ export function createRuntimeV2PlanCollaboration(input: {
           mode: "read_only",
           jobIds: jobs.map((job) => job.id),
           finalJoin: true,
+          cancelUnusedProactive,
           automaticJoinReason: String(reason || "plan_join_boundary")
             .slice(0, 256),
         },

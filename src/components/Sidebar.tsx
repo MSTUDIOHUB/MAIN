@@ -796,7 +796,8 @@ export default function Sidebar({
       } ${
         isWorkspaceDropActive ? "border-[var(--accent)]" : "border-[#27272a]"
       }`}
-      style={{ width: `${sidebarWidth}px` }}
+      style={{ width: `var(--panel-drag-width, ${sidebarWidth}px)` }}
+      data-workbench-panel="sidebar"
       data-testid="workspace-sidebar"
     >
       <div

@@ -14,6 +14,24 @@ import { requestRuntimeV2ToolPermission } from "./executionToolPermission";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import { getShellPermissionCommandForTool } from "../../lib/shellAutoApproval";
 
+const shellDenialRecovery = new Map([
+  ["trusted_execution::PathnameExpansion", {
+    code: "shell_pathname_expansion",
+    en: 'Reuse exact paths from earlier results. For filename patterns use glob_search or pass a quoted pattern to find -name, such as "*.hlsl". Use grep_search for text.',
+    zh: '复用前面返回的精确路径。文件名模式用 glob_search 或把 "*.hlsl" 这样的模式作为带引号的 find -name 参数。搜索正文用 grep_search。',
+  }],
+  ["trusted_execution::WorkingDirectoryChange", {
+    code: "shell_working_directory_change",
+    en: "Set the run_command cwd field to the exact workspace-relative directory and use literal paths in the command.",
+    zh: "把精确的工作区相对目录填入 run_command 的 cwd 字段，命令内使用确定的路径。",
+  }],
+  ["trusted_execution::WorkspacePathEscape", {
+    code: "shell_workspace_path_escape",
+    en: "Search the exact workspace-relative directory already identified. For project dependencies, reuse the resolved package path inside the workspace. Submit independent observations as separate tool calls.",
+    zh: "在已确定的工作区相对目录内查询。调查项目依赖时复用工作区内实际解析的包路径。各项独立读取分别提交工具调用。",
+  }],
+]);
+
 export type RuntimeV2ToolAuthorizationResolution =
   | {
       readonly allowed: true;
@@ -42,6 +60,7 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
     input.ports,
     input.toolName,
     input.args,
+    { command: input.command, target: input.target },
   );
   if (
     !authorization.allowed &&
@@ -124,7 +143,7 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
     }
     if (review.action === "accept") {
       const pendingAuthorization = authorization;
-      authorization = await authorizeToolForCurrentTurn(input.ports, input.toolName, input.args);
+      authorization = await authorizeToolForCurrentTurn(input.ports, input.toolName, input.args, { command: input.command, target: input.target });
       const sameReview = authorization.approvalRequired === true &&
         authorization.risk === pendingAuthorization.risk &&
         authorization.approvalRequiredCapability === pendingAuthorization.approvalRequiredCapability;
@@ -165,8 +184,11 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
     return { allowed: true, authorization };
   }
 
-  const content =
-    `TOOL_BLOCKED: ${authorization.reason || `${input.toolName} is not authorized for this Turn.`}`;
+  const correction = shellDenialRecovery.get(authorization.shellPermissionDecision?.matchedRule || "");
+  const content = [
+    `TOOL_BLOCKED: ${authorization.reason || `${input.toolName} is not authorized for this Turn.`}`,
+    correction?.[input.ports.context.phaseLanguage],
+  ].filter(Boolean).join("\n");
   recordToolResultHistory({
     ports: input.ports,
     command: input.command,
@@ -182,6 +204,7 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
     toolName: input.toolName,
     target: input.target || null,
     reason: authorization.reason || "authorization_required",
+    ...(correction ? { reasonCode: correction.code } : {}),
   });
   return {
     allowed: false,
@@ -194,6 +217,9 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
       content,
       "blocked",
       "not_authorized",
+      undefined,
+      undefined,
+      correction?.code,
     ),
   };
 }

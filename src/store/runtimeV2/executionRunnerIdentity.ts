@@ -22,7 +22,7 @@ export function createRuntimeV2RunnerIdentity(
   run: RuntimeV2RunIdentity;
 } {
   const sessionEpoch = resolveRuntimeV2SessionEpoch(state, context, turn);
-  const workspaceKey = String(context.runWorkspace || "global").trim() || "global";
+  const workspaceKey = String(context.runScopeKey).trim();
   const turnIdentity: RuntimeV2TurnIdentity = {
     workspaceKey,
     sessionKey: context.runSessionKey,

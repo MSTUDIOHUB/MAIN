@@ -11,6 +11,7 @@ import {
 } from "../../lib/runtime-v2";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
+import { unresolvedUnityEditorCheck, unityCompilationMessage } from "../../lib/runtime-v2/unityCompilation";
 
 export function runtimeV2ExecuteTerminalDecision(input: {
   aggregate: ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"];
@@ -39,6 +40,13 @@ export function runtimeV2ExecuteTerminalDecision(input: {
     hasProviderConclusion: !!finalMarkdown,
   });
   if (!decision) return null;
+  const compilation = unresolvedUnityEditorCheck(aggregate);
+  if (compilation && decision.resultKind === "success") {
+    const checkLabel = compilation.result.kind === "shader_import" ? "Shader 导入" : "引擎编译";
+    const reason = compilation.result.status === "failed" ? `${checkLabel}仍有错误，修改已保留。`
+      : `未取得${checkLabel}结果，修改已保留。`;
+    return { resultKind: "partial", resultReason: reason, finalMarkdown: [reason, unityCompilationMessage(compilation.result)].filter(Boolean).join("\n\n") };
+  }
   return {
     ...decision,
     ...(finalMarkdown ? { finalMarkdown } : {}),
@@ -55,12 +63,10 @@ export function truthfulRuntimeV2RecoveryStallDecision(input: {
   resultReason: string;
   finalMarkdown?: string;
 } {
-  const hasMutation = input.aggregate.evidence.some(
-    (evidence) => evidence.kind === "mutation",
-  );
   const evidence = summarizeRuntimeV2ExecuteEvidence(input.aggregate, {
     isMutationToolName: isWorkspaceMutationToolName,
   });
+  const hasMutation = evidence.mutationCount > 0;
   const planCoverage =
     deriveRuntimeV2PlanExecutionCoverage(input.aggregate);
   const missingTargets = planCoverage?.missingMutationTargets || [];

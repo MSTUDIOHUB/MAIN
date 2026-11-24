@@ -1,13 +1,7 @@
 import { expect, test } from "@playwright/test";
+import { installCapsuleFixtureStartup } from "./capsuleFixtureStartup";
 
-test.beforeEach(async ({ page }) => {
-  await page.addInitScript(() => {
-    if (!window.sessionStorage.getItem("__CODELY_E2E_STORAGE_RESET__")) {
-      window.localStorage.clear();
-      window.sessionStorage.setItem("__CODELY_E2E_STORAGE_RESET__", "1");
-    }
-  });
-});
+test.beforeEach(({ page }) => installCapsuleFixtureStartup(page));
 
 test("realistic plan prompt renders as narrative plus a folded process archive", async ({ page }) => {
   await page.goto("/?e2eScenario=opencode-transcript-display");
@@ -25,8 +19,7 @@ test("realistic plan prompt renders as narrative plus a folded process archive",
   await expect(page.getByTestId("turn-state-anchor")).toContainText("计划");
   const archiveToggle = page.getByTestId("turn-process-archive-toggle");
   await expect(archiveToggle).toHaveAttribute("aria-expanded", "false");
-  await expect(archiveToggle).toContainText("2 步");
-  await expect(archiveToggle).toContainText("ChatArea.tsx");
+  await expect(archiveToggle).toContainText("2 项活动");
   await archiveToggle.click();
 
   const steps = page.getByTestId("turn-archive-step");

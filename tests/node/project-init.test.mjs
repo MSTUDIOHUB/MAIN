@@ -107,12 +107,35 @@ function createIo(options = {}) {
   };
 }
 
-test("slash parsing accepts only /init and /init --refresh", () => {
-  assert.deepEqual(projectInit.parseProjectInitCommand("/init"), { kind: "project_init", refresh: false });
-  assert.deepEqual(projectInit.parseProjectInitCommand("  /init   --refresh  "), { kind: "project_init", refresh: true });
-  for (const invalid of ["/initial", "/init now", "/init --refresh extra", "/init --force", "/INIT", "/init\n--refresh", "please /init", ""]) {
-    assert.equal(projectInit.parseProjectInitCommand(invalid), null, invalid);
+test("automatic rules refresh preserves human bytes and requires review after a hand edit", async () => {
+  const original = projectInit.renderProjectInitManagedBlock(makeBaseline());
+  const human = "# Human rules\n\nKeep this.\n\n";
+  const preference = { blockDigest: projectInit.projectInitManagedBlockDigest(original), locale: "en" };
+  const same = createIo({ exists: true, content: human + original });
+  const refresh = (io, isCurrent = () => true) =>
+    projectInit.refreshApprovedProjectInitBlock({ workspace: "/fixture/repo", preference, io, isCurrent });
+  assert.equal(await refresh(same), null);
+  assert.equal(same.calls.commit.length, 0);
+  const changed = createIo({ exists: true, content: human + original, baseline: makeBaseline({ fingerprint: "project-baseline-sha256-two" }) });
+  const updated = await refresh(changed);
+  assert.notEqual(updated.blockDigest, preference.blockDigest);
+  assert.ok(changed.calls.commit[0].proposedContent.startsWith(human));
+  const edited = createIo({ exists: true, content: human + original.replace("Runtimes", "Edited runtimes") });
+  assert.equal(await refresh(edited), "needs_review");
+  assert.equal(edited.calls.commit.length, 0);
+  assert.equal(await refresh(changed, () => false), null);
+  assert.equal(changed.calls.commit.length, 1);
+});
+
+test("rules command accepts a request and keeps init as a hidden alias", () => {
+  for (const command of ["/规则", "/rules", "/init", "/INIT"]) {
+    assert.deepEqual(projectInit.parseProjectInitCommand(command), { kind: "project_init", refresh: false });
+    assert.deepEqual(projectInit.parseProjectInitCommand(`${command} preserve human rules`), { kind: "project_init", refresh: false, request: "preserve human rules" });
   }
+  assert.deepEqual(projectInit.parseProjectInitCommand("  /init   --refresh  "), { kind: "project_init", refresh: true });
+  assert.deepEqual(projectInit.parseProjectInitCommand("/规则 --refresh 更新项目规范"), { kind: "project_init", refresh: true, request: "更新项目规范" });
+  assert.deepEqual(projectInit.parseProjectInitCommand("/rules\nPreserve this exact instruction"), { kind: "project_init", refresh: false, request: "Preserve this exact instruction" });
+  for (const invalid of ["/initial", "/init-more", "/rules-extra", "please /init", ""]) assert.equal(projectInit.parseProjectInitCommand(invalid), null, invalid);
 });
 
 test("new initialization builds a deterministic bilingual managed block and commits exact CAS identities", async () => {
@@ -330,4 +353,25 @@ test("a proposed managed block cannot exceed the shared write ceiling", async ()
     /PROJECT_INIT_CONTENT_TOO_LARGE/,
   );
   assert.equal(io.calls.commit.length, 0);
+});
+
+test("investigated rules drafts and editable diffs retain the original file CAS through empty and subsequent edits", async () => {
+  const io = createIo({ exists: true, content: "# Human rules\nPreserve public API.\n", baseVersion: "sha256-before-interview" });
+  const inspection = await io.inspect({ workspace: "/fixture/repo", targetPath: "AGENTS.md" });
+  const draft = projectInit.buildProjectRulesPreview(inspection, "# Human rules\nPreserve public API.\nUse offline tests.\n");
+  assert.equal(draft.editableDraft, true);
+  assert.match(draft.unifiedDiff, /\+Use offline tests/);
+  assert.equal(io.calls.buildBaseline.length, 0, "AI-drafted rules are not replaced with a deterministic snapshot");
+  const empty = projectInit.updateProjectRulesPreview(draft, "");
+  assert.equal(empty.proposed, "", "Ctrl+A deletion must remain editable");
+  await assert.rejects(projectInit.commitProjectInitPreview({ preview: empty, currentWorkspaceIdentity: draft.workspaceIdentity, io }), /PROJECT_RULES_DRAFT_EMPTY/);
+  const edited = projectInit.updateProjectRulesPreview(empty, "# Human rules\nPreserve public API.\nReview accessibility.\n");
+  assert.equal(edited.baseVersion, inspection.baseVersion);
+  assert.equal(edited.existing, inspection.content);
+  await projectInit.commitProjectInitPreview({ preview: edited, currentWorkspaceIdentity: edited.workspaceIdentity, io });
+  assert.equal(io.calls.commit.length, 1);
+  assert.equal(io.calls.commit[0].expectedBaseVersion, "sha256-before-interview");
+  assert.equal(io.calls.commit[0].proposedContent, edited.proposed);
+  const staleIo = createIo({ commitResult: { status: "stale", reason: "base_version" } });
+  assert.deepEqual(await projectInit.commitProjectInitPreview({ preview: edited, currentWorkspaceIdentity: edited.workspaceIdentity, io: staleIo }), { status: "stale", reason: "base_version" });
 });

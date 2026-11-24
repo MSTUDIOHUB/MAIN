@@ -34,11 +34,13 @@ MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性
 6. 工具通过 TypeScript IPC 进入 Rust；已经迁移到统一边界的入口再做路径、Shell、网络、超时与进程回收校验。工具结果进入结构化证据账本。
 7. canonical Turn 状态、审批、Plan artifact、证据与兼容事件回到 Session 投影；ChatArea、进度胶囊和时间线只从这些结构化事实渲染。
 
-“Chat / Plan / Fast”只改变策略和工具暴露，不改变工作区模型提交的身份：每次这类提交都是一个 Turn。`/init` 由 Composer 在接纳前截获，只打开本地 `AGENTS.md` 审阅并在确认后走专用 CAS IPC，因此不创建 Turn/Run，也不进入 provider 链。
+普通 MAIN 提交、`/计划`、`/规则` 及兼容别名 `/init` 都走同一 Workspace Turn 接纳路径。`/规则` 与 `/init` 进入 `planPurpose: rules` 的 Plan 访谈：先调查项目和根 `AGENTS.md`，询问关键约束并保存规则草稿，再由用户编辑、审阅并通过专用 CAS IPC 写入根文件。访谈回答和草稿保存均不授予执行批准。
 
 ## Provider-neutral Plan 边界
 
-Runtime v2 Plan 使用一条较小的单向权威链：
+新 Plan 至少经过一次结构化确认。概念计划经 `savePlanDocument` 保存版本化文档后完成，不需要虚构文件改动或验证命令；规则草稿保存后另行审阅根 `AGENTS.md`。
+
+选择实施计划后，Runtime v2 使用以下单向权威链：
 
 ```text
 Turn intake
@@ -52,7 +54,7 @@ Turn intake
 
 - `src/lib/runtime-v2/workPlan.ts` 的 `SealedWorkPlanV1` 与 `RuntimeV2PlanReviewCommit` 是当前审批权威。Markdown 只从 sealed plan 单向生成，不反向解析为权限。
 - native tool、结构化 response 和文本 transport 最终必须进入同一个 WorkPlan 校验器。provider 名称、隐藏 reasoning 和普通正文没有审批状态权威。
-- Plan runner 只读取和提交待审计划；批准后由 Runtime v2 Execute 使用 exact plan identity、scope 和 validations。Plan 本身不写项目文件。
+- Plan 调查不修改业务源码；版本化计划文档由受限 `savePlanDocument` IPC 落盘。实施计划的实际保存回执、documentRef 和 sealed authority 一致后才开放审核；独立批准后由同一 Run 的 Runtime v2 Execute 使用 exact plan identity、scope 和 validations。
 - Plan 候选结构无效时可以带着明确 issue 修订；固定轮数或字符数只能保护单次资源，不能把未提交计划伪装成成功。
 
 Provider adapter 的职责到“能力检测、请求/响应形状、stream、图片、native tool 与文本 fallback”截止。它不能决定 Plan 是否合格、是否进入审核、任务是否完成或 Turn 的终态。
@@ -100,7 +102,7 @@ Plan evidence、child evidence 与 Execute evidence 可以有不同持久化形�
 7. Plan 的自然语言与 Markdown 不得成为执行或审核状态的第二事实源；typed graph 只可单向生成 review projection。
 8. `plan.artifact_accepted` 必须投影为非终态 `pending_review / awaiting_approval`。它不能被通用的 done/idle 收尾覆盖，也不能在没有 exact artifact/action-request/lifecycle identity 时恢复审批。
 9. provider、模型、语言和项目类型只能改变 adapter/内容，不得改变 typed Plan、validation、evidence、subagent 或 Turn 状态机语义。
-10. active Run 输入必须明确区分 Queue 与 Guide：Queue 接纳一个新的 durable Turn；Guide 只向当前 running Run 注入一次文本引导，不创建 Turn，也不能携带附件或显式 Plan/Goal 意图。
+10. active Run 输入必须明确区分 Queue 与 Guide：Queue 接纳一个新的 durable Turn；Guide 只向当前 running Run 注入一次文本引导，不创建 Turn，也不能携带附件或显式 Plan 意图。
 
 ## 修改路由
 

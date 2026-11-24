@@ -56,6 +56,11 @@ async function loadStreamingModule(invokeMock, listenMock) {
 // #region Responses 路由与降级
 test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", async () => {
   const requests = [];
+  const activity = [];
+  let markInvoked;
+  const invoked = new Promise(resolve => { markInvoked = resolve; });
+  let releaseResponse;
+  const responseGate = new Promise(resolve => { releaseResponse = resolve; });
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
     assert.equal(command, "proxy_request");
     const body = JSON.parse(args.body);
@@ -65,12 +70,14 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
     assert.equal(body.model, "gpt-5.4");
     assert.equal(body.user_prompt_id, undefined);
     assert.equal(Array.isArray(body.input), true);
+    markInvoked();
+    await responseGate;
     return JSON.stringify({ output_text: "ok" });
   });
   const tokens = [];
   let doneCount = 0;
 
-  const result = await streamChatCompletion(
+  const pending = streamChatCompletion(
     [{ role: "user", content: "你好" }],
     {
       baseUrl: "https://www.aiwanwu.cc/v1",
@@ -85,8 +92,21 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
       onToken: (token) => tokens.push(token),
       onDone: () => { doneCount += 1; },
       onError: (error) => { throw error; },
+      onRequestDispatched: () => {
+        activity.push("dispatched");
+        return () => activity.push("streaming");
+      },
     },
   );
+
+  await Promise.race([invoked, pending]);
+  try {
+    assert.deepEqual(activity, ["dispatched"]);
+    assert.deepEqual(tokens, []);
+  } finally {
+    releaseResponse();
+  }
+  const result = await pending;
 
   assert.equal(result.content, "ok");
   assert.deepEqual(tokens, ["ok"]);
@@ -1943,6 +1963,126 @@ test("a failed Rust stream acknowledgement cancels the exact dispatched request 
 });
 
 for (const transport of ["Rust", "fetch"]) {
+  for (const nextOutput of ["empty tool", "semantic text", "named tool", "Anthropic thinking"]) test(`${transport} Plan reasoning-only timer distinguishes ${nextOutput}`, async () => {
+    const listeners = new Map();
+    const cancelled = [];
+    const originalFetch = globalThis.fetch;
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    const limitMs = 4321;
+    const timerHandle = {};
+    let expire;
+    let pushChunk;
+    let closeFetch;
+    let closeRust;
+    let dispatchedId;
+    let markDispatched;
+    let markProgress;
+    const dispatched = new Promise(resolve => { markDispatched = resolve; });
+    const firstOutput = new Promise(resolve => { markProgress = resolve; });
+    let doneCount = 0;
+    const anthropic = nextOutput === "Anthropic thinking";
+    const { streamChatCompletion, isStreamOutputLimited } = await loadStreamingModule(async (command, args) => {
+      if (command === "cancel_chat_stream") {
+        cancelled.push(args.streamId);
+        return;
+      }
+      assert.equal(command, "start_chat_stream");
+      dispatchedId = args.streamId;
+      pushChunk = chunk => listeners.get("chat-stream-chunk")?.({ payload: { stream_id: dispatchedId, chunk } });
+      closeRust = () => listeners.get("chat-stream-done")?.({ payload: { stream_id: dispatchedId, status: "success" } });
+      markDispatched();
+    }, async (name, handler) => { listeners.set(name, handler); return () => listeners.delete(name); });
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      start(controller) {
+        pushChunk = chunk => controller.enqueue(new TextEncoder().encode(chunk));
+        closeFetch = () => controller.close();
+        markDispatched();
+      },
+      cancel() { cancelled.push("fetch"); },
+    }));
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      if (delay !== limitMs) return originalSetTimeout(callback, delay, ...args);
+      expire = callback;
+      return timerHandle;
+    };
+    globalThis.clearTimeout = handle => {
+      if (handle !== timerHandle) originalClearTimeout(handle);
+      else expire = undefined;
+    };
+    const controller = new AbortController();
+    const pushDelta = (delta, finish_reason) => pushChunk(`data: ${JSON.stringify({ choices: [{ delta, finish_reason }] })}\n\n`);
+    const pushAnthropic = (event, payload) => pushChunk(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    const pending = streamChatCompletion(
+      [{ role: "user", content: "Inspect the requested target." }],
+      {
+        baseUrl: "http://127.0.0.1:8000/v1", model: "fixture", provider: anthropic ? "Anthropic" : "OMLX",
+        ...(anthropic ? { apiProtocol: "anthropic" } : {}), useRustProxy: transport === "Rust",
+      },
+      {
+        onToken() {},
+        onDone() { doneCount++; },
+        onError() {},
+        onRequestDispatched() { return markProgress; },
+      },
+      controller.signal, undefined, 22_118,
+      { reasoningOnlyTimeoutMs: limitMs, contextOwnership: "caller" },
+    );
+    try {
+      await dispatched;
+      pushChunk(": keepalive\n\n");
+      if (anthropic) pushAnthropic("message_start", { type: "message_start" });
+      else pushDelta({ role: "assistant" });
+      await Promise.resolve();
+      assert.equal(expire, undefined, "connection traffic and role do not start the timer");
+      if (anthropic) pushAnthropic("content_block_delta", { delta: { type: "thinking_delta", thinking: "Still examining the project." } });
+      else pushDelta({ reasoning_content: "Still examining the project." });
+      await firstOutput;
+      assert.equal(typeof expire, "function");
+      const deadline = expire;
+      pushChunk(": keepalive\n\n");
+      assert.equal(expire, deadline, "heartbeats cannot clear the timer");
+      if (nextOutput === "semantic text" || nextOutput === "named tool") {
+        if (nextOutput === "semantic text") pushDelta({ content: '{"changes": [' });
+        else pushDelta({ tool_calls: [{ index: 0, id: "read-a", function: { name: "read_file", arguments: '{"path":' } }] });
+        await new Promise(setImmediate);
+        assert.equal(expire, undefined, "a real body or native action can continue after the reasoning-only deadline");
+        if (nextOutput === "semantic text") pushDelta({ content: ']}' }, "stop");
+        else pushDelta({ tool_calls: [{ index: 0, function: { arguments: '"a"}' } }] }, "tool_calls");
+        closeRust?.();
+        closeFetch?.();
+      } else {
+        if (!anthropic) pushDelta({ tool_calls: [{ index: 0, function: { arguments: "" } }] });
+        await new Promise(setImmediate);
+        assert.equal(expire, deadline, "connection traffic and an empty tool placeholder cannot extend or clear the timer");
+        deadline();
+      }
+      const result = await pending;
+      if (nextOutput === "semantic text" || nextOutput === "named tool") {
+        assert.equal(result.clientStopReason, undefined);
+        assert.equal(isStreamOutputLimited(result), false);
+        assert.deepEqual(cancelled, []);
+        if (nextOutput === "semantic text") assert.equal(result.content, '{"changes": []}');
+        else assert.equal(result.toolCalls[0].arguments, '{"path":"a"}');
+      } else {
+        assert.equal(result.clientStopReason, "reasoning_only_timeout");
+        assert.equal(result.finishReason, null);
+        assert.deepEqual(result.toolCalls, []);
+        assert.equal(isStreamOutputLimited(result), true);
+        assert.deepEqual(cancelled, [transport === "Rust" ? dispatchedId : "fetch"]);
+      }
+      assert.equal(doneCount, 1);
+      assert.equal(expire, undefined);
+    } finally {
+      controller.abort();
+      try { closeFetch?.(); } catch { /* reader already closed */ }
+      await pending.catch(() => {});
+      globalThis.fetch = originalFetch;
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+    }
+  });
+
   test(`${transport} provider-budget reasoning streams bypass implicit character guards and retain real finish reasons`, async () => {
     for (const scenario of [
       { limit: null, finish: "tool_calls" },
@@ -2185,9 +2325,13 @@ test("OpenAI-compatible chat replays assistant reasoning only with a discovered 
 
   assert.equal(result.content, "ok");
   assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].messages[1], { role: "assistant", content: "我先读取。" });
   assert.equal(requests[0].messages[1].reasoning_content, undefined);
-  assert.equal(requests[0].messages[1].tool_calls[0].function.name, "read_file");
-  assert.equal(requests[0].messages[2].reasoning_content, undefined);
+  const firstToolMessage = requests[0].messages.find(message => message.tool_calls?.some(call => call.id === "call_1"));
+  assert.equal(firstToolMessage.content, "");
+  assert.equal(firstToolMessage.tool_calls[0].function.name, "read_file");
+  assert.equal(firstToolMessage.reasoning_content, undefined);
+  assert.equal(requests[0].messages.find(message => message.tool_call_id === "call_1").reasoning_content, undefined);
 
   await streamChatCompletion(
     [
@@ -2222,11 +2366,14 @@ test("OpenAI-compatible chat replays assistant reasoning only with a discovered 
   );
 
   assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1].messages[1], { role: "assistant", content: "我先读取。" });
+  const secondToolMessage = requests[1].messages.find(message => message.tool_calls?.some(call => call.id === "call_2"));
   assert.equal(
-    requests[1].messages[1].reasoning_content,
+    secondToolMessage.reasoning_content,
     "Need to inspect the file before answering.",
   );
-  assert.equal(requests[1].messages[2].reasoning_content, undefined);
+  assert.equal(secondToolMessage.content, "");
+  assert.equal(requests[1].messages.find(message => message.tool_call_id === "call_2").reasoning_content, undefined);
 });
 
 test("OpenAI Responses retries 524 failures with aggressive compact input without reasoning", async () => {

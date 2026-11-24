@@ -15,6 +15,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
+import PlanDocumentCard from "./PlanDocumentCard";
+import { continuePlanDraft } from "../store/planDraftContinuation";
+import { resolvePlanDocumentFromAggregate, resolvePlanDraftFromAggregate, resolveSessionPlanDocument } from "../lib/planDocumentRecords";
+import { samePlanDocumentRef } from "../lib/planDocuments";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EQuickReplyHandler, getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
@@ -34,7 +38,9 @@ import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { isPlanCandidateBlock, isReviewablePlanBlock, selectLatestPlanCandidatePreview } from "../lib/chat/chatBlockVisibility";
 import { isPlanApprovalLeaseBoundToState } from "../lib/planLifecycle";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
-import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
+import { getApprovedWorkPlanContinuationIssues, getApprovedWorkPlanExecutionRepair, getContinuableApprovedWorkPlan } from "../store/runtimeV2/approvedPlanContinuation";
+import { latestRuntimeV2ProactiveSkipReason, normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
+import { projectRuntimeV2PlanProgress } from "../lib/runtime-v2/planProgressPresentation";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -1059,6 +1065,25 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     resolveSessionWorkspaceKey(currentWorkspace),
     currentSessionId,
   );
+  const activeSessionEpoch = useAppStore((state) => {
+    const workspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
+    const session = (state.sessionsByWorkspace[workspaceKey] || []).find(candidate => candidate.id === currentSessionId);
+    return session?.planLifecycleEpoch || (state.planLifecycle.sessionKey === activeSessionKey ? state.planLifecycle.sessionEpoch : null);
+  });
+  const versionedPlanTurn = useMemo(() => resolveSessionPlanDocument(conversationTurns, {
+    sessionKey: activeSessionKey, sessionEpoch: activeSessionEpoch,
+  }), [activeSessionKey, activeSessionEpoch, conversationTurns]);
+  const versionedPlanRef = versionedPlanTurn?.planDocument;
+  const versionedPlanAggregate = useMemo(() => versionedPlanTurn ? normalizeRuntimeV2Checkpoint(
+    runtimeV2Checkpoints[versionedPlanTurn.id], {
+      turnId: versionedPlanTurn.id, sessionKey: activeSessionKey ?? undefined, sessionEpoch: activeSessionEpoch ?? undefined,
+    },
+  )?.aggregate : null, [activeSessionEpoch, activeSessionKey, runtimeV2Checkpoints, versionedPlanTurn]);
+  const versionedPlanDocument = useMemo(() => resolvePlanDocumentFromAggregate(versionedPlanAggregate), [versionedPlanAggregate]);
+  const versionedDraft = useMemo(() => {
+    const draft = resolvePlanDraftFromAggregate(versionedPlanAggregate);
+    return draft && samePlanDocumentRef(draft.documentRef, versionedPlanRef) ? draft : null;
+  }, [versionedPlanAggregate, versionedPlanRef]);
   const latestPlanEntry = useMemo(() => {
     const entries = conversationTurns.map((turn) => ({
       turn,
@@ -1079,13 +1104,24 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     ),
     [activeActionRequest, activeSessionKey, conversationTurns],
   );
-  const latestPlanTurn = useMemo(
-    () => actionOwnedPlanTurn ||
-      latestPlanEntry?.turn ||
-      [...conversationTurns].reverse().find((turn) => isPlanConversationTurn(turn)) ||
-      null,
-    [actionOwnedPlanTurn, conversationTurns, latestPlanEntry],
-  );
+  const latestPlanTurn = useMemo(() => {
+    if (actionOwnedPlanTurn) return actionOwnedPlanTurn;
+    const newestFirst = [...conversationTurns].reverse();
+    const selected = newestFirst.find((turn) => turn.id === latestPlanEntry?.turn.id || turn.approvedPlanContinuation) ||
+      newestFirst.find((turn) => isPlanConversationTurn(turn)) || null;
+    const source = selected?.approvedPlanContinuation?.turn;
+    if (!selected || !source || source.sessionKey !== activeSessionKey || source.sessionEpoch !== activeSessionEpoch) {
+      return selected;
+    }
+    const aggregate = normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[selected.id], {
+      sessionKey: source.sessionKey, sessionEpoch: source.sessionEpoch, turnId: selected.id,
+    })?.aggregate;
+    // A drift-blocked or still-preparing attempt cannot replace the approved
+    // source in the panel. Switch when the continuation binds its own review.
+    return aggregate?.planReviewCommit
+      ? selected
+      : conversationTurns.find((turn) => turn.id === source.turnId) ?? selected;
+  }, [actionOwnedPlanTurn, activeSessionEpoch, activeSessionKey, conversationTurns, latestPlanEntry, runtimeV2Checkpoints]);
   const hasVisiblePlanChoice = useMemo(
     () => !!latestPlanTurn && taskFlow.some((block) =>
       block.turnId === latestPlanTurn.id &&
@@ -1101,17 +1137,42 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       : taskFlow;
     return collectChangeEntries(scopedTaskFlow, getDiffStats);
   }, [latestPlanTurn, taskFlow]);
-  const runtimeV2PlanReview = useMemo(
+  const runtimeV2PlanPanel = useMemo(
     () => {
       if (!latestPlanTurn) return null;
-      const checkpoint = normalizeRuntimeV2Checkpoint(
+      const aggregate = normalizeRuntimeV2Checkpoint(
         runtimeV2Checkpoints[latestPlanTurn.id],
-        { turnId: latestPlanTurn.id },
-      );
-      return resolveRuntimeV2PlanReviewFromAggregate(checkpoint?.aggregate);
+        {
+          turnId: latestPlanTurn.id,
+          sessionKey: activeSessionKey ?? undefined,
+          sessionEpoch: activeSessionEpoch ?? undefined,
+        },
+      )?.aggregate;
+      const review = resolveRuntimeV2PlanReviewFromAggregate(aggregate);
+      if (!aggregate || !review) return null;
+      const documentRef = review.commit.artifact.documentRef ?? aggregate.planContinuation?.source.documentRef;
+      if (!review.pending && versionedPlanRef &&
+          !samePlanDocumentRef(documentRef, versionedPlanRef)) {
+        return null;
+      }
+      return { review, progress: projectRuntimeV2PlanProgress(aggregate, review.commit.panel) };
     },
-    [latestPlanTurn, runtimeV2Checkpoints],
+    [activeSessionEpoch, activeSessionKey, latestPlanTurn, runtimeV2Checkpoints, versionedPlanRef],
   );
+  const runtimeV2PlanReview = runtimeV2PlanPanel?.review;
+  const canActOnApprovedPlan = !!runtimeV2PlanReview && !runtimeV2PlanReview.pending && !!latestPlanTurn &&
+    !isGenerating && !abortController && activeActionRequest?.status !== "pending" &&
+    (agentStatus === "idle" || agentStatus === "error");
+  const canContinueApprovedPlan = useAppStore((state) =>
+    canActOnApprovedPlan && !!latestPlanTurn &&
+    !!getContinuableApprovedWorkPlan(state, latestPlanTurn.id)
+  );
+  const approvedPlanContinuationIssues = useMemo(() => latestPlanTurn && runtimeV2PlanReview
+    ? getApprovedWorkPlanContinuationIssues(useAppStore.getState(), latestPlanTurn.id)
+    : [], [latestPlanTurn, runtimeV2PlanReview, runtimeV2Checkpoints]);
+  const approvedPlanRepair = useMemo(() => latestPlanTurn && runtimeV2PlanReview
+    ? getApprovedWorkPlanExecutionRepair(useAppStore.getState(), latestPlanTurn.id)
+    : undefined, [latestPlanTurn, runtimeV2PlanReview, runtimeV2Checkpoints]);
   const legacyPlanApprovalIdentity = buildTypedPlanApprovalIdentity(planArtifacts);
   const planApprovalIdentity = runtimeV2PlanReview
     ? {
@@ -1145,7 +1206,13 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasMatchingPlanActionOwner &&
     !!planApprovalIdentity &&
     activeActionRequest.planRevision === planApprovalIdentity.revision &&
-    activeActionRequest.artifactHash === planApprovalIdentity.artifactHash;
+    activeActionRequest.artifactHash === planApprovalIdentity.artifactHash &&
+    (!activeActionRequest.documentRef || (
+      runtimeV2PlanReview?.pending === true &&
+      activeActionRequest.requestId === runtimeV2PlanReview.commit.review.requestId &&
+      activeActionRequest.sessionEpoch === runtimeV2PlanReview.commit.review.sessionEpoch &&
+      samePlanDocumentRef(activeActionRequest.documentRef, runtimeV2PlanReview.commit.artifact.documentRef)
+    ));
   const hasMatchingPlanChoiceRequest =
     activeActionRequest?.kind === "user_choice" &&
     hasMatchingPlanActionOwner;
@@ -1171,6 +1238,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     !isPlanApproved &&
     latestPlanTurn?.status === "awaiting_input";
   const canResumeExecution =
+    !runtimeV2PlanReview &&
     hasActivePlanContext &&
     !!activeSessionKey &&
     planLifecycle.sessionKey === activeSessionKey &&
@@ -1184,7 +1252,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   // has materialized and verified a plan artifact. Never offer formal-plan
   // continuation/rejection controls for a candidate that failed the gate.
   // A paused, lease-bound execution always wins over planning continuation.
-  const canContinuePlanning = !canResumeExecution && canOfferPlanContinuation({
+  const canContinuePlanning = !runtimeV2PlanPanel?.progress && !canResumeExecution && canOfferPlanContinuation({
     hasActivePlanContext,
     isPlanApproved,
     isAwaitingInput,
@@ -1316,9 +1384,16 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   };
   const hasPlanPanelContent =
     !!runtimeV2PlanReview ||
+    !!versionedPlanRef ||
     planArtifacts.length > 0 ||
     fallbackPlanPreview.length > 0;
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  const subagentTurnId = currentTurnId || conversationTurns[conversationTurns.length - 1]?.id;
+  const proactiveSkipReason = useMemo(() => subagentTurnId && activeSessionKey && activeSessionEpoch
+    ? latestRuntimeV2ProactiveSkipReason(normalizeRuntimeV2Checkpoint(runtimeV2Checkpoints[subagentTurnId], {
+      turnId: subagentTurnId, sessionKey: activeSessionKey, sessionEpoch: activeSessionEpoch,
+    })?.aggregate)
+    : undefined, [activeSessionEpoch, activeSessionKey, subagentTurnId, runtimeV2Checkpoints]);
   // Lane capacity is learned from live first-token overlap and can change
   // without a config write. Resolve it on each panel render so child lifecycle
   // updates also refresh the displayed capacity truth.
@@ -1359,9 +1434,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     return {
       icon: IconFileText,
       title: language === "zh" ? "计划工作区" : "Plan Workspace",
-      description: latestPlanTurn?.title || (language === "zh" ? "在这里查看计划预览、审批状态和执行进度。" : "Review plan previews, approval state, and execution progress here."),
+      description: (!runtimeV2PlanReview ? versionedPlanRef?.title : null) || latestPlanTurn?.title || (language === "zh" ? "在这里查看计划预览、审批状态和执行进度。" : "Review plan previews, approval state, and execution progress here."),
     };
-  }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, subagentRuns.length, viewedDiffTask?.target]);
+  }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, runtimeV2PlanReview, subagentRuns.length, versionedPlanRef?.title, viewedDiffTask?.target]);
 
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
   const isBlackTheme = config.themeMode === "black";
@@ -1411,6 +1486,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       }`} onMouseDown={startResizing} />
       <div
         data-testid="right-panel"
+        data-workbench-panel="right"
         data-panel-tab={rightPanelTab}
         data-turn-lifecycle={rightPanelTab === "plan" ? planPresentation.lifecycle : undefined}
         data-action-kind={rightPanelTab === "plan" ? planPresentation.actionKind : undefined}
@@ -1468,6 +1544,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                       ? language === "zh" ? "失败" : "Failed"
                       : planPresentationBehavior.mode === "no_action"
                       ? language === "zh" ? "未执行" : "No Action"
+                      : versionedDraft
+                      ? language === "zh" ? "草稿" : "Draft"
+                      : versionedPlanRef
+                      ? language === "zh" ? "已保存" : "Saved"
                       : planArtifacts.length > 0
                       ? language === "zh" ? "已同步" : "Synced"
                       : fallbackPlanPreview
@@ -1507,9 +1587,18 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
 
         <div className="min-h-0 flex-1 overflow-hidden">
           {rightPanelTab === "plan" && hasPlanPanelContent && (
+            !runtimeV2PlanReview && versionedPlanRef ? (
+              <div data-testid="versioned-plan-panel" className="h-full overflow-y-auto px-4 pb-5">
+                <PlanDocumentCard reference={versionedPlanRef} draft={versionedDraft} language={language}
+                  inlineMarkdown={versionedPlanDocument && samePlanDocumentRef(versionedPlanDocument.documentRef, versionedPlanRef) ? versionedPlanDocument.markdown : undefined}
+                  continuationDisabled={agentStatus !== "idle" || isGenerating || activeActionRequest?.status === "pending"}
+                  onCompleteValidation={versionedDraft ? async (supplement) => (await continuePlanDraft({ get: useAppStore.getState, record: versionedDraft, supplement })).accepted : undefined} />
+              </div>
+            ) : (
             <PlanPanel
               presentation={planPresentation}
               runtimeV2Review={runtimeV2PlanReview?.commit.panel || null}
+              runtimeV2Progress={runtimeV2PlanPanel?.progress}
               artifacts={planArtifacts}
               tasks={planTasks}
               evidenceLedger={planExecutionEvidenceLedger}
@@ -1531,6 +1620,14 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               onContinuePlanning={handleContinuePlanning}
               onRequestAdjustment={handlePlanAdjustment}
               onResumeExecution={handleResumeExecution}
+              onContinueApprovedWorkPlan={canContinueApprovedPlan && !approvedPlanRepair && latestPlanTurn && runtimeV2PlanReview
+                ? () => useAppStore.getState().continueApprovedWorkPlan(latestPlanTurn.id, runtimeV2PlanReview.commit.authority)
+                : undefined}
+              continuationIssues={approvedPlanContinuationIssues}
+              executionRepair={approvedPlanRepair}
+              onReviseApprovedWorkPlan={canActOnApprovedPlan && (approvedPlanContinuationIssues.length > 0 || approvedPlanRepair) && latestPlanTurn && runtimeV2PlanReview
+                ? () => useAppStore.getState().reviseApprovedWorkPlan(latestPlanTurn.id, runtimeV2PlanReview.commit.authority)
+                : undefined}
               onSaveDocument={handleSavePlanDocument}
               onApprove={() => {
                 if (planReviewResolutionIdentity) {
@@ -1547,7 +1644,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                   void rejectPlanAndDeleteFiles(planReviewResolutionIdentity);
                 }
               }}
-            />
+            />)
           )}
 
           {rightPanelTab === "diff" && (
@@ -1579,6 +1676,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               runs={subagentRuns}
               selectedId={selectedSubagentId}
               capacityPolicy={subagentCapacityPolicy}
+              proactiveSkipReason={proactiveSkipReason}
               language={language}
               themeMode={config.themeMode}
               onSelect={selectSubagent}

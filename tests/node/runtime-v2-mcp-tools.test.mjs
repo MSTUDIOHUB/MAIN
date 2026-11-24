@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import ts from "typescript";
 
@@ -199,7 +200,7 @@ test("Runtime v2 freezes discovered MCP tools, advertises a bounded surface, and
 
   const coldSurface = authorizationContext.providerToolDefinitionsForCommand(ports, { kind: "request_model", payload: { mode: "analyze" } });
   assert.ok(coldSurface.some(tool => tool.function.name === "tool_search"));
-  assert.ok(!coldSurface.some(tool => tool.function.name === mcpEntry.exposedName));
+  assert.ok(coldSurface.some(tool => tool.function.name === mcpEntry.exposedName), "the relevant admitted tool is already usable");
   toolDiscovery.unlockToolsForSession("session-mcp", [mcpEntry.exposedName]);
   const surface = authorizationContext.providerToolDefinitionsForCommand(
     ports,
@@ -331,13 +332,14 @@ test("Runtime v2 keeps MCP effects out of Analyze and requires existing effect a
   });
   assert.equal(effectCompletion.type, "tool.completed");
   assert.equal(effectCompletion.status, "succeeded");
-  assert.ok(effectCompletion.evidence.some((item) => item.kind === "mutation"));
+  assert.equal(effectCompletion.effectKind, "external_operation");
+  assert.deepEqual(effectCompletion.evidence.map((item) => item.kind), ["tool"]);
   assert.deepEqual(
     effectCompletion.evidence.map((item) => item.target),
     ["issue-1"],
     "an MCP effect keeps its external target instead of borrowing a workspace path",
   );
-  assert.equal(ports.live.hasExecutedMutationEffect, true);
+  assert.equal(ports.live.hasExecutedMutationEffect, false);
 
   const turn = {
     workspaceKey: "/tmp/runtime-v2-mcp",
@@ -541,4 +543,161 @@ test("Runtime MCP authorization consumes the admitted workspace snapshot rather 
   assert.ok(!frozen.toolCatalog.entries.some((entry) => entry.executionName === "other_workspace_read"));
   ports.context.workspaceMcpSnapshot = null;
   assert.equal(authorizationContext.authorizationFor(ports), frozen);
+});
+
+test("Analyze receives the bound Editor Console result and rejects raw Unity effects", async (t) => {
+  const { bindWorkspaceUnityMcpView, resolveWorkspaceMcpView } = loadTs("src/lib/workspaceMcp.ts");
+  const { runRuntimeV2ReadOnlyLoop } = loadTs("src/lib/runtime-v2/readOnly.ts");
+  const workspace = "/tmp/runtime-v2-mcp";
+  const server = { name: "Editor fixture", type: "http", url: "http://fixture-editor.example/mcp", enabled: true };
+  const hash = createHash("sha1").update(`${workspace}/Assets`).digest("hex").slice(0, 16);
+  const instance = { id: `fixture@${hash}`, hash, unity_version: "2022.3.62t16" };
+  const schemas = [
+    ["read_console", "Read or clear the Console."],
+    ["unity_reflect", "Inspect API types and members."],
+    ["manage_scene", "Read or change the active scene. Example: get the active scene."],
+    ["find_gameobjects", "Find objects in the active scene."],
+    ["execute_code", "Run C# in Unity and return diagnostics. Example: read the active scene."],
+    ["batch_execute", "Submit tools together and read their results. Example: inspect several assets."],
+    ["apply_text_edits", "Apply text edits and return the resulting status. Example: edit a script."],
+    ["set_active_instance", "Select an Editor instance."],
+  ].map(([name, description]) => ({ name, description, inputSchema: { type: "object", properties: {} } }));
+  const calls = [];
+  const marker = "Console fixture warning 731";
+  const consoleResult = { success: true, message: "Retrieved 1 log entries.",
+    data: [{ type: "Warning", file: "Assets/Fixture.cs", line: 12, message: marker }] };
+  mcpClient.__clearMcpDiscoveryFailureCacheForTests();
+  mcpClient.__setMcpInvokeForTests(async (_command, payload) => {
+    const request = JSON.parse(payload.body);
+    let result = {};
+    if (request.method === "initialize") result = { serverInfo: { name: "mcp-for-unity-server" } };
+    if (request.method === "tools/list") result = { tools: schemas };
+    if (request.method === "resources/read") result = { contents: [{ text: JSON.stringify({ success: true, instances: [instance] }) }] };
+    if (request.method === "tools/call") {
+      calls.push(request.params);
+      result = request.params.name === "set_active_instance"
+        ? { structuredContent: { success: true, data: { instance: instance.id } } }
+        : { content: [{ type: "text", text: JSON.stringify(consoleResult) }], structuredContent: consoleResult };
+    }
+    return { status: 200, ok: true, body: JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) };
+  });
+  t.after(() => {
+    mcpClient.__setMcpInvokeForTests(null);
+    mcpClient.__clearMcpDiscoveryFailureCacheForTests();
+  });
+  const discovery = await mcpClient.discoverAllMcpTools([server], { forceRefresh: true });
+  const workspaceMcpSnapshot = await bindWorkspaceUnityMcpView(resolveWorkspaceMcpView({
+    workspace, manualServers: [server], manualTools: discovery.tools, manualToolServerMap: discovery.toolServerMap,
+  }), instance.unity_version);
+  const state = stateForMcp([], {}, { currentTurnExecutionConsent: { turnId: "turn-mcp", granted: true } });
+  const ports = portsFor(state);
+  ports.context = { ...ports.context, runtimeRunIntent: "analyze", workspaceMcpSnapshot };
+  const turn = {
+    workspaceKey: workspace, sessionKey: "session-mcp", sessionEpoch: "epoch-mcp",
+    clientSubmissionId: "submission-console", turnId: "turn-mcp",
+  };
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId,
+    runId: "run-console", parentRunId: null, attemptId: "attempt-console" };
+  const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+  const scope = authorizationContext.authorizationFor(ports);
+  const rawEntries = scope.toolCatalog.entries.filter(entry => entry.source === "mcp");
+  toolDiscovery.unlockToolsForSession(turn.sessionKey, rawEntries.map(entry => entry.exposedName));
+  const rawEffectNames = rawEntries.filter(entry => ["execute_code", "batch_execute", "apply_text_edits", "read_console", "manage_scene"].includes(entry.executionName));
+  const requested = { id: "console-read", name: "unity_mcp_console", arguments: {} };
+  const published = [];
+  let nextId = 0;
+  let providerRequests = 0;
+  let initialSurface = [];
+  let modelReceivedConsole = false;
+  const result = await runRuntimeV2ReadOnlyLoop({
+    strategy: "analyze", turn, run, objective: "Read the connected Editor Console.",
+    now: Date.now, deadlineMs: 5_000, signal: new AbortController().signal,
+    ports: {
+      clockId: { now: Date.now, nextId: (kind) => `${kind}-${++nextId}`, nextIdempotencyKey: ({ kind }) => `${kind}-${++nextId}` },
+      checkpoint: { append: async (input) => {
+        const result = runtime.appendRuntimeV2Checkpoint({ ...input, checkpoint: state.runtimeV2Checkpoints[turn.turnId] });
+        assert.equal(result.disposition, "committed");
+        state.runtimeV2Checkpoints[turn.turnId] = result.checkpoint;
+        return result;
+      } },
+      provider: { request: async ({ command }) => {
+        if (++providerRequests === 1) {
+          initialSurface = authorizationContext.providerToolDefinitionsForCommand(ports, command).map(tool => tool.function.name);
+          ports.live.messages.push({ role: "assistant", content: "", tool_calls: [{
+            id: requested.id, type: "function", function: { name: requested.name, arguments: "{}" },
+          }] });
+          return { visibleText: "", toolCalls: [requested], diagnostics: [] };
+        }
+        modelReceivedConsole = ports.live.messages.some(message => message.role === "tool" && message.content.includes(marker));
+        return { visibleText: marker, toolCalls: [], diagnostics: [] };
+      } },
+      tool: toolPort,
+      scheduler: { execute: async () => assert.fail("Console read should not schedule children") },
+      projection: { publish: async input => published.push(input) },
+    },
+  });
+  assert.ok(initialSurface.includes(requested.name));
+  const receipt = result.aggregate.events.find(event => event.type === "tool.completed");
+  assert.equal(receipt?.status, "succeeded", receipt?.failureReasonCode);
+  assert.deepEqual(JSON.parse(receipt.modelContent), consoleResult);
+  assert.deepEqual(receipt.evidence.map(item => item.kind), ["tool"]);
+  assert.equal(receipt.effectKind, "observation");
+  assert.equal(modelReceivedConsole, true);
+  assert.equal(result.resultKind, "success");
+  assert.equal(providerRequests, 2);
+  assert.equal(result.aggregate.events.filter(event => event.type === "run.completed").length, 1);
+  assert.equal(result.aggregate.events.filter(event => event.type === "turn.completed").length, 1);
+  assert.equal(published.filter(input => input.audience === "final").length, 1);
+
+  const executeEvidence = (receiptOrigin) => result.aggregate.events
+    .filter(event => event.sequence <= receipt.sequence)
+    .reduce((aggregate, event) => runtime.transition(aggregate,
+      event.type === "turn.admitted" ? { ...event, strategy: "execute", constraints: [], completionRequirement: { kind: "workspace_change", editorDiagnostics: true } }
+        : event === receipt ? { ...event, receiptOrigin } : event), null);
+  assert.equal(runtime.runtimeV2CommandTaskReadyForConclusion(executeEvidence("executed")), false);
+  assert.equal(runtime.runtimeV2CommandTaskReadyForConclusion(executeEvidence("replayed")), false);
+
+  const modelCommand = { kind: "request_model", payload: { mode: "analyze" } };
+  const surface = authorizationContext.providerToolDefinitionsForCommand(ports, modelCommand).map(tool => tool.function.name);
+  assert.ok(surface.includes("unity_mcp_scene"));
+  assert.ok(surface.includes("find_gameobjects"), "an explicitly read-only connector tool remains available");
+  assert.equal(rawEffectNames.length, 5);
+  for (const entry of rawEffectNames) {
+    assert.ok(!surface.includes(entry.exposedName), `${entry.executionName} appeared in Analyze`);
+    const completion = await toolPort.execute({ command: {
+      kind: "execute_tool", phase: "observing", run, idempotencyKey: entry.exposedName,
+      payload: { toolName: entry.exposedName, arguments: { action: "get", query: "SELECT 1" } },
+    }, signal: new AbortController().signal });
+    assert.equal(completion.status, "blocked", entry.executionName);
+    assert.equal(completion.failureReasonCode, "workspace_read_only_authority", entry.executionName);
+    assert.deepEqual(completion.evidence, []);
+  }
+  assert.deepEqual(calls, [
+    { name: "set_active_instance", arguments: { instance: instance.id } },
+    { name: "read_console", arguments: { action: "get", types: ["error", "warning"], count: 25, format: "json" } },
+  ]);
+
+  const { boundRuntimeV2ProviderToolCalls } = loadTs("src/store/runtimeV2/providerToolSurface.ts");
+  const observations = [["read_console", { action: "get", count: 30 }], ["unity_reflect", { action: "get_type", class_name: "UnityEngine.Mesh" }]]
+    .map(([name, args]) => ({ id: name, name: rawEntries.find(entry => entry.executionName === name).exposedName,
+      arguments: args }));
+  const batch = boundRuntimeV2ProviderToolCalls(observations.map(call => ({ ...call,
+    boundEditorObservation: !!authorizationContext.runtimeV2BoundEditorObservation(ports, call.name, call.arguments),
+  })), new Set(), new Set());
+  assert.equal(batch.selection, "safe_batch");
+  assert.equal(batch.accepted.length, 2);
+  for (const call of batch.accepted) {
+    const completion = await toolPort.execute({ command: { kind: "execute_tool", phase: "observing", run,
+      idempotencyKey: call.id, payload: { toolName: call.name, arguments: call.arguments } }, signal: new AbortController().signal });
+    assert.equal(completion.status, "succeeded");
+    assert.equal(completion.effectKind, "observation");
+    assert.deepEqual(completion.evidence.map(item => item.kind), ["tool"]);
+  }
+  assert.deepEqual(calls.slice(-4).map(call => call.name), ["set_active_instance", "read_console", "set_active_instance", "unity_reflect"]);
+
+  state.config.toolPermissionPolicy = { disabledRiskLevels: ["external_read"] };
+  const disabledPorts = { ...ports, live: executionTypes.createRuntimeV2LiveExecutionState() };
+  assert.ok(!authorizationContext.providerToolDefinitionsForCommand(disabledPorts, modelCommand)
+    .some(tool => tool.function.name === requested.name));
+  assert.equal((await authorization.authorizeToolForCurrentTurn(disabledPorts, requested.name, {})).allowed, false);
 });

@@ -100,7 +100,7 @@ function complete(state, resultKind = "success", reason = `run_${resultKind}`) {
 }
 
 test("every workspace strategy starts as one admitted, open Turn before a Run exists", () => {
-  for (const strategy of ["chat", "plan", "execute", "goal"]) {
+  for (const strategy of ["chat", "plan", "execute"]) {
     const state = create(strategy);
     assert.equal(state.turn.strategy, strategy);
     assert.equal(state.turn.status, "open");
@@ -384,7 +384,7 @@ test("canceled completion without abort and non-canceled completion after abort 
 });
 
 test("run identity fence rejects stale epochs, attempts, and run ids", () => {
-  const state = start(create("goal"), "investigating");
+  const state = start(create("execute"), "investigating");
   for (const staleRun of [
     { ...baseRun, sessionEpoch: "epoch-old" },
     { ...baseRun, attemptId: "attempt-old" },
@@ -490,13 +490,13 @@ test("guidance fails closed without a running owner and a closed Turn admits imm
   const closed = complete(start(create("chat")), "partial", "partial_done");
   assert.deepEqual(decideTurnIngress({
     mode: "submit",
-    strategy: "goal",
+    strategy: "execute",
     activeTurn: closed,
   }), {
     kind: "admit_turn",
     createsTurn: true,
     admission: "immediate",
-    strategy: "goal",
+    strategy: "execute",
   });
 });
 

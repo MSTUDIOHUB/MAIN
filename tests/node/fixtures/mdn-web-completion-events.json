@@ -1,0 +1,605 @@
+[
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 0,
+    "eventId": "runtime-v2-event:mw55vmbz:1",
+    "at": 1793980849103,
+    "type": "turn.admitted",
+    "workspaceInstructionContext": "",
+    "networkRead": {
+      "enabled": true,
+      "provider": "bing"
+    },
+    "turn": {
+      "workspaceKey": "__MAIN_GLOBAL_CHAT__",
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "clientSubmissionId": "turn-1793980848987-y4re7h",
+      "turnId": "turn-1793980848987-y4re7h"
+    },
+    "strategy": "execute",
+    "objective": "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。",
+    "capabilityRestrictions": [],
+    "approvalRequiredCapabilities": [],
+    "constraints": [],
+    "acceptanceCriteria": [
+      "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。"
+    ],
+    "acceptanceCriterionIds": [
+      "criterion-user-objective"
+    ],
+    "acceptanceEvidenceRequirements": [
+      null
+    ]
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 1,
+    "eventId": "runtime-v2-event:mw55vmd7:2",
+    "at": 1793980849147,
+    "type": "run.started",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "phase": "preparing"
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 2,
+    "eventId": "runtime-v2-event:mw55vmdv:3",
+    "at": 1793980849171,
+    "type": "command.scheduled",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "command": {
+      "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:preparing:collect_observation:attempt-1:runtime-v2-action-sha256-70e915fe3b066e4b63197413b4cf10cc26e706b642920e80efbc7b74a3b5a388",
+      "kind": "collect_observation",
+      "run": {
+        "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+        "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+        "turnId": "turn-1793980848987-y4re7h",
+        "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+        "parentRunId": null,
+        "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+      },
+      "phase": "preparing",
+      "payload": {
+        "objective": "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。",
+        "acceptanceCriteria": [
+          "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。"
+        ],
+        "actionFingerprint": "runtime-v2-action-sha256-70e915fe3b066e4b63197413b4cf10cc26e706b642920e80efbc7b74a3b5a388",
+        "attempt": 1
+      }
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 3,
+    "eventId": "runtime-v2-event:mw55vmej:5",
+    "at": 1793980849195,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vmej:4",
+    "projection": {
+      "id": "capsule:mw55vmej:4",
+      "audience": "capsule_live",
+      "markdown": "正在收集与当前目标相关的上下文与证据。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:action:run-19043c4b-9f30-4ed5-b904-37f6758f1432:preparing:collect_observation:attempt-1:runtime-v2-action-sha256-70e915fe3b066e4b63197413b4cf10cc26e706b642920e80efbc7b74a3b5a388"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 4,
+    "eventId": "runtime-v2-event:mw55vmfv:7",
+    "at": 1793980849243,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "timeline",
+    "projectionId": "timeline:mw55vmfv:6",
+    "projection": {
+      "id": "timeline:mw55vmfv:6",
+      "audience": "timeline",
+      "markdown": "正在收集与当前目标相关的上下文与证据。",
+      "kind": "timeline",
+      "dedupeKey": "turn-1793980848987-y4re7h:command:run-19043c4b-9f30-4ed5-b904-37f6758f1432:preparing:collect_observation:attempt-1:runtime-v2-action-sha256-70e915fe3b066e4b63197413b4cf10cc26e706b642920e80efbc7b74a3b5a388"
+    }
+  },
+  {
+    "type": "command.completed",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:preparing:collect_observation:attempt-1:runtime-v2-action-sha256-70e915fe3b066e4b63197413b4cf10cc26e706b642920e80efbc7b74a3b5a388",
+    "status": "succeeded",
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 5,
+    "eventId": "runtime-v2-event:mw55vmhu:8",
+    "at": 1793980849314
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 6,
+    "eventId": "runtime-v2-event:mw55vmik:11",
+    "at": 1793980849340,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vmik:10",
+    "projection": {
+      "id": "capsule:mw55vmik:10",
+      "audience": "capsule_live",
+      "markdown": "正在准备执行。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:phase:preparing:1793980849314"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 7,
+    "eventId": "runtime-v2-event:mw55vmki:12",
+    "at": 1793980849410,
+    "type": "phase.changed",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "phase": "observing",
+    "reason": "初始准备已处理，继续获取本轮任务所需的信息。"
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 8,
+    "eventId": "runtime-v2-event:mw55vml9:14",
+    "at": 1793980849437,
+    "type": "command.scheduled",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "command": {
+      "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-bdaa5cdc331a6274193d96978868cfef5a5068855fe76ee64d30b45305c46333",
+      "kind": "request_model",
+      "run": {
+        "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+        "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+        "turnId": "turn-1793980848987-y4re7h",
+        "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+        "parentRunId": null,
+        "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+      },
+      "phase": "observing",
+      "payload": {
+        "mode": "execute",
+        "objective": "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。",
+        "acceptanceCriteria": [
+          "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。"
+        ],
+        "evidenceIds": [],
+        "hasVersionedSourceEvidence": false,
+        "collaborationAllowed": false,
+        "collaborationPreferred": false,
+        "collaborationRequestMode": "parallel",
+        "collaborationAction": "optional",
+        "activeSubagents": [],
+        "failedSubagents": [],
+        "maxActiveSubagents": 1,
+        "maxChildRuns": 1,
+        "remainingSubagentCapacity": 1,
+        "actionFingerprint": "runtime-v2-action-sha256-bdaa5cdc331a6274193d96978868cfef5a5068855fe76ee64d30b45305c46333",
+        "attempt": 1
+      }
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 9,
+    "eventId": "runtime-v2-event:mw55vmm1:16",
+    "at": 1793980849465,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vmm1:15",
+    "projection": {
+      "id": "capsule:mw55vmm1:15",
+      "audience": "capsule_live",
+      "markdown": "正在确认实施方案所需的关键细节。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:action:run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-bdaa5cdc331a6274193d96978868cfef5a5068855fe76ee64d30b45305c46333"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 10,
+    "eventId": "runtime-v2-event:mw55vmnf:18",
+    "at": 1793980849515,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "timeline",
+    "projectionId": "timeline:mw55vmnf:17",
+    "projection": {
+      "id": "timeline:mw55vmnf:17",
+      "audience": "timeline",
+      "markdown": "正在确认实施方案所需的关键细节。",
+      "kind": "timeline",
+      "dedupeKey": "turn-1793980848987-y4re7h:command:run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-bdaa5cdc331a6274193d96978868cfef5a5068855fe76ee64d30b45305c46333"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 11,
+    "eventId": "runtime-v2-event:mw55vpfd:20",
+    "at": 1793980853113,
+    "type": "provider.responded",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-bdaa5cdc331a6274193d96978868cfef5a5068855fe76ee64d30b45305c46333",
+    "result": {
+      "toolCalls": [
+        {
+          "id": "provider-tool-call:mw55vpfd:19",
+          "name": "web_fetch",
+          "arguments": {
+            "url": "https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone"
+          }
+        }
+      ],
+      "diagnostics": []
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 12,
+    "eventId": "runtime-v2-event:mw55vpg4:23",
+    "at": 1793980853140,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vpg4:22",
+    "projection": {
+      "id": "capsule:mw55vpg4:22",
+      "audience": "capsule_live",
+      "markdown": "正在收集证据。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:phase:observing:1793980853113"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 13,
+    "eventId": "runtime-v2-event:mw55vphk:24",
+    "at": 1793980853192,
+    "type": "command.scheduled",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "command": {
+      "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:execute_tool:attempt-1:runtime-v2-action-sha256-dae6cb0e7454824bf2a0cf7c72855c91e7bd1324e5a47f37eb6b58dd4cf482a6",
+      "kind": "execute_tool",
+      "run": {
+        "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+        "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+        "turnId": "turn-1793980848987-y4re7h",
+        "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+        "parentRunId": null,
+        "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+      },
+      "phase": "observing",
+      "payload": {
+        "toolCallId": "provider-tool-call:mw55vpfd:19",
+        "toolName": "web_fetch",
+        "arguments": {
+          "url": "https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone"
+        },
+        "collaborationPreferred": false,
+        "collaborationAction": "optional",
+        "maxActiveSubagents": 1,
+        "maxChildRuns": 1,
+        "actionFingerprint": "runtime-v2-action-sha256-dae6cb0e7454824bf2a0cf7c72855c91e7bd1324e5a47f37eb6b58dd4cf482a6",
+        "attempt": 1
+      }
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 14,
+    "eventId": "runtime-v2-event:mw55vpic:26",
+    "at": 1793980853220,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vpic:25",
+    "projection": {
+      "id": "capsule:mw55vpic:25",
+      "audience": "capsule_live",
+      "markdown": "正在抓取网页 当前工作区 的详细内容。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:action:run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:execute_tool:attempt-1:runtime-v2-action-sha256-dae6cb0e7454824bf2a0cf7c72855c91e7bd1324e5a47f37eb6b58dd4cf482a6"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 15,
+    "eventId": "runtime-v2-event:mw55vpjs:28",
+    "at": 1793980853272,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "timeline",
+    "projectionId": "timeline:mw55vpjs:27",
+    "projection": {
+      "id": "timeline:mw55vpjs:27",
+      "audience": "timeline",
+      "markdown": "正在抓取网页 当前工作区 的详细内容。",
+      "kind": "timeline",
+      "dedupeKey": "turn-1793980848987-y4re7h:command:run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:execute_tool:attempt-1:runtime-v2-action-sha256-dae6cb0e7454824bf2a0cf7c72855c91e7bd1324e5a47f37eb6b58dd4cf482a6"
+    }
+  },
+  {
+    "type": "tool.completed",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:execute_tool:attempt-1:runtime-v2-action-sha256-dae6cb0e7454824bf2a0cf7c72855c91e7bd1324e5a47f37eb6b58dd4cf482a6",
+    "status": "succeeded",
+    "evidence": [
+      {
+        "id": "E1",
+        "kind": "tool",
+        "target": "https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone",
+        "version": "sha256-d512fbe6779817cfc874cee40fd2194149aa02d5e067569e61e19b1d75e56421"
+      }
+    ],
+    "presentation": {
+      "toolName": "web_fetch",
+      "target": "https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone",
+      "message": "{\"charCount\":11473,\"content\":\"Window: structuredClone() method - Web APIs | MDN Skip to main content Skip to search HTML HTML: Markup language HTML reference Elements Global attributes Attributes See all… HTML guides Responsive images HTML cheatsheet Date & time formats See all… Markup languages SVG MathML XML CSS CSS: Styling language CSS reference Properties Selectors At-rules Values See all… CSS guides Box model Animations Flexbox Colors See all… Layout cookbook Column layouts Centering an element Card component See all… JavaScript JS JavaScript: Scripting language JS reference Standard built-in objects Expressions & operators Statements & declarations Functions See all… JS guides Control flow & error handling Loops and iteration Working with objects Using classes See all… Web APIs Web APIs: Programming interfaces Web API reference File system API Fetch API Geolocation API HTML DOM API Push API Service worker API See all… Web API guides Using the Web animation API Using the Fetch API Working with the History API Using the Web speech API Using web workers All All web technology Technologies Accessibility HTTP URI Web extensions WebAssembly WebDriver See all… Topics Media Performance Privacy Security Progressive web apps Learn Learn web development Frontend developer course Getting started modules Core modules MDN Curriculum Check out the video course from Scrimba, our partner Learn HTML Structuring content with HTML module Learn CSS CSS styling basics module CSS layout module Learn JavaScript Dynamic scripting with JavaScript module Tools Discover our tools Playground HTTP Observatory Border-image generator Border-radius generator Box-shadow generator Color format converter Color mixer Shape generator About Get to know MDN better About MDN Advertise with us Community MDN on GitHub Blog Toggle sidebar Web Web APIs Window structuredClone() Theme OS default Light Dark English (US) Remember language Learn more Deutsch English (US) Français 日本語 한국어 中文 (简体) Window: structuredClone() method Baseline Widely available This feature is well established and works across many devices and browser versions. It’s been available across browsers since March 2022. See full compatibility Learn more The structuredClone() method of the Window interface creates a deep clone of a value using the structured clone algorithm . The method also allows transferable objects in the original value to be transferred rather than cloned to the new object. Transferred objects are detached from the original object and attached to the new object; they are no longer accessible in the original object. Note: Up to Firefox 148, structuredClone.call(iframe.contentWindow) incorrectly created objects in the caller's realm instead of the iframe's realm. In Firefox 149, the implementation changed to instantiate objects in the this realm, so the method's behavior more closely matches the specification. Across all browsers, a direct call structuredClone(value) clones values in the caller's realm. From Firefox 149, web extension content scripts can call window.structuredClone(value) to clone values in the page's realm and globalThis.structuredClone(value) to clone into the realm of the content script. For more information, see structuredClone in content scripts . In this article Syntax Description Examples Specifications Browser compatibility See also Syntax js structuredClone(value) structuredClone(value, options) Parameters value The object to be cloned. This can be any structured-cloneable type . options Optional An object with the following properties: transfer An array of transferable objects that will be moved rather than cloned to the returned object. Return value A deep copy of the original value . Exceptions DataCloneError DOMException Thrown if any part of the input value is not serializable. Description This function can be used to deep copy JavaScript values. It also supports circular references, as shown below: js // Create\n[Tool output truncated by Runtime v2.]",
+      "observationSummary": "{\"charCount\":11473,\"content\":\"Window: structuredClone() method - Web APIs | MDN Skip to main content Skip to search HTML HTML: Markup language HTML reference Elements Global attributes Attributes See all… HTML guides Responsive images HTML cheatsheet Date & time formats See all… Markup languages SVG MathML XML CSS CSS: Styling language CSS reference Properties Selectors At-rules Values See all… CSS guides Box model Animations Flexbox Colors See all… Layout cookbook Column layouts Centering an element Card component See all… JavaScript JS JavaScript: Scripting language JS reference Standard built-in objects Expressions & operators Statements & declarations Functions See all… JS guides Control flow & error handling Loops and iteration Working with objects Using classes See all… Web APIs Web APIs: Programming interfaces Web API reference File system API Fetch API Geolocation API HTML DOM API Push API Service worker API See all… Web API guides Using the Web animation API Using the Fetch API Working with the History API Using the Web speech API Using web workers All All web technology Technologies Accessibility HTTP URI Web extensions WebAssembly We\n[Tool output truncated by Runtime v2.]"
+    },
+    "modelContent": "{\"charCount\":11473,\"content\":\"Window: structuredClone() method - Web APIs | MDN Skip to main content Skip to search HTML HTML: Markup language HTML reference Elements Global attributes Attributes See all… HTML guides Responsive images HTML cheatsheet Date & time formats See all… Markup languages SVG MathML XML CSS CSS: Styling language CSS reference Properties Selectors At-rules Values See all… CSS guides Box model Animations Flexbox Colors See all… Layout cookbook Column layouts Centering an element Card component See all… JavaScript JS JavaScript: Scripting language JS reference Standard built-in objects Expressions & operators Statements & declarations Functions See all… JS guides Control flow & error handling Loops and iteration Working with objects Using classes See all… Web APIs Web APIs: Programming interfaces Web API reference File system API Fetch API Geolocation API HTML DOM API Push API Service worker API See all… Web API guides Using the Web animation API Using the Fetch API Working with the History API Using the Web speech API Using web workers All All web technology Technologies Accessibility HTTP URI Web extensions WebAssembly WebDriver See all… Topics Media Performance Privacy Security Progressive web apps Learn Learn web development Frontend developer course Getting started modules Core modules MDN Curriculum Check out the video course from Scrimba, our partner Learn HTML Structuring content with HTML module Learn CSS CSS styling basics module CSS layout module Learn JavaScript Dynamic scripting with JavaScript module Tools Discover our tools Playground HTTP Observatory Border-image generator Border-radius generator Box-shadow generator Color format converter Color mixer Shape generator About Get to know MDN better About MDN Advertise with us Community MDN on GitHub Blog Toggle sidebar Web Web APIs Window structuredClone() Theme OS default Light Dark English (US) Remember language Learn more Deutsch English (US) Français 日本語 한국어 中文 (简体) Window: structuredClone() method Baseline Widely available This feature is well established and works across many devices and browser versions. It’s been available across browsers since March 2022. See full compatibility Learn more The structuredClone() method of the Window interface creates a deep clone of a value using the structured clone algorithm . The method also allows transferable objects in the original value to be transferred rather than cloned to the new object. Transferred objects are detached from the original object and attached to the new object; they are no longer accessible in the original object. Note: Up to Firefox 148, structuredClone.call(iframe.contentWindow) incorrectly created objects in the caller's realm instead of the iframe's realm. In Firefox 149, the implementation changed to instantiate objects in the this realm, so the method's behavior more closely matches the specification. Across all browsers, a direct call structuredClone(value) clones values in the caller's realm. From Firefox 149, web extension content scripts can call window.structuredClone(value) to clone values in the page's realm and globalThis.structuredClone(value) to clone into the realm of the content script. For more information, see structuredClone in content scripts . In this article Syntax Description Examples Specifications Browser compatibility See also Syntax js structuredClone(value) structuredClone(value, options) Parameters value The object to be cloned. This can be any structured-cloneable type . options Optional An object with the following properties: transfer An array of transferable objects that will be moved rather than cloned to the returned object. Return value A deep copy of the original value . Exceptions DataCloneError DOMException Thrown if any part of the input value is not serializable. Description This function can be used to deep copy JavaScript values. It also supports circular references, as shown below: js // Create an object with a value and a circular reference to itself. const original = { name: \\\"MDN\\\" }; original.itself = original; // Clone it const clone = structuredClone(original); console.assert(clone !== original); // the objects are not the same (not same identity) console.assert(clone.name === \\\"MDN\\\"); // they do have the same values console.assert(clone.itself === clone); // and the circular reference is preserved Transferring values Transferable objects (only) can be transferred rather than duplicated in the cloned object, using the transfer property of the options parameter. Transferring makes the original object unusable. Note: A scenario where this might be useful is when asynchronously validating some data in a buffer before saving it. To avoid the buffer being modified before the data is saved, you can clone the buffer and validate that data. If you also transfer the data, any attempts to modify the original buffer will fail, preventing its accidental misuse. This code shows how to clone an array and transfer its underlying resources to the new object. On return, the original uInt8Array.buffer is cleared. js // 16MB = 1024 * 1024 * 16 const uInt8Array = Uint8Array.from({ length: 1024 * 1024 * 16 }, (v, i) => i); const transferred = structuredClone(uInt8Array, { transfer: [uInt8Array.buffer], }); console.log(uInt8Array.byteLength); // 0 You can clone any number of objects and transfer any subset of those objects. For example, this code transfers arrayBuffer1 from the passed in value, but not arrayBuffer2 . js const transferred = structuredClone( { x: { y: { z: arrayBuffer1, w: arrayBuffer2 } } }, { transfer: [arrayBuffer1] }, ); Examples Cloning an object In this example, we clone an object with one member, which is an array. After cloning, changes to each object do not affect the other object. js const mushrooms1 = { amanita: [\\\"muscaria\\\", \\\"virosa\\\"], }; const mushrooms2 = structuredClone(mushrooms1); mushrooms2.amanita.push(\\\"pantherina\\\"); mushrooms1.amanita.pop(); console.log(mushrooms2.amanita); // [\\\"muscaria\\\", \\\"virosa\\\", \\\"pantherina\\\"] console.log(mushrooms1.amanita); // [\\\"muscaria\\\"] Transferring an object In this example we create an ArrayBuffer and then clone the object it is a member of, transferring the buffer. We can use the buffer in the cloned object, but if we try to use the original buffer we get an exception. js // Create an ArrayBuffer with a size in bytes const buffer = new ArrayBuffer(16); const object1 = { buffer, }; // Clone the object containing the buffer, and transfer it const object2 = structuredClone(object1, { transfer: [buffer] }); // Create an array from the cloned buffer const int32View2 = new Int32Array(object2.buffer); int32View2[0] = 42; console.log(int32View2[0]); // Creating an array from the original buffer throws a TypeError const int32View1 = new Int32Array(object1.buffer); Specifications Specification HTML # dom-structuredclone Browser compatibility See also A polyfill of structuredClone is available in core-js Structured clone algorithm Help improve MDN Was this page helpful to you? Yes No Learn how to contribute This page was last modified on Oct 26, 2026 by MDN contributors . View this page on GitHub • Report a problem with this content Filter sidebar Clear filter input HTML DOM API Window Instance properties caches closed cookieStore crashReport credentialless crossOriginIsolated crypto customElements devicePixelRatio document documentPictureInPicture event external fence frameElement frames fullScreen history indexedDB innerHeight innerWidth isSecureContext launchQueue length localStorage location locationbar menubar mozInnerScreenX mozInnerScreenY name navigation navigator opener orientation origin originAgentCluster outerHeight outerWidth parent performance personalbar scheduler screen screenLeft screenTop screenX screenY scrollbars scrollMaxX scrollMaxY scrollX scrollY self sessionStorage sharedStorage speechSynthesis status statusbar toolbar top trustedTypes viewport visualViewport window Instance methods alert() atob() blur() btoa() cancelAnimationFrame() cancelIdleCallback() captureEvents() clearImmediate() clearInterval() clearTimeout() close() confirm() createImageBitmap() dump() fetch() fetchLater() find() focus() getComputedStyle() getDefaultComputedStyle() getScreenDetails() getSelection() matchMedia() moveBy() moveTo() open() postMessage() print() prompt() queryLocalFonts() queueMicrotask() releaseEvents() reportError() requestAnimationFrame() requestFileSystem() requestIdleCallback() requestResize() resizeBy() resizeTo() scroll() scrollBy() scrollByLines() scrollByPages() scrollTo() setImmediate() setInterval() setResizable() setTimeout() showDirectoryPicker() showOpenFilePicker() showSaveFilePicker() sizeToContent() stop() structuredClone() webkitConvertPointFromNodeToPage() webkitConvertPointFromPageToNode() Events afterprint appinstalled beforeinstallprompt beforeprint beforeunload blur devicemotion deviceorientation deviceorientationabsolute error focus gamepadconnected gamepaddisconnected hashchange languagechange load message messageerror offline online orientationchange pagehide pagereveal pageshow pageswap popstate rejectionhandled resize scrollsnapchange scrollsnapchanging storage unhandledrejection unload vrdisplayactivate vrdisplayconnect vrdisplaydeactivate vrdisplaydisconnect vrdisplaypresentchange Inheritance EventTarget Related pages for HTML DOM BeforeUnloadEvent DOMStringMap ErrorEvent HTMLAnchorElement HTMLAreaElement HTMLAudioElement HTMLBRElement HTMLBaseElement HTMLBodyElement HTMLButtonElement HTMLCanvasElement HTMLDListElement HTMLDataElement HTMLDataListElement HTMLDialogElement HTMLDivElement HTMLDocument HTMLElement HTMLEmbedElement HTMLFieldSetElement HTMLFormControlsCollection HTMLFormElement HTMLFrameSetElement HTMLGeolocationElement HTMLHRElement HTMLHeadElement HTMLHeadingElement HTMLHtmlElement HTMLIFrameElement HTMLImageElement HTMLInputElement HTMLLIElement HTMLLabelElement HTMLLegendElement HTMLLinkElement HTMLMapElement HTMLMediaElement HTMLMenuElement HTMLMetaElement HTMLMeterElement HTMLModElement HTMLOListElement HTMLObjectElement HTMLOptGroupElement HTMLOptionElement HTMLOptionsCollection HTMLOutputElement HTMLParagraphElement HTMLPictureElement HTMLPreElement HTMLProgressElement HTMLQuoteElement HTMLScriptElement HTMLSelectElement HTMLSourceElement HTMLSpanElement HTMLStyleElement HTMLTableCaptionElement HTMLTableCellElement HTMLTableColElement HTMLTableElement HTMLTableRowElement HTMLTableSectionElement HTMLTemplateElement HTMLTextAreaElement HTMLTimeElement HTMLTitleElement HTMLTrackElement HTMLUListElement HTMLUnknownElement HTMLVideoElement HashChangeEvent History ImageData Location MessageChannel MessageEvent MessagePort Navigator PageRevealEvent PageSwapEvent PageTransitionEvent Plugin PluginArray PromiseRejectionEvent RadioNodeList TimeRanges UserActivation ValidityState WorkletGlobalScope Guides Using microtasks in JavaScript with queueMicrotask() In depth: Microtasks and the JavaScript runtime environment Your blueprint for a better internet. MDN About Blog Mozilla careers Advertise with us MDN Plus Product help Contribute MDN Community Community resources Writing guidelines MDN Discord MDN on GitHub Developers Web technologies Learn web development Guides Tutorials Glossary Hacks blog Website Privacy Notice Telemetry Settings Legal Community Participation Guidelines Portions of this content are ©1998–2026 by individual mozilla.org contributors. Content available under a Creative Commons license .\",\"contentType\":\"text/html\",\"finalUrl\":\"https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone\",\"source\":\"web\",\"title\":\"Window: structuredClone() method - Web APIs | MDN\",\"truncated\":false,\"url\":\"https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone\"}",
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 16,
+    "eventId": "runtime-v2-event:mw55vs54:29",
+    "at": 1793980856632
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 17,
+    "eventId": "runtime-v2-event:mw55vs5x:31",
+    "at": 1793980856661,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vs5x:30",
+    "projection": {
+      "id": "capsule:mw55vs5x:30",
+      "audience": "capsule_live",
+      "markdown": "正在收集证据。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:phase:observing:1793980856632"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 18,
+    "eventId": "runtime-v2-event:mw55vs87:32",
+    "at": 1793980856743,
+    "type": "command.scheduled",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "command": {
+      "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-3600b5f71940e98b081f06050f2ddde651c29f7e961f845b94e97d8816cbb4ba",
+      "kind": "request_model",
+      "run": {
+        "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+        "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+        "turnId": "turn-1793980848987-y4re7h",
+        "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+        "parentRunId": null,
+        "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+      },
+      "phase": "observing",
+      "payload": {
+        "mode": "execute",
+        "objective": "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。",
+        "acceptanceCriteria": [
+          "请联网搜索 MDN 的 structuredClone 文档，并打开 https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone ，说明 transfer 参数对原 ArrayBuffer 有什么影响。请给出来源链接。"
+        ],
+        "evidenceIds": [
+          "E1"
+        ],
+        "hasVersionedSourceEvidence": false,
+        "collaborationAllowed": false,
+        "collaborationPreferred": false,
+        "collaborationRequestMode": "parallel",
+        "collaborationAction": "optional",
+        "activeSubagents": [],
+        "failedSubagents": [],
+        "maxActiveSubagents": 1,
+        "maxChildRuns": 1,
+        "remainingSubagentCapacity": 1,
+        "actionFingerprint": "runtime-v2-action-sha256-3600b5f71940e98b081f06050f2ddde651c29f7e961f845b94e97d8816cbb4ba",
+        "attempt": 1
+      }
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 19,
+    "eventId": "runtime-v2-event:mw55vs93:34",
+    "at": 1793980856775,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "capsule_live",
+    "projectionId": "capsule:mw55vs93:33",
+    "projection": {
+      "id": "capsule:mw55vs93:33",
+      "audience": "capsule_live",
+      "markdown": "正在确认实施方案所需的关键细节。",
+      "kind": "live_action",
+      "dedupeKey": "turn-1793980848987-y4re7h:action:run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-3600b5f71940e98b081f06050f2ddde651c29f7e961f845b94e97d8816cbb4ba"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 20,
+    "eventId": "runtime-v2-event:mw55vsar:36",
+    "at": 1793980856835,
+    "type": "projection.published",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "audience": "timeline",
+    "projectionId": "timeline:mw55vsar:35",
+    "projection": {
+      "id": "timeline:mw55vsar:35",
+      "audience": "timeline",
+      "markdown": "正在确认实施方案所需的关键细节。",
+      "kind": "timeline",
+      "dedupeKey": "turn-1793980848987-y4re7h:command:run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-3600b5f71940e98b081f06050f2ddde651c29f7e961f845b94e97d8816cbb4ba"
+    }
+  },
+  {
+    "schemaVersion": "runtime-v2-event.v1",
+    "sequence": 21,
+    "eventId": "runtime-v2-event:mw55w1np:37",
+    "at": 1793980868965,
+    "type": "provider.responded",
+    "run": {
+      "sessionKey": "__MAIN_GLOBAL_CHAT__:839719",
+      "sessionEpoch": "plan-session-1793980833167-99d270e8-9d0e-447b-949f-006d7ab33c3b",
+      "turnId": "turn-1793980848987-y4re7h",
+      "runId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432",
+      "parentRunId": null,
+      "attemptId": "run-19043c4b-9f30-4ed5-b904-37f6758f1432"
+    },
+    "idempotencyKey": "run-19043c4b-9f30-4ed5-b904-37f6758f1432:observing:request_model:attempt-1:runtime-v2-action-sha256-3600b5f71940e98b081f06050f2ddde651c29f7e961f845b94e97d8816cbb4ba",
+    "result": {
+      "toolCalls": [],
+      "diagnostics": [],
+      "visibleText": "## 结论\n\n在 `structuredClone(value, { transfer: [buffer] })` 中，`transfer` 参数会把指定的可转移对象（如 `ArrayBuffer`）**从原对象中\"剥离/转移\"（detach）出来**，而不是复制一份。\n\n### 对原 ArrayBuffer 的具体影响\n\n**转移后，原 ArrayBuffer 被\"清空/失效\"，变成不可用状态：**\n\n- 它的 `byteLength` 变为 `0`（资源被拿走，长度归零）。\n- 任何试图使用它的操作都会抛错。MDN 的例子中，对原 buffer 创建 `Int32Array` 视图会抛出 `TypeError`。\n\nMDN 原文关键描述：\n\n> Transferable objects (only) can be transferred rather than duplicated in the cloned object, using the transfer property of the options parameter. **Transferring makes the original object unusable.**\n\n> On return, the original `uInt8Array.buffer` is cleared.\n\n### 代码示例（来自 MDN）\n\n```js\n// 转移后，原 buffer 的 byteLength 变为 0\nconst uInt8Array = Uint8Array.from({ length: 1024 * 1024 * 16 }, (v, i) => i);\nconst transferred = structuredClone(uInt8Array, { transfer: [uInt8Array.buffer] });\nconsole.log(uInt8Array.byteLength); // 0\n\n// 对原 buffer 创建视图会抛 TypeError\nconst buffer = new ArrayBuffer(16);\nconst object1 = { buffer };\nconst object2 = structuredClone(object1, { transfer: [buffer] });\nnew Int32Array(object2.buffer);   // ✅ 克隆出的 buffer 可用\nnew Int32Array(object1.buffer);   // ❌ 抛出 TypeError（原 buffer 已失效）\n```\n\n### 要点小结\n\n| 维度 | 效果 |\n|------|------|\n| 克隆出的对象 | 获得该 `ArrayBuffer` 的完整资源，可正常使用 |\n| 原 `ArrayBuffer` | 被 detach，`byteLength` 变 `0`，再访问抛 `TypeError` |\n| 转移数量 | 可以转移传入对象中任意子集（例如只转移 `arrayBuffer1`，保留 `arrayBuffer2`） |\n\n> 注意：`transfer` 数组里**只能**放可转移对象（transferable，如 `ArrayBuffer`、`MessagePort` 等），不能放普通对象，否则抛 `DataCloneError`。\n\n### 来源链接\n\n- 本文档：https://developer.mozilla.org/en-US/docs/Web/API/Window/structuredClone\n- 规范原文（HTML #dom-structuredclone）：https://html.spec.whatwg.org/multipage/clones.html#dom-structuredclone"
+    }
+  }
+]

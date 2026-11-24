@@ -244,6 +244,12 @@ export interface AnthropicStreamProcessor {
   processChunk: (chunk: string) => void;
   flush: () => void;
   getResult: () => StreamResultLike;
+  getProgress: () => {
+    reasoningChars: number;
+    visibleChars: number;
+    toolCalls: Iterable<StreamedToolCallLike>;
+    finished: boolean;
+  };
 }
 
 function truncateText(value: string, maxChars: number): string {
@@ -1636,13 +1642,17 @@ function mapAnthropicStopReason(stopReason: unknown): StreamResultLike["finishRe
   return null;
 }
 
-export function createAnthropicStreamProcessor(onToken: (token: string) => void): AnthropicStreamProcessor {
+export function createAnthropicStreamProcessor(
+  onToken: (token: string) => void,
+  onModelOutput?: () => void,
+): AnthropicStreamProcessor {
   let buffer = "";
   let currentEvent: string | null = null;
   let currentDataLines: string[] = [];
   let fullContent = "";
   let reasoningContent = "";
   let finishReason: StreamResultLike["finishReason"] = null;
+  let terminalSeen = false;
 
   const toolCallsMap = new Map<number, StreamedToolCallLike>();
   const toolInputFallbacks = new Map<number, unknown>();
@@ -1670,6 +1680,7 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         const contentBlock = payload?.content_block;
         if (!contentBlock || typeof contentBlock !== "object") return;
         if (contentBlock.type === "tool_use") {
+          onModelOutput?.();
           toolCallsMap.set(index, {
             index,
             id: typeof contentBlock.id === "string" ? contentBlock.id : "",
@@ -1688,22 +1699,26 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         if (!delta || typeof delta !== "object") return;
 
         if (delta.type === "text_delta" && typeof delta.text === "string") {
+          if (delta.text) onModelOutput?.();
           fullContent += delta.text;
           onToken(delta.text);
           return;
         }
 
         if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+          if (delta.thinking) onModelOutput?.();
           reasoningContent += delta.thinking;
           return;
         }
 
         if (delta.type === "thinking_delta" && typeof delta.text === "string") {
+          if (delta.text) onModelOutput?.();
           reasoningContent += delta.text;
           return;
         }
 
         if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+          if (delta.partial_json) onModelOutput?.();
           const existing = toolCallsMap.get(index) ?? {
             index,
             id: "",
@@ -1724,10 +1739,12 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         const message = payload?.error?.message;
         throw new Error(typeof message === "string" && message.trim() ? message : rawData);
       }
+      case "message_stop":
+        terminalSeen = true;
+        return;
       case "ping":
       case "message_start":
       case "content_block_stop":
-      case "message_stop":
       default:
         return;
     }
@@ -1782,6 +1799,14 @@ export function createAnthropicStreamProcessor(onToken: (token: string) => void)
         ...(reasoningContent.trim()
           ? { reasoningContent, reasoningField: "reasoning" as const }
           : {}),
+      };
+    },
+    getProgress() {
+      return {
+        reasoningChars: reasoningContent.length,
+        visibleChars: fullContent.trim().length,
+        toolCalls: toolCallsMap.values(),
+        finished: terminalSeen || finishReason !== null,
       };
     },
   };

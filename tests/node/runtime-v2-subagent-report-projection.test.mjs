@@ -63,6 +63,8 @@ function restoreCompletedChild() {
     ["./executionTypes", {
       createRuntimeV2LiveExecutionState: () => ({}),
     }],
+    ["./proactiveSubagents", {}],
+    ["./planQuestionTool", {}],
   ]));
   const evidence = [];
   const evidenceContents = new Map();

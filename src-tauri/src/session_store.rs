@@ -299,6 +299,59 @@ impl SessionStore {
         .collect()
     }
 
+    /// Complete opaque snapshots for maintenance; no UI pagination/projection.
+    pub fn list_all_session_snapshots(&self) -> SessionStoreResult<Vec<SessionSnapshotRecord>> {
+        let connection = self.lock_connection()?;
+        let mut statement=connection.prepare("SELECT workspace,session_id,revision,snapshot_json,updated_at_ms FROM session_snapshots ORDER BY workspace,session_id").map_err(SessionStoreError::database)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(SessionStoreError::database)?;
+        rows.map(|row| {
+            row.map_err(SessionStoreError::database)
+                .and_then(decode_session_snapshot_row)
+        })
+        .collect()
+    }
+
+    /// Fence external maintenance against every SQLite writer, including other
+    /// connections. The caller owns filesystem policy; snapshots stay opaque.
+    pub fn with_verified_snapshot_revision<T>(
+        &self,
+        key: &SessionKey,
+        expected_revision: u64,
+        expected_snapshot: &Value,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> SessionStoreResult<T> {
+        validate_session_key(key)?;
+        serialize_snapshot(expected_snapshot)?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(SessionStoreError::database)?;
+        let current = read_session_snapshot(&transaction, key)?;
+        if current.as_ref().map(|record| record.revision) != Some(expected_revision)
+            || current.as_ref().map(|record| &record.snapshot) != Some(expected_snapshot)
+        {
+            return Err(SessionStoreError::new(
+                SessionStoreErrorCode::RevisionConflict,
+                "Session snapshot changed before imported-copy maintenance.",
+            )
+            .with_entity("session_snapshot"));
+        }
+        let result = operation()
+            .map_err(|error| SessionStoreError::new(SessionStoreErrorCode::Io, error))?;
+        transaction.commit().map_err(SessionStoreError::database)?;
+        Ok(result)
+    }
+
     pub fn import_legacy_snapshot_if_absent(
         &self,
         request: ImportLegacySnapshotIfAbsentRequest,
@@ -1035,6 +1088,60 @@ mod tests {
     }
 
     #[test]
+    fn full_maintenance_enumeration_preserves_all_owners_and_cas_fences() {
+        let store =
+            SessionStore::open_in_memory_with_options(SessionStoreOptions::default()).unwrap();
+        for workspace in [
+            "__MAIN_GLOBAL_CHAT__",
+            "/workspace/main",
+            "/workspace/unlisted",
+        ] {
+            store.import_legacy_snapshot_if_absent(ImportLegacySnapshotIfAbsentRequest {key:SessionKey{workspace:workspace.into(),session_id:"same-id".into()},snapshot:json!({"id":"same-id","messages":[{"content":"preserve"}],"runtimeSnapshot":{"canonical":"ledger"}}),updated_at_ms:1000}).unwrap();
+        }
+        let listed = store.list_all_session_snapshots().unwrap();
+        assert_eq!(listed.len(), 3);
+        let captured = listed
+            .iter()
+            .find(|record| record.workspace == "/workspace/unlisted")
+            .unwrap();
+        assert_eq!(captured.snapshot["runtimeSnapshot"]["canonical"], "ledger");
+        let key = SessionKey {
+            workspace: captured.workspace.clone(),
+            session_id: captured.session_id.clone(),
+        };
+        let changed = store
+            .compare_and_swap_session_snapshot(CompareAndSwapSessionSnapshotRequest {
+                key: key.clone(),
+                expected_revision: captured.revision,
+                snapshot: json!({"new":"writer"}),
+                updated_at_ms: 1001,
+            })
+            .unwrap();
+        let stale = store
+            .compare_and_swap_session_snapshot(CompareAndSwapSessionSnapshotRequest {
+                key: key.clone(),
+                expected_revision: captured.revision,
+                snapshot: captured.snapshot.clone(),
+                updated_at_ms: 1002,
+            })
+            .unwrap_err();
+        assert_eq!(stale.code, SessionStoreErrorCode::RevisionConflict);
+        assert_eq!(
+            store.get_session_snapshot(&key).unwrap().unwrap(),
+            changed.snapshot
+        );
+        assert_eq!(
+            store
+                .list_all_session_snapshots()
+                .unwrap()
+                .iter()
+                .filter(|record| record.workspace != key.workspace)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn list_session_snapshots_is_recent_first_with_stable_ties() {
         let store = SessionStore::open_in_memory_with_options(SessionStoreOptions::default())
             .expect("open store");
@@ -1210,5 +1317,47 @@ mod tests {
             .expect("query schema")
             .map(|row| row.expect("table name"))
             .collect()
+    }
+    #[test]
+    fn maintenance_revision_fence_holds_sqlite_write_lock_across_connections() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.sqlite3");
+        let store = SessionStore::open(&path).unwrap();
+        let key = SessionKey {
+            workspace: "/w".into(),
+            session_id: "s".into(),
+        };
+        let snapshot = json!({"id":"s","messages":["retained"]});
+        store
+            .compare_and_swap_session_snapshot(CompareAndSwapSessionSnapshotRequest {
+                key: key.clone(),
+                expected_revision: 0,
+                snapshot: snapshot.clone(),
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        store
+            .with_verified_snapshot_revision(&key, 1, &snapshot, || {
+                let other = SessionStore::open_with_options(
+                    &path,
+                    SessionStoreOptions { busy_timeout_ms: 1 },
+                )
+                .unwrap();
+                let error = other
+                    .compare_and_swap_session_snapshot(CompareAndSwapSessionSnapshotRequest {
+                        key: key.clone(),
+                        expected_revision: 1,
+                        snapshot: json!({"id":"s","messages":["new"]}),
+                        updated_at_ms: 2,
+                    })
+                    .unwrap_err();
+                assert_eq!(error.code, SessionStoreErrorCode::DatabaseBusy);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.get_session_snapshot(&key).unwrap().unwrap().revision,
+            1
+        );
     }
 }

@@ -23,8 +23,6 @@ export const WORKSPACE_INSTRUCTION_SOURCES = Object.freeze([
   "custom_reply",
   "plan_adjustment",
   "natural_language_approval",
-  "image_studio",
-  "image_generation",
   "slash_command",
   "im_adapter",
   "replay",
@@ -49,6 +47,8 @@ export interface WorkspaceInstructionPayload {
   readonly images?: readonly string[];
   readonly contextMentions?: readonly string[];
   readonly attachedFiles?: readonly WorkspaceInstructionAttachment[];
+  /** Explicit, message-scoped references frozen before FIFO admission. */
+  readonly knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
   /**
    * JSON-only dispatch candidates such as resolved intent, Goal authority,
    * reply identity, or Plan lease. Persistence does not make them authority.

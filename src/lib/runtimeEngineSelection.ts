@@ -3,16 +3,13 @@ import type { RuntimeEngineVersion } from "./runtime-v2/contracts";
 
 /**
  * The kernel is selected once at Turn admission and never inferred from
- * provider prose. Every agentic Turn is admitted to Runtime v2. Image Studio
- * is handled by its local renderer before this selector and therefore remains
- * outside the agent runtime.
+ * provider prose. Every agentic Turn is admitted to Runtime v2.
  */
 export function selectRuntimeEngineVersionForNewTurn(
   intent: ResolvedRunIntent | null | undefined,
 ): RuntimeEngineVersion {
   return intent === "execute" ||
       intent === "plan" ||
-      intent === "goal" ||
       isRuntimeV2ChatIntent(intent)
     ? "v2"
     : "legacy";
@@ -53,7 +50,6 @@ export function isRuntimeV2WorkspaceReadTurn(
 export type RuntimeV2VisibleRunnerKind =
   | "execute"
   | "plan"
-  | "goal"
   | "chat"
   | "workspace_read";
 
@@ -69,7 +65,6 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   // redirect the admitted Turn or force it back to another executor.
   if (input.runtimeIntent === "execute") return "execute";
   if (input.runtimeIntent === "plan") return "plan";
-  if (input.runtimeIntent === "goal") return "goal";
   if (
     isRuntimeV2ChatIntent(input.runtimeIntent) &&
     String(input.runWorkspace || "").trim().length === 0 &&

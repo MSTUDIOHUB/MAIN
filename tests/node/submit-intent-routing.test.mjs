@@ -55,6 +55,9 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitIntentRouting.ts"),
 );
+const { resolveSubmitPreflightEffectAction } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"),
+);
 
 function createHarness(overrides = {}) {
   const calls = {
@@ -166,6 +169,95 @@ test("a continuation supplies its exact prior objective as context without inher
   assert.equal(harness.calls.planResumes.length, 0);
 });
 
+test("Plan selection survives the semantic handoff and ambiguous results conclude before dispatch", () => {
+  const planContinuationCandidates = [
+    { id: "bricks:v2", title: "Brick breaker", objective: "Make a playable Unity brick breaker", status: "canceled" },
+    { id: "collector:v1", title: "Collector", objective: "Prototype a collection game", status: "review" },
+  ];
+  const text = "Continue the plan.";
+  const harness = createHarness({ text, preferredLanguage: "en", hasWorkspace: true, hasPlanArtifacts: true,
+    planContinuationCandidates, currentTurn: { userPrompt: "What does the Editor do?" } });
+  assert.deepEqual(harness.resolve(), { handled: true, returnValue: true });
+  assert.equal(harness.calls.preflights.length, 1);
+  assert.deepEqual(harness.calls.preflights[0].request.planContinuationCandidates, planContinuationCandidates);
+  const preflight = { intent: "respond", confidence: 0.9, semantic: {
+    objective: text, workType: "answer", answerFormat: "answer", requiredCapabilities: [], forbiddenCapabilities: ["command"],
+    approvalRequiredCapabilities: ["workspace_write"],
+  } };
+  const decide = (planContinuation, isOriginOwnerCurrent = true) => resolveSubmitPreflightEffectAction({
+    effect: harness.calls.preflights[0], preflight: { ...preflight, planContinuation }, latestInput: text,
+    latestMainModeKey: "main_mode", isOriginSessionActive: true, isOriginOwnerCurrent,
+  });
+  const selected = { kind: "continue", candidateId: "bricks:v2" };
+  const handoff = decide(selected);
+  assert.equal(handoff.kind, "resume");
+  assert.deepEqual(handoff.options.planContinuation, selected);
+  assert.deepEqual(handoff.options.semanticIntent, preflight.semantic);
+  assert.equal(handoff.options.executionConsentGranted, undefined);
+  assert.equal(decide(selected, false).kind, "skip_inactive_session");
+  const ambiguous = decide({ kind: "ambiguous", candidateIds: ["bricks:v2", "collector:v1"] });
+  assert.equal(ambiguous.kind, "conclude_without_execution");
+  assert.equal(ambiguous.resultKind, "blocked");
+  assert.match(ambiguous.summary, /Which plan do you mean\?/);
+  assert.match(ambiguous.summary, /- Brick breaker\n- Collector/);
+  assert.equal(harness.calls.planResumes.length, 0);
+  assert.equal(harness.calls.approvedPlans, 0);
+});
+
+test("unavailable continuation states give specific guidance before dispatch", () => {
+  const text = "Continue the selected plan.";
+  const planContinuationCandidates = ["review", "paused", "draft", "completed"].map(status => ({
+    id: status, status, objective: `Selected ${status} plan`,
+  }));
+  const outcome = (kind, candidateId, explicitIntent, preferredLanguage = "en") => {
+    const harness = createHarness({ text, preferredLanguage, hasWorkspace: true, hasPlanArtifacts: true,
+      planContinuationCandidates, options: { explicitIntent } });
+    assert.equal(harness.resolve().handled, true);
+    return resolveSubmitPreflightEffectAction({
+      effect: harness.calls.preflights[0], preflight: {
+        intent: kind === "revise" || explicitIntent === "plan" ? "plan" : "execute", confidence: 0.9,
+        semantic: { objective: text, workType: "plan", answerFormat: "plan", requiredCapabilities: [],
+          forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
+        planContinuation: { kind, candidateId },
+      }, latestInput: text, latestMainModeKey: "main_mode", isOriginSessionActive: true, isOriginOwnerCurrent: true,
+    });
+  };
+  for (const [status, guidance] of [
+    ["review", /waiting for approval.*Plan panel/],
+    ["paused", /paused.*pending choice or prerequisite/],
+    ["draft", /still a draft.*continue planning/],
+    ["completed", /no remaining work.*new work/],
+  ]) {
+    const action = outcome("continue", status);
+    assert.equal(action.kind, "conclude_without_execution");
+    assert.equal(action.resultKind, "blocked");
+    assert.match(action.summary, guidance);
+    assert.equal(outcome("continue", status, "plan").kind, "conclude_without_execution");
+    assert.match(outcome("revise", status).summary, /select Plan mode/);
+    const revision = outcome("revise", status, "plan");
+    assert.equal(revision.kind, "resume");
+    assert.equal(revision.options.resolvedIntent, "plan");
+    assert.equal(revision.options.planContinuation, undefined);
+  }
+  assert.match(outcome("continue", "review", undefined, "zh").summary, /等待审批.*计划面板/);
+  assert.match(outcome("continue", "other-session").summary, /no longer available/);
+  assert.equal(outcome("discuss", "completed").kind, "resume");
+});
+
+for (const text of ["继续", "Continue", "What about its latest announcement?"]) {
+  test(`semantic admission sees the preceding read-only question without lexical continuation authority: ${text}`, () => {
+    const prior = { id: "prior-chat", userPrompt: "查询该基金今天上午的行情", intent: "analyze", status: "done" };
+    const harness = createHarness({ text, currentTurn: prior, currentTurnIntent: "analyze" });
+    assert.equal(harness.resolve().handled, true);
+    const request = harness.calls.preflights[0].request;
+    assert.equal(request.input, text);
+    assert.equal(request.previousRequest, prior.userPrompt);
+    assert.equal(request.explicitIntent, undefined);
+    assert.equal(harness.calls.planResumes.length, 0);
+    assert.equal(harness.calls.approvedPlans, 0);
+  });
+}
+
 test("an explicit capsule is passed as a mode boundary while its natural restrictions are interpreted", () => {
   const harness = createHarness({ text: "Only inspect; do not write or run commands.", hasWorkspace: true,
     lockedComposerIntent: "execute" });
@@ -237,20 +329,4 @@ test("hidden skip-intent control prompts do not infer shell directives from embe
   assert.equal(result.effectiveRunIntent, "execute");
   assert.equal(result.effectiveCommandDirective, null);
   assert.deepEqual(harness.calls.preflights, []);
-});
-
-test("intent routing does not promote internal resolved Goal intent into creation authority", () => {
-  const harness = createHarness({
-    text: "continue internally",
-    isHidden: true,
-    options: {
-      resolvedIntent: "goal",
-      skipIntentResolution: true,
-    },
-  });
-  const result = harness.resolve();
-
-  assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "execute");
-  assert.equal(result.goalCreationAuthorization, null);
 });

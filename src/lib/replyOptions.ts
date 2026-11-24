@@ -265,7 +265,7 @@ export function shouldSuppressMutationRuntimeReplyOptions(params: {
   visibleText?: string;
 }): boolean {
   if (!Array.isArray(params.replyOptions) || params.replyOptions.length === 0) return false;
-  if (!["execute", "goal"].includes(String(params.runtimeIntent || ""))) {
+  if (!["execute"].includes(String(params.runtimeIntent || ""))) {
     return false;
   }
   if ((params.toolCallCount || 0) > 0) return true;

@@ -70,6 +70,23 @@ const {
 const sessionKey = "/repo::session-7";
 const sessionEpoch = "session-epoch-7";
 
+test("knowledge selections and versions survive FIFO normalization and reject same-id replacement", () => {
+  const references = [{ kind: "source", kbId: "kb-1", sourceId: "source-1", sourceRevision: "rev-1", label: "Selected manual" }];
+  const admitted = instruction("knowledge", 10, { payload: { text: "answer from this source", knowledgeReferences: references } });
+  const normalized = normalizeWorkspaceInstruction(JSON.parse(JSON.stringify(admitted)));
+  assert.deepEqual(normalized.payload.knowledgeReferences, references);
+  assert.ok(Object.isFrozen(normalized.payload.knowledgeReferences[0]));
+  const queue = createWorkspaceTurnQueueState({ sessionKey, sessionEpoch });
+  const command = { type: "append", expectedVersion: queue.version, at: 10, instruction: admitted, receipt: receipt("knowledge", 10) };
+  const first = reduceWorkspaceTurnQueue(queue, command);
+  assert.equal(first.disposition, "applied");
+  const replacement = reduceWorkspaceTurnQueue(first.state, { ...command, expectedVersion: first.state.version,
+    instruction: { ...admitted, payload: { ...admitted.payload, knowledgeReferences: [{ ...references[0], sourceRevision: "rev-2" }] } },
+  });
+  assert.equal(replacement.disposition, "rejected");
+  assert.equal(first.state.entries[0].instruction.payload.knowledgeReferences[0].sourceRevision, "rev-1");
+});
+
 function instruction(id, at, overrides = {}) {
   return {
     schemaVersion: 1,

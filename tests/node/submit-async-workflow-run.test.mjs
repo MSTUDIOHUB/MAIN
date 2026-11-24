@@ -709,6 +709,58 @@ test("composite workspace admission freezes one baseline and skips the legacy tr
   );
 });
 
+test("an exact executable Plan resume refreshes permissions and Skills without a second project baseline", async () => {
+  const runtime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
+  const turn = { workspaceKey: "/tmp/workspace", sessionKey: "workspace::7", sessionEpoch: "runtime-v2:turn-1",
+    clientSubmissionId: "submission-1", turnId: "turn-1" };
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId,
+    runId: "plan-run", parentRunId: null, attemptId: "plan-run" };
+  const requestId = "plan-question";
+  const events = [
+    { type: "turn.admitted", turn, strategy: "plan", planPurpose: "plan", objective: "Plan changes", constraints: [], acceptanceCriteria: [] },
+    { type: "run.started", run, phase: "planning" },
+    { type: "run.paused", run, blocker: { requestId, reasonCode: "user_questionnaire", evidenceSequence: 1,
+      message: "Choose result", options: ["recheck", "stop"], questionnaire: { revision: 1, purpose: "plan_confirmation",
+        title: "Choose result", questions: [{ id: "result_kind", prompt: "Choose result", selectionMode: "single", required: true,
+          options: [{ id: "executable", label: "Implementation plan" }] }] } } },
+    { type: "run.decision_recorded", run, requestId, choice: "recheck",
+      answer: { requestId, revision: 1, answers: [{ questionId: "result_kind", selectedValues: ["executable"] }] } },
+  ].map((event, index) => ({ ...event, schemaVersion: "runtime-v2-event.v1", sequence: index, at: index + 1, eventId: `plan-event-${index}` }));
+  const aggregate = runtime.replayRuntimeV2Events(events);
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate, revision: events.length, updatedAt: events.length });
+  const skillCatalog = { entries: [], explicitSkillIds: [], warnings: [], loadedAt: 1 };
+  const mcpSnapshot = { servers: [], tools: [], toolServerMap: {} };
+  let refreshed;
+  let captured;
+  const harness = createHarness({ state: { runtimeV2Checkpoints: { "turn-1": checkpoint },
+    conversationTurns: [{ id: "turn-1", userPrompt: "Plan changes with $unity-cli" }] }, input: {
+    text: "Use the existing PlayMode runner",
+    runIdOverride: run.runId,
+    effectiveRunIntent: "plan",
+    runtimeRunIntent: "plan",
+    mentionSnapshot: [],
+    attachedFilesSnapshot: [],
+    refreshWorkspaceAdmission: async (workspace, prompt, options) => {
+      refreshed = { workspace, prompt, options };
+      return { instructions: { layers: [], templates: [], sources: [], matchedRules: [], associatedPaths: [],
+        loadedAt: 1, debugSummary: "", skillCatalog }, baseline: null, mcpSnapshot };
+    },
+    phaseRunners: {
+      createRuntimeContext: (input) => { captured = input; return { ...input, streamBuffer: null, thinkingInterceptor: null, agentBlockIdsCreatedThisRun: new Set() }; },
+      runRuntime: () => Promise.resolve(true),
+    },
+  } });
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+  assert.deepEqual(refreshed, { workspace: "/tmp/workspace", prompt: "Plan changes with $unity-cli\nUse the existing PlayMode runner",
+    options: { includeProjectBaseline: false } });
+  assert.equal(captured.skillCatalog, skillCatalog);
+  assert.equal(captured.workspaceMcpSnapshot, mcpSnapshot);
+  assert.equal(captured.projectBaselineContext, null);
+  assert.equal(captured.workspaceTree, null);
+  assert.equal(harness.calls.some(([name]) => name === "workspace_tree"), false);
+});
+
 for (const constraint of ["approvalRequiredCapabilities", "forbiddenCapabilities"]) {
   for (const admission of ["composite", "instructions"]) {
     test(`${constraint} workspace_read defers pre-run file reads through ${admission} admission`, async () => {
@@ -900,71 +952,7 @@ test("an admitted A Run keeps its A instruction snapshot when the UI switches to
   assert.equal(harness.state.resolvedInstructionSet, bInstructions);
 });
 
-test("Goal continuation becomes active only after its exact Run lease is acquired", async () => {
-  const authorization = {
-    kind: "goal_continuation_authorization",
-    source: "goal_manual_resume",
-    workspaceKey: "/tmp/workspace",
-    sessionKey: "workspace::7",
-    goalId: "goal-1",
-    goalRevision: 2,
-    ownerTurnId: "turn-old",
-  };
-  const harness = createHarness({
-    input: {
-      effectiveRunIntent: "goal",
-      runtimeRunIntent: "goal",
-      goalContinuationAuthorization: authorization,
-      phaseRunners: {
-        buildAttachmentContext: async () => ({
-          userContent: "resume",
-          attachmentRefs: [],
-          failedAttachmentCount: 0,
-        }),
-        buildPromptContext: () => ({ userContent: "resume" }),
-        startRunLease: () => {
-          harness.calls.push(["exact_resume_lease"]);
-          return {
-            turnAgentMessagesStart: 0,
-            agentUserMessage: { role: "user", content: "resume" },
-            abortController: new AbortController(),
-            harnessRunMarker: {
-              runId: "run-resume",
-              parentRunId: "run-old",
-              instanceId: "instance-1",
-              startedAt: 100,
-            },
-            runId: "run-resume",
-            parentRunId: "run-old",
-          };
-        },
-        createRuntimeContext: (input) => {
-          harness.calls.push(["resume_context"]);
-          return {
-            ...input,
-            streamBuffer: null,
-            thinkingInterceptor: null,
-            agentBlockIdsCreatedThisRun: new Set(),
-          };
-        },
-        startStreamingUi: () => {},
-        runRuntime: () => Promise.resolve(true),
-      },
-    },
-  });
 
-  await runSubmitAsyncWorkflowRun(harness.input);
-
-  const ordered = harness.calls.map((entry) => entry[0]);
-  assert.ok(ordered.indexOf("exact_resume_lease") < ordered.indexOf("activate_goal_continuation"));
-  assert.ok(ordered.indexOf("activate_goal_continuation") < ordered.indexOf("resume_context"));
-  const activation = harness.calls.find(
-    (entry) => entry[0] === "activate_goal_continuation",
-  )?.[1];
-  assert.equal(activation.authorization, authorization);
-  assert.equal(activation.ownerTurnId, "turn-1");
-  assert.equal(Number.isFinite(activation.timestampMs), true);
-});
 
 test("submit async workflow run awaits the workflow engine terminal transaction", async () => {
   let releaseEngine;

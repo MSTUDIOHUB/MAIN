@@ -65,7 +65,7 @@ export function latestReadOnlyAnswer(state: TurnAggregateV1, input: {
  * Receipts and their novelty are reconstructed from the canonical ledger. */
 export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
   readonly finalTextIsProgress?: boolean;
-} = {}): RuntimeV2ProviderRecoveryWindow | null {
+} = {}): (RuntimeV2ProviderRecoveryWindow & { readonly startedSequence: number }) | null {
   if (state.pendingToolCalls.length || state.scheduledCommands.length) return null;
   const commands = new Map(state.events.flatMap((event) => event.type === "command.scheduled" ? [[event.command.idempotencyKey, event.command] as const] : []));
   const completions = new Map<string, Array<Extract<RuntimeV2Event, { type: "tool.completed" }>>>();
@@ -82,16 +82,27 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
   const coverage = new Map<string, Array<[number, number]>>();
   let occurrence = 0;
   let startedAt = 0;
+  let startedSequence = 0;
   // Search returns candidate locations. Reworded discovery alone cannot
   // renew the lease forever; a newly read source reopens that frontier.
   let discoveryPending = false;
   let reason: RuntimeV2ProviderRecoveryWindow["pressure"]["reason"] = "empty_response";
-  const fail = (at: number, nextReason: typeof reason) => {
-    if (!occurrence) startedAt = at;
+  const fail = (event: RuntimeV2Event, nextReason: typeof reason, at = event.at) => {
+    if (!occurrence) {
+      startedAt = at;
+      startedSequence = event.sequence;
+    }
     occurrence += 1;
     reason = nextReason;
   };
   for (const event of state.events) {
+    // A validated answer is new user information, not provider progress or
+    // effect authority. Waiting for that answer cannot consume the provider's
+    // semantic-recovery lease; legacy recheck decisions carry no such fact.
+    if (event.type === "run.decision_recorded" && event.answer && event.choice !== "stop") {
+      occurrence = 0; discoveryPending = false;
+      continue;
+    }
     // Scheduling and settling delegated work are decision boundaries, not
     // source/acceptance evidence. In particular, time spent joining a child
     // must not consume the parent's semantic-recovery lease. A failed child
@@ -106,11 +117,11 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
     }
     if (policy.finalTextIsProgress === false && event.type === "tool.completed" && event.status === "failed" &&
       !providerCallIds.has(String(commands.get(event.idempotencyKey)?.payload.toolCallId || ""))) {
-      fail(event.at, "non_novel_evidence");
+      fail(event, "non_novel_evidence");
       continue;
     }
     if (event.type === "command.completed" && event.status === "failed" && commands.get(event.idempotencyKey)?.kind === "request_model") {
-      fail(event.at, "provider_request_failed");
+      fail(event, "provider_request_failed");
       continue;
     }
     if (event.type !== "provider.responded") continue;
@@ -168,7 +179,7 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
       discoveryPending = false;
     } else if (searchCandidates) discoveryPending = true;
     if (novel) occurrence = 0;
-    else fail(settledAt, event.result.toolCalls.length ? "non_novel_evidence" : event.result.diagnostics.some((item) => item.code === "repeated_action_rejected") ? "repeated_action_rejected" : "empty_response");
+    else fail(event, event.result.toolCalls.length ? "non_novel_evidence" : event.result.diagnostics.some((item) => item.code === "repeated_action_rejected") ? "repeated_action_rejected" : "empty_response", settledAt);
   }
-  return occurrence ? { startedAt, pressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason, occurrence, stage: occurrence >= 2 ? "reframe" : "reconsider" } } : null;
+  return occurrence ? { startedAt, startedSequence, pressure: { schemaVersion: "runtime-v2-provider-recovery.v1", reason, occurrence, stage: occurrence >= 2 ? "reframe" : "reconsider" } } : null;
 }

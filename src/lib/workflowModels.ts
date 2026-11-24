@@ -25,7 +25,7 @@ import {
 
 // region: 共享类型
 
-export type RightPanelTab = "plan" | "diff" | "terminal" | "goal" | "subagents";
+export type RightPanelTab = "plan" | "diff" | "terminal" | "subagents";
 
 export type ResponseLanguagePolicy =
   | "follow_input_language"
@@ -45,8 +45,13 @@ export function detectDominantLanguage(text: string, fallback: "zh" | "en" = "zh
   const probe = stripNonNaturalLanguageContent(stripLeadingSlashCommand(text));
   const hanCount = (probe.match(/[\u3400-\u9fff]/g) || []).length;
   const latinCount = (probe.match(/[A-Za-z]/g) || []).length;
+  const latinWordCount = (probe.match(/[A-Za-z]{2,}/g) || []).length;
 
   if (hanCount === 0 && latinCount === 0) return fallback;
+  if (hanCount >= 2 && (hanCount * 3 >= latinCount || latinWordCount < 4)) return "zh";
+  if (hanCount >= 4) {
+    return latinWordCount >= 8 && latinCount > hanCount * 4 ? "en" : "zh";
+  }
   return hanCount * 2 >= latinCount ? "zh" : "en";
 }
 
@@ -101,6 +106,13 @@ function stripNonNaturalLanguageContent(text: string): string {
     .replace(/https?:\/\/\S+/gi, " ")
     .replace(/(?:^|\s)(?:\/[^\s`'"，。；、]+)+/g, " ")
     .replace(/(?:^|\s)[A-Za-z]:[\\/][^\s`'"，。；、]+/g, " ")
+    .replace(/(?:\.\.?\/)+[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*|\b[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+){2,}\b/g, " ")
+    .replace(/\b[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts|json|md|mdx|css|scss|less|html|htm|rs|py|cs|cpp|c|h|hpp|java|kt|go|rb|php|sh|zsh|bash|ps1|yml|yaml|toml|xml|svg|png|jpg|jpeg|webp|log|txt|lock|sql|shader|hlsl|cginc|meta|prefab|unity|asset)\b/gi, " ")
+    .replace(/\b(?:[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*)\b/g, " ")
+    .replace(/\b[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+\b/g, " ")
+    .replace(/\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}\b/g, " ")
+    .replace(/\b[A-Za-z]+:[A-Za-z0-9_-]+\b/g, " ")
+    .replace(/(?:^|\s)--?[A-Za-z0-9][A-Za-z0-9-]*/g, " ")
     .replace(/(?:^|\n)\s*>.*$/gm, " ")
     .replace(/[\[\]{}()<>_=+*/\\|~^#@:$%&-]/g, " ")
     .replace(/\s+/g, " ")
@@ -682,6 +694,11 @@ export interface DurableTurnContext {
 }
 
 export interface ConversationTurn {
+  planDraft?: import("./planDrafts").PlanDraftRecord;
+  /** Exact data source for a new Plan Turn; never approval authority. */
+  sourcePlanDraft?: import("./planDrafts").PlanDraftRecord;
+  approvedPlanContinuation?: import("./runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
+  planDocument?: import("./planDocuments").PlanDocumentRef;
   id: string;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   /** Stable admission id for one workspace-visible user submission. */

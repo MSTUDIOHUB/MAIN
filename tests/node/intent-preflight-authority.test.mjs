@@ -59,6 +59,142 @@ function candidate(overrides = {}) {
   };
 }
 
+const planContinuationCandidates = [
+  { id: "brick-breaker:v3", title: "Unity brick breaker", objective: "Build a playable Unity 6 brick breaker", status: "canceled" },
+  { id: "collector:v1", title: "Unity collector", objective: "Prototype a collectible game", status: "review" },
+];
+
+test("one tool-free semantic request distinguishes continuing, revising and discussing a scoped plan", async () => {
+  for (const [input, kind, expectedIntent, language] of [
+    ["继续完成计划方案", "continue", "respond", "zh"],
+    ["Revise the brick breaker plan for touch controls.", "revise", "plan", "en"],
+    ["Explain the proposed brick breaker verification.", "discuss", "respond", "en"],
+    ["Explain how an unrelated browser API works.", "new", "respond", "en"],
+  ]) {
+    const relation = kind === "new" ? { kind } : { kind, candidateId: planContinuationCandidates[0].id };
+    const wire = { ...candidate({ forbiddenCapabilities: ["command"] }), planContinuation: relation, approved: true };
+    let requests = 0;
+    const preflight = loadPreflight(null, async (messages, _settings, _callbacks, _signal, tools) => {
+      requests += 1;
+      assert.deepEqual(tools, []);
+      assert.deepEqual(JSON.parse(messages[1].content), {
+        currentRequest: input, previousRequest: "Pause the previous run.", planContinuationCandidates,
+      });
+      return { content: JSON.stringify(wire), finishReason: "stop", toolCalls: [] };
+    });
+    const result = await preflight({ ...params, input, language, hasWorkspace: true,
+      previousRequest: "Pause the previous run.", planContinuationCandidates });
+    assert.equal(requests, 1);
+    assert.equal(result.intent, expectedIntent);
+    assert.deepEqual(result.planContinuation, kind === "new" ? undefined : relation);
+    assert.deepEqual(result.semantic.forbiddenCapabilities, ["command"]);
+    assert.equal(result.approved, undefined);
+  }
+});
+
+test("continuation candidates cannot be guessed, repeated, or invented by the classifier", async () => {
+  const invalid = [
+    { kind: "continue", candidateId: "other-session:v3" },
+    { kind: "approve", candidateId: planContinuationCandidates[0].id },
+    { kind: "ambiguous", candidateIds: [planContinuationCandidates[0].id, planContinuationCandidates[0].id] },
+  ];
+  for (const planContinuation of invalid) {
+    const diagnostics = [];
+    const result = await loadPreflight({ ...candidate(), planContinuation })({
+      ...params, hasWorkspace: true, planContinuationCandidates, onDiagnostic: value => diagnostics.push(value),
+    });
+    assert.equal(result, null);
+    assert.equal(diagnostics[0].field, "planContinuation");
+  }
+  const operation = { ...candidate({ workType: "implement", requiredCapabilities: ["workspace_write"], forbiddenCapabilities: [] }),
+    planContinuation: { kind: "discuss", candidateId: planContinuationCandidates[0].id } };
+  assert.equal(await loadPreflight(operation)({ ...params, hasWorkspace: true, planContinuationCandidates }), null);
+  const unbound = { ...candidate(), planContinuation: { kind: "continue", candidateId: planContinuationCandidates[0].id } };
+  assert.equal(await loadPreflight(unbound)({ ...params, hasWorkspace: true }), null);
+});
+
+test("a missing continuation decision can retain read-only semantics or explicit Plan, while autonomous effects and planning fail closed", async () => {
+  for (const [workType, requiredCapabilities, explicitIntent, expected] of [
+    ["answer", [], undefined, "respond"],
+    ["investigate", ["workspace_read"], undefined, "analyze"],
+    ["plan", ["workspace_read"], "plan", "plan"],
+    ["plan", ["workspace_read"], undefined, null],
+    ["implement", ["workspace_write"], undefined, null],
+    ["operate", ["command"], undefined, null],
+  ]) {
+    const diagnostics = [];
+    const result = await loadPreflight(candidate({ workType, requiredCapabilities, forbiddenCapabilities: [] }))({
+      ...params, hasWorkspace: true, explicitIntent, planContinuationCandidates,
+      onDiagnostic: value => diagnostics.push(value),
+    });
+    assert.equal(result?.intent ?? null, expected);
+    assert.equal(result?.planContinuation, undefined);
+    assert.equal(diagnostics[0]?.field, expected === null ? "planContinuation" : undefined);
+  }
+});
+
+test("public web research uses network capability without becoming an interactive operation", async () => {
+  for (const [workType, intent] of [["answer", "respond"], ["investigate", "analyze"], ["operate", "respond"]]) {
+    const wire = candidate({
+      objective: "Find the requested current public information",
+      workType,
+      requiredCapabilities: ["network"],
+      forbiddenCapabilities: [],
+    });
+    let request;
+    const preflight = loadPreflight(null, async (messages) => {
+      request = messages;
+      return { content: JSON.stringify(wire), finishReason: "stop", toolCalls: [] };
+    });
+    const result = await preflight({ ...params, input: "Find current information on the public web." });
+    const instruction = request.find(message => message.role === "system").content;
+    assert.match(instruction, /network[^\n]*public[^\n]*web_search[^\n]*web_fetch/i,
+      "the classifier must know public search and page fetching are network reads");
+    assert.match(instruction, /external_interaction[^\n]*browser[^\n]*app[^\n]*MCP/i,
+      "the classifier must distinguish interactive tools from public network reads");
+    assert.equal(result.intent, intent);
+    assert.equal(result.commandDirective.kind, "none");
+    assert.equal(result.requiresApproval, false);
+    assert.deepEqual(result.semantic.requiredCapabilities, ["network"]);
+  }
+});
+
+test("operate describes work without overriding its declared read-only capabilities", async () => {
+  for (const [requiredCapabilities, expected] of [[[], "respond"], [["workspace_read"], "analyze"], [["workspace_read", "network"], "analyze"]]) {
+    const wire = candidate({ objective: "Inspect the supplied guidance and report its confirmed marker", workType: "operate", requiredCapabilities });
+    const result = await loadPreflight(wire)(params);
+    assert.equal(result.intent, expected);
+    assert.deepEqual(result.semantic, wire.semantic);
+    assert.equal(result.commandDirective.kind, "none");
+    assert.equal(result.requiresApproval, false);
+    assert.equal(result.needsUserChoice, false);
+  }
+});
+
+test("a coarse operate label cannot invent a conflict under the explicit Analyze ceiling", async () => {
+  const wire = candidate({ workType: "operate", requiredCapabilities: ["workspace_read"] });
+  const result = await loadPreflight(wire)({ ...params, explicitIntent: "analyze" });
+  assert.equal(result.intent, "analyze");
+  assert.equal(result.needsUserChoice, false);
+  assert.equal(result.semantic.clarification, undefined);
+  assert.deepEqual(result.semantic.forbiddenCapabilities, ["workspace_write", "command"]);
+});
+
+test("declared effect capabilities and implementation retain Execute independently of the operate label", async () => {
+  for (const [workType, requiredCapabilities, kind] of [
+    ["operate", ["workspace_write"], "file_modify"],
+    ["operate", ["command"], "shell"],
+    ["operate", ["external_interaction"], "mcp"],
+    ["implement", [], "file_modify"],
+  ]) {
+    const result = await loadPreflight(candidate({ workType, requiredCapabilities, forbiddenCapabilities: [] }))(params);
+    assert.equal(result.intent, "execute");
+    assert.equal(result.commandDirective.kind, kind);
+    assert.equal(result.requiresApproval, true);
+    assert.equal(result.approved, undefined);
+  }
+});
+
 test("semantic preflight drops model authority, commands, and completion claims", async () => {
   const result = await loadPreflight({
     ...candidate(), intent: "execute", requiresApproval: true, approved: true,
@@ -137,6 +273,30 @@ test("valid semantic objectives supply missing display titles without changing s
   assert.equal(await loadPreflight({ title: "A title alone is not a semantic result" })(params), null);
 });
 
+test("complete semantics remain usable when non-authoritative confidence or choice hints are omitted", async () => {
+  const semantic = candidate({ objective: "查询特定ETF当天的上午行情", workType: "investigate", requiredCapabilities: ["network"], forbiddenCapabilities: [] }).semantic;
+  for (const hints of [{}, { confidence: 0.8 }, { needsUserChoice: false }]) {
+    const result = await loadPreflight({ semantic, ...hints })({ ...params, input: "这只基金今天上午的行情怎么样？" });
+    assert.ok(result, "complete semantic fields must not depend on optional presentation hints");
+    assert.deepEqual(result.semantic, semantic);
+    assert.equal(result.intent, "analyze");
+    assert.equal(result.confidence, hints.confidence ?? 0);
+    assert.equal(result.needsUserChoice, false);
+    assert.equal(result.requiresApproval, false);
+  }
+  const input = "Deploy to staging or production; I have not selected the target.";
+  const clarification = { kind: "target_ambiguity", field: "deployment target", evidence: "staging or production", question: "Which target?", choices: ["staging", "production"] };
+  const clarified = await loadPreflight({ semantic, clarification })({ ...params, input });
+  assert.equal(clarified.needsUserChoice, true, "grounded clarification remains authoritative even without the hint");
+  assert.deepEqual(clarified.semantic.clarification, clarification);
+  const operation = candidate({ workType: "operate", requiredCapabilities: ["command"], forbiddenCapabilities: [], approvalRequiredCapabilities: ["command"] }).semantic;
+  const executable = await loadPreflight({ semantic: operation })({ ...params, input: "Run the requested command only after individual approval." });
+  assert.equal(executable.intent, "execute");
+  assert.equal(executable.requiresApproval, true);
+  assert.deepEqual(executable.semantic.approvalRequiredCapabilities, ["command"]);
+  assert.equal(await loadPreflight({ semantic: { ...operation, approvalRequiredCapabilities: undefined } })(params), null);
+});
+
 test("work and capabilities determine execution independently of response format", async () => {
   for (const [workType, requiredCapabilities, answerFormat, intent, kind] of [
     ["implement", ["workspace_read", "workspace_write", "command"], "analysis", "execute", "file_modify"],
@@ -153,6 +313,26 @@ test("work and capabilities determine execution independently of response format
     assert.equal(result.commandDirective.exactCommand, undefined);
     assert.equal(result.requiresApproval, kind !== "none");
     assert.equal(result.needsUserChoice, false);
+  }
+});
+
+for (const [language, input, objective] of [
+  ["zh", "请帮我完善项目设计，跟我讨论并记录我的选择，以后再生成 README.md。", "协助完善项目设计，记录用户决策，为后续生成 README.md 做准备"],
+  ["en", "Help refine this project, discuss and record my choices, and generate README.md later.", "Discuss project design and record choices for a future README"],
+]) test(`a capability-free natural plan is a discussion while explicit Plan remains structured (${language})`, async () => {
+  const wire = { semantic: { objective, workType: "plan", answerFormat: "plan", requiredCapabilities: [], forbiddenCapabilities: [], approvalRequiredCapabilities: [] } };
+  const result = await loadPreflight(wire)({ ...params, input, language, hasWorkspace: true });
+  assert.equal(result.intent, "respond");
+  assert.deepEqual(result.semantic, wire.semantic, "presentation semantics must remain intact");
+  assert.equal(result.outputFormat, "plan");
+  assert.equal(result.commandDirective.kind, "none");
+  assert.equal(result.requiresApproval, false);
+  const explicit = await loadPreflight(wire)({ ...params, input, language, hasWorkspace: true, explicitIntent: "plan" });
+  assert.equal(explicit.intent, "plan", "a user-selected Plan still owns its artifact contract");
+  assert.deepEqual(explicit.semantic, wire.semantic);
+  for (const requiredCapabilities of [["workspace_read"], ["workspace_read", "workspace_write", "command"]]) {
+    const operational = await loadPreflight({ semantic: { ...wire.semantic, requiredCapabilities } })({ ...params, input, language, hasWorkspace: true });
+    assert.equal(operational.intent, "plan", "nonempty capability sets keep the existing Plan mapping");
   }
 });
 

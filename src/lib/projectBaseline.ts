@@ -1,7 +1,7 @@
 import { sha256Hex } from "./sha256";
 
 export const PROJECT_BASELINE_SCHEMA_VERSION = 1;
-export const PROJECT_BASELINE_PARSER_VERSION = 2;
+export const PROJECT_BASELINE_PARSER_VERSION = 3;
 
 export interface ProjectBaselineLimits {
   readonly maxAnchorBytes: number;
@@ -89,6 +89,7 @@ export interface ProjectBaselineFacts {
   readonly languages: readonly ProjectBaselineFact[];
   readonly packageManagers: readonly ProjectBaselineFact[];
   readonly runtimes: readonly ProjectBaselineFact[];
+  readonly packages?: readonly ProjectBaselineFact[];
   readonly scripts: readonly ProjectBaselineScript[];
 }
 
@@ -165,8 +166,9 @@ const STATIC_ANCHORS: readonly AnchorCandidate[] = [
 ];
 
 const NESTED_METADATA_ANCHORS: readonly AnchorCandidate[] = [
-  { path: "Packages/manifest.json", kind: "manifest" },
   { path: "ProjectSettings/ProjectVersion.txt", kind: "config" },
+  { path: "Packages/packages-lock.json", kind: "lockfile" },
+  { path: "Packages/manifest.json", kind: "manifest" },
 ];
 
 const DYNAMIC_RULE_DIRECTORIES = [".cursor/rules", ".MAIN/steering", ".MAIN/rules"] as const;
@@ -276,13 +278,13 @@ async function scanTopology(io: ProjectBaselineIo, workspace: string, limits: Pr
   return { topology: topology.sort((a, b) => compareText(a.path, b.path) || compareText(a.kind, b.kind)), truncated };
 }
 
-async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omissions: ProjectBaselineOmission[]): Promise<AnchorCandidate[]> {
-  const candidates = [...STATIC_ANCHORS];
+async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omissions: ProjectBaselineOmission[], metadataOnly: boolean): Promise<AnchorCandidate[]> {
+  const candidates = metadataOnly ? [] : [...STATIC_ANCHORS];
   const rootEntries = await safeList(io, workspace, "");
   for (const entry of rootEntries) {
     const path = joinRelative("", String(entry?.name || ""));
     if (!path || entry.kind !== "file") continue;
-    if (/\.(?:sln|csproj|fsproj|vbproj)$/.test(path.toLowerCase())) candidates.push({ path, kind: "manifest" });
+    if (!metadataOnly && /\.(?:sln|csproj|fsproj|vbproj)$/.test(path.toLowerCase())) candidates.push({ path, kind: "manifest" });
   }
   for (const candidate of NESTED_METADATA_ANCHORS) {
     const [directory, fileName] = candidate.path.split("/");
@@ -292,7 +294,7 @@ async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omis
     const entries = await safeList(io, workspace, directory!);
     if (entries.some(entry => entry.name === fileName && entry.kind === "file")) candidates.push(candidate);
   }
-  for (const directory of DYNAMIC_RULE_DIRECTORIES) {
+  for (const directory of metadataOnly ? [] : DYNAMIC_RULE_DIRECTORIES) {
     for (const entry of await safeList(io, workspace, directory)) {
       const path = joinRelative(directory, String(entry?.name || ""));
       if (!path || path.length > DEFAULT_PROJECT_BASELINE_LIMITS.maxPathLength) {
@@ -304,14 +306,16 @@ async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omis
   }
   const unique = new Map<string, AnchorCandidate>();
   for (const candidate of candidates) if (!isProjectBaselineSensitivePath(candidate.path)) unique.set(candidate.path, candidate);
-  return [...unique.values()].sort((a, b) => compareText(a.path, b.path));
+  const priority = NESTED_METADATA_ANCHORS.map(candidate => candidate.path);
+  const order = (path: string) => priority.includes(path) ? priority.indexOf(path) : priority.length;
+  return [...unique.values()].sort((a, b) => order(a.path) - order(b.path) || compareText(a.path, b.path));
 }
 
-async function loadAnchors(io: ProjectBaselineIo, workspace: string, limits: ProjectBaselineLimits, omissions: ProjectBaselineOmission[]) {
+async function loadAnchors(io: ProjectBaselineIo, workspace: string, limits: ProjectBaselineLimits, omissions: ProjectBaselineOmission[], metadataOnly: boolean) {
   const loaded: LoadedAnchor[] = [];
   let totalBytes = 0;
   let truncated = false;
-  for (const candidate of await discoverCandidates(io, workspace, omissions)) {
+  for (const candidate of await discoverCandidates(io, workspace, omissions, metadataOnly)) {
     if (candidate.path.length > limits.maxPathLength) continue;
     if (loaded.length >= limits.maxAnchors) {
       omissions.push({ path: candidate.path, reason: "anchor_count_limit" });
@@ -399,6 +403,7 @@ function buildFacts(loaded: LoadedAnchor[], topology: readonly ProjectBaselineTo
   const languages: ProjectBaselineFact[] = [];
   const packageManagers: ProjectBaselineFact[] = [];
   const runtimes: ProjectBaselineFact[] = [];
+  const packages: ProjectBaselineFact[] = [];
   const scripts: ProjectBaselineScript[] = [];
   let scriptsTruncated = false;
   const add = (bucket: ProjectBaselineFact[], name: string, anchor: LoadedAnchor, selector: string, extra: Pick<ProjectBaselineFact, "version" | "constraint"> = {}) => bucket.push({ name, ...extra, provenance: provenance(anchor, selector) });
@@ -424,6 +429,26 @@ function buildFacts(loaded: LoadedAnchor[], topology: readonly ProjectBaselineTo
       if (version) add(runtimes, name!, editorVersion, field!, { version });
     }
   }
+  const upmLock = byPath.get("Packages/packages-lock.json");
+  const resolvedPackages = new Set<string>();
+  const upmVersion = (raw: unknown) =>
+    typeof raw === "string" && /^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.+-]+)?$/.test(raw) && raw.length <= 96
+      ? raw : null;
+  const upmPackageName = (name: string) => /^[a-z0-9]+(?:\.[a-z0-9_-]+)+$/.test(name) && name.length <= 128;
+  if (upmLock) {
+    try {
+      const parsed = JSON.parse(upmLock.content)?.dependencies;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Invalid package lock");
+      for (const [name, record] of Object.entries(parsed)) {
+        const version = upmVersion((record as { version?: unknown } | null)?.version);
+        if (!version || !upmPackageName(name)) continue;
+        add(packages, name, upmLock, `$.dependencies.${name}.version`, { version });
+        resolvedPackages.add(name);
+      }
+    } catch {
+      diagnostics.push({ code: "manifest_parse_failed", path: upmLock.path });
+    }
+  }
   const upmManifest = byPath.get("Packages/manifest.json");
   if (upmManifest) {
     try {
@@ -437,6 +462,13 @@ function buildFacts(loaded: LoadedAnchor[], topology: readonly ProjectBaselineTo
         throw new Error("Invalid project dependencies");
       }
       add(packageManagers, "upm", upmManifest, "project_manifest");
+      for (const [name, raw] of Object.entries((dependencies || {}) as Record<string, unknown>)) {
+        // Git and local dependency URLs can contain credentials or private paths.
+        const constraint = upmVersion(raw);
+        if (constraint && upmPackageName(name) && !resolvedPackages.has(name)) {
+          add(packages, name, upmManifest, `$.dependencies.${name}`, { constraint });
+        }
+      }
     } catch {
       diagnostics.push({ code: "manifest_parse_failed", path: upmManifest.path });
     }
@@ -480,7 +512,7 @@ function buildFacts(loaded: LoadedAnchor[], topology: readonly ProjectBaselineTo
     const language = extensionLanguage[extension];
     if (language) languages.push({ name: language, provenance: { path: entry.path, selector: "file_extension", contentHash: `path-sha256-${sha256Hex(entry.path)}` } });
   }
-  return { languages: dedupeFacts(languages), packageManagers: dedupeFacts(packageManagers), runtimes: dedupeFacts(runtimes), scripts, scriptsTruncated };
+  return { languages: dedupeFacts(languages), packageManagers: dedupeFacts(packageManagers), runtimes: dedupeFacts(runtimes), packages: dedupeFacts(packages), scripts, scriptsTruncated };
 }
 
 function uniqueSortedOmissions(input: ProjectBaselineOmission[]): ProjectBaselineOmission[] {
@@ -494,15 +526,15 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value);
 }
 
-export async function buildProjectBaselineContext(input: { readonly workspace: string; readonly io: ProjectBaselineIo; readonly limits?: Partial<ProjectBaselineLimits> }): Promise<ProjectBaselineContext> {
+export async function buildProjectBaselineContext(input: { readonly workspace: string; readonly io: ProjectBaselineIo; readonly limits?: Partial<ProjectBaselineLimits>; readonly metadataOnly?: boolean }): Promise<ProjectBaselineContext> {
   const canonicalPath = normalizeCanonicalPath(await input.io.canonicalizeWorkspace(input.workspace));
   const limits = resolveLimits(input.limits);
   const omissions: ProjectBaselineOmission[] = [];
   const diagnostics: ProjectBaselineDiagnostic[] = [];
-  const scanned = await scanTopology(input.io, canonicalPath, limits, omissions);
-  const anchorsResult = await loadAnchors(input.io, canonicalPath, limits, omissions);
+  const scanned = input.metadataOnly ? { topology: [], truncated: false } : await scanTopology(input.io, canonicalPath, limits, omissions);
+  const anchorsResult = await loadAnchors(input.io, canonicalPath, limits, omissions, input.metadataOnly === true);
   const factsResult = buildFacts(anchorsResult.loaded, scanned.topology, limits, diagnostics);
-  const vcsCandidate = input.io.resolveVcsRoot ? await input.io.resolveVcsRoot(canonicalPath).catch(() => null) : null;
+  const vcsCandidate = !input.metadataOnly && input.io.resolveVcsRoot ? await input.io.resolveVcsRoot(canonicalPath).catch(() => null) : null;
   const vcsRoot = vcsCandidate ? normalizeCanonicalPath(await input.io.canonicalizeWorkspace(vcsCandidate)) : null;
   const workspace = {
     canonicalPath,
@@ -510,7 +542,13 @@ export async function buildProjectBaselineContext(input: { readonly workspace: s
     vcs: vcsRoot ? { kind: "git" as const, canonicalRoot: vcsRoot, identity: `project-vcs-root-sha256-${sha256Hex(vcsRoot)}` } : null,
   };
   const anchors = anchorsResult.loaded.map(({ content: _content, ...anchor }) => anchor);
-  const facts: ProjectBaselineFacts = { languages: factsResult.languages, packageManagers: factsResult.packageManagers, runtimes: factsResult.runtimes, scripts: factsResult.scripts };
+  const facts: ProjectBaselineFacts = {
+    languages: factsResult.languages,
+    packageManagers: factsResult.packageManagers,
+    runtimes: factsResult.runtimes,
+    ...(factsResult.packages.length ? { packages: factsResult.packages } : {}),
+    scripts: factsResult.scripts,
+  };
   const normalizedOmissions = uniqueSortedOmissions(omissions);
   const truncated = { anchors: anchorsResult.truncated, topology: scanned.truncated, scripts: factsResult.scriptsTruncated };
   const fingerprints = {

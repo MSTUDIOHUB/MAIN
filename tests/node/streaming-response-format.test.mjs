@@ -64,6 +64,9 @@ test('native optional format rejection retries once without leaking a failed ter
   assert.deepEqual(bodies[1], first, 'only the optional format constraint changes; messages, tools, budget and reasoning remain exact');
   assert.equal(bodies[1].tools[0].function.name, 'read_file');
   assert.deepEqual(errors, []); assert.equal(done, 1); assert.equal(lifecycle.filter(x => x.phase === 'stream_error').length, 0); assert.equal(listeners.size, 0);
+  assert.deepEqual(lifecycle.filter(event => event.phase === 'response_format_downgraded'), [
+    { phase: 'response_format_downgraded', status: 'unsupported_response_format' },
+  ]);
 });
 test('native format fallback does not repeat and final errors are delivered once', async () => {
   const r = await nativeRequest({ fail: () => 'HTTP 422: unsupported response_format', tolerateError: true });

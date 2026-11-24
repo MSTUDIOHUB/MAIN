@@ -1,18 +1,25 @@
 import type { TurnAggregateV1 } from "./aggregate";
+import { unresolvedUnityEditorCheck, verifiedUnityConsoleRepair } from "./unityCompilation";
+import { isRuntimeV2EditorDiagnosticRepair } from "./editorConsoleEvidence";
 import type {
   RuntimeV2AcceptanceEvidenceRequirementSlot,
-  RuntimeV2Command,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
 import { deriveRuntimeV2ExecutionContractCoverage } from "./executionContractCoverage";
-import { analyzeValidationCommand } from "../validationContract";
+import { deriveRuntimeV2ExecutionContract } from "./executionContract";
+import { analyzeValidationCommand, unityValidationInvocations } from "../validationContract";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { approvedRuntimeV2PlanContinuation } from "./planContinuationBaseline";
 import { workspacePathsReferToSameFile } from "../workspacePaths";
 import {
+  deriveRuntimeV2ValidationBoundary,
+  isRuntimeV2FileVersion,
   runtimeV2DirectExecuteAuthorityDigest,
   runtimeV2DirectExecuteCriterionIds,
   runtimeV2DirectExecuteMutationTargets,
+  runtimeV2WorkspaceChangeReceipts,
+  latestRuntimeV2WorkspaceChange,
   runtimeV2ValidationBoundaryMatchesCurrent,
 } from "./validationReceipt";
 
@@ -79,12 +86,6 @@ function currentPhaseEvents(state: TurnAggregateV1): readonly RuntimeV2Event[] {
   return [];
 }
 
-function toolName(command: RuntimeV2Command): string {
-  return typeof command.payload.toolName === "string"
-    ? command.payload.toolName.trim()
-    : "";
-}
-
 export function isRuntimeV2ValidationToolCall(
   call: Pick<
     TurnAggregateV1["pendingToolCalls"][number],
@@ -100,40 +101,6 @@ export function isRuntimeV2ValidationToolCall(
   }
   return call.name === "browser_evaluate" ||
     call.name === "computer_use";
-}
-
-function committedMutationSequences(
-  events: readonly RuntimeV2Event[],
-  isMutationToolName: RuntimeV2ExecutePhaseTransitionInput["isMutationToolName"],
-): readonly number[] {
-  const mutations = new Set(
-    events
-      .filter((event): event is Extract<RuntimeV2Event, { type: "command.scheduled" }> =>
-        event.type === "command.scheduled" && event.command.kind === "execute_tool"
-      )
-      .filter((event) => {
-        const name = toolName(event.command);
-        return event.command.payload.runtimeOwnedPlanArtifact !== true &&
-          !!name &&
-          isMutationToolName(name);
-      })
-      .map((event) => event.command.idempotencyKey),
-  );
-  const parentMutations = events
-    .filter((event): event is Extract<RuntimeV2Event, { type: "tool.completed" }> =>
-      event.type === "tool.completed" &&
-      event.status === "succeeded" &&
-      mutations.has(event.idempotencyKey)
-    )
-    .map((event) => event.sequence);
-  const childMutations = events
-    .filter((event): event is Extract<RuntimeV2Event, { type: "subagent.completed" }> =>
-      event.type === "subagent.completed" &&
-      event.status === "completed" &&
-      event.evidence.some((evidence) => evidence.kind === "mutation")
-    )
-    .map((event) => event.sequence);
-  return [...parentMutations, ...childMutations];
 }
 
 function latestSequence(values: readonly number[]): number {
@@ -236,26 +203,12 @@ function currentDirectExecuteValidationPasses(
   state: TurnAggregateV1,
 ): Extract<RuntimeV2Event, { type: "validation.completed" }>[] {
   const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
-  const latestMutationSequence = state.events.reduce(
-    (latest, event) =>
-      (
-        (
-          event.type === "tool.completed" &&
-          event.status === "succeeded"
-        ) ||
-        (
-          event.type === "subagent.completed" &&
-          event.status === "completed"
-        )
-      ) &&
-        event.evidence.some((evidence) => evidence.kind === "mutation")
-        ? Math.max(latest, event.sequence)
-        : latest,
-    -1,
-  );
+  const latestMutationSequence = latestRuntimeV2WorkspaceChange(state)?.sequence ?? -1;
   if (latestMutationSequence < 0) return [];
   const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
   if (criterionIds.length === 0 || mutationTargets.length === 0) return [];
+  if (state.objective.completionRequirement?.kind === "workspace_change" &&
+      deriveRuntimeV2ValidationBoundary(state, mutationTargets).validatedMutationVersions.some(item => !isRuntimeV2FileVersion(item.version))) return [];
   const expectedDigest = runtimeV2DirectExecuteAuthorityDigest({
     turnId: state.turn.turnId,
     objective: state.objective,
@@ -312,15 +265,22 @@ export function runtimeV2DirectExecuteContractCoverage(state: TurnAggregateV1) {
 /** The latest admitted real pass at the current mutation boundary. Earlier
  * failed attempts may be superseded by this final workspace validation. */
 export function latestRuntimeV2DirectExecuteValidationSequence(state: TurnAggregateV1): number {
-  return latestSequence(currentDirectExecuteValidationPasses(state).map((event) => event.sequence));
+  const editor = verifiedUnityConsoleRepair(state);
+  return latestSequence([...currentDirectExecuteValidationPasses(state), ...(editor?.receipts ?? [])].map(event => event.sequence));
 }
 
 export function runtimeV2DirectExecuteReadyForConclusion(state: TurnAggregateV1): boolean {
-  const validPasses = currentDirectExecuteValidationPasses(state);
+  const requirements = state.objective.acceptanceEvidenceRequirements || [];
+  const editorRepair = isRuntimeV2EditorDiagnosticRepair(state);
+  const editor = editorRepair ? verifiedUnityConsoleRepair(state) : null;
+  if (editorRepair && !editor) return false;
+  if (editor && !editor.requiresBehavioralValidation && !requirements.some(item => item === "behavioral" || item === "interaction") &&
+      !deriveRuntimeV2ExecutionContract(state)) return true;
+  const validPasses = currentDirectExecuteValidationPasses(state).filter(event => !editor?.requiresBehavioralValidation ||
+    validationSupportsRequirement(event, "behavioral") && unityValidationInvocations(event.presentation?.target || "").length > 0);
   if (!validPasses.length) return false;
   const criterionIds = runtimeV2DirectExecuteCriterionIds(state.objective);
   const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
-  const requirements = state.objective.acceptanceEvidenceRequirements || [];
   const allCriteriaCovered = criterionIds.every((criterionId, index) =>
     validPasses.some((event) =>
       event.authority!.criterionIds.includes(criterionId) &&
@@ -379,7 +339,7 @@ function failedValidationSummarySinceLastPass(
  * counters cannot be used for completion because they disappear on restore. */
 export function summarizeRuntimeV2ExecuteEvidence(
   state: TurnAggregateV1 | null,
-  input: RuntimeV2ExecutePhaseTransitionInput,
+  _input: RuntimeV2ExecutePhaseTransitionInput,
 ): RuntimeV2ExecuteEvidenceSummary {
   if (!state) {
     return {
@@ -391,16 +351,17 @@ export function summarizeRuntimeV2ExecuteEvidence(
       failedProviderRequestCount: 0,
     };
   }
-  const latestMutationSequence = state.events.reduce((latest, event) =>
-    event.type === "tool.completed" &&
-    event.status === "succeeded" &&
-    event.evidence.some((evidence) => evidence.kind === "mutation")
-      ? Math.max(latest, event.sequence)
-      : latest
-  , -1);
+  const mutations = runtimeV2WorkspaceChangeReceipts(state);
+  const latestMutationSequence = mutations[mutations.length - 1]?.sequence ?? -1;
   const failedValidations = failedValidationSummarySinceLastPass(
     state.events,
   );
+  const editor = verifiedUnityConsoleRepair(state);
+  if (editor && failedValidations.total > 0 && latestSequence(editor.receipts.map(item => item.sequence)) >
+      latestSequence(state.events.filter(isRuntimeV2ValidationAttempt).map(item => item.sequence))) {
+    failedValidations.total = 0;
+    failedValidations.stalled = 0;
+  }
   const providerRequestKeys = new Set(
     state.events.flatMap((event) =>
       event.type === "command.scheduled" &&
@@ -432,13 +393,12 @@ export function summarizeRuntimeV2ExecuteEvidence(
     }),
   );
   return {
-    mutationCount:
-      committedMutationSequences(state.events, input.isMutationToolName).length,
+    mutationCount: mutations.length,
     passedValidationCount: state.events.filter((event) =>
       isRuntimeV2ValidationAttempt(event) &&
       event.passed &&
       event.sequence > latestMutationSequence
-    ).length,
+    ).length + (editor?.receipts.length ?? 0),
     failedValidationCount: failedValidations.total,
     stalledValidationCount: failedValidations.stalled,
     failedOperationCount: state.events.filter((event) =>
@@ -528,21 +488,18 @@ export function decideRuntimeV2ExecutePhaseTransition(
   }
 
   if (state.pendingToolCalls.length > 0) return null;
+  const compilationFailed = unresolvedUnityEditorCheck(state)?.result.status === "failed";
+  if (compilationFailed && state.phase === "validating") {
+    return { from: "validating", to: "acting", reason: "validation_failed" };
+  }
+  if (compilationFailed) return null;
   const phaseEvents = currentPhaseEvents(state);
 
-  if (state.phase === "acting") {
-    const latestPhaseMutationSequence = latestSequence(
-      committedMutationSequences(
-        phaseEvents,
-        input.isMutationToolName,
-      ),
-    );
-    const latestMutationSequence = latestSequence(
-      committedMutationSequences(
-        state.events,
-        input.isMutationToolName,
-      ),
-    );
+  const continued = approvedRuntimeV2PlanContinuation(state.events);
+  if (state.phase === "acting" || state.phase === "observing" && continued) {
+    const latestMutation = latestRuntimeV2WorkspaceChange(state);
+    const latestPhaseMutationSequence = latestMutation && phaseEvents.includes(latestMutation) ? latestMutation.sequence : -1;
+    const latestMutationSequence = Math.max(continued?.sequence ?? -1, latestMutation?.sequence ?? -1);
     const latestValidationSequence = latestSequence(
       state.events
         .filter(isRuntimeV2ValidationAttempt)
@@ -556,7 +513,7 @@ export function decideRuntimeV2ExecutePhaseTransition(
       )
     ) {
       return {
-        from: "acting",
+        from: state.phase,
         to: "validating",
         reason: latestPhaseMutationSequence >= 0
           ? "mutation_committed"

@@ -23,7 +23,8 @@ test.beforeEach(async ({ page }) => {
         capture.savedSessions.push(JSON.parse(JSON.stringify(args?.session ?? null)));
         return args?.session ?? null;
       }
-      if (cmd === "list_project_sessions") return [];
+      if (["list_project_sessions", "list_all_session_snapshots", "list_legacy_session_files"].includes(cmd)) return [];
+      if (cmd === "cleanup_legacy_image_studio_outputs") return { removedDirectories: 0 };
       return null;
     };
   });
@@ -329,4 +330,87 @@ test("chat history remains scrollable during rapid streaming updates", async ({ 
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().tickCount ?? 0))
     .toBeGreaterThan(5);
+});
+
+test("queued plain text is shown as waiting and can guide the exact v2 Turn", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=composer-running-guidance");
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+  await page.evaluate(async () => {
+    const { useAppStore } = await import("/src/store/useAppStore.ts");
+    const runtime = await import("/src/lib/runtime-v2/index.ts");
+    const state = useAppStore.getState();
+    const canonical = state.turnRuntimeCheckpoints[state.currentTurnId!].canonical;
+    const turn = canonical.turn.identity;
+    const run = canonical.run!.identity;
+    const now = Date.now();
+    const admitted = runtime.transition(null, {
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "v2-admission", at: now,
+      type: "turn.admitted", turn, strategy: "execute", objective: "检查运行中输入体验", constraints: [], acceptanceCriteria: [],
+    });
+    const aggregate = runtime.transition(admitted, {
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 1, eventId: "v2-run-start", at: now + 1,
+      type: "run.started", run, phase: "observing",
+    });
+    useAppStore.setState({
+      turnRuntimeCheckpoints: {},
+      runtimeV2Checkpoints: {
+        [turn.turnId]: runtime.createRuntimeV2Checkpoint({ aggregate, revision: 2, updatedAt: now + 1 }),
+      },
+    });
+  });
+  const textarea = page.getByTestId("composer-textarea");
+  const text = "留意 Console 窗口的报错";
+  await textarea.fill(text);
+  await textarea.press("Enter");
+
+  const queue = page.getByTestId("composer-queued-message");
+  await expect(queue).toContainText(text);
+  await expect(page.getByTestId("turn-state-anchor").filter({ hasText: text })).toContainText("已排队");
+  await expect(page.getByTestId("turn-state-anchor").filter({ hasText: text }).getByTestId("turn-elapsed-time")).toHaveCount(0);
+  const guide = queue.getByTestId("composer-guide-queued-message");
+  for (const theme of ["light", "dark", "black"] as const) {
+    await page.evaluate(nextTheme => (window as any).__CODELY_E2E__?.setThemeMode?.(nextTheme), theme);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await expect(guide).toBeVisible();
+    await expect(guide).toBeEnabled();
+    await queue.screenshot({ path: testInfo.outputPath(`queued-v2-guidance-${theme}.png`) });
+  }
+  await guide.click();
+
+  await expect.poll(() => page.evaluate(() => {
+    const records = JSON.parse(localStorage.getItem("main.debugLog.v1") || "[]");
+    return {
+      queued: !!document.querySelector('[data-testid="composer-queued-message"]'),
+      rejected: records.filter((entry: { source?: string }) => entry.source === "store.active_guidance_rejected")
+        .map((entry: { message?: string }) => JSON.parse(entry.message || "{}").reason),
+    };
+  })).toEqual({ queued: false, rejected: [] });
+  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(1);
+  await expect(page.getByTestId("runtime-guidance-record")).toContainText("等待引导本回合");
+  await expect(page.getByTestId("user-message-content").filter({ hasText: text })).toHaveCount(1);
+  await expect.poll(() => page.evaluate(async () => {
+    const { useAppStore } = await import("/src/store/useAppStore.ts");
+    const runtime = await import("/src/lib/runtime-v2/index.ts");
+    const state = useAppStore.getState();
+    const active = runtime.normalizeRuntimeV2Checkpoint(state.runtimeV2Checkpoints[state.currentTurnId!]);
+    return {
+      queued: state.workspaceTurnQueue?.entries.length ?? 0,
+      turns: state.conversationTurns.length,
+      guidance: active?.events.filter(event => event.type === "guidance.admitted").length,
+    };
+  })).toEqual({ queued: 0, turns: 1, guidance: 1 });
+
+  await page.getByTestId("composer-stop-button").click();
+  const record = page.getByTestId("runtime-guidance-record");
+  await expect(record).toContainText("引导未应用");
+  for (const theme of ["light", "dark", "black"] as const) {
+    await page.evaluate(nextTheme => (window as any).__CODELY_E2E__?.setThemeMode?.(nextTheme), theme);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await expect(record.getByTestId("restore-unapplied-guidance")).toBeVisible();
+    await record.screenshot({ path: testInfo.outputPath(`unapplied-v2-guidance-${theme}.png`) });
+  }
+  await textarea.fill("已有草稿");
+  await record.getByTestId("restore-unapplied-guidance").click();
+  await expect(textarea).toHaveValue(`已有草稿\n\n${text}`);
+  await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
 });

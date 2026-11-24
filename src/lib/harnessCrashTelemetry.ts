@@ -25,8 +25,6 @@ export interface HarnessRunMarker {
   parentRunId?: string | null;
   /** Earliest durable message index for this logical turn across resumed runs. */
   turnStartMessageIndex?: number;
-  /** Last derived Goal slice run, used to preserve slice lineage across iterations. */
-  lastGoalSliceRunId?: string | null;
   instanceId: string;
   sessionKey: string;
   workspace: string | null;
@@ -223,9 +221,6 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
         ? Number(record.turnStartMessageIndex)
         : Math.max(0, (Number(record.messagesLen) || 1) - 1),
     ),
-    lastGoalSliceRunId: typeof record.lastGoalSliceRunId === "string" && record.lastGoalSliceRunId.trim()
-      ? record.lastGoalSliceRunId.trim()
-      : null,
     instanceId: typeof record.instanceId === "string" ? record.instanceId : "unknown",
     sessionKey,
     workspace: typeof record.workspace === "string" ? record.workspace : null,

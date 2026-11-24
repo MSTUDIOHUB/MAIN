@@ -1,3 +1,4 @@
+import { normalizePlanDraftRecord } from "../lib/planDrafts";
 import type { TaskBlock } from "../lib/taskTypes";
 import {
   getIntentPolicy,
@@ -27,8 +28,8 @@ const WORKSPACE_TURN_INTENT_HINTS = new Set<ResolvedRunIntent>([
   "analyze",
   "summarize",
   "report",
-  "image_studio",
-  "goal",
+
+
 ]);
 
 export type WorkspaceInstructionProjectionConflict =
@@ -159,6 +160,9 @@ export function buildWorkspaceInstructionConversationTurn(input: {
   blockIds?: number[];
 }): ConversationTurn {
   const hintedIntent = resolveWorkspaceInstructionIntentHint(input.instruction);
+  const sourcePlanDraft = normalizePlanDraftRecord(input.instruction.payload.dispatchHints?.sourcePlanDraft);
+  const boundSourcePlanDraft = sourcePlanDraft?.documentRef.owner.sessionKey === input.instruction.sessionKey &&
+    sourcePlanDraft.documentRef.owner.sessionEpoch === input.instruction.sessionEpoch ? sourcePlanDraft : null;
   // This projection is presentation-only: it grants no capability and the
   // dispatcher still owns authoritative intent resolution. An ordinary
   // workspace repair must nevertheless look like an Execute Turn immediately
@@ -178,6 +182,7 @@ export function buildWorkspaceInstructionConversationTurn(input: {
   return {
     id: input.receipt.turnId,
     clientSubmissionId: input.instruction.clientSubmissionId,
+    ...(boundSourcePlanDraft ? { sourcePlanDraft: boundSourcePlanDraft } : {}),
     runtimeEngineVersion: selectRuntimeEngineVersionForNewTurn(projectedIntent),
     networkRead: input.receipt.networkRead,
     workspaceInstructionReceiptId: input.receipt.receiptId,

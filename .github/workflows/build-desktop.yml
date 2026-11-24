@@ -38,7 +38,7 @@ env:
 jobs:
   macos:
     name: Build macOS zip
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       VERSION: ${{ inputs.version }}
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}

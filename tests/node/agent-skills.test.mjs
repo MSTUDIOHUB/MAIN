@@ -39,6 +39,12 @@ async function loadAgentSkillsModule(ipcStubs) {
   }).outputText;
   const sourcesModule = { exports: {} };
   new Function("exports", "module", sourcesOutput)(sourcesModule.exports, sourcesModule);
+  const engineModule = { exports: {} };
+  const engineSource = await fs.readFile(path.join(workspaceRoot, "src/lib/engineManualSkills.ts"), "utf8");
+  const engineOutput = ts.transpileModule(engineSource, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  }).outputText;
+  new Function("exports", "module", engineOutput)(engineModule.exports, engineModule);
   const module = { exports: {} };
   const localRequire = (specifier) => {
     if (specifier === "yaml") return createRequire(import.meta.url)(specifier);
@@ -46,6 +52,7 @@ async function loadAgentSkillsModule(ipcStubs) {
     if (specifier === "./protocolPackages") return protocolModule.exports;
     if (specifier === "./externalSkillSelections") return selectionModule.exports;
     if (specifier === "./externalSkillSources") return sourcesModule.exports;
+    if (specifier === "./engineManualSkills") return engineModule.exports;
     throw new Error(`Unexpected require in test: ${specifier}`);
   };
   new Function("exports", "module", "require", transpiled)(

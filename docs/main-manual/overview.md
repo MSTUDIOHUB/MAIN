@@ -12,14 +12,13 @@ sourceFeature: "MAIN 桌面应用、MAIN 场景、工具编排、工作区与会
 
 MAIN 是一个桌面 AI 工作台。它把模型、工作区、会话、工具执行、审批和结果总结放在同一个窗口里。
 
-![MAIN 主工作台：左侧管理工作区和会话，中间输入任务，顶部显示当前模型。](assets/screenshots/main-workbench.png)
 
 ## 适用场景
 
 - 阅读项目结构、代码和文档。
 - 修 bug、实现功能、重构并验证。
 - 先看计划或 Diff，再批准写入。
-- 使用知识库和 MCP 扩展 MAIN，或切换到图像工作室生成图片。
+- 使用知识库和 MCP 扩展 MAIN。
 
 ## 前置条件
 
@@ -56,5 +55,5 @@ MAIN 是一个桌面 AI 工作台。它把模型、工作区、会话、工具�
 ## 下一步
 
 - 阅读 [快速开始](quickstart.md)，完成第一次模型连接和任务发送。
-- 阅读 [MAIN 场景](main-modes.md)，选择合适入口。
+- 阅读 [MAIN 工作流](main-modes.md)，选择合适入口。
 - 阅读 [权限与审批](permissions-and-approval.md)，理解写入保护。

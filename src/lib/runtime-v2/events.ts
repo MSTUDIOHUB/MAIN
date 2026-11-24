@@ -2,10 +2,12 @@ import {
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
   type RuntimeV2AcceptanceEvidenceRequirementSlot,
   type RuntimeV2Command,
+  type RuntimeV2CompletionRequirement,
   type RuntimeV2EvidenceReference,
   type RuntimeV2ExecutionValidationAuthority,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2Phase,
+  type RuntimeV2PlanContinuation,
   type RuntimeV2Projection,
   type RuntimeV2ProjectionAudience,
   type RuntimeV2RecoveryScope,
@@ -18,7 +20,9 @@ import {
   type RuntimeV2SubagentTelemetry,
   type RuntimeV2TerminalOutcome,
   type RuntimeV2ToolPresentation,
+  type RuntimeV2ToolEffectKind,
   type RuntimeV2TurnIdentity,
+  type RuntimeV2ValidatedMutationVersion,
   type RuntimeV2WorkPlanReference,
 } from "./contracts";
 import type {
@@ -26,9 +30,6 @@ import type {
   SealedWorkPlanV1,
 } from "./workPlan";
 import type { RuntimeV2SubagentReportV1 } from "./subagentReport";
-import type {
-  RuntimeV2ValidatedMutationVersion,
-} from "./validationReceipt";
 
 export interface RuntimeV2EventBase {
   readonly schemaVersion: typeof RUNTIME_V2_EVENT_SCHEMA_VERSION;
@@ -54,20 +55,29 @@ export type RuntimeV2Event =
       readonly run: RuntimeV2RunIdentity;
       readonly requestId: string;
       readonly choice: "recheck" | "continue" | "stop";
+      readonly source?: "editor_reconnected";
       readonly reply?: string;
+      readonly answer?: import("../userQuestions").UserChoiceAnswer;
     })
   | (RuntimeV2EventBase & {
       readonly type: "run.resumed";
       readonly run: RuntimeV2RunIdentity;
       readonly requestId: string;
+      readonly completionRequirement?: Exclude<RuntimeV2CompletionRequirement, { kind: "unspecified" }>;
     })
   | (RuntimeV2EventBase & {
       readonly type: "turn.admitted";
+      readonly planPurpose?: "plan" | "rules";
+      /** Exact prior saved draft selected for a new completion Turn; data only. */
+      readonly sourcePlanDraft?: import("../planDrafts").PlanDraftRecord;
+      readonly workspaceInstructionContext?: string;
+      readonly knowledgeContext?: import("../knowledgeReferences").KnowledgeContextPacket;
       readonly networkRead?: import("../networkRead").NetworkReadPolicy;
       readonly turn: RuntimeV2TurnIdentity;
       readonly strategy: RuntimeV2Strategy;
       readonly subagentRequirement?: "optional" | "required";
       readonly objective: string;
+      readonly completionRequirement?: RuntimeV2CompletionRequirement;
       readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
       readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
       readonly constraints: readonly string[];
@@ -91,8 +101,16 @@ export type RuntimeV2Event =
   | (RuntimeV2EventBase & {
       readonly type: "observation.recorded";
       readonly modelContent?: string;
+      /** Runtime receipt after validating the admitted draft and its saved bytes. */
+      readonly sourcePlanDraft?: import("../planDrafts").PlanDraftRecord;
       readonly run: RuntimeV2RunIdentity;
       readonly evidence: RuntimeV2EvidenceReference;
+    })
+  | (RuntimeV2EventBase & {
+      readonly type: "guidance.admitted";
+      readonly run: RuntimeV2RunIdentity;
+      readonly text: string;
+      readonly sourceReceiptId?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "command.scheduled";
@@ -123,6 +141,11 @@ export type RuntimeV2Event =
       readonly idempotencyKey: string;
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly status: "succeeded" | "failed" | "blocked";
+      readonly effectKind?: RuntimeV2ToolEffectKind;
+      readonly operationName?: string;
+      /** Fingerprint of an attempted command's failure for recovery only. */
+      readonly diagnosticVersion?: string;
+      readonly editorConsole?: import("./editorConsoleEvidence").RuntimeV2EditorConsoleEvidence;
       /** Actual successful mutation operations determined at the effect boundary.
        * Historical events without this field retain their static-tool fallback. */
       readonly mutationRequests?: readonly {
@@ -134,6 +157,7 @@ export type RuntimeV2Event =
        * boundary and therefore carries no new evidence. */
       readonly receiptOrigin?: "executed" | "replayed";
       readonly presentation?: RuntimeV2ToolPresentation;
+      readonly approvedPlanRepair?: import("./unityCompilation").ApprovedPlanExecutionRepair;
       readonly failureKind?:
         | "execution_failed"
         | "not_authorized"
@@ -153,6 +177,7 @@ export type RuntimeV2Event =
       readonly evidence: readonly RuntimeV2EvidenceReference[];
       readonly passed: boolean;
       readonly presentation?: RuntimeV2ToolPresentation;
+      readonly approvedPlanRepair?: import("./unityCompilation").ApprovedPlanExecutionRepair;
       /** Exact authority and criterion linkage used when this validation was
        * admitted. A receipt without it cannot prove Execute completion. */
       readonly authority?: RuntimeV2ExecutionValidationAuthority;
@@ -180,11 +205,13 @@ export type RuntimeV2Event =
       readonly workPlan: RuntimeV2WorkPlanReference;
       readonly sealedPlan: SealedWorkPlanV1;
       readonly reviewCommit: RuntimeV2PlanReviewCommit;
+      readonly continuation?: RuntimeV2PlanContinuation;
     })
   | (RuntimeV2EventBase & {
       readonly type: "work_plan.approved";
       readonly run: RuntimeV2RunIdentity;
       readonly workPlan: RuntimeV2WorkPlanReference;
+      readonly continuationApprovalId?: string;
     })
   | (RuntimeV2EventBase & {
       readonly type: "work_plan.invalidated";
@@ -237,6 +264,7 @@ export type RuntimeV2Event =
         "completed" | "degraded" | "failed" | "canceled"
       >;
       readonly summary: string;
+      readonly resourceInterruption?: "memory" | "provider_capacity";
       /** Parent evidence available to a review child. It is not appended to
        * the aggregate again and cannot be counted as child-produced evidence. */
       readonly inheritedEvidence?:

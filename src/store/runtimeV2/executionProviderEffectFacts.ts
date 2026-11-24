@@ -11,6 +11,8 @@ import {
 } from "./providerReadReceipts";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { isRuntimeV2UnexecutedToolReceipt } from "../../lib/runtime-v2/toolReceipt";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { runtimeV2WorkspaceChangeReceipts } from "../../lib/runtime-v2/validationReceipt";
 
 export interface RuntimeV2ProviderEffectFacts {
   readonly failedToolCallIds?: ReadonlySet<string>;
@@ -99,9 +101,16 @@ const RESULT_SEMANTIC_TOOL_NAMES = new Set([
   "browser_evaluate",
 ]);
 
+const SOURCE_PREREQUISITE_REJECTION_CODES = new Set([
+  "mutation_source_lease_missing",
+  "mutation_source_text_mismatch",
+  "mutation_target_lease_mismatch",
+]);
+
 export function deriveRuntimeV2ProviderEffectFacts(
   aggregate: TurnAggregateV1 | null,
 ): RuntimeV2ProviderEffectFacts {
+  const writes = new Set(aggregate ? runtimeV2WorkspaceChangeReceipts(aggregate) : []);
   const toolCallIdsByCommand = new Map<string, string>();
   const commandsByIdempotencyKey =
     new Map<string, RuntimeV2Command>();
@@ -146,6 +155,11 @@ export function deriveRuntimeV2ProviderEffectFacts(
     }
   >();
   const rejectedActionIdentities = new Set<string>();
+  const sourcePrerequisites = new Map<string, {
+    readonly command: RuntimeV2Command;
+    remainingTargets: readonly string[];
+  }>();
+  const sourceReadProtectedIdentities = new Set<string>();
   const failedToolCallIds = new Set<string>();
   const unexecutedToolCallIds = new Set<string>();
   const observationActionsByFingerprint =
@@ -169,7 +183,11 @@ export function deriveRuntimeV2ProviderEffectFacts(
         // A repeated-rejection reflection carries no independent denial.
         // Reconstruct authority from its original receipt, including after
         // restoring a checkpoint written by the old unexecuted-action bug.
-        if (receipt.status === "rejected" && receipt.reasonCode !== "already_rejected") rejectedActionIdentities.add(receipt.actionIdentity);
+        if (receipt.status === "rejected" && receipt.reasonCode !== "already_rejected") {
+          rejectedActionIdentities.add(receipt.actionIdentity);
+          sourcePrerequisites.delete(receipt.actionIdentity);
+          sourceReadProtectedIdentities.add(receipt.actionIdentity);
+        }
         else if (receipt.status === "not_executed") unexecutedToolCallIds.add(receipt.call.id);
       }
     }
@@ -186,13 +204,16 @@ export function deriveRuntimeV2ProviderEffectFacts(
           return command && (name === "run_command" || isWorkspaceMutationToolName(name) || name === "mcp_call" || name === "computer_use") &&
             runtimeV2ProviderToolCallIdentity({ name, arguments: command.payload.arguments as Record<string, unknown> || {} }) === identity;
         });
-        if (!executedFailure) rejectedActionIdentities.delete(identity);
+        if (!executedFailure) {
+          rejectedActionIdentities.delete(identity);
+          sourcePrerequisites.delete(identity);
+          sourceReadProtectedIdentities.delete(identity);
+        }
       }
     }
     if (
       event.type === "subagent.completed" &&
-      event.status === "completed" &&
-      event.evidence.some((evidence) => evidence.kind === "mutation")
+      writes.has(event)
     ) {
       for (const toolCallId of sourceReadVersionsByToolCallId.keys()) {
         invalidatedSourceReadToolCallIds.add(toolCallId);
@@ -200,6 +221,8 @@ export function deriveRuntimeV2ProviderEffectFacts(
       correctiveMutationFailureToolCallIds.clear();
       correctiveMutationRequirementsByToolCallId.clear();
       rejectedActionIdentities.clear();
+      sourcePrerequisites.clear();
+      sourceReadProtectedIdentities.clear();
       observationActionsByFingerprint.clear();
       repeatedObservationToolNames.clear();
       replayedSourceReceiptCountSinceMutation = 0;
@@ -210,12 +233,12 @@ export function deriveRuntimeV2ProviderEffectFacts(
     const command = commandsByIdempotencyKey.get(
       event.idempotencyKey,
     );
-    const targets = [...new Set(
+    const targets = writes.has(event) ? [...new Set(
       event.evidence
         .filter((evidence) => evidence.kind === "mutation")
         .map((evidence) => String(evidence.target || "").trim())
         .filter(Boolean),
-    )];
+    )] : [];
     const toolCallId = toolCallIdsByCommand.get(event.idempotencyKey);
     const rawArguments = command?.payload.arguments;
     const argumentsValue =
@@ -282,12 +305,23 @@ export function deriveRuntimeV2ProviderEffectFacts(
       )
     ) {
       if (toolName) {
-        rejectedActionIdentities.add(
-          runtimeV2ProviderToolCallIdentity({
-            name: toolName,
-            arguments: argumentsValue,
-          }),
-        );
+        const identity = runtimeV2ProviderToolCallIdentity({
+          name: toolName,
+          arguments: argumentsValue,
+        });
+        rejectedActionIdentities.add(identity);
+        const prerequisiteTargets = event.status === "blocked" &&
+            (event.failureKind === "protocol_invalid" || event.failureKind === "source_mismatch") &&
+            SOURCE_PREREQUISITE_REJECTION_CODES.has(event.failureReasonCode || "") &&
+            isWorkspaceMutationToolName(toolName) && targets.length === 0
+          ? resolveWorkspaceMutationTargets(toolName, argumentsValue, event.presentation?.target || "")
+          : [];
+        if (prerequisiteTargets.length > 0 && !sourceReadProtectedIdentities.has(identity)) {
+          sourcePrerequisites.set(identity, { command, remainingTargets: prerequisiteTargets });
+        } else {
+          sourcePrerequisites.delete(identity);
+          sourceReadProtectedIdentities.add(identity);
+        }
       }
     }
     if (toolCallId && event.receiptOrigin === "replayed") {
@@ -303,17 +337,35 @@ export function deriveRuntimeV2ProviderEffectFacts(
         version: String(source.version || "").trim(),
       });
     }
+    if (event.status === "succeeded" && command?.kind === "execute_tool" &&
+        toolName === "read_file" && source?.version) {
+      for (const [identity, prerequisite] of sourcePrerequisites) {
+        const priorRun = prerequisite.command.run;
+        const readRun = command.run;
+        if (!priorRun || !readRun ||
+            priorRun.sessionKey !== readRun.sessionKey || priorRun.sessionEpoch !== readRun.sessionEpoch ||
+            priorRun.turnId !== readRun.turnId || priorRun.runId !== readRun.runId ||
+            priorRun.parentRunId !== readRun.parentRunId || priorRun.attemptId !== readRun.attemptId) continue;
+        prerequisite.remainingTargets = prerequisite.remainingTargets.filter(target =>
+          !workspacePathsReferToSameFile(target, source.target));
+        if (prerequisite.remainingTargets.length > 0) continue;
+        // This only reopens provider eligibility for an unexecuted proposal.
+        // The next request must still materialize current source and pass the
+        // unchanged Tool-port lease, scope, permission and mutation preflight.
+        rejectedActionIdentities.delete(identity);
+        sourcePrerequisites.delete(identity);
+      }
+    }
     const observation = event.evidence.find((evidence) =>
       evidence.kind === "source" || evidence.kind === "tool"
     );
     const observationVersion = String(
-      observation?.version || "",
+      event.status === "succeeded" ? observation?.version || "" : event.diagnosticVersion || "",
     ).trim();
     const observationSummary = String(
       event.presentation?.observationSummary || "",
     ).trim();
     if (
-      event.status === "succeeded" &&
       event.receiptOrigin !== "replayed" &&
       toolName &&
       RESULT_SEMANTIC_TOOL_NAMES.has(toolName) &&
@@ -341,6 +393,8 @@ export function deriveRuntimeV2ProviderEffectFacts(
       correctiveMutationFailureToolCallIds.clear();
       correctiveMutationRequirementsByToolCallId.clear();
       rejectedActionIdentities.clear();
+      sourcePrerequisites.clear();
+      sourceReadProtectedIdentities.clear();
       observationActionsByFingerprint.clear();
       repeatedObservationToolNames.clear();
       replayedSourceReceiptCountSinceMutation = 0;

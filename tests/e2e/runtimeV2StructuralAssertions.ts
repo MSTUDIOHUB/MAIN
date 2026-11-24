@@ -306,7 +306,11 @@ export function expectRuntimeV2ReadOnlyCollaboration(
         .toBeLessThan(sealedSequence);
       expect(sealedSequence)
         .toBeLessThan(Number(appliedEvent?.sequence || 0));
-      expect(appliedEvent?.handoffSource).toBe("work_plan");
+      // Canonical events use `source`; the older public-summary shape uses
+      // an alias. A present invalid canonical value must not borrow the alias.
+      const handoffSource = Object.prototype.hasOwnProperty.call(appliedEvent, "source")
+        ? appliedEvent.source : appliedEvent?.handoffSource;
+      expect(handoffSource).toBe("work_plan");
       expect(appliedEvent?.sourceEventId).toBe(sealedEvent?.eventId);
       expect((appliedEvent?.evidenceIds || []).length).toBeGreaterThan(0);
       expect((appliedEvent?.evidenceIds || []).every(

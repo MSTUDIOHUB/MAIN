@@ -1,23 +1,28 @@
 // @ts-nocheck
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  knowledgeBootstrapPreset,
   knowledgeCreateBase,
   knowledgeDeleteBase,
   knowledgeImportSource,
   knowledgeImportUrl,
   knowledgeCancelImportUrl,
   knowledgeListBases,
+  knowledgeListPresets,
   knowledgeListSources,
   knowledgeRebuildBase,
   knowledgeSearch,
   knowledgeSetBaseEnabled,
+  type EngineManualPreset,
   type KnowledgeBase,
   type KnowledgeSearchHit,
   type KnowledgeSource,
 } from "../lib/ipc";
+import { normalizeWebSearchProvider } from "../lib/networkRead";
 import { useAppStore } from "../store/useAppStore";
 import ToggleSwitch from "./ToggleSwitch";
+import KnowledgeEvidence from "./KnowledgeEvidence";
 import {
   IconBook,
   IconClose,
@@ -31,7 +36,7 @@ import {
 const COPY = {
   zh: {
     title: "知识库",
-    subtitle: "启用的知识库会在发送指令时按需检索，不会把全文塞进上下文。",
+    subtitle: "在聊天中输入 # 选择整库或单篇资料，仅本条消息检索。资料保存在个人知识库，不会把全文塞进上下文。",
     create: "新建知识库",
     namePlaceholder: "例如 Python 官方标准库",
     descPlaceholder: "用途说明，可选",
@@ -57,7 +62,7 @@ const COPY = {
   },
   en: {
     title: "Knowledge",
-    subtitle: "Enabled knowledge bases are searched on demand when you send a prompt; full documents are not injected.",
+    subtitle: "Type # in chat to select libraries or documents for that message only. Your personal sources are searched locally; full documents are not injected.",
     create: "New Knowledge Base",
     namePlaceholder: "e.g. Python Standard Library Docs",
     descPlaceholder: "Optional description",
@@ -110,8 +115,12 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
   currentWorkspace?: string;
 }) {
   const language = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
+  const themeMode = useAppStore((s) => s.config.themeMode) || "dark";
+  const isLight = themeMode === "light";
+  const isBlack = themeMode === "black";
   const copy = COPY[language];
   const knowledgeBases = useAppStore((s) => s.knowledgeBases);
+  const searchProvider = useAppStore((s) => s.webSearchProvider);
   const setKnowledgeBases = useAppStore((s) => s.setKnowledgeBases);
   const upsertKnowledgeBase = useAppStore((s) => s.upsertKnowledgeBase);
   const removeKnowledgeBase = useAppStore((s) => s.removeKnowledgeBase);
@@ -122,7 +131,9 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [allowWebFallbackSearch, setAllowWebFallbackSearch] = useState(false);
   const [hits, setHits] = useState<KnowledgeSearchHit[]>([]);
+  const [presets, setPresets] = useState<readonly EngineManualPreset[]>([]);
 
   const [showImportMenu, setShowImportMenu] = useState(false);
   const [webImportState, setWebImportState] = useState<"idle" | "input" | "progress">("idle");
@@ -143,10 +154,29 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
     [knowledgeBases, selectedId],
   );
 
+  const ownerKey = `${isOpen}:${selectedBase?.id || ""}:${selectedBase?.indexRevision || ""}`;
+  const ownerRef = useRef({ key: ownerKey, generation: 0 });
+  if (ownerRef.current.key !== ownerKey) ownerRef.current = { key: ownerKey, generation: ownerRef.current.generation + 1 };
+  const searchRequest = useRef<AbortController | null>(null);
+  useEffect(() => {
+    setHits([]);
+    setBusy(current => current === "search" ? "" : current);
+    return () => searchRequest.current?.abort();
+  }, [ownerKey]);
+
   useEffect(() => {
     if (!isOpen) return;
     let cancelled = false;
     setBusy("load");
+    knowledgeListPresets()
+      .then((items) => {
+        if (!cancelled && Array.isArray(items) && items.length > 0) {
+          setPresets(items);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPresets([]);
+      });
     knowledgeListBases()
       .then((bases) => {
         if (cancelled) return;
@@ -170,6 +200,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
       return;
     }
     let cancelled = false;
+    setSources([]);
     knowledgeListSources(selectedBase.id)
       .then((items) => {
         if (!cancelled) setSources(items);
@@ -183,20 +214,22 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
   }, [isOpen, selectedBase?.id]);
 
   useEffect(() => {
-    if (webImportState !== "progress" || !selectedBase) return;
+    const isPresetBusy = busy.startsWith("preset:");
+    if ((webImportState !== "progress" || !selectedBase) && !isPresetBusy) return;
     let unlistenFn: (() => void) | null = null;
     
     const setupListener = async () => {
       const { listen } = await import("@tauri-apps/api/event");
       const unlisten = await listen<{
         kbId: string;
+        presetId?: string;
         status: string;
         url?: string;
         current: number;
         total: number;
         error?: string;
       }>("knowledge-import-progress", (event) => {
-        if (event.payload.kbId !== selectedBase.id) return;
+        if (!isPresetBusy && selectedBase && event.payload.kbId !== selectedBase.id) return;
         setProgress({
           status: event.payload.status,
           url: event.payload.url || "",
@@ -204,7 +237,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
           total: event.payload.total,
           error: event.payload.error || "",
         });
-        if (event.payload.status === "done") {
+        if (event.payload.status === "done" && webImportState === "progress" && selectedBase) {
           setWebImportState("idle");
           knowledgeListSources(selectedBase.id).then(setSources);
         }
@@ -217,7 +250,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
     return () => {
       if (unlistenFn) unlistenFn();
     };
-  }, [webImportState, selectedBase?.id]);
+  }, [webImportState, selectedBase?.id, busy]);
 
   if (!isOpen) return null;
 
@@ -239,11 +272,29 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
     }
   };
 
-  const toggleBase = async (base: KnowledgeBase) => {
+  const bootstrapPreset = async (presetId: string) => {
+    if (busy) return;
+    setBusy(`preset:${presetId}`);
+    setError("");
+    try {
+      const base = await knowledgeBootstrapPreset(presetId);
+      upsertKnowledgeBase(base);
+      setSelectedId(base.id);
+      setSources(await knowledgeListSources(base.id));
+    } catch (err) {
+      setError(friendlyErrorMessage(err, copy));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const toggleBaseEnabled = async (base: KnowledgeBase, enabled: boolean) => {
+    if (busy) return;
     setBusy(`toggle:${base.id}`);
     setError("");
     try {
-      upsertKnowledgeBase(await knowledgeSetBaseEnabled(base.id, !base.enabled));
+      const updated = await knowledgeSetBaseEnabled(base.id, enabled);
+      upsertKnowledgeBase(updated);
     } catch (err) {
       setError(friendlyErrorMessage(err, copy));
     } finally {
@@ -351,20 +402,79 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
 
   const runSearch = async () => {
     if (!selectedBase || !searchQuery.trim() || busy) return;
+    const requestOwner = ownerRef.current.generation;
+    const request = new AbortController();
+    searchRequest.current = request;
     setBusy("search");
     setError("");
     try {
-      const result = await knowledgeSearch(searchQuery.trim(), [selectedBase.id], 6);
-      setHits(result.hits || []);
+      const bases = await knowledgeListBases();
+      request.signal.throwIfAborted();
+      const base = bases.find(item => item.id === selectedBase.id);
+      if (!base) throw new Error(copy.noBases);
+      const allowNetwork = allowWebFallbackSearch && base.enabled && !!base.presetId;
+      const result = await knowledgeSearch(
+        searchQuery.trim(),
+        [{
+          kind: "base",
+          kbId: base.id,
+          indexRevision: base.indexRevision,
+          ...(allowNetwork ? { activationMode: "workspace_active", presetId: base.presetId! } as const : {}),
+        }],
+        6,
+        allowNetwork ? { mode: "officialSearch", provider: normalizeWebSearchProvider(searchProvider) } : { mode: "local" },
+        request.signal,
+      );
+      if (ownerRef.current.generation === requestOwner) setHits(result.hits || []);
     } catch (err) {
-      setError(friendlyErrorMessage(err, copy));
+      if (!request.signal.aborted && ownerRef.current.generation === requestOwner) setError(friendlyErrorMessage(err, copy));
     } finally {
-      setBusy("");
+      if (searchRequest.current === request) searchRequest.current = null;
+      if (ownerRef.current.generation === requestOwner) setBusy("");
     }
   };
 
+  const errorBoxClass = isLight
+    ? "border-[#fca5a5] bg-[#fef2f2] text-[#b91c1c]"
+    : isBlack
+      ? "border-[#7f1d1d] bg-[#220c0e] text-[#fca5a5]"
+      : "border-[#7f1d1d] bg-[#3a1d1f] text-[#fca5a5]";
+
+  const dangerButtonClass = isLight
+    ? "border-[#fca5a5] bg-[#fef2f2] text-[#dc2626] hover:bg-[#fee2e2]"
+    : isBlack
+      ? "border-[#7f1d1d] bg-[#140a0c] text-[#fca5a5] hover:bg-[#2a1215]"
+      : "border-[#7f1d1d] bg-[#1f1214] text-[#fca5a5] hover:bg-[#3a1d1f]";
+
+  const enabledBadgeClass = isLight
+    ? "border border-[#86efac] bg-[#dcfce7] text-[#047857]"
+    : isBlack
+      ? "border border-[#166534] bg-[#031d0e] text-[#34d399]"
+      : "border border-[#166534] bg-[#052e16] text-[#34d399]";
+
+  const disabledBadgeClass = isLight
+    ? "border border-[#d4d4d8] bg-[#e4e4e7] text-[#52525b]"
+    : "bg-[#18181b] text-[#71717a]";
+
+  const selectedCardClass = isLight
+    ? "theme-border bg-[color-mix(in_srgb,var(--accent,#9333ea)_7%,#ffffff_93%)] shadow-xs"
+    : isBlack
+      ? "theme-border bg-[color-mix(in_srgb,var(--accent,#9333ea)_16%,#050507_84%)]"
+      : "theme-border bg-[color-mix(in_srgb,var(--accent,#9333ea)_14%,#19191d_86%)]";
+
+  const idlePresetCardClass = isLight
+    ? "border-[#d4d4d8] bg-[#f8fafc] hover:border-[#a1a1aa]"
+    : isBlack
+      ? "border-[#202026] bg-[#050507] hover:border-[#303038]"
+      : "border-[#2b2b32] bg-[#151518] hover:border-[#3f3f48]";
+
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
+    <div
+      data-theme-mode={themeMode}
+      className={`absolute inset-0 z-50 flex items-center justify-center backdrop-blur-sm ${
+        isLight ? "bg-slate-900/45" : "bg-black/80"
+      }`}
+    >
       <div className="flex max-h-[82vh] w-[860px] overflow-hidden rounded-xl border border-[#27272a] bg-[#09090b] shadow-2xl">
         <div className="flex w-[280px] shrink-0 flex-col border-r border-[#27272a] bg-[#050507]">
           <div className="flex items-center justify-between border-b border-[#27272a] px-4 py-4">
@@ -406,21 +516,25 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                 {knowledgeBases.map((base) => (
                   <button
                     key={base.id}
+                    disabled={!!busy}
                     onClick={() => setSelectedId(base.id)}
                     className={`w-full rounded-lg border p-3 text-left transition-colors ${
                       selectedBase?.id === base.id
-                        ? "theme-subtle-bg theme-border"
+                        ? selectedCardClass
                         : "border-[#27272a] bg-[#000000] hover:border-[#3f3f46]"
                     }`}
                   >
                     <div className="flex items-center gap-2">
                       <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#f4f4f5]">{base.name}</span>
-                      <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${base.enabled ? "bg-[#0f2e0f] text-[#86d9a3]" : "bg-[#18181b] text-[#71717a]"}`}>
+                      <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold ${base.enabled ? enabledBadgeClass : disabledBadgeClass}`}>
                         {base.enabled ? copy.enabled : copy.disabled}
                       </span>
                     </div>
                     <div className="mt-1 text-[10px] text-[#71717a]">
-                      {base.sourceCount} {copy.sources} · {base.indexStatus}
+                      {base.sourceCount} {copy.sources}
+                      {(base.tocEntryCount ?? 0) > 0 ? ` · ${base.tocEntryCount} TOC` : ""}
+                      {" · "}
+                      {base.indexStatus}
                     </div>
                   </button>
                 ))}
@@ -432,7 +546,117 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="border-b border-[#27272a] px-5 py-4">
             <p className="text-xs text-[#a1a1aa]">{copy.subtitle}</p>
-            {error && <p className="mt-2 rounded-md border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-300">{error}</p>}
+            {error && (
+              <p
+                role="alert"
+                className={`mt-2.5 rounded-md border px-3 py-2 text-xs font-medium ${errorBoxClass}`}
+              >
+                {error}
+              </p>
+            )}
+            <div className="mt-3">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-[#e4e4e7]">
+                  {language === "en" ? "Official Engine Code Manuals (One-Click Acquire & Auto-Sync)" : "官方引擎代码手册 (一键获取 · 零预注入按需检索 · 联网穿透)"}
+                </span>
+                <span className="text-[10px] text-[#71717a]">
+                  {language === "en" ? "Workspace-aware mutual exclusion + Navigator Skill" : "自动识别工作区引擎 · 跨引擎互斥 · 自动挂载导航 Skill"}
+                </span>
+              </div>
+              <div className="grid grid-cols-3 gap-2.5">
+                {presets.map((preset) => {
+                  const matchedBase = knowledgeBases.find(
+                    (base) => base.presetId === preset.presetId,
+                  );
+                  const isBootstrapping = busy === `preset:${preset.presetId}`;
+                  const isSelectedPreset = !!matchedBase && selectedBase?.id === matchedBase.id;
+                  return (
+                    <div
+                      key={preset.presetId}
+                      className={`flex flex-col justify-between rounded-lg border p-2.5 transition-colors ${
+                        isSelectedPreset ? selectedCardClass : idlePresetCardClass
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-center justify-between gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => matchedBase && setSelectedId(matchedBase.id)}
+                            className={`truncate text-left text-xs font-bold hover:underline ${
+                              isLight ? "text-[#09090b]" : "text-[#fafafa]"
+                            }`}
+                          >
+                            {preset.name}
+                          </button>
+                          {matchedBase && (
+                            <ToggleSwitch
+                              checked={matchedBase.enabled}
+                              disabled={!!busy}
+                              onCheckedChange={(checked) => void toggleBaseEnabled(matchedBase, checked)}
+                              aria-label={`${copy.enableBase}: ${preset.name}`}
+                            />
+                          )}
+                        </div>
+                        <p className={`mt-1 line-clamp-2 text-[10px] leading-relaxed ${isLight ? "text-[#52525b]" : "text-[#a1a1aa]"}`}>
+                          {preset.description}
+                        </p>
+                        <p className={`mt-1 text-[10px] ${isLight ? "text-[#52525b]" : "text-[#a1a1aa]"}`}>
+                          {preset.documentationVersion}
+                          {matchedBase && ` · ${matchedBase.tocIndexedSourceCount ?? 0}/${preset.tocUrls.length} ${language === "en" ? "verified indexes" : "已核验目录"}`}
+                        </p>
+                        {matchedBase?.presetSyncStatus === "partial" && (
+                          <p role="status" className="mt-1 text-[10px] opacity-80">
+                            {language === "en" ? "Some official files could not be acquired" : "部分官方文件获取失败"}
+                          </p>
+                        )}
+                      </div>
+                      <div
+                        className={`mt-2.5 flex items-center justify-between gap-2 border-t pt-2 ${
+                          isLight ? "border-[#e4e4e7]" : isBlack ? "border-[#18181b]" : "border-[#232329]"
+                        }`}
+                      >
+                        <span className={`truncate text-[10px] font-medium ${isLight ? "text-[#52525b]" : "text-[#8c8c97]"}`}>
+                          {isBootstrapping && progress.total > 0
+                            ? `${progress.current} / ${progress.total}`
+                            : matchedBase
+                              ? `${matchedBase.sourceCount} ${copy.sources} · ${matchedBase.tocEntryCount ?? 0} TOC`
+                              : language === "en"
+                                ? "Not acquired"
+                                : "尚未获取"}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={!!busy}
+                          onClick={() => void bootstrapPreset(preset.presetId)}
+                          title={language === "en" ? "Download from the official documentation site" : "从官方文档站点联网获取"}
+                          className={`shrink-0 rounded px-2.5 py-1 text-[10px] font-bold transition-colors disabled:opacity-50 ${
+                            matchedBase
+                              ? isLight
+                                ? "border border-[#d4d4d8] bg-[#ffffff] text-[#18181b] hover:bg-[#f4f4f5]"
+                                : isBlack
+                                  ? "border border-[#27272a] bg-[#121216] text-[#e4e4e7] hover:bg-[#1d1d23] hover:text-white"
+                                  : "border border-[#3f3f46] bg-[#202025] text-[#e4e4e7] hover:bg-[#27272d] hover:text-white"
+                              : "theme-bg theme-bg-hover"
+                          }`}
+                        >
+                          {isBootstrapping
+                            ? language === "en"
+                              ? "Syncing..."
+                              : "正在获取..."
+                            : matchedBase
+                              ? language === "en"
+                                ? "Download update"
+                                : "联网更新"
+                              : language === "en"
+                                ? "Download manual"
+                                : "联网获取"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
 
           {selectedBase ? (
@@ -440,11 +664,16 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div className="min-w-0">
                   <h3 className="truncate text-base font-bold text-white">{selectedBase.name}</h3>
-                  <p className="mt-1 text-xs text-[#a1a1aa]">{selectedBase.description || selectedBase.embeddingProfile}</p>
+                  <p className="mt-1 text-xs text-[#a1a1aa]">{selectedBase.description || (language === "en" ? "Local keyword retrieval" : "本地关键词检索")}</p>
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <label className="flex items-center gap-2 text-xs text-[#e4e4e7]">
-                    <ToggleSwitch checked={selectedBase.enabled} onCheckedChange={() => void toggleBase(selectedBase)} disabled={!!busy} aria-label={`${copy.enableBase}: ${selectedBase.name}`} />
+                <div className="flex shrink-0 items-center gap-3">
+                  <label className="flex items-center gap-2 text-xs text-[#a1a1aa] cursor-pointer hover:text-white">
+                    <ToggleSwitch
+                      checked={selectedBase.enabled}
+                      disabled={!!busy}
+                      onCheckedChange={(checked) => void toggleBaseEnabled(selectedBase, checked)}
+                      aria-label={copy.enableBase}
+                    />
                     <span>{selectedBase.enabled ? copy.enabled : copy.disabled}</span>
                   </label>
                   <div className="relative">
@@ -567,7 +796,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                     </span>
                     <button
                       onClick={cancelWebImport}
-                      className="rounded border border-red-950 bg-[#000000] px-2.5 py-1 text-[10px] text-red-300 hover:bg-red-950/40"
+                      className={`rounded border px-2.5 py-1 text-[10px] font-medium transition-colors ${dangerButtonClass}`}
                     >
                       终止抓取
                     </button>
@@ -599,7 +828,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                   <IconRefresh className="h-3.5 w-3.5" />
                   {copy.rebuild}
                 </button>
-                <button onClick={deleteBase} disabled={!!busy} className="flex items-center gap-2 rounded-md border border-red-950 bg-[#000000] px-3 py-2 text-xs text-red-300 hover:bg-red-950/40 disabled:opacity-50">
+                <button onClick={deleteBase} disabled={!!busy} className={`flex items-center gap-2 rounded-md border px-3 py-2 text-xs font-medium transition-colors disabled:opacity-50 ${dangerButtonClass}`}>
                   <IconTrash className="h-3.5 w-3.5" />
                   {copy.delete}
                 </button>
@@ -619,7 +848,9 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                           <span className="text-[10px] text-[#71717a]">{formatSize(source.size)}</span>
                         </div>
                         <div className="mt-1 flex flex-wrap gap-2 text-[10px] text-[#71717a]">
-                          <span>{copy.status}: {source.status}</span>
+                          <span>{copy.status}: {source.provenance === "unverified_legacy"
+                            ? (language === "en" ? "Reverification needed" : "等待重新核验")
+                            : source.status}</span>
                           <span>{source.ext}</span>
                           <span>{source.hash}</span>
                         </div>
@@ -630,7 +861,18 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
               </div>
 
               <div>
-                <div className="mb-2 text-xs font-bold uppercase tracking-wide text-[#71717a]">{copy.testSearch}</div>
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-xs font-bold uppercase tracking-wide text-[#71717a]">{copy.testSearch}</div>
+                  <label className="flex items-center gap-2 text-[11px] text-[#a1a1aa] cursor-pointer hover:text-white">
+                    <ToggleSwitch
+                      checked={allowWebFallbackSearch}
+                      onCheckedChange={setAllowWebFallbackSearch}
+                      disabled={!selectedBase?.enabled || !selectedBase?.presetId}
+                      aria-label="允许官方站点联网穿透检索"
+                    />
+                    <span>{language === "en" ? "Allow official web fallback & auto-cache" : "未命中时允许官方站点联网检索并自动缓存"}</span>
+                  </label>
+                </div>
                 <div className="flex gap-2">
                   <input
                     value={searchQuery}
@@ -654,9 +896,9 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                           {hit.citation.sourceTitle}
                           {hit.citation.page ? ` · p.${hit.citation.page}` : ""}
                           {hit.citation.block ? ` · ${hit.citation.block}` : ""}
-                          {` · ${(hit.citation.score * 100).toFixed(0)}%`}
+
                         </div>
-                        <p className="text-xs leading-relaxed text-[#d4d4d8]">{hit.excerpt}</p>
+                        <KnowledgeEvidence packet={{ state: "retrieved", query: searchQuery, references: selectedBase ? [{ kind: "base", kbId: selectedBase.id, indexRevision: selectedBase.indexRevision }] : [], hits: [hit], note: "" }} language={language === "en" ? "en" : "zh"} />
                       </div>
                     ))}
                   </div>

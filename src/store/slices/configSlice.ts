@@ -51,6 +51,22 @@ export function normalizeLocalConfig(
     : fallback.contextLimit;
   const apiKey = typeof input?.apiKey === "string" ? input.apiKey : fallback.apiKey;
   const hasStoredToolProtocol = !!input && Object.prototype.hasOwnProperty.call(input, "toolProtocol");
+  const hasStoredMaxActiveRequests = !!input && Object.prototype.hasOwnProperty.call(input, "maxActiveRequests");
+  const normalizedInputMaxActiveRequests = Number(input?.maxActiveRequests);
+  const normalizedFallbackMaxActiveRequests = Number(fallback.maxActiveRequests);
+  const maxActiveRequests = hasStoredMaxActiveRequests
+    ? (
+        Number.isSafeInteger(normalizedInputMaxActiveRequests) &&
+          normalizedInputMaxActiveRequests > 0
+          ? normalizedInputMaxActiveRequests
+          : undefined
+      )
+    : (
+        Number.isSafeInteger(normalizedFallbackMaxActiveRequests) &&
+          normalizedFallbackMaxActiveRequests > 0
+          ? normalizedFallbackMaxActiveRequests
+          : undefined
+      );
 
   return {
     provider,
@@ -62,15 +78,7 @@ export function normalizeLocalConfig(
       hasStoredToolProtocol ? input?.toolProtocol : undefined,
       provider,
     ),
-    ...(
-      Number.isSafeInteger(Number(input?.maxActiveRequests)) &&
-        Number(input?.maxActiveRequests) > 0
-        ? { maxActiveRequests: Number(input?.maxActiveRequests) }
-        : Number.isSafeInteger(Number(fallback.maxActiveRequests)) &&
-            Number(fallback.maxActiveRequests) > 0
-          ? { maxActiveRequests: Number(fallback.maxActiveRequests) }
-          : {}
-    ),
+    ...(maxActiveRequests !== undefined ? { maxActiveRequests } : {}),
   };
 }
 

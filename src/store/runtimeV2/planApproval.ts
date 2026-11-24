@@ -4,6 +4,7 @@ import {
   type RuntimeV2CheckpointV3,
   type RuntimeV2Event,
 } from "../../lib/runtime-v2";
+import { samePlanDocumentRef } from "../../lib/planDocuments";
 import type {
   PlanReviewActionRequest,
   PlanReviewResolutionIdentity,
@@ -45,6 +46,7 @@ function sameExpectedIdentity(
     expected.runId === request.runId &&
     (expected.parentRunId || null) === (request.parentRunId || null) &&
     expected.planRevision === request.planRevision &&
+    samePlanDocumentRef(expected.documentRef, request.documentRef) &&
     expected.artifactHash === request.artifactHash
   );
 }
@@ -81,6 +83,7 @@ export async function approveRuntimeV2PlanReviewCheckpoint(input: {
     request.artifactHash !== commit.authority.projectionHash ||
     request.artifactPaths.length !== 1 ||
     request.artifactPaths[0] !== commit.artifact.path
+    || !samePlanDocumentRef(request.documentRef, commit.artifact.documentRef)
   ) {
     return { ok: false, reason: "runtime_v2_plan_request_mismatch" };
   }

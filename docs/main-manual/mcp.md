@@ -56,6 +56,6 @@ MAIN 就能在普通 Plan 或 Execute 流程中按权限调用它们，不需要
 
 ## 下一步
 
-- 阅读 [MAIN 场景](main-modes.md)，了解通用任务与图像工作室的边界。
+- 阅读 [MAIN 工作流](main-modes.md)，了解统一任务入口与计划执行。
 - 阅读 [工具参考](tools-reference.md)，区分内置工具和 MCP 工具。
 - 阅读 [故障排查](troubleshooting.md)，处理 MCP 错误。

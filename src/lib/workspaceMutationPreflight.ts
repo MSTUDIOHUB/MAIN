@@ -36,6 +36,7 @@ export type WorkspaceWriteFileTargetFact =
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
   writeFileTarget?: WorkspaceWriteFileTargetFact;
+  postImages?: readonly { readonly path: string; readonly content: string | null }[];
   reason?: WorkspaceMutationPreflightReason;
   message?: string;
   /** Best available workspace target for recovery and progress correlation. */
@@ -64,6 +65,8 @@ export interface WorkspaceMutationPreflightInput {
   checkSyntax?: (
     path: string,
     content: string,
+    workspace?: string,
+    patchPaths?: Readonly<Record<string, boolean>>,
   ) => Promise<{
     applicable: boolean;
     hasErrors: boolean;
@@ -450,13 +453,14 @@ async function blockedSyntaxResult(
   content: string,
   language: "zh" | "en",
   previousContent?: string,
+  patchPaths?: Readonly<Record<string, boolean>>,
 ): Promise<WorkspaceMutationPreflightResult | null> {
   if (!input.checkSyntax) return null;
-  const checked = await input.checkSyntax(path, content);
+  const checked = await input.checkSyntax(path, content, input.workspaceRoot, patchPaths);
   if (!checked.applicable || !checked.hasErrors) return null;
   const previous = previousContent === undefined
     ? null
-    : await input.checkSyntax(path, previousContent);
+    : await input.checkSyntax(path, previousContent, input.workspaceRoot);
   if (isStrictlyMonotonicSyntaxRepair(previous, checked)) return null;
   const reportedErrors = (checked.errors || [])
     .filter((error) =>
@@ -623,6 +627,7 @@ export async function preflightWorkspaceMutation(
         });
       }
     }
+    const patchPaths = Object.fromEntries(preview.changes.map(change => [change.path, change.kind !== "delete"]));
     for (const change of preview.changes) {
       if (change.kind === "delete") continue;
       const syntaxFailure = await blockedSyntaxResult(
@@ -631,6 +636,7 @@ export async function preflightWorkspaceMutation(
         change.newContent,
         language,
         change.kind === "update" ? change.oldContent : undefined,
+        patchPaths,
       );
       if (syntaxFailure) return syntaxFailure;
     }
@@ -646,7 +652,9 @@ export async function preflightWorkspaceMutation(
       language,
     );
     if (publicContractFailure) return publicContractFailure;
-    return { ok: true };
+    return { ok: true, postImages: preview.changes.map(change => ({
+      path: change.path, content: change.kind === "delete" ? null : change.newContent,
+    })) };
   }
 
   if (toolName === "write_file") {
@@ -687,7 +695,7 @@ export async function preflightWorkspaceMutation(
         sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
         existedBefore: true, previousContent: current, toolName,
       });
-      return { ok: true, writeFileTarget: { path, exists: true, content: current } };
+      return { ok: true, writeFileTarget: { path, exists: true, content: current }, postImages: [{ path, content }] };
     }
     const syntaxFailure = await blockedSyntaxResult(input, path, content, language);
     if (syntaxFailure) return syntaxFailure;
@@ -695,7 +703,7 @@ export async function preflightWorkspaceMutation(
       sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
       existedBefore: false, previousContent: null, toolName,
     });
-    return { ok: true, writeFileTarget: { path, exists: false } };
+    return { ok: true, writeFileTarget: { path, exists: false }, postImages: [{ path, content }] };
   }
 
   const searchText = asText(input.args.search_text);
@@ -809,5 +817,5 @@ export async function preflightWorkspaceMutation(
     input,
     [{ path, oldContent: current, newContent: updated }],
     language,
-  )) || { ok: true };
+  )) || { ok: true, postImages: [{ path, content: updated }] };
 }

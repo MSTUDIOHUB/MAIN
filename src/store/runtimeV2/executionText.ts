@@ -79,6 +79,7 @@ export function runtimeV2ContextBoundToolArguments(
   budget?: RuntimeContextBudget | null,
   options: {
     readonly parallelReadCount?: number;
+    readonly skillDefaultWindowChars?: number;
   } = {},
 ): Record<string, unknown> {
   if (toolName === "load_skill" && args.operation !== "list") {
@@ -97,7 +98,7 @@ export function runtimeV2ContextBoundToolArguments(
       ...args,
       max_chars: Number.isFinite(requested) && requested > 0
         ? Math.min(Math.floor(requested), sharedWindow)
-        : Math.min(defaultWindow, sharedWindow),
+        : Math.min(defaultWindow, sharedWindow, options.skillDefaultWindowChars ?? defaultWindow),
     };
   }
   if (
@@ -130,6 +131,6 @@ export function runtimeV2ParallelReadCount(
 ): number {
   return Math.max(
     1,
-    calls.filter((call) => call.name === "read_file" || call.name === "load_skill" || call.name === "run_command").length,
+    calls.filter((call) => ["read_file", "load_skill", "run_command", "knowledge_search", "knowledge_get_excerpt"].includes(call.name)).length,
   );
 }

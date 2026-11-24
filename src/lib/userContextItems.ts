@@ -5,7 +5,7 @@ import {
 } from "../utils/imageUtils";
 import { relativizeToWorkspacePath } from "./workspacePaths";
 
-export type UserContextItemKind = "mention" | "attachment" | "image";
+export type UserContextItemKind = "mention" | "attachment" | "image" | "knowledge";
 export type UserContextItemStatus = "ready" | "failed";
 
 export interface UserContextItem {
@@ -45,10 +45,18 @@ export function buildUserContextItems(input: {
   images?: string[];
   workspace?: string | null;
   language?: "zh" | "en";
+  knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];
 }): UserContextItem[] {
   const language = input.language === "en" ? "en" : "zh";
   const items: UserContextItem[] = [];
   const seen = new Set<string>();
+
+  for (const reference of input.knowledgeReferences || []) {
+    const id = reference.kind === "base" ? `knowledge:${reference.kbId}` : `knowledge:${reference.kbId}:${reference.sourceId}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    items.push({ id, kind: "knowledge", label: reference.label || (reference.kind === "base" ? reference.kbId : reference.sourceId), status: "ready" });
+  }
 
   for (const mention of input.contextMentions || []) {
     const path = String(mention || "").trim();
@@ -102,7 +110,7 @@ export function sanitizeUserContextItemsForPersist(items: unknown): UserContextI
     .map((item, index): UserContextItem | null => {
       if (!item || typeof item !== "object") return null;
       const raw = item as Partial<UserContextItem>;
-      const kind = raw.kind === "mention" || raw.kind === "attachment" || raw.kind === "image"
+      const kind = raw.kind === "mention" || raw.kind === "attachment" || raw.kind === "image" || raw.kind === "knowledge"
         ? raw.kind
         : null;
       if (!kind) return null;

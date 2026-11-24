@@ -18,16 +18,6 @@ export interface RestorableRunOwner {
   activeRunId?: string | null;
 }
 
-export interface RestorableGoalRuntimeIdentity {
-  status?: string | null;
-  goal?: {
-    id?: string | null;
-    revision?: number | null;
-    sessionKey?: string | null;
-    ownerTurnId?: string | null;
-  } | null;
-}
-
 function findExactUserChoiceBlock(
   request: Extract<ActionRequest, { kind: "user_choice" }>,
   taskFlow: TaskBlock[],
@@ -36,11 +26,11 @@ function findExactUserChoiceBlock(
     candidate.type === "agent" &&
     candidate.turnId === request.turnId &&
     isExactUserChoiceResolutionIdentity(candidate.choiceRequest, request) &&
-    Array.isArray(candidate.options) &&
+    (!!request.questionnaire || (Array.isArray(candidate.options) &&
     candidate.options.length === request.optionValues.length &&
     candidate.options.every((option, index) =>
       String(option.value || option.label || "").trim() === request.optionValues[index]
-    )
+    )))
   );
   return block?.type === "agent" ? block : null;
 }
@@ -52,6 +42,7 @@ export function isInternalUnapprovedPlanChoiceRestore(input: {
   unapprovedPlanTurnIds?: string[];
 }): boolean {
   const request = input.request;
+  if (request?.kind === "user_choice" && (request.questionnaire || request.executionBlocker)) return false;
   if (
     request?.kind !== "user_choice" ||
     !(input.unapprovedPlanTurnIds || []).includes(request.turnId)
@@ -113,7 +104,6 @@ export function restorePendingActionRequest(input: {
   /** Typed authority required to restore a pending Plan review control. */
   planReviewIdentity?: PlanApprovalIdentity | null;
   taskFlow?: TaskBlock[];
-  goalRuntime?: RestorableGoalRuntimeIdentity | null;
   unapprovedPlanTurnIds?: string[];
 }): ActionRequest | null {
   const request = normalizeActionRequest(input.request);
@@ -142,18 +132,6 @@ export function restorePendingActionRequest(input: {
       return null;
     }
     return request;
-  }
-
-  if (request.kind === "goal_confirmation") {
-    const goalRuntime = input.goalRuntime;
-    const goal = goalRuntime?.goal;
-    return goalRuntime?.status === "awaiting_input" &&
-      goal?.id === request.goalId &&
-      (!goal.sessionKey || goal.sessionKey === request.sessionKey) &&
-      (Number(goal.revision) || 1) === request.goalRevision &&
-      goal.ownerTurnId === request.turnId
-      ? request
-      : null;
   }
 
   return null;

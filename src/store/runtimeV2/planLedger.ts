@@ -29,6 +29,7 @@ export class PlanLedger {
     private readonly port: CheckpointPort,
     private readonly projection: ProjectionPort,
     initial: { readonly revision: number; readonly aggregate: TurnAggregateV1 } | null,
+    private readonly logEvent?: (event: string, data: Record<string, unknown>) => void,
   ) {
     this.revision = initial?.revision || 0;
     this.aggregate = initial?.aggregate || null;
@@ -67,10 +68,11 @@ export class PlanLedger {
     }
     this.revision = result.checkpoint.revision;
     this.aggregate = result.checkpoint.aggregate;
-    if (event.type === "work_plan.sealed") {
-      await this.appendSealedPlanHandoffs(event);
+    const committed = this.aggregate.events.find(candidate => candidate.eventId === event.eventId) || event;
+    if (committed.type === "work_plan.sealed") {
+      await this.appendSealedPlanHandoffs(committed);
     }
-    return event;
+    return committed;
   }
 
   private async appendSealedPlanHandoffs(
@@ -160,6 +162,8 @@ export class PlanLedger {
       run: command.run,
       command,
     });
+    const modelRequest = command.kind === "request_model" ? { turnId: command.run.turnId, runId: command.run.runId, commandKey: command.idempotencyKey } : null;
+    if (modelRequest) this.logEvent?.("runtime_v2_model_schedule_committed", modelRequest);
     const aggregate = this.aggregate!;
     await this.publish(buildRuntimeV2CapsuleProjection(
       aggregate,
@@ -170,6 +174,7 @@ export class PlanLedger {
       command,
       this.nextId("runtime-v2-plan-timeline"),
     ));
+    if (modelRequest) this.logEvent?.("runtime_v2_model_schedule_projection_returned", modelRequest);
   }
 
   async publish(projection: RuntimeV2Projection): Promise<void> {
