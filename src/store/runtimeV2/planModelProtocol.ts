@@ -56,7 +56,7 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
   function: {
     name: SUBMIT_WORK_PLAN_TOOL_NAME,
     description:
-      "提交可审阅的实现计划。必须提供 Markdown 方案说明（planMarkdown）、文件变更步骤（changes）及验证方式（validations）。主动核实可用的构建、测试或交互检查，将能判定通过或失败的检查写入 validations。仅当完成计划取决于用户决定时才追问。不要编造命令。省略的依赖关系与准则映射由运行时自动推断。",
+      "提交可审阅的实现计划。必须提供 Markdown 方案说明（planMarkdown）、文件变更步骤（changes）及验证方式（validations）。主动核实可用的构建、测试或交互检查，将能判定通过或失败的检查写入 validations。请为每个步骤在 dependsOn 中显式声明前置依赖（省略 dependsOn 表示 [] 无依赖，运行时不会自动推断；共享接口/基类、消费模块与服务组装入口之间的依赖关系必须明确列出）。仅准则映射在省略时由运行时补充；不要编造命令。",
     parameters: {
       type: "object",
       properties: {
@@ -96,7 +96,7 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
               dependsOn: {
                 type: "array",
                 items: { type: "integer" },
-                description: "可选，前置步骤的 0-based 索引列表，默认自动推断",
+                description: "可选，前置步骤的 0-based 索引列表；省略表示 []（无前置依赖），运行时不会自动推断。当存在共享接口、基类或总装注册入口时，消费模块和总装步必须显式依赖定义它们的前置步骤。",
               },
               criterionIds: {
                 type: "array",
@@ -473,7 +473,7 @@ export function synthesisPlanTranscript(input: {
         input.canAskPlanQuestions && (input.transport === "structured_response"
           ? "If a consequential new user decision blocks completion, put the specific question in the questions field so MAIN pauses for an answer. Treat explicit requirements in the original request and confirmed answers as resolved decisions."
           : PLAN_CLARIFICATION_GUIDANCE),
-        "Preserve every admitted criterion, dependency edge and bounded validation. Cite the exact IDs of any adopted child evidence. A rejected submission is not a new fact or approval.",
+        "Explicitly declare dependsOn 0-based step indexes between shared interfaces/base classes, consumer modules, and final assembly entrypoints; omitted dependsOn means [] (no dependencies) and is never auto-inferred. Preserve every admitted criterion and bounded validation. Cite the exact IDs of any adopted child evidence. A rejected submission is not a new fact or approval.",
       ].filter(Boolean).join(" "),
     },
   ];

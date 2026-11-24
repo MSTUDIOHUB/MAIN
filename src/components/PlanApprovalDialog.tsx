@@ -30,6 +30,7 @@ export default function PlanApprovalDialog({ request, markdown, language, onClos
 
   const button = "rounded-lg border px-3 py-2 text-xs font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2";
   const isManualVerification = markdown.includes("人工 / 外部验证模式");
+  const hasSameTurnRepairPreAuth = markdown.includes("本轮修复预授权");
   return createPortal(
     <dialog ref={dialogRef} aria-labelledby={titleId} aria-describedby={descriptionId} data-testid="plan-approval-dialog"
       data-request-id={request.requestId} data-artifact-hash={request.artifactHash}
@@ -48,6 +49,14 @@ export default function PlanApprovalDialog({ request, markdown, language, onClos
               {zh
                 ? "人工 / 外部验证模式：本计划未绑定必选自动测试。执行完成后将生成代码改动与待你人工确认的验收清单。"
                 : "Manual / external verification mode: no required automated tests are bound. Execution will apply changes and provide a manual verification checklist."}
+            </div>
+          )}
+          {hasSameTurnRepairPreAuth && (
+            <div data-testid="plan-same-turn-repair-notice" className="mt-2 rounded-lg border px-3 py-2 text-xs leading-relaxed"
+              style={{ borderColor: "color-mix(in srgb, var(--accent) 38%, var(--surface-border))", background: "color-mix(in srgb, var(--accent) 8%, var(--surface-2))", color: "var(--surface-text)" }}>
+              {zh
+                ? "本轮修复预授权：允许修正本轮创建或修改的已批准文件以消除阻碍原验收条件的具体缺陷；超出已批准路径仍需修订计划。"
+                : "Same-turn repair pre-authorized: fixes within approved paths for files created or modified this turn are allowed to resolve defects blocking original acceptance criteria."}
             </div>
           )}
         </header>

@@ -14,9 +14,11 @@ import { runUnityEditorOperation } from "../../lib/ipc";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
   isRuntimeV2LifecycleDeadlineError,
+  RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
   type RuntimeV2ExecutionValidationAuthority,
   type ToolPort,
 } from "../../lib/runtime-v2";
+import { executeResolveReviewFindingReceiptJson } from "./executionPlanAuthorization";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
@@ -316,7 +318,9 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 next:
                   "Advance only a listed exact change or validation; revise explicitly if new evidence changes scope.",
               })
-            : await executeRuntimeV2ToolWithDeadline({
+            : toolName === RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME
+              ? executeResolveReviewFindingReceiptJson(aggregateForCurrentTurn(input), executionArgs)
+              : await executeRuntimeV2ToolWithDeadline({
                 toolName,
                 toolTimeoutMs: unityTimeout ? unityTimeout + 3_000 : undefined,
                 activity: activity(toolName, target),

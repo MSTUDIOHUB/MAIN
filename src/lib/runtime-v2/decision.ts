@@ -15,6 +15,7 @@ import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 import { resolveRuntimeV2SubagentReferences, runtimeV2SubagentModelHandle, type RuntimeV2SubagentScopeCandidate } from "./subagents";
 import { deriveRuntimeV2PlanExecutionCoverage, resolveRuntimeV2PlanValidationScope, runtimeV2PlanValidationAuthority } from "./planExecution";
+import { deriveRuntimeV2ReviewDispositionLedger } from "./reviewFindings";
 import { isRuntimeV2ValidationToolCall, runtimeV2DirectExecuteReadyForConclusion } from "./phaseTransition";
 import { deriveRuntimeV2ValidationBoundary, latestRuntimeV2WorkspaceChange, resolveRuntimeV2DirectExecuteValidationAuthority } from "./validationReceipt";
 
@@ -228,6 +229,16 @@ function boundedCommand(
 }
 
 function executeReadyForConclusion(state: TurnAggregateV1): boolean {
+  if (
+    currentRunSubagents(state).some(
+      (job) => job.status === "queued" || job.status === "running",
+    )
+  ) {
+    return false;
+  }
+  if (deriveRuntimeV2ReviewDispositionLedger(state).pendingBlockingCount > 0) {
+    return false;
+  }
   const planCoverage = deriveRuntimeV2PlanExecutionCoverage(state);
   if (planCoverage) {
     return planCoverage.allMutationTargetsCovered &&
@@ -717,6 +728,17 @@ export function decideNextCommands(
   const settledProactive = currentRunSubagents(state).filter(job => job.proactiveKey &&
     (job.status === "queued" || job.status === "running") && input.settledProactiveJobIds?.includes(job.id));
   if (settledProactive.length) return [boundedCommand(state, "join_subagents", { jobIds: settledProactive.map(job => job.id) })];
+  const approvedPlanCoverage = state.strategy === "plan" && state.workPlan?.status === "approved"
+    ? deriveRuntimeV2PlanExecutionCoverage(state)
+    : null;
+  if (
+    approvedPlanCoverage?.allMutationTargetsCovered &&
+    approvedPlanCoverage.allRequiredValidationsPassed &&
+    !runtimeV2PendingGuidance(state)
+  ) {
+    const remainingJoin = finalJoinActiveSubagentsCommand(state);
+    if (remainingJoin) return [remainingJoin];
+  }
   if (input.subagentPreference === "preferred" && state.subagentRequirement !== "required" &&
       input.subagentRequestMode === "parallel" && input.subagentCapacity &&
       input.proactiveCollaboration && "candidate" in input.proactiveCollaboration) {

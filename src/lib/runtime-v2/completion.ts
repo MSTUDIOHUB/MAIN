@@ -1,11 +1,14 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2CompletionRequirement, RuntimeV2ResultKind } from "./contracts";
 import { deriveRuntimeV2PlanExecutionCoverage } from "./planExecution";
+import { deriveRuntimeV2ReviewDispositionLedger } from "./reviewFindings";
+import { canFinalizeApprovedWorkPlanWithoutModel } from "./terminalFacts";
 import { latestRuntimeV2Answer } from "./providerAnswer";
 import {
   deriveRuntimeV2ExecutionContract,
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
 } from "./executionContract";
+import { RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME } from "./reviewFindings";
 import { latestRuntimeV2DirectExecuteValidationSequence, runtimeV2DirectExecuteReadyForConclusion, summarizeRuntimeV2ExecuteEvidence } from "./phaseTransition";
 import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
 import { isRuntimeV2ReadOnlyToolName, RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "./workspaceReadPolicy";
@@ -123,7 +126,9 @@ function completedRuntimeV2ActionFacts(
       : requirement?.channel !== "external" || (event.type === "tool.completed" && event.effectKind === "external_operation");
     results.set(command.key, {
       settled: succeeded && (networkRead ? hasNetworkResult : readOnly || hasEffect),
-      operation: succeeded && matchesEffect && hasEffect && command.name !== RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
+      operation: succeeded && matchesEffect && hasEffect &&
+        command.name !== RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME &&
+        command.name !== RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME &&
         (!readOnly || requirement?.channel === "command" || requirement?.channel === "network")
         ? matchedRequestedOperation(requirement, command.name, command.args, event.type === "tool.completed" ? event.operationName : undefined) : null,
     });
@@ -218,6 +223,13 @@ export function decideRuntimeV2TerminalOutcome(
       resultReason: aggregate.recovery.exhausted.reason,
     };
   }
+  const hasActiveSubagent = (aggregate.subagents || []).some(
+    (job) => job.status === "queued" || job.status === "running",
+  );
+  const reviewLedger = deriveRuntimeV2ReviewDispositionLedger(aggregate);
+  if (hasActiveSubagent || reviewLedger.pendingBlockingCount > 0) {
+    return null;
+  }
   if (aggregate.strategy === "execute") {
     const requirement = effectiveRuntimeV2CompletionRequirement(aggregate);
     if (requirement?.kind === "unspecified") return null;
@@ -231,6 +243,16 @@ export function decideRuntimeV2TerminalOutcome(
       facts.failedValidationCount === 0;
     if (!facts.hasProviderConclusion) return null;
     if (hasVerifiedEffect) {
+      if (reviewLedger.breaksAcceptance) {
+        const blockingDetail = reviewLedger.deferredUnresolvedFindings
+          .filter((item) => item.breaksAcceptance)
+          .map((item) => `${item.findingId}(${item.dispositionSummary || item.statement})`)
+          .join("；");
+        return {
+          resultKind: "partial",
+          resultReason: `已确认存在阻碍验收条件成立的未解决缺陷：${blockingDetail}。`,
+        };
+      }
       return {
         resultKind: "success",
         resultReason:
@@ -284,14 +306,25 @@ export function decideRuntimeV2TerminalOutcome(
               `模型已结束本轮，但已批准 WorkPlan 没有形成可验收的实际修改。${detail}`,
           };
     }
-    return facts.hasProviderConclusion
-      ? {
-          resultKind: "success",
-          resultReason: approvedPlanCoverage.requiredValidationIndexes.length === 0
-            ? "已批准 WorkPlan 的全部修改目标已完成；按已确认方案保留人工/外部验收清单，未运行自动测试。"
-            : "已批准 WorkPlan 的全部修改目标和必需验证均由最终修改后的匹配回执覆盖。",
-        }
-      : null;
+    if (!facts.hasProviderConclusion && !canFinalizeApprovedWorkPlanWithoutModel(aggregate)) {
+      return null;
+    }
+    if (reviewLedger.breaksAcceptance) {
+      const blockingDetail = reviewLedger.deferredUnresolvedFindings
+        .filter((item) => item.breaksAcceptance)
+        .map((item) => `${item.findingId}(${item.dispositionSummary || item.statement})`)
+        .join("；");
+      return {
+        resultKind: "partial",
+        resultReason: `已确认存在阻碍原验收条件成立的未解决缺陷：${blockingDetail}。`,
+      };
+    }
+    return {
+      resultKind: "success",
+      resultReason: approvedPlanCoverage.requiredValidationIndexes.length === 0
+        ? "已批准 WorkPlan 的全部修改目标已完成；按已确认方案保留人工/外部验收清单，未运行自动测试。"
+        : "已批准 WorkPlan 的全部修改目标和必需验证均由最终修改后的匹配回执覆盖。",
+    };
   }
   return null;
 }

@@ -88,7 +88,11 @@ export function runtimeV2ToolEvidenceProjection(input: {
     targets: [{ target: input.target || input.toolName }],
     kind: RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(input.toolName) ? "source" : "tool",
     effectKind: observation ? "observation" : externalOperation ? "external_operation" : undefined,
-    ...(externalOperation && tool.status === "resolved" ? { operationName: tool.entry.executionName } : {}),
+    ...(externalOperation && tool.status === "resolved"
+      ? { operationName: tool.entry.executionName }
+      : input.toolName === "resolve_review_finding"
+        ? { operationName: "resolve_review_finding" }
+        : {}),
   };
 }
 

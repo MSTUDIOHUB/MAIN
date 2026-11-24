@@ -1,4 +1,5 @@
 import {
+  authorizeRuntimeV2WriteDelegation,
   deriveRuntimeV2SubagentConcurrency,
   runtimeV2SubagentModelHandle,
   runtimeV2JobMatchesSchedule,
@@ -8,7 +9,10 @@ import {
   type SchedulerPort,
 } from "../../lib/runtime-v2";
 import type { RuntimeV2ExecutionPortsInput } from "./executionContext";
-import { aggregateForCurrentTurn } from "./executionAggregate";
+import {
+  aggregateForCurrentTurn,
+  approvedPlanForCurrentTurn,
+} from "./executionAggregate";
 import { assertRuntimeV2SubagentScheduleRunway, closeCollaborationToolCall } from "./executionSchedulerAdmission";
 import { runtimeV2ModelSelectedSubagentCandidate, runtimeV2SubagentCapacityFromCommand } from "./executionSubagentCandidate";
 import { startRuntimeV2Child } from "./executionSubagentRunner";
@@ -20,10 +24,8 @@ import {
   writeRuntimeV2SettledBatchAnchor,
 } from "./executionSubagentJoin";
 import { runtimeV2ParentOverlapDiagnostics } from "./executionSubagentOverlap";
-import { parentHasImplementationSourceAuthority } from "./executionSubagentAuthority";
+import { directExecuteScopeForSubagent } from "./executionSubagentStaging";
 import type { RuntimeV2ChildResult } from "./executionTypes";
-import { deriveRuntimeV2ExecutionContract, runtimeV2ExecutionContractAllowsTargets } from "./executionContract";
-import { deriveRuntimeV2ValidationCorrectionWindow } from "./executionValidationCorrection";
 
 function fallbackScheduleScopeKey(command: Parameters<NonNullable<SchedulerPort["prepareSchedule"]>>[0]["command"]): string {
   const args = command.payload.arguments && typeof command.payload.arguments === "object" && !Array.isArray(command.payload.arguments)
@@ -58,26 +60,20 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
         const candidate = runtimeV2ModelSelectedSubagentCandidate(command);
         candidateScopeKey = candidate.scopeKey;
         const aggregate = aggregateForCurrentTurn(input);
-        if ((candidate.taskKind === "implement" || candidate.accessMode === "write") && aggregate?.strategy !== "execute") {
-          throw new Error("Only an Execute Run may delegate an implement/write child; planning and analysis children are read-only.");
-        }
-        if (candidate.taskKind === "implement" && candidate.accessMode === "write" && aggregate?.strategy === "execute") {
-          const executionContract = deriveRuntimeV2ExecutionContract(aggregate);
-          const validationCorrection = deriveRuntimeV2ValidationCorrectionWindow(aggregate);
-          if (!executionContract && !validationCorrection.active) {
-            throw new Error(
-              "implement subagents require a recorded parent execution contract; use a read-only child until the parent has an evidence-backed solution.",
-            );
-          }
-          if (executionContract && !validationCorrection.active &&
-              !runtimeV2ExecutionContractAllowsTargets({ contract: executionContract, targets: candidate.allowedPaths })) {
-            throw new Error("implement subagent write paths must be exact mutation targets in the current parent execution contract.");
-          }
-        }
-        if (!parentHasImplementationSourceAuthority({ ports: input, candidate })) {
-          throw new Error(
-            "implement subagents may modify or delete only after the parent has versioned source evidence for every exact assigned file path.",
-          );
+        const writeAuth = authorizeRuntimeV2WriteDelegation({
+          aggregate,
+          approved: typeof approvedPlanForCurrentTurn === "function" ? approvedPlanForCurrentTurn(input) : null,
+          workspace: input.context?.runWorkspace || aggregate?.turn.workspaceKey || "",
+          taskKind: candidate.taskKind,
+          accessMode: candidate.accessMode,
+          implementationOperation: candidate.implementationOperation,
+          allowedPaths: candidate.allowedPaths,
+          activeChildJobs: existingJobs,
+          sourceCoverage: input.live.latestProviderRequestSourceCoverage || [],
+          directExecuteScope: directExecuteScopeForSubagent(input, candidate.allowedPaths),
+        });
+        if (!writeAuth.allowed) {
+          throw new Error(writeAuth.message);
         }
         decision = scheduleRuntimeV2Subagents({
           parentRun: command.run, candidates: [candidate], existingJobs,

@@ -1,5 +1,6 @@
 import {
   RuntimeV2Controller,
+  canFinalizeApprovedWorkPlanWithoutModel,
   countDistinctRuntimeV2EvidenceFacts,
   decideRuntimeV2TerminalOutcome,
   deriveRuntimeV2PlanExecutionCoverage,
@@ -37,7 +38,7 @@ export function runtimeV2ExecuteTerminalDecision(input: {
       runtimeV2DirectExecuteReadyForConclusion(aggregate),
     failedValidationCount: evidence.failedValidationCount,
     stalledValidationCount: evidence.stalledValidationCount,
-    hasProviderConclusion: !!finalMarkdown,
+    hasProviderConclusion: !!finalMarkdown || canFinalizeApprovedWorkPlanWithoutModel(aggregate),
   });
   if (!decision) return null;
   const compilation = unresolvedUnityEditorCheck(aggregate);
@@ -147,6 +148,8 @@ export function runtimeV2PhaseTransitionMessage(
     unvalidated_mutation_pending:
       "本次修改没有落账；较早的工作区修改仍需有限验证。",
     validation_failed: "有限验证未通过；返回修改阶段，根据失败证据进行一次针对性修复。",
+    delegated_mutation_active: "已向实现子任务委派写操作，进入实施阶段。",
+    delegated_mutation_committed: "实现子任务修改已提交；继续完成其余计划目标。",
   } as const;
   return messages[reason];
 }

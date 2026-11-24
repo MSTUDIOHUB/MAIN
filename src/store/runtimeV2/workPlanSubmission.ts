@@ -478,6 +478,7 @@ export function workPlanDraftFromSubmission(
     risks: stringList(raw.risks),
     assumptions: stringList(raw.assumptions),
     blockingQuestions: stringList(raw.blockingQuestions),
+    sameTurnDefectCorrection: "authorized",
   };
   return {
     draft,

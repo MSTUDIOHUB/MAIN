@@ -21,6 +21,7 @@ import { normalizeRuntimeV2WorkspacePath } from "./executionProviderContext";
 import { isAllowedBySessionAutoApprove } from "../../lib/runtimeTools";
 import {
   approvedRuntimeV2PlanContinuation,
+  RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
@@ -56,8 +57,9 @@ import {
   type RuntimeV2ToolAuthorizationResult,
 } from "./executionAuthorizationContext";
 import {
+  requiresApprovedPlanRepairLease,
+  validateResolveReviewFindingToolAuthorization,
   validateToolAgainstApprovedPlan,
-  isApprovedUnityCorrection,
   type RuntimeV2PlanToolAuthorizationResult,
 } from "./executionPlanAuthorization";
 
@@ -136,6 +138,9 @@ export function validateToolAgainstPhaseAndPlan(input: {
       failureKind: "protocol_invalid",
       reasonCode: "validation_tool_source_untrusted",
     };
+  }
+  if (input.toolName === RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME) {
+    return validateResolveReviewFindingToolAuthorization(aggregate, input.args);
   }
   if (
     input.toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
@@ -326,9 +331,10 @@ export function validateToolAgainstPhaseAndPlan(input: {
   }
   const plan = validateToolAgainstApprovedPlan({ ...input, aggregate });
   if (!plan.allowed) return plan;
-  if (input.command.kind === "execute_tool" && isWorkspaceMutationToolName(input.toolName) &&
-      resolveWorkspaceMutationRequests(input.toolName, input.args, input.target)
-        .some(request => request.operation === "modify" && isApprovedUnityCorrection(aggregate, request.target))) {
+  if (
+    input.command.kind === "execute_tool" &&
+    requiresApprovedPlanRepairLease(aggregate, input.toolName, input.args, input.target)
+  ) {
     const rejected = leaseRejection(true);
     if (rejected) return rejected;
   }

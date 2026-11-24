@@ -8,6 +8,7 @@ import {
   deriveProviderAdapterCapabilities,
 } from "../../lib/providerLaneSettings";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
+import { buildCompactRuntimeV2ConcludeConversation } from "./executionConcludeContext";
 import {
   streamChatCompletion,
   type OpenAiToolChoice,
@@ -159,7 +160,13 @@ async function performRuntimeV2ProviderRequest(
     input.live.latestProviderActionWindow,
   );
   const readOnly = requestMode === "chat" || requestMode === "analyze" || input.command.payload.conclusionKind === "read_only";
-  const canonicalDecisionConversation = history.messages;
+  const canonicalDecisionConversation = requestMode === "conclude"
+    ? buildCompactRuntimeV2ConcludeConversation({
+        messages: history.messages,
+        aggregate,
+        language: input.ports.context.phaseLanguage,
+      })
+    : history.messages;
   input.live.latestProviderRequestSourceCoverage =
     materializedRuntimeV2SourceCoverage(
       canonicalDecisionConversation,

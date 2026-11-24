@@ -300,11 +300,14 @@ test("typed required collaboration hard-admits spawn until the Plan requirement 
   );
 });
 
-test("Plan submission schema offers optional typed dependency and validation coverage edges", () => {
+test("Plan submission schema offers optional typed dependency edges without false auto-inference claims", () => {
   const properties = protocol.SUBMIT_WORK_PLAN_TOOL.function.parameters.properties;
   const change = properties.changes.items;
   const validation = properties.validations.items;
   assert.deepEqual(change.required, ["targets", "change"]);
+  assert.doesNotMatch(protocol.SUBMIT_WORK_PLAN_TOOL.function.description, /省略的依赖关系.*由运行时自动推断/);
+  assert.doesNotMatch(change.properties.dependsOn.description, /默认自动推断/);
+  assert.match(protocol.SUBMIT_WORK_PLAN_TOOL.function.description, /不会自动推断/);
   assert.deepEqual(
     change.properties.dependsOn.items,
     { type: "integer" },

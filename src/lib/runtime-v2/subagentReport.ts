@@ -4,8 +4,12 @@ export const RUNTIME_V2_SUBAGENT_REPORT_SCHEMA_VERSION =
   "runtime-v2-subagent-report.v1" as const;
 
 export interface RuntimeV2SubagentFindingV1 {
+  readonly id?: string;
+  readonly severity?: "blocking" | "advisory";
   readonly statement: string;
   readonly evidenceIds: readonly string[];
+  readonly targetPaths?: readonly string[];
+  readonly criterionIds?: readonly string[];
 }
 
 export interface RuntimeV2SubagentReportV1 {
@@ -185,7 +189,23 @@ export function compileRuntimeV2SubagentReport(input: {
         `RUNTIME_V2_SUBAGENT_REPORT_INVALID:evidence_unknown:${index}`,
       );
     }
-    return { statement, evidenceIds };
+    const id = text(finding.id);
+    const severity: "blocking" | "advisory" | undefined =
+      finding.severity === "blocking"
+        ? "blocking"
+        : finding.severity === "advisory"
+          ? "advisory"
+          : undefined;
+    const targetPaths = strings(finding.target_paths ?? finding.targetPaths);
+    const criterionIds = strings(finding.criterion_ids ?? finding.criterionIds);
+    return {
+      ...(id ? { id } : {}),
+      ...(severity ? { severity } : {}),
+      statement,
+      evidenceIds,
+      ...(targetPaths.length > 0 ? { targetPaths } : {}),
+      ...(criterionIds.length > 0 ? { criterionIds } : {}),
+    };
   });
   if (!Array.isArray(draft.unresolved)) {
     throw new Error(
@@ -218,13 +238,32 @@ export function compileRuntimeV2SubagentTextReport(input: {
     explicitlyReferencesEvidenceId(input.summary, evidence.id) ||
     sourceIds.has(evidence.id)
   );
+  const citeLineEvidence = (line: string, fallbackIds: readonly string[]): string[] => {
+    const lineSourceIds = citedSourceEvidenceIds({ ...input, summary: line });
+    const ids = [...input.evidence, ...(input.inheritedEvidence || [])]
+      .filter((item) => explicitlyReferencesEvidenceId(line, item.id) || lineSourceIds.has(item.id))
+      .map((item) => item.id);
+    return ids.length > 0 ? ids : [...fallbackIds];
+  };
+  const taggedLines = input.summary
+    .split("\n")
+    .map((line) => line.replace(/^\s*(?:[-*]|\d+\.)\s*/, "").trim())
+    .filter((line) => /\[(?:BLOCKING|ADVISORY)\]/i.test(line));
+  const fallbackIds = citedEvidence.map((evidence) => evidence.id);
+  const findings = taggedLines.length > 0
+    ? taggedLines.map((line) => ({
+        severity: /\[BLOCKING\]/i.test(line) ? "blocking" as const : "advisory" as const,
+        statement: line,
+        evidence_ids: citeLineEvidence(line, fallbackIds),
+      }))
+    : [{
+        statement: input.summary,
+        evidence_ids: fallbackIds,
+      }];
   return compileRuntimeV2SubagentReport({
     draft: {
       summary: input.summary,
-      findings: [{
-        statement: input.summary,
-        evidence_ids: citedEvidence.map((evidence) => evidence.id),
-      }],
+      findings,
       unresolved: [],
     },
     evidence: input.evidence,
@@ -267,8 +306,12 @@ export function validateRuntimeV2SubagentReport(input: {
       draft: {
         summary: input.report.summary,
         findings: input.report.findings.map((finding) => ({
+          ...(finding.id ? { id: finding.id } : {}),
+          ...(finding.severity ? { severity: finding.severity } : {}),
           statement: finding.statement,
           evidence_ids: finding.evidenceIds,
+          ...(finding.targetPaths?.length ? { target_paths: finding.targetPaths } : {}),
+          ...(finding.criterionIds?.length ? { criterion_ids: finding.criterionIds } : {}),
         })),
         unresolved: input.report.unresolved,
       },

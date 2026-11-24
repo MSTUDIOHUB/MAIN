@@ -102,10 +102,12 @@ export function deriveProactiveCollaboration(input: {
   const ready = frontier?.steps.filter(step => step.status === "ready" && step.operation !== "preserve") || [];
   const writes = approved?.plan.draft.steps.filter(step => step.operation !== "preserve").flatMap(step => step.targets) ||
     contract?.changes.filter(change => change.operation !== "preserve").flatMap(change => change.targets) || [];
-  const sourceVersions = new Map(state.evidence.flatMap(evidence => {
-    const path = evidence.kind === "source" && evidence.version && normalizeValidationWorkspaceCwd(evidence.target, input.workspace || undefined);
-    return path ? [[path, evidence.version] as const] : [];
-  }));
+  const sourceVersions = new Map<string, string>();
+  for (const evidence of state.evidence) {
+    if ((evidence.kind !== "source" && evidence.kind !== "mutation") || !evidence.version) continue;
+    const resolved = normalizeValidationWorkspaceCwd(evidence.target, input.workspace || undefined);
+    if (resolved) sourceVersions.set(resolved, evidence.version);
+  }
   const exactReads = new Set(sourceVersions.keys());
   const hasValidation = approved?.plan.draft.validations.some(check => check.required && check.kind !== "advisory") ||
     !!contract?.validations.length;
@@ -176,13 +178,49 @@ export function deriveProactiveCollaboration(input: {
       }
     }
   }
-  if (approved && frontier && (ready.length > 0 || validationInFlight)) {
-    const otherWrites = frontier.steps.filter(step => step.status !== "completed" && step.operation !== "preserve").flatMap(step => step.targets);
+  if (approved && frontier && (ready.length > 0 || validationInFlight || !hasValidation)) {
+    const otherWrites = frontier.steps
+      .filter((step) => step.status !== "completed" && step.operation !== "preserve")
+      .flatMap((step) => step.targets);
+    const dependentsByStep = new Map<number, number[]>();
+    approved.plan.draft.steps.forEach((planStep, stepIndex) => {
+      for (const depIndex of planStep.dependsOn) {
+        const list = dependentsByStep.get(depIndex) || [];
+        list.push(stepIndex);
+        dependentsByStep.set(depIndex, list);
+      }
+    });
+    const manualVerificationMode = !hasValidation;
     for (const step of frontier.steps) {
       if (step.status !== "completed" || step.operation === "preserve" || step.operation === "delete") continue;
       if (otherWrites.length > 0 && !scopesDisjoint(step.targets, otherWrites)) continue;
-      add("review", input.language === "zh" ? "已提交改动审查" : "Review committed changes", step.targets,
-        `Review the committed step against its intended outcome: ${approved.plan.draft.steps[step.stepIndex].expectedOutcome}. Identify concrete defects while the parent continues independent work.`);
+      const planStep = approved.plan.draft.steps[step.stepIndex]!;
+      const sharesContractEdge = planStep.dependsOn.length > 0 || (dependentsByStep.get(step.stepIndex)?.length || 0) > 0;
+      const lacksRequiredValidation = manualVerificationMode || Boolean(
+        planStep.criterionIds?.some((criterionId) =>
+          !approved.plan.draft.validations.some((v) =>
+            v.required && (!v.criterionIds?.length || v.criterionIds.includes(criterionId)),
+          ),
+        ),
+      );
+      if (!sharesContractEdge && !lacksRequiredValidation) continue;
+      const prerequisitePaths = [...new Set(
+        planStep.dependsOn.flatMap((depIndex) => {
+          const depStep = approved.plan.draft.steps[depIndex];
+          if (!depStep || depStep.operation === "delete") return [];
+          return depStep.targets.filter((target) => otherWrites.length === 0 || scopesDisjoint([target], otherWrites));
+        }),
+      )];
+      const auditTargets = [...new Set([...step.targets, ...prerequisitePaths])].slice(0, 6);
+      const contractQuestion = prerequisitePaths.length > 0
+        ? `Check interface compatibility, type conformance, inheritance contracts, and acceptance compliance against prerequisite files (${prerequisitePaths.join(", ")}).`
+        : "Check type safety, interface conformance, and acceptance compliance.";
+      add(
+        "review",
+        input.language === "zh" ? "高风险改动合同审查" : "Risk review of committed changes",
+        auditTargets,
+        `Review ${step.targets.join(", ")} against step outcome (${planStep.expectedOutcome}). ${contractQuestion} Prefix any concrete compile, type, inheritance, or contract-breaking defect with [BLOCKING] (naming exact file path and symbol); prefix clean confirmations or minor notes with [ADVISORY].`,
+      );
     }
   }
   return candidates[0] ? { candidate: candidates[0] } : { reason: "no_independent_scope" };

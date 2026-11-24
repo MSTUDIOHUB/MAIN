@@ -370,6 +370,7 @@ export default function PlanPanel({
       text: step.title,
       label: copy.runtimeStep[step.status],
       requirementRef: step.id,
+      dependsOnIds: step.dependsOnIds,
       retained: false,
       complete: step.status === "applied",
       active: false,
@@ -381,6 +382,7 @@ export default function PlanPanel({
         id: task.id,
         text: task.text,
         requirementRef: task.requirementRef,
+        dependsOnIds: undefined as readonly string[] | undefined,
         retained: task.retained,
         complete,
         active,
@@ -609,9 +611,18 @@ export default function PlanPanel({
             </button>
             {runtimeV2Progress?.compilation && (
               <div data-testid="plan-compilation-status" className="mt-1 text-[11px] text-[var(--surface-text-muted)]">
-                {language === "zh" ? "引擎编译" : "Editor compilation"} · {runtimeV2Progress.compilation === "unavailable"
-                  ? language === "zh" ? "未取得结果" : "Unavailable"
-                  : copy.runtimeValidation[runtimeV2Progress.compilation]}
+                {language === "zh" ? "引擎编译" : "Editor compilation"} · {runtimeV2Progress.compilation === "not_applicable"
+                  ? language === "zh" ? "当前目录不适用 Unity 编译检查" : "Not applicable to this directory"
+                  : runtimeV2Progress.compilation === "unavailable"
+                    ? language === "zh" ? "未取得结果" : "Unavailable"
+                    : copy.runtimeValidation[runtimeV2Progress.compilation]}
+              </div>
+            )}
+            {(runtimeV2Progress?.unresolvedFindingsCount ?? 0) > 0 && (
+              <div data-testid="plan-unresolved-findings" className="mt-1 text-[11px] text-[#fbbf24]">
+                {language === "zh"
+                  ? `未解决审查发现 · ${runtimeV2Progress?.unresolvedFindingsCount}`
+                  : `Unresolved review findings · ${runtimeV2Progress?.unresolvedFindingsCount}`}
               </div>
             )}
             {totalCount > 0 && (
@@ -654,10 +665,20 @@ export default function PlanPanel({
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="text-[12px] leading-relaxed text-[#e4e4e7]">{task.text}</div>
-                      {(task.requirementRef || task.retained) && (
+                      {(task.requirementRef || task.retained || (task.dependsOnIds && task.dependsOnIds.length > 0)) && (
                         <div className="mt-1 flex flex-wrap items-center gap-2">
                           {task.requirementRef && (
                             <span className="text-[10px] tracking-wide text-[#71717a]">{task.requirementRef}</span>
+                          )}
+                          {task.dependsOnIds && task.dependsOnIds.length > 0 && (
+                            <span
+                              data-testid="plan-task-deps"
+                              className="rounded border border-[#27272a] bg-[#141418] px-1.5 py-0.5 text-[10px] text-[#a1a1aa]"
+                            >
+                              {language === "zh"
+                                ? `前置: ${task.dependsOnIds.join(", ")}`
+                                : `Depends on: ${task.dependsOnIds.join(", ")}`}
+                            </span>
                           )}
                           {task.retained && (
                             <span className="rounded-full border border-[rgba(251,191,36,0.24)] bg-[rgba(251,191,36,0.1)] px-2 py-0.5 text-[10px] text-[#fcd34d]">

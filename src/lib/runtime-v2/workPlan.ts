@@ -55,6 +55,7 @@ export interface WorkPlanDraftV1 {
   readonly risks: readonly string[];
   readonly assumptions: readonly string[];
   readonly blockingQuestions: readonly string[];
+  readonly sameTurnDefectCorrection?: "authorized";
 }
 
 export interface WorkPlanRuntimeEvidence {
@@ -106,6 +107,7 @@ export interface RuntimeV2PlanPanelProjection {
     readonly operation: WorkPlanOperation;
     readonly targets: readonly string[];
     readonly expectedOutcome: string;
+    readonly dependsOn?: readonly number[];
   }[];
   readonly validationCount: number;
 }
@@ -361,6 +363,12 @@ export function validateWorkPlanDraftV1(
       message: "An executable WorkPlan cannot be approved while user decisions remain unresolved.",
     });
   }
+  if (draft.sameTurnDefectCorrection !== undefined && draft.sameTurnDefectCorrection !== "authorized") {
+    issues.push({
+      path: "sameTurnDefectCorrection",
+      message: 'sameTurnDefectCorrection must be "authorized" when present.',
+    });
+  }
   return issues;
 }
 
@@ -419,6 +427,12 @@ export function projectWorkPlanMarkdown(plan: Pick<SealedWorkPlanV1, "draft" | "
   }
   if (draft.risks.length > 0) lines.push("## 风险", "", markdownList(draft.risks), "");
   if (draft.assumptions.length > 0) lines.push("## 假设", "", markdownList(draft.assumptions), "");
+  if (draft.sameTurnDefectCorrection === "authorized") {
+    lines.push(
+      "> **本轮修复预授权**：允许在原批准路径内修正本轮已创建或已修改的文件，以消除阻碍原验收条件成立的具体缺陷；超出已批准路径或改变验收范围仍需修订计划。",
+      "",
+    );
+  }
   if (draft.blockingQuestions.length > 0) lines.push("## 需要用户决定", "", markdownList(draft.blockingQuestions), "");
   lines.push("---", `计划 ID：${plan.id} · 修订：${plan.revision} · 摘要：${plan.digest}`);
   return appendPlanDecisionJournal(lines.join("\n").replace(/\n{3,}/g, "\n\n").trim(), plan.decisionJournal);

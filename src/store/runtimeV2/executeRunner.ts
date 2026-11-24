@@ -7,12 +7,14 @@ import type { SubmitSessionPersistence } from "../persistSubmitRuntimeProjection
 import {
   RuntimeV2Controller,
   advanceRuntimeV2ProviderRecoveryStallLease,
+  canFinalizeApprovedWorkPlanWithoutModel,
   createRuntimeV2EmergencyTerminalEnvelope,
   countDistinctRuntimeV2EvidenceFacts,
   decideRuntimeV2ExecutePhaseTransition,
   deriveRuntimeV2ProviderRecoveryWindow,
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanSourceFreshness,
+  deriveRuntimeV2ReviewDispositionLedger,
   hasCompletedRuntimeV2InitialObservation,
   isRuntimeV2TurnTerminallyClosed,
   runtimeV2DirectExecuteReadyForConclusion,
@@ -578,6 +580,13 @@ export async function runSubmitRuntimeV2Execute(
     const finalAggregate = controller.snapshot().aggregate!;
     const planCoverage =
       deriveRuntimeV2PlanExecutionCoverage(finalAggregate);
+    const reviewLedger = deriveRuntimeV2ReviewDispositionLedger(finalAggregate);
+    const concludeModelCalls = finalAggregate.events.filter(
+      (event) =>
+        event.type === "command.scheduled" &&
+        event.command.kind === "request_model" &&
+        event.command.payload.mode === "conclude",
+    ).length;
     input.logStoreEvent("runtime_v2_execute_terminal", {
       turnId: identity.turn.turnId,
       runId: identity.run.runId,
@@ -596,6 +605,13 @@ export async function runSubmitRuntimeV2Execute(
       failedProviderRequests:
         executionEvidence.failedProviderRequestCount,
       childRuns: controller.snapshot().aggregate?.subagents.length || 0,
+      concludeModelCalls,
+      zeroModelConclude: concludeModelCalls === 0 && canFinalizeApprovedWorkPlanWithoutModel(finalAggregate),
+      reviewDeliveredCount: reviewLedger.reviewDeliveredCount,
+      reviewAdoptedCount: reviewLedger.reviewAdoptedCount,
+      reviewRepairedCount: reviewLedger.repairedFindings.length,
+      reviewFalsifiedCount: reviewLedger.falsifiedFindings.length,
+      reviewUnresolvedCount: reviewLedger.unresolvedFindings.length,
       executionAuthorityKind: planCoverage ? "work_plan" : "direct_execute",
       executionAuthorityId:
         finalAggregate.sealedWorkPlan?.id || finalAggregate.turn.turnId,

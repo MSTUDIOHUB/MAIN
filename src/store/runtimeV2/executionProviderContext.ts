@@ -8,6 +8,7 @@ import {
   deriveRuntimeV2PlanExecutionCoverage,
   deriveRuntimeV2PlanExecutionFrontier,
   deriveRuntimeV2PlanSourceFreshness,
+  deriveRuntimeV2ReviewDispositionLedger,
   deriveRuntimeV2ValidationBoundary,
   runtimeV2DirectExecuteContractCoverage,
   type ProviderLaneProfileV1,
@@ -128,11 +129,27 @@ export function recordApprovedPlanContext(
   const freshness = deriveRuntimeV2PlanSourceFreshness(aggregate);
   const frontier = deriveRuntimeV2PlanExecutionFrontier(aggregate);
   const coverage = deriveRuntimeV2PlanExecutionCoverage(aggregate);
+  const reviewLedger = deriveRuntimeV2ReviewDispositionLedger(aggregate);
   const compileFailed = unresolvedUnityEditorCheck(aggregate)?.result.status === "failed";
   const manualVerificationOnly = !!frontier?.validationReady &&
     !!coverage &&
     coverage.missingRequiredValidationIndexes.length === 0 &&
     approved.plan.draft.validations.some(validation => !validation.required);
+  const delegableReadySteps = frontier
+    ? frontier.steps
+        .filter((step) => step.status === "ready" && step.operation !== "preserve")
+        .map((step) => ({
+          stepId: `S${step.stepIndex + 1}`,
+          operation: step.operation,
+          targets: step.targets,
+        }))
+    : [];
+  const pendingBlockingFindings = reviewLedger.pendingBlockingFindings.map((finding) => ({
+    findingId: finding.findingId,
+    jobId: finding.jobId,
+    targetPaths: finding.targetPaths,
+    statement: finding.statement,
+  }));
   return {
     approvalKey: approvalEvent.eventId,
     frontierInstruction: [
@@ -149,15 +166,19 @@ export function recordApprovedPlanContext(
           readyStepIndexes: frontier.readyStepIndexes,
           blockedStepIndexes: frontier.blockedStepIndexes,
           readyMutationTargets: frontier.readyMutationTargets,
+          delegableReadySteps,
           validationReady: frontier.validationReady && !compileFailed,
         } : null,
+        ...(pendingBlockingFindings.length > 0 ? { pendingBlockingFindings } : {}),
       }),
       compileFailed ? "Resolve the current compiler diagnostics before PlayMode."
+        : pendingBlockingFindings.length > 0
+        ? "Verify every pending [BLOCKING] review finding against current source, repair if confirmed within authorized scope, and call resolve_review_finding before concluding."
         : manualVerificationOnly
         ? "All planned mutations are complete and no required automated checks remain. Write the final summary clearly separating completed automated checks (if any) from the user-confirmed manual/external verification checklist; never claim automated tests passed when none ran."
         : frontier?.validationReady
         ? "All mutation stages are complete. Run the planned validations."
-        : "Follow the approved WorkPlan steps and verify once changes are complete.",
+        : "Follow the approved WorkPlan frontier and dependency order; independent ready steps may execute directly or via bounded implement subagents with exact non-overlapping targets.",
     ].join(" "),
   };
 }
