@@ -89,7 +89,7 @@ test("real OMLX workspace inventory stops at a deterministic hard file limit", a
 
 test("real OMLX command verification executes against final workspace bytes", async (t) => {
   const workspace = await createTempWorkspace(t);
-  await writeFixtureFile(workspace, "broken.js", "function broken( {\\n");
+  await writeFixtureFile(workspace, "broken.js", "function broken( {\n");
 
   const failed = await proxy.runRealOmlxWorkspaceCommand(
     workspace,
@@ -98,7 +98,7 @@ test("real OMLX command verification executes against final workspace bytes", as
   assert.notEqual(failed.exitCode, 0);
   assert.match(failed.stderr, /SyntaxError|Unexpected token/);
 
-  await writeFixtureFile(workspace, "broken.js", "export const ready = true;\\n");
+  await writeFixtureFile(workspace, "broken.js", "export const ready = true;\n");
   const passed = await proxy.runRealOmlxWorkspaceCommand(
     workspace,
     `"${process.execPath}" --check broken.js`,
