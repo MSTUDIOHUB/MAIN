@@ -1,14 +1,14 @@
 # `/规则`、计划访谈与项目基线
 
-更新时间：2026-11-06
+更新时间：2026-11-25
 
 ## 用户入口
 
-Composer 的 `/` 菜单只展示 `/计划` 与 `/规则`。`/rules` 与旧 `/init` 是 `/规则` 的兼容别名，可跟自然语言要求；旧 `--refresh` 仍可解析，但不再触发本地确定性事实快照流程。
+Composer 的 `/` 菜单提供 `/计划`、`/grill-me` 和 `/规则`。`/rules` 与旧 `/init` 是 `/规则` 的兼容别名，可跟自然语言要求。旧 `--refresh` 仍可解析，但不再触发本地确定性事实快照流程。
 
 `/规则` 会创建正常的用户 Turn 与 Plan Run：先调查当前项目及根目录 `AGENTS.md`，再通过 ExecutionCapsule 询问会影响规则的关键约束，随后由模型起草规则文档。访谈结束保存草稿，并打开可编辑正文及 diff 的审阅窗口。只有确认保存才通过固定目标的 CAS IPC 写入根目录 `AGENTS.md`。
 
-普通 `/计划` 同样至少经过一次任务相关的结构化确认，可以多轮追问。用户可确认本轮交付为计划文档，或在项目会话中形成另行审批的实施计划。概念方案无需编造文件目标、命令或验收步骤；可执行 WorkPlan 仍须满足原有源码、依赖、验收及独立执行审批边界。访谈确认不是执行许可。
+工作区中的普通 `/计划` 直接进入 WorkPlan 调查，遇到有实质影响的取舍时可以询问。`/grill-me` 或在计划请求中明确要求先访谈时，进入需要记录用户回答的访谈流程。概念方案可以保存为计划文档。项目会话中的可执行 WorkPlan 仍须满足源码、依赖和验收要求，并另行批准执行。
 
 ## 问题、答案与恢复
 
@@ -34,7 +34,7 @@ Composer 的 `/` 菜单只展示 `/计划` 与 `/规则`。`/rules` 与旧 `/ini
 
 模型保存的 `rules_draft` 只是草稿。审阅 UI 可编辑全文并同步 diff，允许清空后继续输入，空稿不能保存。编辑始终保留原 inspection 和 base version。确认时由现有专用 IPC 再核对 workspace、target 与 base version；并发修改、目标变化或工作区切换返回 stale，要求重新调查或审阅，不会静默覆盖。
 
-现有 `AGENTS.md` 的人工内容是调查依据，模型须保留尚未被用户改变的规则。新流程不按旧 managed marker 猜测可替换片段，也不新增嵌套 AGENTS 的发现或加载策略；本次写入目标始终是根文件。
+现有 `AGENTS.md` 的人工内容是调查依据，模型须保留尚未被用户改变的规则。具备同一工作区的基线时，运行时生成或更新 MAIN 管理的摘要段落。确认写入始终使用根 `AGENTS.md` 作为目标。
 
 ## 指令、知识与事实仍分层
 
@@ -49,5 +49,5 @@ baseline 包含 canonical workspace、manifest/lockfile/config 的路径与 hash
 - `plan-interview-production.test.mjs`：真实 Plan producer、结构化回答、同 Run 多轮与 JSON 冷恢复、无项目文档、规则原版本捕获、独立 WorkPlan 审批、admit-only 中断恢复、前文与冻结规则。
 - `user-questions.test.mjs` / `runtime-v2-user-questionnaire.test.mjs`：稳定 ID、基数、自由文本、过期和非法答案、canonical replay。
 - `runtime-v2-plan-production.test.mjs`：严格 WorkPlan 工具与源码证据、子任务、协议恢复、完整终态及知识 scope；历史核心场景显式使用原 pre-interview checkpoint，不关闭新 admission 门禁。
-- `project-init.test.mjs`：兼容命令、可编辑草稿、空稿、原始 CAS、并发 stale；保留旧 managed-block 纯 helper 的兼容覆盖，生产入口已不使用该 helper。
+- `project-init.test.mjs` 覆盖兼容命令、可编辑草稿、空稿、原始 CAS、并发 stale 和 MAIN 管理段落的生成。
 - Rust `plan_documents` 及原 `project_init` 测试：版本、owner、lost-ack 幂等、CAS、hash、路径、符号链接与目标复核。

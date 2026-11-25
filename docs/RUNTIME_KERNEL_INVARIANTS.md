@@ -17,21 +17,21 @@
 ```text
 submitAsyncWorkflowRun.ts
   -> submitRuntimeRunner.ts
-  -> runtimeV2/{chat,workspaceRead,plan,execute}Runner
-  -> RuntimeV2Controller + provider/tool/checkpoint/projection ports
-  -> streaming.ts / toolExecutor.ts
-  -> Rust IPC 受信任执行与 Session 存储
+     -> Execute / Chat / Analyze: RuntimeV2Controller
+     -> 审批前 Plan: planRunner.ts / PlanLedger
+  -> 共享 Runtime v2 事件、检查点与投影
+  -> provider/tool ports 与 Rust 受信任执行 / Session 存储
 ```
 
 - `submitRuntimeRunner.ts` 对没有 v2 admission marker 的 Turn fail closed；生产没有 v1 回退。
-- 旧 `AgentOrchestrator`、旧恢复辅助函数和 Rust `RuntimeLoop` 可以用于历史对照、Replay 或 Harness，但不能据文件名推断其仍拥有生产策略。
+- 旧 TypeScript `AgentOrchestrator` 可在 Git 历史中对照。Rust `RuntimeLoop` 通过固定步骤的诊断入口和 Golden 测试运行，Rust 的 `PermissionGuard` 则同时服务生产工具。生产模型请求使用上述 TypeScript runner。
 - 文档、测试或 UI 声称某项能力前，必须能从上述入口追到实际调用点。仅存在导出函数不代表能力已经接线。
 
 工作区自然语言接纳由 `useAppStore` → `resolveAndApplySubmitIntentRouting` → `resolveTurnRunIntent` 决定当前请求，再进入上述统一 Turn 路径。工作区存在、自动审批开启、开发主题或未来产物都不独立构成执行意图；讨论、选择记录、设计评审和聊天内文稿可以正常回答并结束本 Turn，后续用户输入沿同一 Session 继续。具体当前写入、修改代码、shell 或 Editor 操作仍进入执行策略；审批只决定已请求动作的授权方式，不能把讨论升级为 mutation。参考 Codex 公开的 [Turn 生命周期](https://learn.chatgpt.com/docs/app-server) 和 [权限边界](https://learn.chatgpt.com/docs/agent-approvals-security)，这是 MAIN 的接纳合同，不声称复刻 Codex 私有路由算法。
 
 `commandDirective` 是上述意图的操作描述，不是独立授权。问句、引用、历史记录或禁止执行的说明中出现命令词，不能从二级元数据反向把只读意图升级为 Execute；真正的明确命令须由顶层意图接纳，显式执行选项及已批准计划仍按原授权继续。
 
-主模式自然语言请求统一通过一次无工具语义预检，关键词置信度和自然续接短语仅作提示，不能决定最终模式、批准或恢复执行。任务目标、工作类型、回答形式、能力需求与当前限制独立；显式模式是能力上界，正文限制仍需解析。模型语义不授审批、路径或完成证明。预检归属于已接纳 FIFO claim 的 `intent_preflight` 阶段；同一 claim、epoch、不可变 envelope 和控制器有效时才可接续同一 Turn。失败/截断/无效结果可见 error 收口，歧义结果 blocked 澄清，均不能回落关键词启动工具。取消后的迟到结果不能重排已取消任务，恢复后的新 claim 不能采用旧结果。完整合同见 [SEMANTIC_INTENT_ROUTING.md](SEMANTIC_INTENT_ROUTING.md)。
+主模式自然语言请求统一通过一次无工具语义预检，关键词置信度和自然续接短语仅作提示，不能决定最终模式、批准或恢复执行。任务目标、工作类型、回答形式、能力需求与当前限制独立。显式模式设定能力上界，`/计划`、`/grill-me`、`/规则` 的正文仍通过语义预检提取本轮限制和逐次审批需求。模型语义不授审批、路径或完成证明。预检归属于已接纳 FIFO claim 的 `intent_preflight` 阶段；同一 claim、epoch、不可变 envelope 和控制器有效时才可接续同一 Turn。失败/截断/无效结果可见 error 收口，歧义结果 blocked 澄清，均不能回落关键词启动工具。取消后的迟到结果不能重排已取消任务，恢复后的新 claim 不能采用旧结果。完整合同见 [SEMANTIC_INTENT_ROUTING.md](SEMANTIC_INTENT_ROUTING.md)。
 
 预检恢复与普通提交共用交接语义：同步提交确认接纳且精确 Turn 已采用该 claim 后，消费原 FIFO claim，再由异步 bootstrap 获取 Run。不能在二者之间重新排空同一 claim，也不能以预检耗时或一次界面重绘把有效交接判为失主；拒绝接纳、取消及身份不符均不能获得该确认。
 
@@ -55,7 +55,7 @@ Execute 只需要一个可重复的核心循环：
 不可破坏的语义：
 
 1. 安全读取在普通观察、修改、验证阶段始终属于同一授权面；阶段只表达当前重点。成功 mutation 会产生必须清偿的验证债务；`validate` 仍可接受由当前 exact source 和实施契约支持的后续 mutation，但债务随之移动到最新边界，旧验证不能完成新版本。ledger 已证明当前观察分支无效、且 exact source 仍物化时，provider 的下一动作目录可进入非终态 action window；验证窗口只保留有限验证，编辑窗口只保留有源码租约的 mutation。恢复窗口不开放新建或等待子智能体，避免协作逃避闭合的父线程动作。这不改变 durable 授权，也不产生终态。
-2. 修改必须基于父智能体对目标当前版本的读取。子智能体不得直接写共享工作区；只有父线程已形成证据化实施契约时，`implement/write` child 才可在精确排他路径内暂存 create/modify/delete 事务，并由父线程在 join 时重新校验后提交或整体丢弃。
+2. 父线程直接编辑需要当前决策可见的版本化源码。实现子任务只可按实施契约、已批准 WorkPlan 或明确修正授权，针对精确排他路径暂存 create/modify/delete。父线程在 join 时先校验整个批次，再逐项写入共享工作区。顺序文件操作中途失败时，恢复需核对已落盘范围。
 3. 每次修改形成新的验证边界；修改前的验证不能证明修改后的行为。
 4. provider 正文只负责说明，不能创造 mutation、validation、permission 或 terminal 事实。
 5. 重复读取、无工具响应、协议漂移和弱输出是推进信号，不是任务终态。
@@ -202,8 +202,8 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - 本机技能的 Codex、Claude、Gemini 及其他来源总开关独立于逐技能选择。关闭来源后，原生发现跳过其标准根目录，前端目录、工作区发现回退和 `$` 菜单仍执行同一来源筛选，显式名称及引用也不能绕过；已有逐项选择保留，重新打开来源可恢复。来源设置在 Run 接纳时快照化，运行中目录不变；来源开关不影响用户单独安装的技能包、自定义规则或模型供应商配置。
 - 输入框的 `$` 技能菜单沿用同一准入目录，向用户展示自动和仅手动条目，不能显示未添加或停用项。唯一名称插入 `$name`，重名或不适合作为单词的名称使用精确 `$s:<ref>`；同一引用不能同时按普通名称激活另一技能。菜单只生成显式选择文本，不授予新的工具或路径权限；提交时仍按实际工作区重新接纳。查询在当前候选中本地过滤，工作区、会话或启用选择变更会使旧异步结果失效。
 - child handoff 也从同一 Run 输入预算派生：按目标路径从 canonical transcript 与 ledger 选取当前 mutation boundary 的相关父上下文；源码窗口整条纳入或明确列为 omitted，不能截成伪完整代码，也不再固定截取“最后六条、每条 2400 字符”。
-- `modelLaneCoordinator` 会读取系统内存来控制本地父/子模型请求的并发准入。
-- 模型请求并发不通过提示词询问模型，也不按 Ollama、LM Studio、OMLX 等产品名猜测数值。若活动配置提供 `maxActiveRequests`，它只能在产品总请求安全上限四以内选择更小上限，并仍受内存保护。未提供并发事实的本地或云 lane 从“父线程 + 一个重叠 probe”开始，只有真实首 chunk 证明重叠后才按 2 → 3 → 4 逐级增长；本地每次新重叠还必须通过设备内存保留量检查。轮流占用同一 lane 不会被记作并行能力。
+- `modelLaneCoordinator.ts` 控制本地父子模型请求的重叠准入，`localConcurrencyEstimate.ts` 用可用内存、保留量及上下文估算本地上限。总上限为 8 个模型请求，包含父请求。活动配置可通过 `maxActiveRequests` 选择上限内的基准容量，本地仍逐次检查重叠准入。
+- 未配置并发的 lane 起步最多允许一个父请求和一个探针。本地内存不足可进一步收紧。两个在途请求同时产生 model progress 后，自动本地 lane 可开放到当前内存估算上限，云端可开放到 lane 上限。实际正文、推理或工具增量形成重叠证据，心跳、空帧和依次完成的请求只提供各自传输信息。
 - 只有明确的容量事实会收缩当前 lane：OOM、HTTP 429/明确并发限制或本机内存压力。连接重置、gateway/stream timeout、长 reasoning 和“暂无可见正文”只是该请求的 transport/协议事实，不得把 provider 并发能力错误降为一。真正收缩时优先释放最新子流而不是中断主体；收缩为串行后不再向后续 provider decision 广告 child 容量。
 
 明确限制：
@@ -211,7 +211,7 @@ phase、重试次数、读取权限、验收或终态。也禁止按模型名称
 - 旧的 `modelDiscovery.computeDynamicLocalContextLimit()` 依赖猜测模型体积且没有生产调用方，已删除；不得恢复这种“猜模型、再扩大上限”的旁路。
 - Settings 的滑块/内存展示是用户配置与说明，不是运行中的第二预算所有者。
 - provider 未报告能力或未确认所选模型已加载时，runtime 绝不猜测更大的上限；因此这类 provider 只使用用户配置。
-- OpenAI-compatible API 没有标准字段能查询服务端实际并发；服务自身未报告时，runtime 只能把受控请求的真实首 chunk 重叠当作增长证据。空闲内存只是本地准入保护，模型回答也不是容量事实，两者都不能单独把 lane 提升到更多并发。
+- 自动并发需要观察实际请求的模型进展重叠，空闲内存用于本地准入与估算上限。产品名称、模型对并发的自述和原始流量到达均不具备这种证明力。
 - 设备内存估算是容量保护而非精确 KV 分配器；provider 仍可在请求时返回真实容量错误，后续应把它作为新的资源事实处理，不能静默截断正文。
 - 单次模型可见读取仍有绝对窗口上限。需要全文件语义时必须沿同一版本连续取窗，而不是提高常量或把文件偷偷裁成摘要。
 - reasoning 的专有请求字段只属于 adapter。OMLX 的 `auto` 不发送正向 reasoning 覆盖，保持所选模型声明的默认行为；只有 `explicit` 才依据该次请求的真实输出上限派生 hidden-thinking budget，`off` 用于关闭 thinking 的有界恢复。Execute、Plan 和 child 共用这一 adapter 规则，未知 endpoint 不接收这些字段；Runtime 只消费规范化后的 reasoning-toggle 能力来处理 reasoning-only 的长度截断。
@@ -251,7 +251,7 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - [`/init` 与 Rules](https://opencode.ai/docs/rules/) 扫描重要项目文件并创建或更新可审阅、建议提交到 Git 的 `AGENTS.md`；它不是后台自由文本记忆。
 - [`instruction.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/instruction.ts) 从明确来源解析项目/全局规则，并在读取子目录文件时按路径补充附近规则。MAIN 可以采用“来源有序、按路径懒加载、每个 Turn 去重”的边界，不能让模型总结成为规则权威。
 - [V2 Compaction](https://opencode.ai/v2/docs/compaction) 明确区分 durable session、lossy checkpoint 和 instruction synchronization：压缩不删除历史，也不把历史摘要提升为新指令。MAIN 的 checkpoint、项目规则和任务证据同样必须分层。
-- [`task.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/task.ts) 把 child 建模为有 `parentID`、独立 history 和明确 permission 的子 Session，结果再交回 parent。可见 child history、深度上限和传递式权限值得采用；OpenCode 自身曾出现权限继承、递归和并发问题，因此 MAIN 使用运行时 lane 探测、互斥写入范围、join-time 事务提交和结构化 evidence handoff，而不是允许多个模型无锁改共享工作区。
+- OpenCode 将 child 建模为有 `parentID`、独立 history 和明确 permission 的子 Session，完成后交回 parent。MAIN 使用 lane 探测、互斥写入范围、父线程 join 时校验与顺序提交，以及结构化 evidence handoff。 [OpenCode 公开实现](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/task.ts)
 
 采用 OpenCode 参照后，MAIN 的最小方向不是“再加 Memory Store”，而是：
 
@@ -264,9 +264,9 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 
 - `subagentPreference=preferred` 开启主动协作。Runtime 在发现可独立交付的范围且模型通道允许时，通过现有调度器启动只读子任务，父线程继续推进。模型主动提出的合法候选优先。普通 Execute 取得独立的版本化源码后，可以把准入时已核验版本和依赖来源交给子任务复核。计划和执行契约继续按各自的结构化证据生成候选，调度身份持久化去重。协作开关随本轮准入快照保存，只有用户的显式强制指令可产生 `subagentRequirement=required`。可选子任务的失败或缺席不改变写入、验证与完成的权威边界。
 - Plan 中尚未满足的 `required` 协作只开放精确 `spawn_subagent` 获取面。若该 provider 请求在 child admission 前超时，runtime 只允许在同一真实 discovery/native surface 上重试一次；两次失败由配对的 durable `request_model` command receipt 计数，冷恢复不得续租，也不得谎称已切换到 synthesis/structured transport。第二次超时以专用 `blocked` 原因有限收口；容量不足、provider 超时和用户取消必须保持不同事实。
-- `explore`、`review`、`validate` 只读 child 适合并行调查。父线程已经读取精确源码并形成证据化方案后，`implement/write` child 可获得 create/modify/delete、具体方案、成功标准和每个精确文件目标组成的事务权限。不能把目录作为写授权后让 child 自行选择文件；多个 writer 的目标必须互斥，workspace root 不能成为写范围。
+- `explore`、`review`、`validate` 只读 child 适合并行调查。`implement/write` 需要实施契约、已批准 WorkPlan 或明确修正授权。调用指定 create/modify/delete、具体方案、成功标准和互斥的精确文件目标，并满足当前路径和操作的源码要求。
 - 子智能体接收的是有界的父上下文胶囊，而不是整段对话或父模型私有推理：原始目标、验收条件、已批准 WorkPlan、相关父证据目录、当前范围内的完整版本化源码窗口和同一份 workspace instruction snapshot。继承证据必须带 provenance，不能因协议不允许引用而被迫重读。
-- 实现 child 只能暂存一个与分配 operation 相符的修改事务，不直接写共享工作区。join 重新验证独占范围、base version、批准计划 scope、权限/单次审批和语法，再提交并生成 mutation evidence；任一检查失败都整体丢弃。活动 writer 会阻止父线程或 sibling 修改重叠路径，也会阻止最终 validation 在旧版本上运行。父线程继续不依赖 child 的工作，只在出现依赖时 wait，并始终负责整合、最终验证和完成。
+- 实现 child 暂存与分配操作相符的修改。父线程在 join 时先校验整个批次的独占范围、基础版本、计划范围、权限与语法，再顺序执行文件操作。预检拒绝会阻止批次落盘。写入开始后的 I/O 异常可能留下已落盘的前缀，需复核当前文件与实际回执才能恢复。活动 writer 锁定重叠路径，最终验证等待相关实现任务汇合。父线程负责整合、验证与完成。
 - 普通 child 请求的安全工作工具与普通最终文本能力并存，不预留固定“强制总结阶段”，也不在取得首条证据后撤掉工具。只有普通 final 显式引用子任务真实新证据或明确交付给 `review` 的版本化父证据时，runtime 才记为 `completed`；未形成合法报告则按已有新证据诚实交回 `degraded/failed`，不再强制下一轮调用报告工具。`finishReason=length` 保留为 `output_truncated`，半截调用不得执行，截断正文不得成为合法报告，也不能被误判为工具能力缺失后换协议重放。child 使用同一 Run 准入的单步输出额度，没有报告专属 4096 上限。继承父证据单独保留 provenance，可以支持 review finding，但绝不计入子任务新证据、交付、采用或验收数量；runtime 不代填 finding 或 citation。
 - child 对成功自读文件的完整路径引用可作为既有版本化 receipt ID 的别名；目标有版本歧义、读取失败、路径仅局部匹配或仅来自继承上下文时不能推定引用。交接保留完整报告和证据列表，父线程仍须按 exact ID 明确采用。报告校验比较字段语义，不依赖 JSON 对象键顺序，确保 Rust/SQLite 往返后仍可按同一 ledger 重放；来源身份合法不等于结论已被来源证明，父线程仍负责审阅。
 - child 原生工具调用在 identity、scope 和执行前必须走父线程相同的 advertised-schema normalization；未声明参数和等于 schema 默认值的可选参数不能让同一读取伪装成新动作。若不同参数实际返回同一 `target + output version`，第一次语义重复给出纠正回执，下一次仍命中该关闭观察则立即以 `closed_observation_loop` 降级；真正不同的源码窗口仍是新 evidence 并清空该关闭集合。这不是固定轮数限制，而是结果已经证明无新信息后的幂等边界。
@@ -276,7 +276,7 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - 子智能体 `degraded/failed` 后父线程继续当前目标。首次有效调度与交接是编排进展，合法 join 等待不得计入父线程无进展租约；即使交接没有新证据，父线程仍须获得接管机会，重复交接不能续租。这些边界不创造来源或验收事实；只有 `completed` 且报告引用真实 evidence 时才是成功的协作结果。同一 provider 决策中的 spawn 与独立安全读取保留原顺序，并分别经过 durable command fence；join、写入和验证等可能提交效果的动作仍隔离。
 - 协作容量、派生总量和 active/failed 投影必须按同一 parent Run 隔离。child 活动时，如果父线程的最新决策只重复已经关闭的动作，调度器必须直接 join 现有 child，而不是继续占用共享 provider lane 重试父请求；child 结果到达后父线程再从新的证据边界继续。
 - lane 容量只限制实际 active provider 请求，不是父 Run 的 child 任务总配额。合法独立任务可进入既有 dispatcher 队列，queued/running 或历史 terminal job 数量不得与当前并发容量比较后拒收；兼容字段 `maxChildRuns` 的生产值仅由并发观察派生，不能作为独立 total budget。实际 HTTP 开始仍须经过同一个 lane acquire 的 first-token、内存和并发门；scope 去重、互斥写范围、父权限、取消和共享生命周期保持原权威。
-- 子智能体面板显示当前真实 lane 状态：本地能力未知时显示“模型请求串行／当前不开放子智能体并行”，不能把串行委派误报成多智能体并发；显式并发配置标为“已配置”，受控云探针确认首 token 重叠后才显示已实测数量。不得写死“最多两个子流”，也不得把主体槽位混入子流计数。
+- 子智能体面板区分当前可准入容量、显式配置和已经观测到的重叠数量。当前只能串行时显示零子请求并发。自动 lane 允许重叠且尚无确认结果时显示探测状态。子请求容量从总容量中扣除父请求槽位。
 
 ## 7. 验收与 UI
 
@@ -295,7 +295,8 @@ OpenCode 的公开实现提供了一个有价值的对照，但不是可直接�
 - 同一个 Runtime authority resolver 生成 Execute 工具面并执行授权；本 Turn consent 可允许 `browser_evaluate`，桌面控制仍保留逐次授权。
 - browser validation 只有在存在因果关联的 passed assertion，且没有 page/console error 时才算通过；静态 build 不能单独覆盖行为 criterion。
 - WorkPlan 明确声明的 `behavioral`、`interaction`、`static` 证据类型必须严格保持。普通 Execute 可以用真实有限验证覆盖未分类条件。如果当前改动已获 Editor 核验，模型仍在验证阶段直接给出总结，而且工作区声明了唯一有限测试入口，Runtime 可按现有权限执行一次该测试。测试前复核入口来源的文件版本，真实回执仍按本轮修改边界校验。最终报告如实说明实际验证内容。
-- Plan discovery 同时保留安全读取和 WorkPlan 提交工具，不按读取次数、动作次数或独立 discovery 时钟撤掉读取面。普通 Plan 没有默认八分钟硬限，流式请求的 inactivity watchdog 不限制活跃生成总时长；child 不继承凭父线程年龄计算的隐式截止。
+- 普通工作区 Plan 直接进入 WorkPlan discovery，可为真实取舍调用 `ask_plan_questions`，不要求例行访谈。`/grill-me` 与明确的访谈请求进入文档访谈，提交前需要有效答复。访谈只提供决策证据，实施仍使用独立 WorkPlan 审批。
+- 普通 Plan discovery 同时保留获准的读取和 WorkPlan 提交工具，读取次数、动作次数或独立 discovery 时钟不足以撤掉读取面。普通 Plan 无默认八分钟硬限。流式 inactivity watchdog 只约束无活动请求，child 生命周期来自显式父预算。
 - Plan 的无进展压力从 canonical provider/tool/child 回执重建，只指导改变策略，不因十分钟停滞直接结束为 error；活跃 child 仍先 join。只有调用方明确指定的 deadline 写入 run.started 后可成为父子共享硬边界，compiler 拒绝也不能延长它。已解析且正文非空、但执行结构或验收规范有缺口的候选保存为独立 PlanDocument 草稿，以真实文档回执和结构化缺口结论完成为 partial；它不形成 sealed WorkPlan、子任务采纳或执行审批。无可保存正文时继续协议恢复，工具证据本身仍不能证明计划交付。
 - 草稿正文、来源调用哈希、诊断和 derivedFrom 只保存在同一 ledger 的 runtime-owned 保存命令及回执中。保存前后崩溃复用精确输入，已保存草稿不能在冷恢复时提升为 success；“补全验证”创建绑定原稿精确版本的新 Turn，重新取得当前源码证据并通过完整 WorkPlan 校验后才可进入审批。
 - Plan discovery/synthesis 在预算内保留同一完整 assistant/tool transcript；只在真实预算压力下删除完整组，保护用户目标和最新反馈。工具实际有界内容随 ledger 持久化，冷恢复不重读概览、不重新编号证据，也不能把旧 checkpoint 缺失正文的元数据冒充源码内容。终态意图先持久化，恢复补齐唯一的 run.completed → final projection → turn.completed。

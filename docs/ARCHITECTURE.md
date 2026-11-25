@@ -18,7 +18,7 @@ MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性
 | 文件、Shell、PTY、应用管理的网络请求和 Session 快照存储机制 | Rust | `src-tauri/src/lib.rs`、`src-tauri/src/trusted_execution.rs`、`src-tauri/src/network_guard.rs`、`src-tauri/src/harness/permissions.rs`、`src-tauri/src/session_store.rs` | 重新判断用户意图、计划、队列状态、Run 所有权、transcript 合并或模型恢复策略 |
 | Trace、Replay、Golden、Eval 和回归夹具 | Rust Harness | `src-tauri/src/harness/`、`src-tauri/src/runtime/`、`src-tauri/src/eval/`、`benchmark/` | 推进生产会话的模型循环 |
 
-旧 `AgentOrchestrator`、Rust `RuntimeLoop` 与 `runRuntimeHarness()` 当前不是 Workspace Turn 的生产 Agent 循环。它们只可作为历史对照或验证基础设施；除非先证明新的生产调用方，否则不得把其中的策略描述成当前产品行为。
+旧 TypeScript `AgentOrchestrator` 已从工作树移除，历史对照可查 Git。Rust `RuntimeLoop` 通过 `run_runtime_harness` 和 Rust 测试执行固定步骤并回放 Trace。独立的 `cargo run --bin main -- eval` 检查静态评估夹具。工作区的模型请求和生命周期均在 TypeScript Runtime v2 中推进。详见 [测试与回放](TESTING_AND_REPLAY.md)。
 
 `src-tauri/src/harness/permissions.rs` 当前是一个路径命名例外：生产 Shell 执行和 Harness 都复用其中的 `PermissionGuard`。它的生产权限校验职责属于 Rust 受信任执行边界，不能因为目录名含 `harness` 就把用户审批后的最终命令校验降为测试专用逻辑。
 
@@ -28,17 +28,17 @@ MAIN 采用一个产品运行时、一个受信任执行边界和一个确定性
 
 1. Workspace 接纳先创建稳定的 `clientSubmissionId`、receipt、`turnId`、用户块和回合标题，并把新 Turn 写入 Session/FIFO。
 2. `startSubmitAsyncWorkflowRun()` / `runSubmitAsyncWorkflowRun()` 接管已持久化的提交，`submitRuntimeRunner.ts` 按 admission intent 选择 Runtime v2 runner。
-3. Runtime v2 runner 建立或恢复 exact-owner checkpoint，`RuntimeV2Controller` 与 ports 维护 Run、审批、计划续跑、工具执行和最终投影。
+3. 各 runner 建立或恢复所属回合的检查点。Execute 与 Chat/Analyze 由 `RuntimeV2Controller` 推进，审批前 Plan 由 `planRunner.ts` 和 `PlanLedger` 推进。两条路径共享 Runtime v2 的事件、检查点和投影契约。
 4. provider adapter 执行 provider-neutral 请求和标准 tool-call 协议；Execute 使用可重复的 inspect-edit-verify 工具面，Plan 只产生待审核 artifact。
 5. Plan artifact 经共享 typed ingress/commit 后暂停待审；批准后的执行仍由 Runtime v2 Execute 消费批准 authority，不从 UI Markdown 猜测权限。
 6. 工具通过 TypeScript IPC 进入 Rust；已经迁移到统一边界的入口再做路径、Shell、网络、超时与进程回收校验。工具结果进入结构化证据账本。
 7. canonical Turn 状态、审批、Plan artifact、证据与兼容事件回到 Session 投影；ChatArea、进度胶囊和时间线只从这些结构化事实渲染。
 
-普通 MAIN 提交、`/计划`、`/规则` 及兼容别名 `/init` 都走同一 Workspace Turn 接纳路径。`/规则` 与 `/init` 进入 `planPurpose: rules` 的 Plan 访谈：先调查项目和根 `AGENTS.md`，询问关键约束并保存规则草稿，再由用户编辑、审阅并通过专用 CAS IPC 写入根文件。访谈回答和草稿保存均不授予执行批准。
+普通 MAIN 提交、`/计划`、`/grill-me`、`/规则` 及兼容别名 `/init` 共用 Workspace Turn 接纳路径。显式命令选择 Plan 能力上界，Main 模式仍通过语义预检提取本轮的读取限制与逐次审批要求。`/规则` 与 `/init` 进入 `planPurpose: rules` 的访谈，调查项目和根 `AGENTS.md`，询问关键约束并保存规则草稿。用户编辑、审阅并确认后，由专用 CAS IPC 写入根文件。
 
 ## Provider-neutral Plan 边界
 
-新 Plan 至少经过一次结构化确认。概念计划经 `savePlanDocument` 保存版本化文档后完成，不需要虚构文件改动或验证命令；规则草稿保存后另行审阅根 `AGENTS.md`。
+普通工作区 `/计划`（`/plan`）直接进入 WorkPlan 调研，有影响范围、方法或验收的用户决策时可调用 `ask_plan_questions`。`/grill-me` 与明确的访谈请求进入结构化访谈，要求记录有效答复后才可提交版本化计划文档。没有工作区的普通 Plan 可按需提问，也可直接提交概念计划。访谈答案提供决策依据，实施授权来自后续独立的 WorkPlan 审批。
 
 选择实施计划后，Runtime v2 使用以下单向权威链：
 
@@ -71,10 +71,11 @@ MAIN 使用同一套结构化证据规则贯穿规划和执行，但保留不同
 - 可纠正的 workspace mutation 失败由 durable ledger 以结构化 `failureReasonCode` 标记，恢复不能解析 provider-facing 文案来猜原因。其被拒绝补丁正文不会进入后续提示，但最新失败目标、`effect: none` 和有界解析器／源码诊断会固定在当前 decision view 尾部；更早失败目标不能继续占有恢复工具面。Runtime 只开放一次 post-failure target-locked read，验收回执存在 `path:line` 时强制读取该行附近；成功补读后立刻进入 `corrective_mutation`，新补丁仍按实际可见 exact source 独立授权。连续三次纠错 mutation 都未执行则诚实收口，真实 mutation 清零并建立新边界。未广告工具被记录为一对标准 assistant/tool 拒绝事实，而不是抛成无状态 transport retry。
 - 工具结果的具体因果 handler 先于通用 no-progress policy：真实修改和失败验证必须先推进下一次读取／修正／验证；重复或协议异常只产生软信号。
 - Execute 的任务生命周期没有总生成时限，但每次 provider 决策有阶段化输出预算：普通动作 4096 tokens、action window／验证／恢复 2048、执行结论 4096。reasoning-only 动作流达到 8000 字符仍无工具时只取消本次生成，以明确反馈和 reasoning-off 重试；单步收敛不能结束复杂任务。
-- 子智能体偏好在 Turn admission 就向执行模型注入拆分方法，不等 `spawn_subagent` 出现后才解释规则；hidden intent router 只分类主意图。用户选择优先协作后，任务存在至少两个可独立重叠的有界工作包且工具/容量可用时，执行模型应优先并行派生 child，同时父线程继续不依赖 child 的工作；简单或线性任务仍直接执行，runtime 不把协作设为固定阶段、mutation 或 completion 前置。child 接收自包含目标、相关精确源码/证据、约束和实施契约组成的有界胶囊，不继承父模型私有推理或完整 transcript。`explore/review/validate` 只读分支可并行调查；父线程形成证据化方案后，`implement/write` 可在互不重叠的精确文件目标上暂存一个 create/modify/delete 事务，不能拿目录授权让 child 自行选写入文件。modify/delete 必须继承父线程当前请求中同目标的版本化源码；join 时再校验 base version、WorkPlan scope、权限、破坏性审批和语法，并提交或整体丢弃。写范围活动期间，父线程及 sibling 的重叠修改被拒绝，最终验证必须等待事务汇合。未配置并发事实的 lane 从父线程加一个 probe child 开始，真实首 chunk 重叠后才逐级开放到总计四个模型请求，本地每次重叠还受设备内存保护；轮流占用同一通道不算并行。恢复 action window 不开放新建或等待 child，也不因父线程动作失败自动 join；它要求父线程先完成当前闭合动作，已存在 child 则在后续正常边界收取。协作状态和预算按 parent Run 隔离。
+- 子智能体偏好在 Turn 接纳时传给执行模型。可独立推进且容量允许的工作可并行委派，父线程继续处理自己的步骤。`explore/review/validate` 分支保持只读。父线程拥有实施契约或已批准 WorkPlan 后，`implement/write` 可为互斥的精确文件目标暂存指定的 create/modify/delete 操作。源码依据、计划依赖、操作类型和现行授权都由运行时校验。活动写范围锁住重叠目标，最终验证等待相关子任务汇合。恢复 action window 优先收束父线程的当前动作，子任务在正常边界交回。协作状态按父 Run 隔离。
+- `modelLaneCoordinator.ts` 控制活动模型请求，总上限为 8 个，包含父请求。自动 lane 最初最多允许一个父请求和一个探针。两个同时在途的请求都有实际模型输出后，本地 lane 可开放到当前内存估算上限，仍按每次重叠采样准入。正文、推理和工具增量都可证明模型进展。显式配置选择受上限约束的基准容量，云端自动 lane 也以实际重叠打开并发。
 - child provider 响应必须经过与父线程相同的 advertised-schema 参数规范化后，才参与 identity、授权和执行；未声明字段不能制造新的动作 identity。对不同参数却返回同一 target/version/output 的读取，第一次返回 `CHILD_EVIDENCE_REPEAT` 纠正，下一次仍命中同一关闭观察时立即降级交回父线程，不能用范围或 nonce 抖动占住共享模型 lane；真正的新窗口／新证据仍正常清零停滞状态。
-- 同一父 Run 的 child 总数不超过 admission 时的 child lane 容量；terminal child 不在该 Run 内补充派生配额，避免模型用连续 child 重试替代主体执行。
-- child 用普通最终文本结束有界工作；runtime 只有在结果引用至少一条真实或合法继承 evidence 时才编译合法报告。实现 child 的暂存 evidence 在 join 成功后才替换为 mutation evidence 并可记为 `completed`；提交失败则整体丢弃事务并降级交回主体。父线程显式 wait 或终态 join 后接收结果；任何非 completed child 都不能阻断父线程，child 结果不能凭自身关闭不匹配的验收。
+- lane 容量限制实际在途请求。符合范围与调度规则的子任务可排队，父 Run 仍负责去重、权限、写入和验收。
+- child 用普通最终文本和可引用的证据交回结果。父线程 join 时先校验暂存批次的完整范围、基础版本、权限与语法，再逐笔发起工作区写入。通过预检之后的写入是顺序文件操作，中途 I/O 故障可能留下已落盘的前缀。恢复时应先核对当前文件与已有回执，再决定后续动作。只有完成提交的子任务才可用 mutation evidence 支撑交付。
 
 Plan evidence、child evidence 与 Execute evidence 可以有不同持久化形状，但共享 identity、path/version、provenance 和“不从摘要制造事实”的规则。Rust 仍只负责 opaque snapshot CAS。
 

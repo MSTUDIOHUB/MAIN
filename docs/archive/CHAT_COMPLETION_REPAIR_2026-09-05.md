@@ -39,7 +39,7 @@
 
 原事故 checkpoint 离线回放现在拒绝旧错误回答。140 条历史事件保持不变，36 条出站消息配对完整；9 个回执引用使序列化请求历史从 96,057 字符减至 77,460 字符，减少 18,597 字符。这是同一历史的字符测量，不冒充新的真实 tokenizer 统计。
 
-[事故回放结果](/tmp/main-completion-fix-20260905/incident-verification.json)、[真实工作区终态证据](/tmp/main-completion-fix-20260905/direct-execute-completion.json)、[联网聊天](/tmp/main-completion-fix-20260905/chat-web-1.json)、[多轮记忆](/tmp/main-completion-fix-20260905/chat-offline-2.json)、[验证日志目录](/tmp/main-completion-fix-20260905)。
+当时的验证目录是 `/tmp/main-completion-fix-20260905/`，其中包含事故回放 `incident-verification.json`、工作区终态 `direct-execute-completion.json`、联网聊天 `chat-web-1.json` 和多轮记忆 `chat-offline-2.json`。归档时该本机临时目录已不存在，验证结果摘要见上文。
 
 ## 验证边界
 

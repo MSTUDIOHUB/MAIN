@@ -205,6 +205,8 @@ provider 每轮看到的是稳定、阶段允许的工具集合。执行过一�
 
 ### 6.3 临时记录清理
 
+以下为当时的清理记录。归档时，文中提到的临时 worktree 路径已不存在。
+
 已从 `/private/tmp` 移出 28 个明确属于 MAIN Runtime v2、真实 OMLX 和 MD Viewer 验收的旧目录/记录，合计约 190 MB。保留唯一注册的 Runtime v2 worktree `/private/tmp/MAIN-runtime-v2`，没有触碰其他临时内容。
 
 清理通过 macOS 废纸篓完成；这些项目已不再占用 `/private/tmp`，在废纸篓清空前仍可恢复。
