@@ -2,6 +2,7 @@ import {
   runtimeV2SubagentStartHasRunway,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
+import { attachFailureReasonCode } from "../../lib/workspaceToolFailure";
 import { appendRuntimeV2ToolResultHistory } from "./executionProviderHistory";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 
@@ -35,7 +36,7 @@ export function assertRuntimeV2SubagentScheduleRunway(
   closeCollaborationToolCall(
     input,
     command,
-    `SUBAGENT_SCHEDULE_REJECTED: ${detail}`,
+    `SUBAGENT_SCHEDULE_REJECTED [code=subagent_insufficient_runway]: ${detail}`,
   );
   input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
     turnId: command.run.turnId,
@@ -43,5 +44,5 @@ export function assertRuntimeV2SubagentScheduleRunway(
     reason: "insufficient_lifecycle_runway",
     lifecycleDeadlineAt: input.lifecycleDeadlineAt ?? null,
   });
-  throw new Error(detail);
+  throw attachFailureReasonCode(new Error(detail), "subagent_insufficient_runway");
 }

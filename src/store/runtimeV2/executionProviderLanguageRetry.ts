@@ -62,6 +62,14 @@ export function createRuntimeV2WireCallbacks(input: {
         return input.activity.requestDispatched();
       },
       onLifecycle(event) {
+        if (event.phase === "prompt_progress") {
+          input.activity.reportPromptProgress({
+            processedTokens: event.processedTokens,
+            totalTokens: event.totalTokens,
+            cachedTokens: event.cachedTokens,
+            percent: event.percent,
+          });
+        }
         if (event.phase === "model_progress") onModelProgress();
         if (event.phase === "first_chunk") {
           input.logRequestTiming("first_chunk", {

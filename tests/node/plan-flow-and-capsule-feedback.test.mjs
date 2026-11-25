@@ -236,8 +236,18 @@ test("/grill-me and explicit questions enforce interview while ordinary workspac
   assert.equal(voluntaryResumeBypass, null);
 });
 
-test("explicit /计划 and /grill-me skip redundant semantic preflight when no continuation ambiguity exists", () => {
+test("explicit /计划 and /grill-me trigger semantic preflight to extract read restrictions before bootstrap", () => {
   const { resolveAndApplySubmitIntentRouting } = load("src/store/submitIntentRouting.ts");
+  const { inferExplicitWorkspaceReadGuardsFromText } = load("src/lib/turnCapabilities.ts");
+  assert.deepEqual(inferExplicitWorkspaceReadGuardsFromText("/计划 不要读取任何工作区文件"), {
+    forbiddenWorkspaceRead: true,
+    approvalRequiredWorkspaceRead: false,
+  });
+  assert.deepEqual(inferExplicitWorkspaceReadGuardsFromText("/计划 每次读取项目文件前先问我"), {
+    forbiddenWorkspaceRead: false,
+    approvalRequiredWorkspaceRead: true,
+  });
+
   const preflights = [];
   const logs = [];
   const base = {
@@ -276,34 +286,56 @@ test("explicit /计划 and /grill-me skip redundant semantic preflight when no c
     logStoreEvent: (event, data) => logs.push({ event, data }),
   };
 
-  const planRes = resolveAndApplySubmitIntentRouting({
+  const forbiddenReadPlan = resolveAndApplySubmitIntentRouting({
     ...base,
-    text: "/计划 分析 MFramework",
-    mainIntentShortcut: { intent: "plan", command: "/计划", rest: "分析 MFramework" },
+    text: "/计划 不要读取任何工作区文件",
+    mainIntentShortcut: { intent: "plan", command: "/计划", rest: "不要读取任何工作区文件" },
     options: { explicitIntent: "plan" },
   });
-  assert.equal(planRes.handled, false);
-  assert.equal(planRes.effectiveRunIntent, "plan");
-  assert.equal(preflights.length, 0);
+  assert.equal(forbiddenReadPlan.handled, true);
+  assert.equal(preflights.length, 1);
+  assert.equal(preflights[0].request.explicitIntent, "plan");
+  assert.equal(logs.at(-1).event, "turn_intent_semantic_requested");
+
+  const approvalReadPlan = resolveAndApplySubmitIntentRouting({
+    ...base,
+    text: "/计划 每次读取项目文件前先问我",
+    mainIntentShortcut: { intent: "plan", command: "/计划", rest: "每次读取项目文件前先问我" },
+    options: { explicitIntent: "plan" },
+  });
+  assert.equal(approvalReadPlan.handled, true);
+  assert.equal(preflights.length, 2);
+  assert.equal(preflights[1].request.explicitIntent, "plan");
 
   const grillRes = resolveAndApplySubmitIntentRouting({
     ...base,
     text: "/grill-me 梳理需求",
     options: { explicitIntent: "plan", planPurpose: "plan", planInterviewMode: "grill" },
   });
-  assert.equal(grillRes.handled, false);
-  assert.equal(preflights.length, 0);
+  assert.equal(grillRes.handled, true);
+  assert.equal(preflights.length, 3);
+  assert.equal(preflights[2].request.explicitIntent, "plan");
 
-  const withCandidate = resolveAndApplySubmitIntentRouting({
+  const resolvedPlan = resolveAndApplySubmitIntentRouting({
     ...base,
-    text: "/计划 继续那个方案",
-    mainIntentShortcut: { intent: "plan", command: "/计划", rest: "继续那个方案" },
-    options: { explicitIntent: "plan" },
-    planContinuationCandidates: [{ turnId: "prev-1", title: "Old Plan", summary: "...", status: "approved" }],
+    text: "/计划 不要读取任何工作区文件",
+    mainIntentShortcut: { intent: "plan", command: "/计划", rest: "不要读取任何工作区文件" },
+    options: {
+      explicitIntent: "plan",
+      resolvedIntent: "plan",
+      skipIntentResolution: true,
+      semanticIntent: {
+        intent: "plan",
+        confidence: 1,
+        source: "model_semantic_preflight",
+        forbiddenCapabilities: ["workspace_read"],
+        approvalRequiredCapabilities: [],
+      },
+    },
   });
-  assert.equal(withCandidate.handled, true);
-  assert.equal(preflights.length, 1);
-  assert.equal(logs.at(-1).event, "turn_intent_semantic_requested");
+  assert.equal(resolvedPlan.handled, false);
+  assert.equal(resolvedPlan.effectiveRunIntent, "plan");
+  assert.equal(preflights.length, 3);
 });
 
 test("Sidebar chat height clamps cleanly to container and min bounds", () => {
@@ -403,4 +435,401 @@ test("planDocumentRunner does not inject duplicate prose on rejectedAdmission wa
     calls[1].some((m) => m.role === "system" && m.content.includes("No document has been saved")),
     false,
   );
+});
+
+test("Capsule filters evicted evidence by retained outbound messages and formats live OMLX prompt progress", () => {
+  const {
+    buildCapsuleModelActivityContext,
+    formatCapsuleModelDetailWithProgress,
+  } = load("src/lib/capsuleModelContext.ts");
+  const { extractStreamPromptProgress } = load("src/lib/streaming.ts");
+
+  const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "e1", clientSubmissionId: "s1", turnId: "t-evict" };
+  const baseEvents = [
+    { type: "provider.responded", sequence: 1 },
+    { type: "command.scheduled", sequence: 2, command: { idempotencyKey: "cmd-evict", kind: "execute_tool", payload: { toolName: "read_file", arguments: { path: "Assets/OldEvicted.cs" } } } },
+    { type: "tool.completed", sequence: 3, idempotencyKey: "cmd-evict", status: "succeeded", evidence: [{ target: "Assets/OldEvicted.cs" }], presentation: { toolName: "read_file", target: "Assets/OldEvicted.cs" } },
+    { type: "command.scheduled", sequence: 4, command: { idempotencyKey: "cmd-kept", kind: "execute_tool", payload: { toolName: "read_file", arguments: { path: "Assets/SaveManager.cs" } } } },
+    { type: "tool.completed", sequence: 5, idempotencyKey: "cmd-kept", status: "succeeded", evidence: [{ target: "Assets/SaveManager.cs" }], presentation: { toolName: "read_file", target: "Assets/SaveManager.cs" } },
+  ];
+  const messages = [
+    { role: "user", content: "Review MFramework" },
+    { role: "tool", tool_call_id: "cmd-kept", content: "SaveManager.cs contents" },
+    { role: "system", content: "[runtime-v2 context: child:j-kept]\ncore-arch-review summary" },
+  ];
+
+  const subagentAggregate = {
+    turn,
+    subagents: [
+      { id: "j-evicted", scopeKey: "old-worker" },
+      { id: "j-kept", scopeKey: "core-arch-review" },
+    ],
+    evidence: [],
+    objective: { text: "Review MFramework" },
+    events: [
+      ...baseEvents,
+      { type: "subagent.completed", sequence: 6, jobId: "j-evicted", status: "completed" },
+      { type: "subagent.completed", sequence: 7, jobId: "j-kept", status: "completed" },
+    ],
+  };
+
+  const subagentCtx = buildCapsuleModelActivityContext({
+    aggregate: subagentAggregate,
+    messages,
+    estimatedInputTokens: 45_200,
+  });
+  assert.doesNotMatch(subagentCtx.detailZh, /OldEvicted\.cs|old-worker/);
+  assert.match(subagentCtx.detailZh, /core-arch-review/);
+
+  const readCtx = buildCapsuleModelActivityContext({
+    aggregate: {
+      turn,
+      subagents: [],
+      evidence: [],
+      objective: { text: "Review MFramework" },
+      events: baseEvents,
+    },
+    messages,
+    estimatedInputTokens: 45_200,
+  });
+  assert.doesNotMatch(readCtx.detailZh, /OldEvicted\.cs/);
+  assert.match(readCtx.detailZh, /SaveManager\.cs/);
+
+  const progress = extractStreamPromptProgress({
+    prompt_progress: { processed_tokens: 18400, total_tokens: 64000 },
+  });
+  assert.deepEqual(progress, { processedTokens: 18400, totalTokens: 64000 });
+  const detail = formatCapsuleModelDetailWithProgress(subagentCtx, progress, "zh");
+  assert.match(detail, /已处理 18\.4k \/ 64k tok · 29%/);
+});
+
+test("Workspace read error classifier separates escape/missing/permission and stopped archive card preserves reason", () => {
+  const {
+    classifyWorkspaceReadFailure,
+    describeWorkspaceToolFailure,
+  } = load("src/lib/workspaceToolFailure.ts");
+  const { buildTurnProcessArchiveModel } = load("src/lib/turnProcessArchive.ts");
+
+  assert.equal(
+    classifyWorkspaceReadFailure("READ_PATH_OUT_OF_WORKSPACE: path escapes canonical workspace root")?.code,
+    "path_out_of_workspace",
+  );
+  assert.equal(
+    classifyWorkspaceReadFailure("READ_TARGET_INACCESSIBLE: Permission denied")?.code,
+    "target_inaccessible",
+  );
+  assert.equal(
+    classifyWorkspaceReadFailure("路径越界、不存在或无法访问: Permission denied")?.code,
+    "target_inaccessible",
+  );
+  assert.equal(
+    classifyWorkspaceReadFailure("READ_TARGET_NOT_FOUND: workspace path is missing")?.code,
+    "target_not_found",
+  );
+  assert.match(
+    describeWorkspaceToolFailure("subagent_path_limit_exceeded", "zh")?.cardMessage || "",
+    /超出 6 个上限/,
+  );
+
+  const archive = buildTurnProcessArchiveModel({
+    blocks: [
+      {
+        id: "cmd-subagent",
+        type: "tool",
+        toolCallId: "cmd-subagent",
+        toolName: "spawn_subagent",
+        status: "error",
+        toolStatus: "failed",
+        target: "core-arch-review",
+        summary: "子智能体单次路径超出 6 个上限，需按模块拆分后派发。",
+        message: "子智能体单次路径超出 6 个上限，需按模块拆分后派发。",
+      },
+    ],
+    finalVisibleAgentIndex: -1,
+    language: "zh",
+    includeThoughts: false,
+  });
+  assert.equal(archive.steps.length, 1);
+  assert.match(archive.steps[0].activity?.title || "", /动作受阻：派发子智能体/);
+  const detailText = [
+    archive.steps[0].summary,
+    archive.steps[0].result,
+    archive.steps[0].note,
+    archive.steps[0].activity?.summary,
+  ].filter(Boolean).join("\n");
+  assert.match(detailText, /core-arch-review/);
+  assert.match(detailText, /超出 6 个上限/);
+});
+
+test("requestsExplicitPlanInterview matches 先询问我几个关键问题 and Global Plan cold-restore finishes save without re-calling model", async () => {
+  const { requestsExplicitPlanInterview } = load("src/lib/grillMe.ts");
+  assert.equal(requestsExplicitPlanInterview("/计划 先询问我几个关键问题再写方案"), true);
+
+  let runtimeLib;
+  let state = {
+    currentTurnId: "t-global-restore",
+    currentSessionId: 1,
+    conversationTurns: [{ id: "t-global-restore", clientSubmissionId: "s-gr", userPrompt: "/计划 整理架构目标" }],
+    config: {},
+    planLifecycle: { sessionKey: "__MAIN_GLOBAL_CHAT__:1", sessionEpoch: "e1" },
+    runtimeV2Checkpoints: {},
+    taskFlow: [],
+    harnessRunMarker: { sessionKey: "__MAIN_GLOBAL_CHAT__:1", turnId: "t-global-restore", runId: "r-gr", status: "running", startedAt: 1, instanceId: "i1" },
+    _nextTaskId: () => 1,
+  };
+  let streamCallCount = 0;
+  let forbidModelCalls = false;
+  let savedDocs = 0;
+  const stored = new Map();
+  const customLoad = createTsModuleLoader({
+    "../../lib/streaming": {
+      isStreamOutputLimited: () => false,
+      streamChatCompletion: async () => {
+        if (forbidModelCalls) {
+          throw new Error("Global Plan cold restore after submit_plan_document must not re-call model");
+        }
+        streamCallCount += 1;
+        return {
+          content: "",
+          toolCalls: [{
+            id: "sub-1",
+            name: "submit_plan_document",
+            arguments: JSON.stringify({ title: "Global Plan", markdown: "# Global Plan\n\nConfirmed goal.\n" }),
+          }],
+          protocolViolation: null,
+        };
+      },
+    },
+    "../../lib/modelLaneCoordinator": {
+      acquireModelLane: async () => ({ release() {}, markFirstToken() {}, reportFailure() {}, setPressureHandler() {} }),
+    },
+    "../../lib/providerLaneSettings": {
+      deriveBudgetedStreamSettings: () => ({ provider: "fixture", toolProtocol: "auto" }),
+      deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+    },
+    "../../lib/ipc": {
+      savePlanDocument: async (input) => {
+        savedDocs += 1;
+        const { sha256Hex } = load("src/lib/sha256.ts");
+        const reference = {
+          owner: input.owner,
+          documentId: input.documentId,
+          revision: 1,
+          contentHash: sha256Hex(input.markdown),
+          path: "stored/global-plan/rev-1.md",
+          title: input.title,
+          kind: input.kind,
+        };
+        stored.set(`${input.owner.sessionKey}:${input.documentId}`, { ...reference, markdown: input.markdown });
+        return reference;
+      },
+      readPlanDocument: async (reference) => stored.get(`${reference.owner.sessionKey}:${reference.documentId}`) || {
+        ...reference,
+        markdown: "# Global Plan\n\nConfirmed goal.\n",
+      },
+    },
+    "./checkpointPort": {
+      getRuntimeV2Checkpoint: (_s, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      createRuntimeV2CheckpointPort: () => ({
+        append: async (input) => {
+          const result = runtimeLib.appendRuntimeV2Checkpoint({
+            checkpoint: state.runtimeV2Checkpoints[input.owner.turnId] || null,
+            owner: input.owner,
+            expectedRevision: input.expectedRevision,
+            event: input.event,
+          });
+          state = { ...state, runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [input.owner.turnId]: result.checkpoint } };
+          return result;
+        },
+      }),
+    },
+    "./projectionPort": {
+      createRuntimeV2ProjectionPort: () => ({ publish: async () => undefined }),
+    },
+  });
+  runtimeLib = customLoad("src/lib/runtime-v2/index.ts");
+  const { runRuntimeV2PlanInterview } = customLoad("src/store/runtimeV2/planInterview.ts");
+
+  const ctx = {
+    turnId: "t-global-restore",
+    uiDisplayTurnId: "t-global-restore",
+    runWorkspace: "",
+    runScopeKey: "__MAIN_GLOBAL_CHAT__",
+    runSessionKey: "__MAIN_GLOBAL_CHAT__:1",
+    runSessionEpoch: "e1",
+    runSessionId: 1,
+    harnessRunId: "r-gr",
+    phaseLanguage: "zh",
+    planPurpose: undefined,
+    abortCtrl: new AbortController(),
+    turnInputContextSignals: { subagentPreference: "unspecified", subagentRequirement: "optional", attachedFilePaths: [] },
+    runtimeContextBudget: { contextLimit: 32768, outputBudget: 4096, inputBudget: 28672, readWindowChars: 16000 },
+  };
+  const baseDeps = {
+    get: () => state,
+    set: (patch) => { state = { ...state, ...(typeof patch === "function" ? patch(state) : patch) }; },
+    context: ctx,
+    getSessionRevisionToken: () => 1,
+    sanitizeTaskBlocksForPersist: (x) => x,
+    buildSessionRuntimeSnapshot: (x) => x,
+    publishOwnerScopedRuntimeProjection: () => ({ published: true }),
+    persistSessionRecord: async () => undefined,
+    logStoreEvent: () => {},
+  };
+
+  await runRuntimeV2PlanInterview(baseDeps);
+  const fullEvents = state.runtimeV2Checkpoints["t-global-restore"]?.aggregate?.events || [];
+  const providerIdx = fullEvents.findIndex(
+    (event) => event.type === "provider.responded" && event.result.toolCalls.some((call) => call.name === "submit_plan_document"),
+  );
+  assert.ok(providerIdx >= 0);
+
+  let rewound = null;
+  const turn = { workspaceKey: "__MAIN_GLOBAL_CHAT__", sessionKey: "__MAIN_GLOBAL_CHAT__:1", sessionEpoch: "e1", clientSubmissionId: "s-gr", turnId: "t-global-restore" };
+  for (const event of fullEvents.slice(0, providerIdx + 1)) {
+    const res = runtimeLib.appendRuntimeV2Checkpoint({
+      checkpoint: rewound,
+      owner: turn,
+      expectedRevision: rewound?.revision || 0,
+      event,
+    });
+    assert.equal(res.disposition, "committed");
+    rewound = res.checkpoint;
+  }
+  state = {
+    ...state,
+    conversationTurns: [{ id: "t-global-restore", clientSubmissionId: "s-gr", userPrompt: "/计划 整理架构目标" }],
+    runtimeV2Checkpoints: { "t-global-restore": rewound },
+  };
+  forbidModelCalls = true;
+  savedDocs = 0;
+
+  const settlement = await runRuntimeV2PlanInterview(baseDeps);
+  assert.equal(streamCallCount, 1);
+  assert.equal(savedDocs, 1);
+  assert.equal(settlement.outcome.status, "completed");
+  assert.equal(
+    state.runtimeV2Checkpoints["t-global-restore"]?.aggregate?.terminalOutcome?.resultKind,
+    "success",
+  );
+});
+
+test("WorkPlan planRunner switches to narrowed synthesis after repeated wait_subagents rejections and stops after 4 surface rejections without duplicating receipts", async () => {
+  const calls = [];
+  let runtimeLib;
+  let state = {
+    currentTurnId: "t-wp-loop",
+    currentSessionId: 1,
+    conversationTurns: [{ id: "t-wp-loop", clientSubmissionId: "s-wp", userPrompt: "/计划 设计重构方案" }],
+    config: {},
+    planLifecycle: { sessionKey: "/fixture:1", sessionEpoch: "e1" },
+    runtimeV2Checkpoints: {},
+    taskFlow: [],
+    harnessRunMarker: { sessionKey: "/fixture:1", turnId: "t-wp-loop", runId: "r-wp", status: "running", startedAt: 1, instanceId: "i1" },
+    _nextTaskId: () => 1,
+  };
+  const customLoad = createTsModuleLoader({
+    "../../lib/streaming": {
+      isStreamOutputLimited: () => false,
+      streamChatCompletion: async (messages, _settings, _callbacks, _signal, tools, _maxOutputTokens, requestOptions) => {
+        calls.push({
+          messages: messages.map((m) => ({ role: m.role, content: String(m.content || "") })),
+          tools: Array.isArray(tools) ? tools.map((t) => t?.function?.name || t?.name) : [],
+          requestOptions: requestOptions ?? null,
+        });
+        return {
+          content: "",
+          toolCalls: [{ id: `wp-wait-${calls.length}`, name: "wait_subagents", arguments: "{}" }],
+          protocolViolation: null,
+        };
+      },
+    },
+    "../../lib/modelLaneCoordinator": {
+      acquireModelLane: async () => ({ release() {}, markFirstToken() {}, reportFailure() {}, setPressureHandler() {} }),
+    },
+    "../../lib/providerLaneSettings": {
+      deriveBudgetedStreamSettings: () => ({ provider: "fixture", toolProtocol: "auto" }),
+      deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+    },
+    "../../lib/toolExecutor": {
+      executeTool: async (name) => (name === "get_project_skeleton" ? "Assets/SaveManager.cs" : "SaveManager source body"),
+    },
+    "../../lib/ipc": {
+      inspectProjectInitTarget: async () => ({ canonicalWorkspace: "/fixture", targetPath: "/fixture/AGENTS.md", exists: false }),
+    },
+    "./checkpointPort": {
+      getRuntimeV2Checkpoint: (_s, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      createRuntimeV2CheckpointPort: () => ({
+        append: async (input) => {
+          const result = runtimeLib.appendRuntimeV2Checkpoint({
+            checkpoint: state.runtimeV2Checkpoints[input.owner.turnId] || null,
+            owner: input.owner,
+            expectedRevision: input.expectedRevision,
+            event: input.event,
+          });
+          state = { ...state, runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [input.owner.turnId]: result.checkpoint } };
+          return result;
+        },
+      }),
+    },
+    "./projectionPort": {
+      createRuntimeV2ProjectionPort: () => ({ publish: async () => undefined }),
+    },
+  });
+  runtimeLib = customLoad("src/lib/runtime-v2/index.ts");
+  const { runSubmitRuntimeV2Plan } = customLoad("src/store/runtimeV2/planRunner.ts");
+
+  const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "e1", clientSubmissionId: "s-wp", turnId: "t-wp-loop" };
+  const run = { sessionKey: "/fixture:1", sessionEpoch: "e1", turnId: "t-wp-loop", runId: "r-wp", parentRunId: null, attemptId: "r-wp" };
+  let seededCheckpoint = null;
+  for (const event of [
+    { schemaVersion: runtimeLib.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: "w1", sequence: 0, at: 1, type: "turn.admitted", turn, strategy: "plan", objective: "/计划 设计重构方案", constraints: [], acceptanceCriteria: [] },
+    { schemaVersion: runtimeLib.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: "w2", sequence: 1, at: 2, type: "run.started", run, phase: "planning" },
+    { schemaVersion: runtimeLib.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: "w3", sequence: 2, at: 3, type: "observation.recorded", run, evidence: { id: "E1", kind: "source", target: "Assets/SaveManager.cs", version: "sha256-1" } },
+  ]) {
+    const res = runtimeLib.appendRuntimeV2Checkpoint({
+      checkpoint: seededCheckpoint,
+      owner: turn,
+      expectedRevision: seededCheckpoint?.revision || 0,
+      event,
+    });
+    assert.equal(res.disposition, "committed");
+    seededCheckpoint = res.checkpoint;
+  }
+  state.runtimeV2Checkpoints["t-wp-loop"] = seededCheckpoint;
+
+  const settlement = await runSubmitRuntimeV2Plan({
+    get: () => state,
+    set: (patch) => { state = { ...state, ...(typeof patch === "function" ? patch(state) : patch) }; },
+    context: {
+      turnId: "t-wp-loop",
+      uiDisplayTurnId: "t-wp-loop",
+      runWorkspace: "/fixture",
+      runScopeKey: "/fixture",
+      runSessionKey: "/fixture:1",
+      runSessionEpoch: "e1",
+      runSessionId: 1,
+      harnessRunId: "r-wp",
+      phaseLanguage: "zh",
+      planPurpose: undefined,
+      abortCtrl: new AbortController(),
+      turnInputContextSignals: { subagentPreference: "unspecified", subagentRequirement: "optional", attachedFilePaths: [] },
+      runtimeContextBudget: { contextLimit: 32768, outputBudget: 4096, inputBudget: 28672, readWindowChars: 16000 },
+    },
+    getSessionRevisionToken: () => 1,
+    sanitizeTaskBlocksForPersist: (x) => x,
+    buildSessionRuntimeSnapshot: (x) => x,
+    publishOwnerScopedRuntimeProjection: () => ({ published: true }),
+    persistSessionRecord: async () => undefined,
+    logStoreEvent: () => {},
+  });
+
+  assert.equal(calls.length, 5);
+  assert.equal(settlement.outcome.resultKind, "error");
+  const rejectionCounts = calls.map((c) => c.messages.filter((m) => m.role === "tool" && m.content.includes("PLAN_TOOL_NOT_ADVERTISED:")).length);
+  assert.deepEqual(rejectionCounts, [0, 1, 1, 1, 1]);
+  assert.equal(calls[2].requestOptions?.responseFormat?.type, "json_schema");
+  assert.equal(calls[2].tools.length, 0);
+  assert.ok(!calls[3].tools.includes("wait_subagents"));
+  assert.ok(!calls[3].tools.includes("read_file"));
 });

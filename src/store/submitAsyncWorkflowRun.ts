@@ -44,7 +44,11 @@ import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2/checkpoint";
 import { resolveBoundPlanDraftCheckpoint } from "./runtimeV2/planDraftSource";
 import { hasExecutablePlanChoice } from "./runtimeV2/planQuestionTool";
 import { resolveApprovedWorkPlanContinuation } from "./runtimeV2/approvedPlanContinuation";
-import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
+import {
+  inferExplicitWorkspaceReadGuardsFromText,
+  normalizeTurnApprovalCapabilities,
+  normalizeTurnCapabilityRestrictions,
+} from "../lib/turnCapabilities";
 import {
   createSubmitHarnessRunId,
   startSubmitRunLease,
@@ -1741,12 +1745,39 @@ export async function runSubmitAsyncWorkflowRun<
   ));
   // A restored Turn's immutable objective wins over a missing or looser
   // resubmission context. Legacy objective fields stay absent, never borrowed.
+  const lexicalReadGuards = !checkpoint
+    ? inferExplicitWorkspaceReadGuardsFromText(admissionTurn?.userPrompt || "")
+    : { forbiddenWorkspaceRead: false, approvalRequiredWorkspaceRead: false };
+  const mergeGuardCapabilities = <T extends string>(
+    base: readonly T[] | undefined,
+    extra: boolean,
+    cap: T,
+  ): readonly T[] | undefined => {
+    if (!extra) return base;
+    return [...new Set([...(base || []), cap])];
+  };
   const capabilityRestrictions = checkpoint ? checkpoint.aggregate.objective.capabilityRestrictions : approvedPlanContinuation
-    ? [...new Set([...(sourcePlan?.aggregate.objective.capabilityRestrictions || []), ...(input.semanticIntent?.forbiddenCapabilities || [])])]
-    : input.semanticIntent?.forbiddenCapabilities;
+    ? mergeGuardCapabilities(
+        [...new Set([...(sourcePlan?.aggregate.objective.capabilityRestrictions || []), ...(input.semanticIntent?.forbiddenCapabilities || [])])],
+        lexicalReadGuards.forbiddenWorkspaceRead,
+        "workspace_read",
+      )
+    : mergeGuardCapabilities(
+        input.semanticIntent?.forbiddenCapabilities,
+        lexicalReadGuards.forbiddenWorkspaceRead,
+        "workspace_read",
+      );
   const approvalRequiredCapabilities = checkpoint ? checkpoint.aggregate.objective.approvalRequiredCapabilities : approvedPlanContinuation
-    ? [...new Set([...(sourcePlan?.aggregate.objective.approvalRequiredCapabilities || []), ...(input.semanticIntent?.approvalRequiredCapabilities || [])])]
-    : input.semanticIntent?.approvalRequiredCapabilities;
+    ? mergeGuardCapabilities(
+        [...new Set([...(sourcePlan?.aggregate.objective.approvalRequiredCapabilities || []), ...(input.semanticIntent?.approvalRequiredCapabilities || [])])],
+        lexicalReadGuards.approvalRequiredWorkspaceRead,
+        "workspace_read",
+      )
+    : mergeGuardCapabilities(
+        input.semanticIntent?.approvalRequiredCapabilities,
+        lexicalReadGuards.approvalRequiredWorkspaceRead,
+        "workspace_read",
+      );
   // Bootstrap reads have no exact-call approval resolver. Defer project and
   // attachment content to ordinary authorized tools when this Turn requires it.
   const deferWorkspaceReads = normalizeTurnCapabilityRestrictions(capabilityRestrictions).includes("workspace_read") ||

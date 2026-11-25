@@ -1471,7 +1471,21 @@ fn resolve_existing_path(input: &str, workspace: &Path) -> Result<PathBuf, Strin
         trusted_execution::WorkspacePathMode::Existing,
     )
     .map(|trusted| trusted.path().to_path_buf())
-    .map_err(|error| format!("路径越界、不存在或无法访问: {error}"))
+    .map_err(|error| match error {
+        trusted_execution::WorkspacePathError::Escape { .. } => {
+            format!("READ_PATH_OUT_OF_WORKSPACE: 路径越界，禁止访问工作区之外的内容: {error}")
+        }
+        trusted_execution::WorkspacePathError::Missing { .. } => {
+            format!("READ_TARGET_NOT_FOUND: 目标路径不存在: {error}")
+        }
+        trusted_execution::WorkspacePathError::NotDirectory { .. } => {
+            format!("READ_PARENT_NOT_DIRECTORY: 无法访问，父路径不是目录: {error}")
+        }
+        trusted_execution::WorkspacePathError::InvalidRoot { .. }
+        | trusted_execution::WorkspacePathError::Io { .. } => {
+            format!("READ_TARGET_INACCESSIBLE: 无法访问目标路径: {error}")
+        }
+    })
 }
 
 fn resolve_write_path(input: &str, workspace: &Path) -> Result<PathBuf, String> {

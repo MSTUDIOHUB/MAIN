@@ -2,6 +2,7 @@ import type { TaskBlock } from "../../lib/taskTypes";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { withTurnRuntimePhaseStatus } from "../../lib/turnPhase";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
+import { describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 import { runtimeV2ToolOutcomePresentation } from "./toolOutcomePresentation";
 
 /** Derive settled timeline rows from canonical command and effect receipts.
@@ -117,6 +118,13 @@ export function reconcileRuntimeV2TimelineBlocks(
     }
     if (!blockRunning) return [block];
     const progressFailureHint = failed && block.toolCallId && (() => {
+      const completedEvt = [...aggregate.events].reverse().find(
+        (event): event is Extract<typeof event, { type: "command.completed" | "tool.completed" }> =>
+          (event.type === "command.completed" || event.type === "tool.completed") &&
+          event.idempotencyKey === block.toolCallId,
+      );
+      const fromCode = describeWorkspaceToolFailure(completedEvt?.failureReasonCode, language)?.cardMessage;
+      if (fromCode) return fromCode;
       const cmd = aggregate.events.find((event): event is Extract<typeof event, { type: "command.scheduled" }> =>
         event.type === "command.scheduled" && event.command.idempotencyKey === block.toolCallId)?.command;
       const rawTasks = Array.isArray(cmd?.payload.tasks) ? cmd.payload.tasks : [];

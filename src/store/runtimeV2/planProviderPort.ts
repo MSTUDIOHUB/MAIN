@@ -49,7 +49,7 @@ import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } f
 import { planRequestMetrics } from "./planRequestMetrics";
 import { adaptPlanBlockingQuestions, admittedPlanQuestionPurpose, ASK_PLAN_QUESTIONS } from "./planQuestionTool";
 import { isPlanStreamRepetition, PLAN_REPETITION_FALLBACK_FAILED, PLAN_STREAM_REPETITION_CODE } from "./planRepetitionRecovery";
-import { buildPlanToolAdmissionRejectionMessages } from "./planProviderAdmission";
+import { buildPlanToolAdmissionRejectionMessages, replaceTrailingPlanAdmissionRejectionGroup } from "./planProviderAdmission";
 import { PLAN_VALIDATION_REPAIR_FAILED } from "./planValidationRecovery";
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (event: string, data?: Record<string, unknown>) => void;
@@ -209,6 +209,7 @@ export async function requestPlanModel(input: {
     const requestMetrics = planRequestMetrics({ messages: requestMessages, tools: offeredTools, responseFormat });
     activity.setContext(buildCapsuleModelActivityContext({
       aggregate: input.ledger.snapshot(),
+      messages: requestMessages,
       mode: input.validationRepair ? "validation_repair" : input.submissionRepairPending ? "submission_repair" : input.stage,
       estimatedInputTokens: requestMetrics.estimatedInputTokens,
       objectiveText: input.ledger.snapshot()?.objective.text,
@@ -302,6 +303,15 @@ export async function requestPlanModel(input: {
                     event.phase === "first_chunk" ||
                     event.phase === "chunk_progress"
                   ) {
+                    markProgress();
+                  }
+                  if (event.phase === "prompt_progress") {
+                    activity.reportPromptProgress({
+                      processedTokens: event.processedTokens,
+                      totalTokens: event.totalTokens,
+                      cachedTokens: event.cachedTokens,
+                      percent: event.percent,
+                    });
                     markProgress();
                   }
                   if (event.phase === "model_progress") {
@@ -439,13 +449,16 @@ export async function requestPlanModel(input: {
       result: admitted,
     });
     if (unexpectedToolNames.length > 0 || argumentViolation) {
-      input.messages.push(...buildPlanToolAdmissionRejectionMessages({
-        toolCalls: normalized.toolCalls,
-        unexpectedToolNames,
-        argumentViolation,
-        advertisedToolNames,
-        activeSubagentCount: activeSubagents.length,
-      }));
+      replaceTrailingPlanAdmissionRejectionGroup(
+        input.messages,
+        buildPlanToolAdmissionRejectionMessages({
+          toolCalls: normalized.toolCalls,
+          unexpectedToolNames,
+          argumentViolation,
+          advertisedToolNames,
+          activeSubagentCount: activeSubagents.length,
+        }),
+      );
     } else {
       input.messages.push({
         role: "assistant",

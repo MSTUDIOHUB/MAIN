@@ -450,6 +450,8 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (toolName === "run_command" || toolName === "execute_command") return `ran ${rawTarget}`;
     if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
     if (toolName === "computer_use") return `controlled ${rawTarget}`;
+    if (toolName === "spawn_subagent" || toolName === "schedule_subagents") return `spawned subagent ${rawTarget}`;
+    if (toolName === "wait_subagents" || toolName === "join_subagents") return `joined subagent ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
   }
   if (toolName === "load_skill") return `读取技能 ${rawTarget}`;
@@ -463,6 +465,8 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
   if (toolName === "run_command" || toolName === "execute_command") return `运行 ${rawTarget}`;
   if (toolName === "browser_evaluate") return `验证 ${rawTarget}`;
   if (toolName === "computer_use") return `控制 ${rawTarget}`;
+  if (toolName === "spawn_subagent" || toolName === "schedule_subagents") return `派发子智能体 ${rawTarget}`;
+  if (toolName === "wait_subagents" || toolName === "join_subagents") return `汇合子智能体 ${rawTarget}`;
   return toolName ? `${toolName} ${rawTarget}` : "";
 }
 
@@ -949,7 +953,7 @@ function makeActivityTitle(activity: Pick<ActivityCell, "kind" | "status" | "met
     if (activity.kind === "exploring") {
       return compactLine(`${verb}：${actionSummary}`, 150);
     }
-    if (activity.kind === "edit" || activity.kind === "command" || activity.kind === "browser") {
+    if (activity.kind === "edit" || activity.kind === "command" || activity.kind === "browser" || (activity.kind === "message" && (activity.status === "failed" || activity.status === "rejected"))) {
       return compactLine(`${verb}：${actionSummary}`, 150);
     }
   }

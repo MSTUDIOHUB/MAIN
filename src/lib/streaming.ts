@@ -519,13 +519,17 @@ interface StreamCallbacks {
    * observes decoded model output, separate from connection bytes or pings. */
   onRequestDispatched?: () => (() => void);
   onLifecycle?: (event: {
-    phase: "stream_started" | "first_chunk" | "chunk_progress" | "model_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled" | "response_format_downgraded";
+    phase: "stream_started" | "first_chunk" | "chunk_progress" | "prompt_progress" | "model_progress" | "no_chunk_progress_warning" | "stream_done" | "stream_error" | "stream_cancelled" | "response_format_downgraded";
     streamId?: string;
     elapsedMs?: number;
     chunkCount?: number;
     byteCount?: number;
     status?: string;
     error?: string;
+    processedTokens?: number;
+    totalTokens?: number;
+    cachedTokens?: number;
+    percent?: number;
   }) => void;
 }
 
@@ -622,6 +626,36 @@ function normalizeReasoningFieldForHistory(
 ): "reasoning_content" | "reasoning" | null {
   if (field === "reasoning_content" || field === "reasoning") return field;
   return null;
+}
+
+export function extractStreamPromptProgress(payload: unknown): {
+  processedTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
+  percent?: number;
+} | null {
+  if (!payload || typeof payload !== "object") return null;
+  const root = payload as Record<string, unknown>;
+  const pp = root.prompt_progress && typeof root.prompt_progress === "object"
+    ? root.prompt_progress as Record<string, unknown>
+    : root.prefill_progress && typeof root.prefill_progress === "object"
+      ? root.prefill_progress as Record<string, unknown>
+      : undefined;
+  const num = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+  const processedTokens = num(pp?.processed ?? pp?.processed_tokens ?? root.processed_tokens);
+  const totalTokens = num(pp?.total ?? pp?.total_tokens ?? root.prompt_total_tokens);
+  const cachedTokens = num(pp?.cache ?? pp?.cached ?? pp?.cached_tokens ?? root.cached_tokens);
+  const percent = num(pp?.percent ?? pp?.progress ?? root.prompt_percent);
+  if (processedTokens === undefined && totalTokens === undefined && percent === undefined) {
+    return null;
+  }
+  return {
+    ...(processedTokens !== undefined ? { processedTokens } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(percent !== undefined ? { percent } : {}),
+  };
 }
 
 function extractOpenAiCompatibleDelta(payload: unknown): {
@@ -2159,6 +2193,17 @@ async function streamViaRustProxy(
             : trimmed;
         const json = JSON.parse(jsonText);
         providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
+        const promptProgress = extractStreamPromptProgress(json);
+        if (promptProgress) {
+          callbacks.onLifecycle?.({
+            phase: "prompt_progress",
+            streamId,
+            elapsedMs: Date.now() - streamStartedAt,
+            chunkCount: rustProxyChunkCount,
+            byteCount: rustProxyByteCount,
+            ...promptProgress,
+          });
+        }
         const extracted = extractOpenAiCompatibleDelta(json);
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
           // Buffer tokens until we can verify they're not garbled "?" output
@@ -2953,6 +2998,16 @@ async function streamChatCompletionAttempt(
               : trimmed;
           const json = JSON.parse(jsonText);
           providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
+          const promptProgress = extractStreamPromptProgress(json);
+          if (promptProgress) {
+            callbacks.onLifecycle?.({
+              phase: "prompt_progress",
+              elapsedMs: Date.now() - streamStartedAt,
+              chunkCount: frontendChunkCount,
+              byteCount: frontendByteCount,
+              ...promptProgress,
+            });
+          }
           const extracted = extractOpenAiCompatibleDelta(json);
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
             // Buffer tokens until we can verify they're not garbled "?" output

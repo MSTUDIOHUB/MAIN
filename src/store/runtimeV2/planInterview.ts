@@ -9,6 +9,9 @@ import { runPlanDocumentInterview } from "./planDocumentRunner";
 import { inspectProjectInitTarget } from "../../lib/ipc";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { projectWorkspaceIdentity } from "../../lib/projectInitIpc";
+import { resolvePlanDocumentFromAggregate } from "../../lib/planDocumentRecords";
+import { SUBMIT_PLAN_DOCUMENT } from "./planDocumentProtocol";
+import { resolvePlanDocumentSaveRecovery } from "./planDocumentSavePort";
 import { settlePlanPause } from "./planQuestionControl";
 
 /** One durable interview owner, shared by conceptual plans and /规则 drafts. */
@@ -28,7 +31,24 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
   const interviewQuestions = questions.filter(event => event.type === "run.paused" && event.blocker.questionnaire?.purpose !== "plan_verification_confirmation");
   // Existing pre-interview WorkPlan checkpoints retain their original contract,
   // including workspace WorkPlan turns that voluntarily asked questions.
-  if (existing && !existing.aggregate.planPurpose && (input.context.runWorkspace || !interviewQuestions.length)) return null;
+  // Questionnaire-free Global Plans that already received or started saving a
+  // plan document must resume inside runPlanDocumentInterview (never WorkPlan).
+  const hasDocumentInterviewTrace = Boolean(
+    interviewQuestions.length > 0 ||
+    resolvePlanDocumentFromAggregate(existing?.aggregate) ||
+    (existing && resolvePlanDocumentSaveRecovery(existing.aggregate)) ||
+    existing?.aggregate.pendingToolCalls.some(call => call.name === SUBMIT_PLAN_DOCUMENT) ||
+    existing?.aggregate.events.some(event =>
+      (event.type === "provider.responded" && event.result.toolCalls.some(call => call.name === SUBMIT_PLAN_DOCUMENT)) ||
+      (event.type === "command.scheduled" && event.command.payload.toolName === SUBMIT_PLAN_DOCUMENT)
+    ) ||
+    (!input.context.runWorkspace && existing && !existing.aggregate.objective.acceptanceEvidenceRequirements?.length &&
+      !existing.aggregate.events.some(event =>
+        (event.type === "provider.responded" && event.result.toolCalls.some(call => call.name === "submit_runtime_v2_work_plan")) ||
+        (event.type === "command.scheduled" && event.command.payload.runtimeOwnedPlanArtifact === true)
+      ))
+  );
+  if (existing && !existing.aggregate.planPurpose && (input.context.runWorkspace || !hasDocumentInterviewTrace)) return null;
   const hasExplicitInterview = Boolean(
     existing?.aggregate.planPurpose ||
     input.context.planPurpose ||

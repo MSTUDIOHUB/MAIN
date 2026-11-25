@@ -13,6 +13,7 @@ import { createRuntimeV2RunnerSettlement } from "./executionRunnerIdentity";
 import { ASK_PLAN_QUESTIONS, SUBMIT_PLAN_DOCUMENT, planDocumentMessages, planDocumentTools } from "./planDocumentProtocol";
 import { createRuntimeV2PlanCollaboration } from "./planCollaboration";
 import { requestPlanModel } from "./planProviderPort";
+import { derivePlanAdmissionRejectionRecovery, narrowedPlanSubmissionTools } from "./planProviderAdmission";
 import { executeReadOnlyPlanTool, settlePlanTool } from "./planEvidencePort";
 import { priorPlanConversationMessages } from "./planConversationHistory";
 import { DOCUMENT_SAVE_BLOCKER, planDocumentSaveInput, resolvePlanDocumentSaveRecovery, schedulePlanDocumentSave, writePlanDocumentOrPause, pausePlanDocumentSave } from "./planDocumentSavePort";
@@ -71,11 +72,30 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
   }
   await collaboration.restoreProactive();
   let recoveryCalls = await recoverPlanDocumentInvocations(ledger, run);
-  let rejectedAdmissionStreak = 0;
   while (true) {
     if (input.context.abortCtrl.signal.aborted) throw new Error("PLAN_DOCUMENT_CANCELED");
     if (Date.now() >= deadlineAt) throw new Error("PLAN_DOCUMENT_CALLER_DEADLINE");
     if (!recoveryCalls && await collaboration.advanceProactive()) continue;
+    const collaborationPayload = collaboration.current().payload;
+    const admissionRecovery = !recoveryCalls
+      ? derivePlanAdmissionRejectionRecovery({ aggregate: ledger.snapshot(), run, collaboration: collaborationPayload })
+      : { consecutiveRejections: 0, action: "none" as const };
+    if (admissionRecovery.action === "exhausted") {
+      throw new Error("PLAN_DOCUMENT_ADMISSION_REJECTION_LOOP");
+    }
+    if (admissionRecovery.action === "narrow_to_synthesis" && collaboration.activeChildCount() > 0) {
+      await collaboration.joinActive("plan_document_repeated_rejection_narrow", true);
+      continue;
+    }
+    const narrowRejectionSynthesis = admissionRecovery.action === "narrow_to_synthesis";
+    if (narrowRejectionSynthesis) {
+      const directive = collaboration.activeChildCount() === 0
+        ? "STOP calling discovery or subagent tools (all subagents have already completed and reports are in context). Choose only from the narrowed submission tools (ask_plan_questions or submit_plan_document)."
+        : "STOP calling unadvertised tools. Use only the narrowed submission tools next.";
+      if (!messages.some(message => message.role === "system" && message.content === directive)) {
+        messages.push({ role: "system", content: directive });
+      }
+    }
     const recovery = deriveReadOnlyRecoveryWindow(ledger.snapshot()!, { finalTextIsProgress: false });
     if (recovery && runtimeV2ProviderRecoveryStallExpired({ startedAt: recovery.startedAt, reason: recovery.pressure.reason, latestOccurrence: recovery.pressure.occurrence }, Date.now())) {
       // Stalled exploration changes guidance, never the truth of the Turn.
@@ -85,11 +105,18 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
     }
     const recovered = recoveryCalls;
     recoveryCalls = null;
+    const baseDocumentTools = planDocumentTools({ ...input.context, networkRead: ledger.snapshot()?.networkRead, knowledgeContext: ledger.snapshot()?.knowledgeContext });
+    const hasConfirmedDecision = ledger.snapshot()!.events.some(event => event.type === "run.decision_recorded" && event.answer && event.choice !== "stop");
+    const requiresInterviewConfirmation = input.context.planPurpose === "plan" || input.context.planPurpose === "rules";
+    const documentCustomTools = narrowRejectionSynthesis
+      ? narrowedPlanSubmissionTools(baseDocumentTools, { submissionRepairPending: false })
+          .filter(tool => tool.function.name !== SUBMIT_PLAN_DOCUMENT || !requiresInterviewConfirmation || hasConfirmedDecision)
+      : baseDocumentTools;
     let response: { visibleText?: string; toolCalls: import("../../lib/runtime-v2").RuntimeV2NormalizedProviderResult["toolCalls"]; rejectedAdmission?: boolean; unexpectedToolNames?: readonly string[] };
     try {
       response = recovered ? { visibleText: "", toolCalls: recovered.calls } : await requestPlanModel({ get: input.get, context: input.context, ledger, run, messages, deadlineAt,
-        stage: "discovery", evidence, evidenceContents, collaboration: collaboration.current().payload,
-        submissionRepairPending: false, customTools: planDocumentTools({ ...input.context, networkRead: ledger.snapshot()?.networkRead, knowledgeContext: ledger.snapshot()?.knowledgeContext }), logStoreEvent: input.logStoreEvent });
+        stage: narrowRejectionSynthesis ? "synthesis" : "discovery", compactRecovery: narrowRejectionSynthesis, evidence, evidenceContents, collaboration: collaborationPayload,
+        submissionRepairPending: false, customTools: documentCustomTools.length > 0 ? documentCustomTools : baseDocumentTools, logStoreEvent: input.logStoreEvent });
     } catch (error) {
       if (isRuntimeV2ProviderTransportsUnavailableError(error) || input.context.abortCtrl.signal.aborted) throw error;
       await ledger.recordSoftSignal(run, "protocol_drift");
@@ -98,20 +125,7 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
     }
     input.context.abortCtrl.signal.throwIfAborted();
     if (!recovered && response.rejectedAdmission) {
-      rejectedAdmissionStreak += 1;
       await ledger.recordSoftSignal(run, "protocol_drift");
-      if (rejectedAdmissionStreak >= 4) {
-        throw new Error("PLAN_DOCUMENT_ADMISSION_REJECTION_LOOP");
-      }
-      if (rejectedAdmissionStreak >= 2) {
-        const waitedWhenIdle = response.unexpectedToolNames?.includes("wait_subagents") && collaboration.activeChildCount() === 0;
-        const recoveryDirective = waitedWhenIdle
-          ? "STOP calling wait_subagents: all subagents have already completed and their reports are in context. Your next call MUST be an advertised tool (ask_plan_questions or submit_plan_document)."
-          : "STOP calling unadvertised or invalid tools. Your next call MUST use only the currently advertised tool schema (ask_plan_questions, a targeted read, or submit_plan_document).";
-        if (!messages.some(message => message.role === "system" && message.content === recoveryDirective)) {
-          messages.push({ role: "system", content: recoveryDirective });
-        }
-      }
       continue;
     }
     if (!response.toolCalls.length) {
@@ -119,7 +133,6 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
       messages.push({ role: "system", content: "No document has been saved. Ask a specific user-owned question, read one missing fact, or submit the completed document through submit_plan_document." });
       continue;
     }
-    rejectedAdmissionStreak = 0;
     for (const call of response.toolCalls) {
       const feedback = async (content: string) => {
         await settlePlanTool({ ledger, run, call, status: "failed", evidence: [], modelContent: content, failureKind: "protocol_invalid" });

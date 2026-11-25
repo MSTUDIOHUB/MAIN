@@ -509,6 +509,7 @@ async function performRuntimeV2ProviderRequest(
     });
   activity.setContext(buildCapsuleModelActivityContext({
     aggregate,
+    messages,
     mode: String(input.command.payload.mode || ""),
     estimatedInputTokens,
     objectiveText: aggregate?.objective.text,

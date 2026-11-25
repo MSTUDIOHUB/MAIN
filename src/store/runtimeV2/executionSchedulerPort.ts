@@ -9,6 +9,7 @@ import {
   type SchedulerPort,
 } from "../../lib/runtime-v2";
 import type { RuntimeV2ExecutionPortsInput } from "./executionContext";
+import { attachFailureReasonCode, readFailureReasonCode } from "../../lib/workspaceToolFailure";
 import {
   aggregateForCurrentTurn,
   approvedPlanForCurrentTurn,
@@ -47,12 +48,12 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
       const requestCapacity = runtimeV2SubagentCapacityFromCommand(command);
       if (requestCapacity <= 0) {
         const detail = "The current provider lane does not admit child requests. Continue the parent task directly.";
-        closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED: ${detail}`);
+        closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED [code=subagent_capacity_unavailable]: ${detail}`);
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
           turnId: command.run.turnId, runId: command.run.runId,
           reason: "child_request_capacity_unavailable", requestCapacity,
         });
-        throw new Error(detail);
+        throw attachFailureReasonCode(new Error(detail), "subagent_capacity_unavailable");
       }
       let candidateScopeKey = fallbackScheduleScopeKey(command);
       let decision;
@@ -73,7 +74,7 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
           directExecuteScope: directExecuteScopeForSubagent(input, candidate.allowedPaths),
         });
         if (!writeAuth.allowed) {
-          throw new Error(writeAuth.message);
+          throw attachFailureReasonCode(new Error(writeAuth.message), "subagent_write_unauthorized");
         }
         decision = scheduleRuntimeV2Subagents({
           parentRun: command.run, candidates: [candidate], existingJobs,
@@ -81,13 +82,14 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
         });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
+        const reasonCode = readFailureReasonCode(error) || "subagent_schedule_failed";
         closeCollaborationToolCall(
           input,
           command,
-          `SUBAGENT_SCHEDULE_REJECTED: ${reason} If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.`,
+          `SUBAGENT_SCHEDULE_REJECTED [code=${reasonCode}]: ${reason} If required collaboration is still pending, retry a valid scoped task; otherwise continue the parent task.`,
         );
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
-          turnId: command.run.turnId, runId: command.run.runId, reason, scopeKey: candidateScopeKey,
+          turnId: command.run.turnId, runId: command.run.runId, reason, reasonCode, scopeKey: candidateScopeKey,
         });
         throw error;
       }
@@ -97,7 +99,7 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
           `or violates the access/scope contract: ${
             decision.rejectedScopeKeys.join(", ") || "invalid scope"
           }. If required collaboration is still pending, delegate a genuinely different task; otherwise continue the parent task.`;
-        closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED: ${detail}`);
+        closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED [code=subagent_duplicate_or_overlap]: ${detail}`);
         input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
           turnId: command.run.turnId,
           runId: command.run.runId,
@@ -106,7 +108,7 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
             .filter((job) => job.status === "queued" || job.status === "running")
             .map(runtimeV2SubagentModelHandle),
         });
-        throw new Error(detail);
+        throw attachFailureReasonCode(new Error(detail), "subagent_duplicate_or_overlap");
       }
       return {
         type: "subagents.scheduled",
@@ -186,8 +188,8 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
           input.logStoreEvent("runtime_v2_subagent_reference_rejected", {
             turnId: command.run.turnId, runId: command.run.runId, requestedJobIds, activeTaskHandles,
           });
-          closeCollaborationToolCall(input, command, `SUBAGENT_WAIT_REJECTED: ${detail} Continue independent parent work.`);
-          throw new Error(detail);
+          closeCollaborationToolCall(input, command, `SUBAGENT_WAIT_REJECTED [code=subagent_wait_handle_not_found]: ${detail} Continue independent parent work.`);
+          throw attachFailureReasonCode(new Error(detail), "subagent_wait_handle_not_found");
         }
         const hasToolCallId = typeof command.payload.toolCallId === "string" && command.payload.toolCallId.trim().length > 0;
         if (hasToolCallId && jobIds.length === 0 && requestedJobIds.length === 0) {

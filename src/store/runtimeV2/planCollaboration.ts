@@ -174,6 +174,10 @@ export function createRuntimeV2PlanCollaboration(input: {
       if (input.ledger.snapshot()?.scheduledCommands.some((scheduled) =>
         scheduled.idempotencyKey === command.idempotencyKey
       )) {
+        const rawCode = !input.runner.context.abortCtrl.signal.aborted && error && typeof error === "object" && "failureReasonCode" in error
+          ? (error as { failureReasonCode?: unknown }).failureReasonCode
+          : undefined;
+        const failureReasonCode = typeof rawCode === "string" && rawCode.trim() ? rawCode.trim() : undefined;
         await input.ledger.settleCommand({
           type: "command.completed",
           run: command.run,
@@ -181,6 +185,7 @@ export function createRuntimeV2PlanCollaboration(input: {
           status: input.runner.context.abortCtrl.signal.aborted
             ? "canceled"
             : "failed",
+          ...(failureReasonCode ? { failureReasonCode } : {}),
         });
       }
       if (!command.payload.proactiveKey) await input.ledger.recordSoftSignal(input.run, "repeated_action");

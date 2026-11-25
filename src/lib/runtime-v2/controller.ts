@@ -556,6 +556,7 @@ export class RuntimeV2Controller {
   private async settleScheduledCommand(
     command: RuntimeV2Command,
     status: "succeeded" | "failed" | "canceled",
+    failureReasonCode?: string,
   ): Promise<void> {
     const state = this.requireAggregate();
     if (!state.run || !state.scheduledCommands.some((item) => item.idempotencyKey === command.idempotencyKey)) return;
@@ -565,6 +566,7 @@ export class RuntimeV2Controller {
       run: state.run.identity,
       idempotencyKey: command.idempotencyKey,
       status,
+      ...(failureReasonCode ? { failureReasonCode } : {}),
     }));
   }
 
@@ -574,9 +576,14 @@ export class RuntimeV2Controller {
       command,
       error,
     });
+    const rawFailureCode = error && typeof error === "object" && "failureReasonCode" in error
+      ? (error as { failureReasonCode?: unknown }).failureReasonCode
+      : undefined;
+    const failureReasonCode = typeof rawFailureCode === "string" && rawFailureCode.trim() ? rawFailureCode.trim() : undefined;
     await this.settleScheduledCommand(
       command,
       decision.kind === "lifecycle_boundary" ? "canceled" : "failed",
+      decision.kind === "lifecycle_boundary" ? undefined : failureReasonCode,
     );
     const state = this.requireAggregate();
     if (

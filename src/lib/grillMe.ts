@@ -5,8 +5,8 @@ export interface GrillMeCommand {
 }
 
 const GRILL_ME_PREFIX_PATTERN = /^\/(grill-me|grill|追问|深度追问|访谈)(?=$|\s)([\s\S]*)$/i;
-const NEGATED_QUESTION_PATTERN = /(?:不要问我|不要提问|无需提问|不用提问|不用问我|别问我|直接给方案|don't ask|do not ask|no questions)/i;
-const EXPLICIT_INTERVIEW_PATTERN = /(?:先问我|向我提问|先向我提问|请先提问|有问题请?先问|有不清楚.*问|不确定.*(?:问我|提问)|先提问再|必须.*提问|ask me questions|interview me|grill[\s-]me)/i;
+const NEGATED_QUESTION_PATTERN = /(?:不要(?:问我|提问|询问)|不要?询问|无需(?:提问|询问)|不用(?:提问|询问|问我)|别(?:问我|询问)|直接给方案|don't ask|do not ask|no questions)/i;
+const EXPLICIT_INTERVIEW_PATTERN = /(?:先(?:向我|找我)?(?:提问|询问|发问|确认.{0,6}问题)|(?:向我|对我|找我)(?:提问|询问|发问)|(?:询问|提问|问)我.{0,14}(?:问题|细节|需求|偏好|取舍)|(?:请先|必须先?|务必先?)(?:向我)?(?:提问|询问|问清楚)|(?:有|遇到)(?:任何|什么)?(?:疑问|问题|不确定|不清楚|歧义).{0,12}(?:提问|询问|问我|向我确认)|\b(?:ask\s+me\s+(?:[\w-]+\s+){0,4}questions|interview\s+me|grill[\s-]me|clarify\s+with\s+me\s+first)\b)/i;
 
 /**
  * Parse an explicit `/grill-me` (or `/追问` / `/深度追问` / `/访谈`) command prefix.
