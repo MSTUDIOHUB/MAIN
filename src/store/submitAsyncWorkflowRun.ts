@@ -1,4 +1,5 @@
 import { normalizeAttachedFile, type AttachedFile } from "../lib/attachments";
+import { parseGrillMeCommand, requestsExplicitPlanInterview } from "../lib/grillMe";
 import { saveProjectSession } from "../lib/ipc";
 import { withSubmitSessionPersistenceOwner } from "./persistSubmitRuntimeProjection";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
@@ -43,7 +44,11 @@ import { normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2/checkpoint";
 import { resolveBoundPlanDraftCheckpoint } from "./runtimeV2/planDraftSource";
 import { hasExecutablePlanChoice } from "./runtimeV2/planQuestionTool";
 import { resolveApprovedWorkPlanContinuation } from "./runtimeV2/approvedPlanContinuation";
-import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
+import {
+  inferExplicitWorkspaceReadGuardsFromText,
+  normalizeTurnApprovalCapabilities,
+  normalizeTurnCapabilityRestrictions,
+} from "../lib/turnCapabilities";
 import {
   createSubmitHarnessRunId,
   startSubmitRunLease,
@@ -1703,7 +1708,7 @@ export async function runSubmitAsyncWorkflowRun<
   const submissionRunId = String(input.runIdOverride || "").trim() ||
     createSubmitHarnessRunId(input.nowMs());
   const initialRuntimeOwnerToken = input.getSessionRuntimeOwnerToken();
-  const expectedHarnessRunMarker = input.readHarnessRunMarker();
+  const initialExpectedHarnessRunMarker = input.readHarnessRunMarker();
   let submissionParentRunId = String(input.parentRunIdOverride || "").trim() || null;
   let acquiredRunOwner: SubmitBootstrapRunOwner | null = null;
   let dispatchedPlanExecutionLeaseId = String(input.planExecutionLeaseId || "").trim();
@@ -1740,12 +1745,39 @@ export async function runSubmitAsyncWorkflowRun<
   ));
   // A restored Turn's immutable objective wins over a missing or looser
   // resubmission context. Legacy objective fields stay absent, never borrowed.
+  const lexicalReadGuards = !checkpoint
+    ? inferExplicitWorkspaceReadGuardsFromText(admissionTurn?.userPrompt || "")
+    : { forbiddenWorkspaceRead: false, approvalRequiredWorkspaceRead: false };
+  const mergeGuardCapabilities = <T extends string>(
+    base: readonly T[] | undefined,
+    extra: boolean,
+    cap: T,
+  ): readonly T[] | undefined => {
+    if (!extra) return base;
+    return [...new Set([...(base || []), cap])];
+  };
   const capabilityRestrictions = checkpoint ? checkpoint.aggregate.objective.capabilityRestrictions : approvedPlanContinuation
-    ? [...new Set([...(sourcePlan?.aggregate.objective.capabilityRestrictions || []), ...(input.semanticIntent?.forbiddenCapabilities || [])])]
-    : input.semanticIntent?.forbiddenCapabilities;
+    ? mergeGuardCapabilities(
+        [...new Set([...(sourcePlan?.aggregate.objective.capabilityRestrictions || []), ...(input.semanticIntent?.forbiddenCapabilities || [])])],
+        lexicalReadGuards.forbiddenWorkspaceRead,
+        "workspace_read",
+      )
+    : mergeGuardCapabilities(
+        input.semanticIntent?.forbiddenCapabilities,
+        lexicalReadGuards.forbiddenWorkspaceRead,
+        "workspace_read",
+      );
   const approvalRequiredCapabilities = checkpoint ? checkpoint.aggregate.objective.approvalRequiredCapabilities : approvedPlanContinuation
-    ? [...new Set([...(sourcePlan?.aggregate.objective.approvalRequiredCapabilities || []), ...(input.semanticIntent?.approvalRequiredCapabilities || [])])]
-    : input.semanticIntent?.approvalRequiredCapabilities;
+    ? mergeGuardCapabilities(
+        [...new Set([...(sourcePlan?.aggregate.objective.approvalRequiredCapabilities || []), ...(input.semanticIntent?.approvalRequiredCapabilities || [])])],
+        lexicalReadGuards.approvalRequiredWorkspaceRead,
+        "workspace_read",
+      )
+    : mergeGuardCapabilities(
+        input.semanticIntent?.approvalRequiredCapabilities,
+        lexicalReadGuards.approvalRequiredWorkspaceRead,
+        "workspace_read",
+      );
   // Bootstrap reads have no exact-call approval resolver. Defer project and
   // attachment content to ordinary authorized tools when this Turn requires it.
   const deferWorkspaceReads = normalizeTurnCapabilityRestrictions(capabilityRestrictions).includes("workspace_read") ||
@@ -1994,6 +2026,15 @@ export async function runSubmitAsyncWorkflowRun<
     return;
   }
 
+  const latestHarnessRunMarker = input.readHarnessRunMarker();
+  const currentHarnessInstanceId = input.getCurrentHarnessInstanceId();
+  const expectedHarnessRunMarker =
+    latestHarnessRunMarker &&
+    latestHarnessRunMarker.instanceId === currentHarnessInstanceId &&
+    latestHarnessRunMarker.sessionKey !== input.runSessionKey
+      ? latestHarnessRunMarker
+      : initialExpectedHarnessRunMarker;
+
   const runLease = (phaseRunners.startRunLease || startSubmitRunLease)({
     userContent,
     canonicalUserText: input.text,
@@ -2119,7 +2160,26 @@ export async function runSubmitAsyncWorkflowRun<
     workspaceInstructionContext: renderResolvedInstructionContext(
       resolvedInstructionSnapshot,
     ),
-    planPurpose: (input.options as { planPurpose?: unknown } | undefined)?.planPurpose === "rules" ? "rules" : undefined,
+    planPurpose: (() => {
+      const explicitPurpose = (input.options as { planPurpose?: unknown } | undefined)?.planPurpose;
+      if (explicitPurpose === "rules") return "rules" as const;
+      if (explicitPurpose === "plan") return "plan" as const;
+      if (input.runtimeRunIntent === "plan") {
+        const turnPrompt = input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.userPrompt || "";
+        if (parseGrillMeCommand(turnPrompt) || requestsExplicitPlanInterview(turnPrompt)) {
+          return "plan" as const;
+        }
+      }
+      return undefined;
+    })(),
+    planInterviewMode: (() => {
+      const explicitMode = (input.options as { planInterviewMode?: unknown } | undefined)?.planInterviewMode;
+      if (explicitMode === "grill") return "grill" as const;
+      const turnPrompt = input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.userPrompt || "";
+      return parseGrillMeCommand(turnPrompt) ? "grill" as const : undefined;
+    })(),
+    allowVoluntaryPlanQuestions: input.runtimeRunIntent === "plan" &&
+      (input.options as { planPurpose?: unknown } | undefined)?.planPurpose !== "rules",
     sourcePlanDraft: input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.sourcePlanDraft ||
       (input.options as { sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord } | undefined)?.sourcePlanDraft,
     approvedPlanContinuation,

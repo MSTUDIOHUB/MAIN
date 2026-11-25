@@ -1,4 +1,5 @@
 import type { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
+import { compactDebugString } from "../../lib/debugLog";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { RuntimeV2Command } from "../../lib/runtime-v2";
 import {
@@ -9,6 +10,7 @@ import {
 } from "../../lib/streaming";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
+  aggregateForCurrentTurn,
   appendRuntimeV2ProviderFeedbackHistory,
   materializedRuntimeV2SourceCoverage,
   type RuntimeV2ExecutionPortsInput,
@@ -16,6 +18,7 @@ import {
 } from "./executionContext";
 import {
   buildRuntimeV2LanguageRetryFeedback,
+  canRuntimeV2RequestConcludeWithProse,
   evaluateRuntimeV2LanguageRetry,
   runtimeV2ProviderOutputWasTruncated,
 } from "./executionProviderRequestPolicy";
@@ -59,6 +62,14 @@ export function createRuntimeV2WireCallbacks(input: {
         return input.activity.requestDispatched();
       },
       onLifecycle(event) {
+        if (event.phase === "prompt_progress") {
+          input.activity.reportPromptProgress({
+            processedTokens: event.processedTokens,
+            totalTokens: event.totalTokens,
+            cachedTokens: event.cachedTokens,
+            percent: event.percent,
+          });
+        }
         if (event.phase === "model_progress") onModelProgress();
         if (event.phase === "first_chunk") {
           input.logRequestTiming("first_chunk", {
@@ -154,6 +165,11 @@ export async function retryRuntimeV2ProviderLanguageMismatch(input: {
     attempt: "initial" | "reasoning_retry" | "language_retry",
   ) => Parameters<typeof streamChatCompletion>[2];
 }): Promise<StreamResult> {
+  const proseConclusionAllowed = canRuntimeV2RequestConcludeWithProse({
+    aggregate: aggregateForCurrentTurn(input.ports),
+    requestMode: input.requestMode,
+    readOnly: input.command.payload.readOnly === true,
+  });
   const languageRetryCheck = evaluateRuntimeV2LanguageRetry({
     text: input.result.semanticContent || input.streamedText,
     targetLanguage: input.ports.context.phaseLanguage,
@@ -166,12 +182,16 @@ export async function retryRuntimeV2ProviderLanguageMismatch(input: {
       toolCallCount: input.result.toolCalls.length,
       availableToolCount: input.providerTools.length,
     }),
+    proseConclusionAllowed,
   });
   if (!languageRetryCheck.shouldRetry) {
     return input.result;
   }
   input.activity.preparing();
   const targetLanguage = input.ports.context.phaseLanguage;
+  const mismatchedVisibleText = (
+    input.result.semanticContent || input.streamedText
+  ).trim();
   input.ports.logStoreEvent("runtime_v2_provider_language_retry", {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
@@ -182,31 +202,35 @@ export async function retryRuntimeV2ProviderLanguageMismatch(input: {
     detectedLanguage: languageRetryCheck.detectedLanguage,
     hanCount: languageRetryCheck.hanCount,
     latinWords: languageRetryCheck.latinWords,
+    samplePreview: compactDebugString(mismatchedVisibleText, 160),
   });
-  const mismatchedVisibleText = (
-    input.result.semanticContent || input.streamedText
-  ).trim();
   input.resetStreamedText();
   const languageRetryHistoryStart = input.live.messages.length;
   appendRuntimeV2ProviderFeedbackHistory(input.live, {
     visibleText: mismatchedVisibleText,
     code: "language_mismatch",
-    feedback: buildRuntimeV2LanguageRetryFeedback(targetLanguage),
+    feedback: buildRuntimeV2LanguageRetryFeedback(targetLanguage, {
+      hasToolsAvailable: !input.textEnvelope && input.providerTools.length > 0,
+    }),
   });
   const languageRetryMessages = input.rebuildRetryMessages(languageRetryHistoryStart);
-  return streamChatCompletion(
-    languageRetryMessages,
-    input.requestSettings,
-    input.wireCallbacks("language_retry"),
-    input.signal,
-    input.textEnvelope ? [] : input.providerTools,
-    input.maxOutputTokens,
-    {
-      ...(input.effectiveToolChoice ? { toolChoice: input.effectiveToolChoice } : {}),
-      timeoutMs: input.timeoutMs,
-      contextOwnership: "caller",
-      reasoningOnlyCharLimit: input.reasoningOnlyCharLimit,
-      actionOnlyCharLimit: input.actionOnlyCharLimit,
-    },
-  );
+  try {
+    return await streamChatCompletion(
+      languageRetryMessages,
+      input.requestSettings,
+      input.wireCallbacks("language_retry"),
+      input.signal,
+      input.textEnvelope ? [] : input.providerTools,
+      input.maxOutputTokens,
+      {
+        ...(input.effectiveToolChoice ? { toolChoice: input.effectiveToolChoice } : {}),
+        timeoutMs: input.timeoutMs,
+        contextOwnership: "caller",
+        reasoningOnlyCharLimit: input.reasoningOnlyCharLimit,
+        actionOnlyCharLimit: input.actionOnlyCharLimit,
+      },
+    );
+  } finally {
+    input.live.messages.splice(languageRetryHistoryStart);
+  }
 }

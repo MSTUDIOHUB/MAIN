@@ -1,6 +1,7 @@
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
+import { buildCapsuleModelActivityContext } from "../../lib/capsuleModelContext";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
@@ -8,6 +9,7 @@ import {
   deriveProviderAdapterCapabilities,
 } from "../../lib/providerLaneSettings";
 import { acquireModelLane } from "../../lib/modelLaneCoordinator";
+import { buildCompactRuntimeV2ConcludeConversation } from "./executionConcludeContext";
 import {
   streamChatCompletion,
   type OpenAiToolChoice,
@@ -159,7 +161,13 @@ async function performRuntimeV2ProviderRequest(
     input.live.latestProviderActionWindow,
   );
   const readOnly = requestMode === "chat" || requestMode === "analyze" || input.command.payload.conclusionKind === "read_only";
-  const canonicalDecisionConversation = history.messages;
+  const canonicalDecisionConversation = requestMode === "conclude"
+    ? buildCompactRuntimeV2ConcludeConversation({
+        messages: history.messages,
+        aggregate,
+        language: input.ports.context.phaseLanguage,
+      })
+    : history.messages;
   input.live.latestProviderRequestSourceCoverage =
     materializedRuntimeV2SourceCoverage(
       canonicalDecisionConversation,
@@ -201,7 +209,11 @@ async function performRuntimeV2ProviderRequest(
     toolNames.has("replace_in_file") ||
     toolNames.has("apply_patch") ||
     toolNames.has("write_file");
+  const trailingRepetitionFeedback =
+    typeof input.live.messages[input.live.messages.length - 1]?.content === "string" &&
+    String(input.live.messages[input.live.messages.length - 1]?.content).includes("[runtime-v2 provider feedback: visible_stream_repetition]");
   const structuredActionRequired = !readOnly && (
+    trailingRepetitionFeedback ||
     !!actionWindow ||
     executionContractAdvance.required ||
     validationCorrection.active ||
@@ -398,6 +410,7 @@ async function performRuntimeV2ProviderRequest(
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
     sourceReadAvailable: toolNames.has("read_file"),
+    sourceEvidenceCount: (aggregate?.evidence || []).filter((entry) => entry.kind === "source" && Boolean(entry.version)).length,
     mutationToolAvailable: hasMutationTool,
     conversationHistoryMessages: boundedConversation.length,
     unboundedConversationHistoryMessages: history.historyMessages,
@@ -494,6 +507,13 @@ async function performRuntimeV2ProviderRequest(
       stage,
       ...data,
     });
+  activity.setContext(buildCapsuleModelActivityContext({
+    aggregate,
+    messages,
+    mode: String(input.command.payload.mode || ""),
+    estimatedInputTokens,
+    objectiveText: aggregate?.objective.text,
+  }));
   activity.acquiringLane();
   const laneStartedAt = Date.now();
   logRequestTiming("lane_requested");

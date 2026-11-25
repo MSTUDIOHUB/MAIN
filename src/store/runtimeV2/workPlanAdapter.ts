@@ -182,6 +182,7 @@ function buildPlanPanelProjection(
       operation: step.operation,
       targets: [...step.targets],
       expectedOutcome: step.expectedOutcome,
+      ...(step.dependsOn.length > 0 ? { dependsOn: [...step.dependsOn] } : {}),
     })),
     validationCount: plan.draft.validations.length,
   };

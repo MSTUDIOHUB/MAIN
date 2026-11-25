@@ -1,4 +1,5 @@
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
+import { awaitCanceledTurnTerminalProjection, getPendingSessionCancellation } from "../sessionCancellationBarrier";
 import type {
   RuntimeV2RunIdentity,
   RuntimeV2TurnIdentity,
@@ -139,6 +140,37 @@ export async function recoverRuntimeV2PlanFailure(input: {
 }): Promise<RuntimeV2PlanCompletion> {
   const aggregate = input.ledger.snapshot();
   if (!aggregate?.run || aggregate.phase === "acting") throw input.error;
+  if (
+    !aggregate.terminalOutcome &&
+    input.runner.context.abortCtrl.signal.aborted &&
+    getPendingSessionCancellation(input.run.sessionKey)?.turnId === input.run.turnId
+  ) {
+    input.collaboration.abortChildren("runtime_v2_plan_parent_canceled");
+    if (
+      await awaitCanceledTurnTerminalProjection({
+        sessionKey: input.run.sessionKey,
+        turnId: input.run.turnId,
+        getProjection: () => {
+          const state = input.runner.get();
+          return {
+            runtimeEvents: state.runtimeEvents || [],
+            taskFlow: state.taskFlow || [],
+          };
+        },
+      })
+    ) {
+      return {
+        kind: "settled",
+        settlement: planSettlement(
+          input.runner.context,
+          terminalPlanOutcome(
+            "canceled",
+            "用户已停止计划生成；取消事务已完成唯一终态收口。",
+          ),
+        ),
+      };
+    }
+  }
   if (
     !aggregate.terminalOutcome &&
     !await input.collaboration.abortAndDrain(

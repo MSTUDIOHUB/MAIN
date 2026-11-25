@@ -1,4 +1,5 @@
 import {
+  parseSessionRuntimeKey,
   resolveSessionRuntimeKey,
   resolveSessionWorkspaceKey,
 } from "../lib/sessionTypes";
@@ -213,6 +214,8 @@ export function createSubmitPreRunSessionPatcher<
       state.currentSessionId,
     ) === params.originSessionKey;
 
+  const originIdentity = parseSessionRuntimeKey(params.originSessionKey);
+
   return (patch) => {
     if (!params.originSessionKey || isOriginSessionActive(params.get())) {
       params.set(patch as Partial<TState>);
@@ -224,7 +227,15 @@ export function createSubmitPreRunSessionPatcher<
       if (Object.keys(runtimePatch).length === 0) return {} as Partial<TState>;
       const existing =
         state.runtimeBySessionKey[params.originSessionKey!] ||
-        params.createRuntimeFromState(params.originSnapshot);
+        params.createRuntimeFromState(
+          originIdentity
+            ? ({
+                ...params.originSnapshot,
+                currentWorkspace: originIdentity.currentWorkspace,
+                currentSessionId: originIdentity.sessionId,
+              } as Partial<TState>)
+            : params.originSnapshot,
+        );
       return {
         runtimeBySessionKey: {
           ...state.runtimeBySessionKey,
@@ -259,9 +270,40 @@ export function createSubmitSessionRuntimeFacade<
   const isOwnedRuntime = (runtime: TRuntime | null | undefined): boolean =>
     !!runtime &&
     (runtime as RuntimeWithSubmitOwner)[SUBMIT_SESSION_RUNTIME_OWNER] === expectedStamp;
+  const ownerIdentity = parseSessionRuntimeKey(params.runSessionKey);
+  const scopeStateToOwner = (state: TState, runtime?: TRuntime): TState => {
+    const combined = runtime ? { ...state, ...runtime } : { ...state };
+    if (!ownerIdentity) return combined as TState;
+    const liveConfig = (combined as Record<string, unknown>).config;
+    const scopedConfigPatch =
+      liveConfig &&
+      typeof liveConfig === "object" &&
+      !Array.isArray(liveConfig) &&
+      Object.prototype.hasOwnProperty.call(liveConfig, "workspace")
+        ? {
+            config: {
+              ...(liveConfig as Record<string, unknown>),
+              workspace: ownerIdentity.currentWorkspace,
+            },
+          }
+        : {};
+    return {
+      ...combined,
+      currentWorkspace: ownerIdentity.currentWorkspace,
+      currentSessionId: ownerIdentity.sessionId,
+      ...scopedConfigPatch,
+    } as TState;
+  };
+  const isRunSessionActive = (candidate = params.get()): boolean =>
+    resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(candidate.currentWorkspace),
+      candidate.currentSessionId,
+    ) === params.runSessionKey;
   let lastKnownOwnerRuntime =
-    params.get().runtimeBySessionKey[params.runSessionKey] ||
-    params.createRuntimeFromState(params.get());
+    initialState.runtimeBySessionKey[params.runSessionKey] ||
+    params.createRuntimeFromState(
+      isRunSessionActive(initialState) ? initialState : scopeStateToOwner(initialState),
+    );
   const missingRuntimeRevisionToken = {};
   const hasRuntimeEntry = (state: TState): boolean =>
     Object.prototype.hasOwnProperty.call(state.runtimeBySessionKey, params.runSessionKey);
@@ -281,16 +323,12 @@ export function createSubmitSessionRuntimeFacade<
     return lastKnownOwnerRuntime;
   };
 
-  const isRunSessionActive = (candidate = params.get()): boolean =>
-    resolveSessionRuntimeKey(
-      resolveSessionWorkspaceKey(candidate.currentWorkspace),
-      candidate.currentSessionId,
-    ) === params.runSessionKey;
-
   const seedSessionRuntime = () => {
     if (borrowed) return;
     params.set((state) => {
-      const runtime = stampOwnedRuntime(params.createRuntimeFromState(state));
+      const runtime = stampOwnedRuntime(params.createRuntimeFromState(
+        isRunSessionActive(state) ? state : scopeStateToOwner(state),
+      ));
       lastKnownOwnerRuntime = runtime;
       return {
         runtimeBySessionKey: {
@@ -309,7 +347,7 @@ export function createSubmitSessionRuntimeFacade<
       }
       const active = isRunSessionActive(state);
       const existing = getRuntime(state);
-      const baseState = active ? state : ({ ...state, ...existing } as TState);
+      const baseState = active ? state : scopeStateToOwner(state, existing);
       const rawPatch =
         typeof patchOrUpdater === "function"
           ? patchOrUpdater(baseState)
@@ -342,7 +380,7 @@ export function createSubmitSessionRuntimeFacade<
     const scoped = (
       isRunSessionActive(live) && (!seeded || ownsRuntime)
         ? live
-        : { ...live, ...runtime }
+        : scopeStateToOwner(live, runtime)
     ) as TState;
     return params.decorateScopedState ? params.decorateScopedState(scoped) : scoped;
   };
@@ -350,8 +388,16 @@ export function createSubmitSessionRuntimeFacade<
   const publishOwnerScopedRuntimeProjection = (
     input: SubmitOwnerScopedRuntimeProjectionInput<TState>,
   ): SubmitOwnerScopedRuntimePublicationResult => {
+    const projectionSource = input.durableState || input.projectedState;
+    const ownedProjectionSource = ownerIdentity
+      ? ({
+          ...projectionSource,
+          currentWorkspace: ownerIdentity.currentWorkspace,
+          currentSessionId: ownerIdentity.sessionId,
+        } as TState)
+      : projectionSource;
     const runtimeProjection = stampOwnedRuntime(params.createRuntimeFromState(
-      input.durableState || input.projectedState,
+      ownedProjectionSource,
     ));
     const runtimePatch = params.pickRuntimePatch(
       runtimeProjection as unknown as SubmitSessionPatch<TState>,

@@ -3372,13 +3372,14 @@ test("production Plan preserves a non-empty graph with a missing required change
     "the retained draft identifies the exact missing authored field");
 });
 
-test("production Plan runs, joins, and adopts one read-only child before review", async () => {
+test("production Plan runs, joins, and adopts one read-only child before review", { timeout: 30_000 }, async () => {
   let parentRound = 0;
   let childRound = 0;
   let parentReadWhileChildActive = false;
   let childInFlight = false;
   const requestTools = [];
-  let diagnosticAbort = null;
+  const childStarted = Promise.withResolvers();
+  const parentReadyToJoin = Promise.withResolvers();
   const result = await runProductionPlanScenario(
     async (messages, _settings, callbacks, _signal, tools) => {
       const requestTranscript = messages
@@ -3389,7 +3390,8 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         childInFlight = true;
         callbacks.onLifecycle?.({ phase: "first_chunk" });
         if (childRound === 1) {
-          await new Promise((resolve) => setTimeout(resolve, 60));
+          childStarted.resolve();
+          await parentReadyToJoin.promise;
           childInFlight = false;
           return {
             content: "",
@@ -3429,7 +3431,6 @@ test("production Plan runs, joins, and adopts one read-only child before review"
       }
 
       parentRound += 1;
-      await new Promise((resolve) => setTimeout(resolve, 1));
       const names = tools.map((tool) => tool.function.name);
       requestTools.push(names);
       if (parentRound === 1) {
@@ -3454,7 +3455,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         };
       }
       if (parentRound === 2) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await childStarted.promise;
         parentReadWhileChildActive = childInFlight;
         assert.equal(names.includes("wait_subagents"), true);
         assert.equal(names.includes("spawn_subagent"), true, "a queued child waits at transport admission without closing independent tasks");
@@ -3471,6 +3472,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
       }
       if (parentRound === 3) {
         assert.equal(names.includes("wait_subagents"), true);
+        parentReadyToJoin.resolve();
         return {
           content: "",
           toolCalls: [{
@@ -3543,16 +3545,9 @@ test("production Plan runs, joins, and adopts one read-only child before review"
         maxActiveRequests: 1,
         modelRequestMode: "parallel",
       },
-      onAbortCtrl: (controller) => {
-        diagnosticAbort = setTimeout(
-          () => controller.abort("plan-collaboration-test-timeout"),
-          2_000,
-        );
-      },
     },
   );
 
-  if (diagnosticAbort) clearTimeout(diagnosticAbort);
   assert.equal(
     result.settlement.outcome.status,
     "paused",

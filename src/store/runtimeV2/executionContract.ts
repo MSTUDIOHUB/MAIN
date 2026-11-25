@@ -49,6 +49,8 @@ export const RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL: ToolDefinition = {
         changes: {
           type: "array",
           minItems: 1,
+          description:
+            "Every modify, delete, or preserve target must already have versioned source evidence from this turn or carried over unchanged from an earlier turn in this session. Use operation=\"create\" for new files.",
           items: {
             type: "object",
             properties: {
@@ -61,7 +63,7 @@ export const RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL: ToolDefinition = {
                 minItems: 1,
                 items: { type: "string" },
                 description:
-                  "Every exact workspace-relative file owned by this change. Use preserve for an investigated owner that must remain unchanged.",
+                  "Every exact workspace-relative file owned by this change (each existing file must already have versioned source evidence). Use preserve for an investigated owner that must remain unchanged.",
               },
               change: {
                 type: "string",
@@ -88,7 +90,7 @@ export const RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL: ToolDefinition = {
               command: {
                 type: "string",
                 description:
-                  "For finite_command only: one bounded build, test, lint, typecheck, check, or inline assertion without shell wrappers.",
+                  "For finite_command only: one bounded build, test, lint, typecheck, check, or inline_assertion without shell pipes (no | tail, | head, | grep) and using only && (never ; or ||). When the workspace has no build/test runner, use python3 -c \"...; assert ...\" or node -e \"...; assert.ok(...)\" so failures exit non-zero.",
               },
               expected_outcome: {
                 type: "string",
@@ -153,35 +155,27 @@ export function validateRuntimeV2ExecutionContractSubmission(input: {
     };
   }
   const parsed = parseRuntimeV2ExecutionContractArguments(input.args);
+  const issues: string[] = [];
   if (!parsed.summary || parsed.rootCauses.length === 0) {
-    return {
-      allowed: false,
-      reason:
-        "EXECUTION_CONTRACT_REJECTED: provide a concise complete summary and at least one evidence-backed root cause.",
-    };
+    issues.push(
+      "provide a concise complete summary and at least one evidence-backed root cause.",
+    );
   }
   if (parsed.changes.length === 0 || parsed.validations.length === 0) {
-    return {
-      allowed: false,
-      reason:
-        "EXECUTION_CONTRACT_REJECTED: provide at least one concrete change/preserve entry and one finite or observable validation.",
-    };
-  }
-  const invalidFiniteValidation = parsed.validations.find((validation) =>
-    validation.kind === "finite_command" &&
-    finiteValidationCommandRejection(validation.command)
-  );
-  if (invalidFiniteValidation) {
-    const rejection = finiteValidationCommandRejection(
-      invalidFiniteValidation.command,
+    issues.push(
+      "provide at least one concrete change/preserve entry and one finite or observable validation.",
     );
-    return {
-      allowed: false,
-      reason: [
-        "EXECUTION_CONTRACT_REJECTED: finite_command must be one bounded build, test, lint, typecheck, check, or failing inline assertion; services and observers are not acceptance checks.",
-        rejection?.message || "The command has no finite validation exit status.",
+  }
+  for (const validation of parsed.validations) {
+    if (validation.kind !== "finite_command") continue;
+    const rejection = finiteValidationCommandRejection(validation.command);
+    if (!rejection) continue;
+    issues.push(
+      [
+        "finite_command must be one bounded build, test, lint, typecheck, check, or failing inline assertion; services and observers are not acceptance checks.",
+        rejection.message || "The command has no finite validation exit status.",
       ].join(" "),
-    };
+    );
   }
   const acceptanceRequirements =
     input.aggregate.objective?.acceptanceEvidenceRequirements || [];
@@ -201,33 +195,29 @@ export function validateRuntimeV2ExecutionContractSubmission(input: {
     },
   );
   if (
+    parsed.validations.length > 0 &&
     acceptanceRequirements.includes("interaction") &&
     !hasInteractionValidation
   ) {
-    return {
-      allowed: false,
-      reason:
-        "EXECUTION_CONTRACT_REJECTED: the runtime-owned interaction acceptance floor requires a browser or desktop validation with an observable post-action result; a static command cannot replace it.",
-    };
+    issues.push(
+      "the runtime-owned interaction acceptance floor requires a browser or desktop validation with an observable post-action result; a static command cannot replace it.",
+    );
   }
   if (
+    parsed.validations.length > 0 &&
     acceptanceRequirements.includes("behavioral") &&
     !hasInteractionValidation &&
     !hasBehavioralFiniteValidation
   ) {
-    return {
-      allowed: false,
-      reason:
-        "EXECUTION_CONTRACT_REJECTED: the runtime-owned behavioral acceptance floor requires a real test/inline assertion or browser/desktop validation; build, lint, and source inspection alone cannot prove the user-visible behavior.",
-    };
+    issues.push(
+      "the runtime-owned behavioral acceptance floor requires a real test/inline assertion or browser/desktop validation; build, lint, and source inspection alone cannot prove the user-visible behavior.",
+    );
   }
   const existing = deriveRuntimeV2ExecutionContract(input.aggregate);
   if (existing && !parsed.revisionReason) {
-    return {
-      allowed: false,
-      reason:
-        "EXECUTION_CONTRACT_REJECTED: a revision_reason naming the new evidence is required when replacing the current contract.",
-    };
+    issues.push(
+      "a revision_reason naming the new evidence is required when replacing the current contract.",
+    );
   }
   if (existing) {
     const commands = scheduledCommandsByKey(input.aggregate);
@@ -255,11 +245,9 @@ export function validateRuntimeV2ExecutionContractSubmission(input: {
       )
     );
     if (!hasRevisionBasis) {
-      return {
-        allowed: false,
-        reason:
-          "EXECUTION_CONTRACT_REJECTED: the active contract cannot be churned without newer source, child, rejected-action, or failed-validation evidence.",
-      };
+      issues.push(
+        "the active contract cannot be churned without newer source, child, rejected-action, or failed-validation evidence.",
+      );
     }
   }
   const sourceEvidence = versionedSourceEvidenceBefore(input.aggregate);
@@ -270,13 +258,12 @@ export function validateRuntimeV2ExecutionContractSubmission(input: {
       workspacePathsReferToSameFile(evidence.target, target)
     ));
   if (unreadTargets.length > 0) {
-    return {
-      allowed: false,
-      reason: [
-        "EXECUTION_CONTRACT_REJECTED: every modify/delete/preserve target must have versioned source evidence before planning.",
+    issues.push(
+      [
+        "every modify/delete/preserve target must have versioned source evidence before planning.",
         `Unread targets: ${[...new Set(unreadTargets)].join(", ")}.`,
       ].join(" "),
-    };
+    );
   }
   const operationByTarget = new Map<string, RuntimeV2ExecutionContractOperation>();
   for (const change of parsed.changes) {
@@ -285,14 +272,20 @@ export function validateRuntimeV2ExecutionContractSubmission(input: {
         workspacePathsReferToSameFile(candidate, target)
       );
       if (prior && prior[1] !== change.operation) {
-        return {
-          allowed: false,
-          reason:
-            `EXECUTION_CONTRACT_REJECTED: ${target} has conflicting ${prior[1]} and ${change.operation} operations.`,
-        };
+        issues.push(
+          `${target} has conflicting ${prior[1]} and ${change.operation} operations.`,
+        );
       }
       operationByTarget.set(target, change.operation);
     }
+  }
+  if (issues.length > 0) {
+    return {
+      allowed: false,
+      reason: issues.length === 1
+        ? `EXECUTION_CONTRACT_REJECTED: ${issues[0]}`
+        : `EXECUTION_CONTRACT_REJECTED (${issues.length} issues): ${issues.map((issue, index) => `[${index + 1}] ${issue}`).join(" | ")}`,
+    };
   }
   return { allowed: true, contract: parsed };
 }

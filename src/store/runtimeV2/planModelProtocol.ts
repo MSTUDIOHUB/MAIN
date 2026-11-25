@@ -56,7 +56,7 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
   function: {
     name: SUBMIT_WORK_PLAN_TOOL_NAME,
     description:
-      "提交可审阅的实现计划。必须提供 Markdown 方案说明（planMarkdown）、文件变更步骤（changes）及验证方式（validations）。主动核实可用的构建、测试或交互检查，将能判定通过或失败的检查写入 validations。仅当完成计划取决于用户决定时才追问。不要编造命令。省略的依赖关系与准则映射由运行时自动推断。",
+      "提交可审阅的实现计划。必须提供 Markdown 方案说明（planMarkdown）、文件变更步骤（changes）及验证方式（validations）。主动核实可用的构建、测试或交互检查，将能判定通过或失败的检查写入 validations。请为每个步骤在 dependsOn 中显式声明前置依赖（省略 dependsOn 表示 [] 无依赖，运行时不会自动推断；共享接口/基类、消费模块与服务组装入口之间的依赖关系必须明确列出）。仅准则映射在省略时由运行时补充；不要编造命令。",
     parameters: {
       type: "object",
       properties: {
@@ -96,7 +96,7 @@ export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
               dependsOn: {
                 type: "array",
                 items: { type: "integer" },
-                description: "可选，前置步骤的 0-based 索引列表，默认自动推断",
+                description: "可选，前置步骤的 0-based 索引列表；省略表示 []（无前置依赖），运行时不会自动推断。当存在共享接口、基类或总装注册入口时，消费模块和总装步必须显式依赖定义它们的前置步骤。",
               },
               criterionIds: {
                 type: "array",
@@ -184,7 +184,11 @@ export function planModelToolCandidates(
 }
 
 export function planModelTools(context: RuntimeV2SubmissionContext): ToolDefinition[] {
-  const canAskPlanQuestions = !!(context.planPurpose || context.sourcePlanDraft);
+  const canAskPlanQuestions = Boolean(
+    context.planPurpose ||
+    context.sourcePlanDraft ||
+    context.allowVoluntaryPlanQuestions,
+  );
   return filterToCoreAndUnlockedTools([...planModelToolCandidates(context), ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL] : []), SUBMIT_WORK_PLAN_TOOL], {
     sessionKey: context.runSessionKey,
     alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...UNITY_MCP_OBSERVATION_NAMES,
@@ -209,6 +213,7 @@ function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
       ...source.function,
       description: [
         "Create one bounded read-only planning child for independent investigation, review, or validation design.",
+        "Each child accepts at most 6 narrow workspace-relative paths in required_paths and allowed_paths (never '.' or '*'); split larger module reviews across multiple spawn_subagent calls.",
         "The parent must continue unrelated discovery and later join the child before submitting the WorkPlan.",
         "Planning children cannot modify or stage workspace files.",
       ].join(" "),
@@ -386,7 +391,8 @@ export function providerPlanMessages(input: {
         `Workspace: ${input.context.runWorkspace || "global"}`,
         `Respond in: ${language}`,
         "You are in Plan Mode: inspect relevant files with read-only tools and then submit a clear plan via submit_runtime_v2_work_plan.",
-        "Do not invent file paths or modify project files during planning.",
+        "Do not invent file paths or modify project files during planning. Never guess unverified filenames from a folder name; list the subdirectory or search first when its files are not yet in workspace overview.",
+        "Keep subagent fan-out compact (typically up to 2 focused subagents on disjoint modules with <= 6 paths each; never re-read files in the parent that a subagent already inspected, and never spawn a subagent for files already read).",
         "Use prior read receipts as evidence. Inspect the smallest missing fact about a test entry point, fixture, or interaction capability. Use a relevant admitted Skill when it can identify the check. If adding a test is in scope and the project has a suitable runner, plan that test as a change and bind the runnable check to it. Design the check yourself; ask only for a consequential scope, constraint, or acceptance decision that safe inspection cannot resolve.",
         ...(input.context.projectBaselineContext?.facts.runtimes.some(runtime => ["unity", "tuanjie"].includes(runtime.name)) ? [
           "For Unity or Tuanjie tests, check the project's existing test and runtime assembly definitions and references. Include each necessary .asmdef in the reviewed changes, with dependencies. A PlayMode test using yield must return IEnumerator. Bind PlayMode to a named suite with useProjectEditor and expectedTestCases so the same reviewed check can use the exact Editor or batch mode.",
@@ -397,7 +403,9 @@ export function providerPlanMessages(input: {
         collaborationRequired
           ? "[REQUIRED COLLABORATION]\nThe user explicitly requires a planning child. Before submitting, admit at least one bounded read-only child through spawn_subagent, later join it, assess its result, and cite any adopted exact evidence ID. This is a hard admission condition, not a collaboration preference."
           : "",
-        input.context.planPurpose || input.context.sourcePlanDraft ? PLAN_CLARIFICATION_GUIDANCE : "Use questions only for a real user-owned decision.",
+        input.context.planPurpose || input.context.sourcePlanDraft
+          ? PLAN_CLARIFICATION_GUIDANCE
+          : "Decide whether to call ask_plan_questions based on real ambiguity: if the goal, scope, and implementation approach can be determined from the user's request and workspace inspection, do NOT ask unnecessary questions—submit the complete WorkPlan directly via submit_runtime_v2_work_plan. Call ask_plan_questions ONLY when a consequential design, scope, or acceptance tradeoff genuinely requires the user's choice.",
         collaborationGuidance
           ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
           : "",
@@ -473,7 +481,7 @@ export function synthesisPlanTranscript(input: {
         input.canAskPlanQuestions && (input.transport === "structured_response"
           ? "If a consequential new user decision blocks completion, put the specific question in the questions field so MAIN pauses for an answer. Treat explicit requirements in the original request and confirmed answers as resolved decisions."
           : PLAN_CLARIFICATION_GUIDANCE),
-        "Preserve every admitted criterion, dependency edge and bounded validation. Cite the exact IDs of any adopted child evidence. A rejected submission is not a new fact or approval.",
+        "Explicitly declare dependsOn 0-based step indexes between shared interfaces/base classes, consumer modules, and final assembly entrypoints; omitted dependsOn means [] (no dependencies) and is never auto-inferred. Preserve every admitted criterion and bounded validation. Cite the exact IDs of any adopted child evidence. A rejected submission is not a new fact or approval.",
       ].filter(Boolean).join(" "),
     },
   ];

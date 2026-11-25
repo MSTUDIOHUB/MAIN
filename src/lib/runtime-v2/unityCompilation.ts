@@ -103,6 +103,7 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
   const versions = new Map<string, string | null>();
   const compileCommands = new Map<string, { sequence: number; hasImportTargets: boolean }>();
   let receipt: { boundary: number; sequence: number; result: UnityCompilationResult; hasImportTargets: boolean } | undefined;
+  let notUnityProjectReceipt: { sequence: number; result: UnityCompilationResult; hasImportTargets: boolean } | undefined;
   let recheckRequestId: string | undefined;
   for (const event of aggregate.events) {
     if (!("run" in event) || event.run.runId !== run.identity.runId) continue;
@@ -110,6 +111,14 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
       ? event.evidence.filter(item => item.kind === "mutation")
       : event.type === "work_plan.approved" && event.sequence === continuation?.sequence
         ? continuation.continuation.carriedTargets.map(item => ({ target: item.target, version: item.version ?? "deleted" })) : [];
+    if (
+      changed.some((item) => {
+        const relative = normalizeValidationWorkspaceCwd(item.target, workspace);
+        return relative?.toLowerCase() === "projectsettings/projectversion.txt";
+      })
+    ) {
+      notUnityProjectReceipt = undefined;
+    }
     const resolveTarget = kind === "csharp" ? unityCompilationTarget : unityShaderImportTarget;
     const affected = changed.flatMap(item => {
       const target = resolveTarget(item.target, workspace);
@@ -152,6 +161,13 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
       } catch { /* Invalid receipt remains unavailable. */ }
     }
     receipt = { boundary: boundary.sequence, sequence: event.sequence, result, hasImportTargets: boundary.hasImportTargets };
+    if (result.status === "not_unity_project") {
+      notUnityProjectReceipt = {
+        sequence: event.sequence,
+        result,
+        hasImportTargets: boundary.hasImportTargets,
+      };
+    }
   }
   if (sequence < 0) return null;
   const diagnosticTargets = runtimeV2EditorDiagnosticScope(aggregate)?.diagnostics.flatMap(item => item.kind === kind && item.path ? [item.path] : []) || [];
@@ -171,7 +187,12 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
       receipt.result.message?.startsWith("UNITY_SHADER_INCLUDE_OWNER_UNVERIFIED:")) receipt = undefined;
   if (consoleRepair && receipt?.result.status === "passed" && targets.some(path =>
     !receipt?.result.targets?.some(item => item.path === path))) receipt = undefined;
-  return { kind, sequence, targets, expectedVersions, importTargets, receipt: receipt?.boundary === sequence ? receipt : undefined };
+  const effectiveReceipt = receipt?.boundary === sequence
+    ? receipt
+    : notUnityProjectReceipt
+      ? { boundary: sequence, ...notUnityProjectReceipt }
+      : undefined;
+  return { kind, sequence, targets, expectedVersions, importTargets, receipt: effectiveReceipt };
 }
 
 const checksByAggregate = new WeakMap<TurnAggregateV1, readonly [

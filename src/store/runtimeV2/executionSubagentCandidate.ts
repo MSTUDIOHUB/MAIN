@@ -2,6 +2,7 @@ import type {
   RuntimeV2Command,
   SchedulerPort,
 } from "../../lib/runtime-v2";
+import { attachFailureReasonCode } from "../../lib/workspaceToolFailure";
 import {
   RUNTIME_V2_SUBAGENT_ACCESS_MODES,
   RUNTIME_V2_SUBAGENT_IMPLEMENTATION_OPERATIONS,
@@ -14,7 +15,8 @@ function boundedArgument(value: unknown, max: number): string {
 
 function commaSeparatedPaths(value: unknown): {
   paths: string[];
-  invalid: boolean;
+  overLimit: boolean;
+  invalidPath: boolean;
   provided: boolean;
 } {
   const raw = typeof value === "string" ? value : "";
@@ -27,9 +29,9 @@ function commaSeparatedPaths(value: unknown): {
         .replace(/\/+$/, "")
     )
     .filter(Boolean);
-  const invalid =
+  const overLimit = entries.length > 6;
+  const invalidPath =
     (provided && entries.length === 0) ||
-    entries.length > 6 ||
     entries.some((entry) =>
       entry === "." ||
       entry.startsWith("/") ||
@@ -39,7 +41,8 @@ function commaSeparatedPaths(value: unknown): {
     );
   return {
     paths: [...new Set(entries)],
-    invalid,
+    overLimit,
+    invalidPath,
     provided,
   };
 }
@@ -121,9 +124,16 @@ export function runtimeV2ModelSelectedSubagentCandidate(
   }
   const explicitlyAllowedScope = commaSeparatedPaths(args.allowed_paths);
   const requiredScope = commaSeparatedPaths(args.required_paths);
-  if (explicitlyAllowedScope.invalid || requiredScope.invalid) {
-    throw new Error(
-      "spawn_subagent allowed_paths and required_paths must contain at most 6 narrow workspace-relative paths (for example, src/main.js). Do not mix in an absolute path, a drive-qualified path, the workspace root, or `..`.",
+  if (explicitlyAllowedScope.invalidPath || requiredScope.invalidPath) {
+    throw attachFailureReasonCode(
+      new Error("spawn_subagent allowed_paths and required_paths must use narrow workspace-relative paths (for example, src/main.js). Do not mix in an absolute path, a drive-qualified path, the workspace root, or `..`."),
+      "subagent_path_invalid",
+    );
+  }
+  if (explicitlyAllowedScope.overLimit || requiredScope.overLimit) {
+    throw attachFailureReasonCode(
+      new Error("spawn_subagent allowed_paths and required_paths must contain at most 6 narrow workspace-relative paths; split larger scopes across multiple spawn_subagent calls."),
+      "subagent_path_limit_exceeded",
     );
   }
   const explicitlyAllowedPaths = explicitlyAllowedScope.paths;

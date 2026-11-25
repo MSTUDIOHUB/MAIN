@@ -1,4 +1,5 @@
 import type { RuntimeV2RunIdentity } from "./runtime-v2/contracts";
+import type { CapsuleModelActivityContext, CapsulePromptProgress } from "./capsuleModelContext";
 
 export type CapsuleModelStage = "preparing" | "acquiring_lane" | "waiting" | "receiving";
 
@@ -16,7 +17,12 @@ interface CapsuleActivityBase {
 }
 
 export type CapsuleLiveActivity = CapsuleActivityBase & (
-  | { readonly kind: "model"; readonly stage: CapsuleModelStage }
+  | {
+      readonly kind: "model";
+      readonly stage: CapsuleModelStage;
+      readonly context?: CapsuleModelActivityContext;
+      readonly promptProgress?: CapsulePromptProgress;
+    }
   | { readonly kind: "tool"; readonly toolName: string; readonly target: string; readonly validation: boolean }
 );
 
@@ -99,18 +105,30 @@ export function beginCapsuleModelActivity(run: RuntimeV2RunIdentity, commandKey:
       ? current : { ...current, stage, startedAt: Date.now() }
   );
   return {
+    setContext(context: CapsuleModelActivityContext | undefined): void {
+      entry.update((current) =>
+        current.kind !== "model" ? current : { ...current, context }
+      );
+    },
+    reportPromptProgress(promptProgress: CapsulePromptProgress): void {
+      entry.update((current) =>
+        current.kind !== "model" || current.stage === "receiving"
+          ? current
+          : { ...current, promptProgress }
+      );
+    },
     acquiringLane: () => setStage("acquiring_lane"),
     preparing: () => setStage("preparing"),
     requestDispatched(): () => void {
       const key = newActivityKey();
       entry.update((current) => current.kind === "model"
-        ? { ...current, key, stage: "waiting", startedAt: Date.now() } : current);
+        ? { ...current, key, stage: "waiting", startedAt: Date.now(), promptProgress: undefined } : current);
       let observed = false;
       return () => {
         if (observed) return;
         observed = true;
         entry.update((current) => current.kind === "model" && current.key === key && current.stage === "waiting"
-          ? { ...current, stage: "receiving", startedAt: Date.now() } : current);
+          ? { ...current, stage: "receiving", startedAt: Date.now(), promptProgress: undefined } : current);
       };
     },
     finish: entry.close,

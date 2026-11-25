@@ -31,7 +31,9 @@ export interface RuntimeV2ExecutePhaseTransition {
     | "pending_validation_call"
     | "mutation_committed"
     | "unvalidated_mutation_pending"
-    | "validation_failed";
+    | "validation_failed"
+    | "delegated_mutation_active"
+    | "delegated_mutation_committed";
 }
 
 export interface RuntimeV2ExecutePhaseTransitionInput {
@@ -488,6 +490,21 @@ export function decideRuntimeV2ExecutePhaseTransition(
   }
 
   if (state.pendingToolCalls.length > 0) return null;
+  const activeWriteChild = Boolean(
+    state.run &&
+    (state.subagents || []).some((job) =>
+      job.parentRunId === state.run!.identity.runId &&
+      (job.status === "queued" || job.status === "running") &&
+      (job.taskKind === "implement" || job.accessMode === "write")
+    ),
+  );
+  if (activeWriteChild && state.phase === "observing") {
+    return {
+      from: "observing",
+      to: "acting",
+      reason: "delegated_mutation_active",
+    };
+  }
   const compilationFailed = unresolvedUnityEditorCheck(state)?.result.status === "failed";
   if (compilationFailed && state.phase === "validating") {
     return { from: "validating", to: "acting", reason: "validation_failed" };
@@ -496,10 +513,13 @@ export function decideRuntimeV2ExecutePhaseTransition(
   const phaseEvents = currentPhaseEvents(state);
 
   const continued = approvedRuntimeV2PlanContinuation(state.events);
-  if (state.phase === "acting" || state.phase === "observing" && continued) {
-    const latestMutation = latestRuntimeV2WorkspaceChange(state);
-    const latestPhaseMutationSequence = latestMutation && phaseEvents.includes(latestMutation) ? latestMutation.sequence : -1;
-    const latestMutationSequence = Math.max(continued?.sequence ?? -1, latestMutation?.sequence ?? -1);
+  const committedMutation = latestRuntimeV2WorkspaceChange(state);
+  if (
+    state.phase === "acting" ||
+    (state.phase === "observing" && (continued || committedMutation || (state.strategy === "plan" && approvedPlanCoverage?.allMutationTargetsCovered)))
+  ) {
+    const latestPhaseMutationSequence = committedMutation && phaseEvents.includes(committedMutation) ? committedMutation.sequence : -1;
+    const latestMutationSequence = Math.max(continued?.sequence ?? -1, committedMutation?.sequence ?? -1);
     const latestValidationSequence = latestSequence(
       state.events
         .filter(isRuntimeV2ValidationAttempt)
@@ -518,6 +538,13 @@ export function decideRuntimeV2ExecutePhaseTransition(
         reason: latestPhaseMutationSequence >= 0
           ? "mutation_committed"
           : "unvalidated_mutation_pending",
+      };
+    }
+    if (state.phase === "observing" && committedMutation && state.strategy === "plan" && !approvedPlanCoverage?.allMutationTargetsCovered) {
+      return {
+        from: "observing",
+        to: "acting",
+        reason: "delegated_mutation_committed",
       };
     }
   }

@@ -21,6 +21,28 @@ export function resolveSessionRuntimeKey(
   return `${resolveSessionWorkspaceKey(workspaceOrScope)}:${sessionId}`;
 }
 
+export interface ParsedSessionRuntimeKey {
+  workspaceKey: string;
+  currentWorkspace: string;
+  sessionId: number;
+}
+
+export function parseSessionRuntimeKey(
+  sessionKey: string | null | undefined,
+): ParsedSessionRuntimeKey | null {
+  const normalized = String(sessionKey || "").trim();
+  const separatorIndex = normalized.lastIndexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === normalized.length - 1) return null;
+  const sessionId = Number(normalized.slice(separatorIndex + 1));
+  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return null;
+  const workspaceKey = normalized.slice(0, separatorIndex);
+  return {
+    workspaceKey,
+    currentWorkspace: workspaceKey === GLOBAL_CHAT_KEY ? "" : workspaceKey,
+    sessionId,
+  };
+}
+
 export interface SessionModelConfig {
   provider: string;
   endpoint: string;

@@ -17,6 +17,7 @@ export interface RuntimeV2ReadOnlyLoopInput {
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
   readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly signal: AbortSignal;
+  readonly isExternalCancellationPending?: () => boolean;
   readonly initial?: RuntimeV2ControllerSnapshot;
   readonly now: () => number;
   /** Explicit caller budget only; ordinary local-model Turns have no deadline. */
@@ -36,7 +37,10 @@ export interface RuntimeV2ReadOnlyLoopResult {
 
 /** Independent read-only strategies sharing the canonical controller. */
 export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput): Promise<RuntimeV2ReadOnlyLoopResult> {
-  const controller = new RuntimeV2Controller(input.ports, input.initial, { abortSignal: input.signal });
+  const controller = new RuntimeV2Controller(input.ports, input.initial, {
+    abortSignal: input.signal,
+    isExternalCancellationPending: input.isExternalCancellationPending,
+  });
   if (!input.initial) await controller.admit({
     turn: input.turn, run: input.run, strategy: input.strategy || "chat", objective: input.objective,
     capabilityRestrictions: input.capabilityRestrictions,
@@ -50,7 +54,11 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
     const state = controller.snapshot().aggregate;
     if (!state) throw new Error("RUNTIME_V2_READ_ONLY_AGGREGATE_MISSING");
     if (state.terminalOutcome) break;
-    if (input.signal.aborted) { await controller.driveOnce(); continue; }
+    if (input.signal.aborted) {
+      if (input.isExternalCancellationPending?.()) throw new Error("RUNTIME_V2_EXTERNAL_CANCELLATION_PENDING");
+      await controller.driveOnce();
+      continue;
+    }
     const blocked = input.blocked?.();
     if (blocked) {
       await controller.driveOnce({ resultKind: "blocked", resultReason: blocked.reason, finalMarkdown: blocked.finalMarkdown });

@@ -65,27 +65,16 @@ export class RuntimeV2Controller {
   private revision = 0;
   private readonly abortSignal: AbortSignal | null;
 
-  constructor(
-    private readonly ports: RuntimeV2Ports,
-    initial?: RuntimeV2ControllerSnapshot,
-    private readonly options?: { readonly abortSignal?: AbortSignal; readonly logEvent?: (event: string, data: Record<string, unknown>) => void },
-  ) {
+  constructor(private readonly ports: RuntimeV2Ports, initial?: RuntimeV2ControllerSnapshot, private readonly options?: { readonly abortSignal?: AbortSignal; readonly isExternalCancellationPending?: () => boolean; readonly logEvent?: (event: string, data: Record<string, unknown>) => void }) {
     this.aggregate = initial?.aggregate || null;
     this.revision = initial?.revision || 0;
     this.abortSignal = options?.abortSignal || null;
   }
 
-  snapshot(): RuntimeV2ControllerSnapshot {
-    return { aggregate: this.aggregate, revision: this.revision };
-  }
+  snapshot(): RuntimeV2ControllerSnapshot { return { aggregate: this.aggregate, revision: this.revision }; }
 
   private eventBase(): { readonly schemaVersion: typeof RUNTIME_V2_EVENT_SCHEMA_VERSION; readonly sequence: number; readonly eventId: string; readonly at: number } {
-    return {
-      schemaVersion: RUNTIME_V2_EVENT_SCHEMA_VERSION,
-      sequence: this.aggregate?.nextSequence || 0,
-      eventId: this.ports.clockId.nextId("runtime-v2-event"),
-      at: this.ports.clockId.now(),
-    };
+    return { schemaVersion: RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: this.aggregate?.nextSequence || 0, eventId: this.ports.clockId.nextId("runtime-v2-event"), at: this.ports.clockId.now() };
   }
 
   /** Controller-owned identity prevents a late callback publishing a stale
@@ -328,19 +317,14 @@ export class RuntimeV2Controller {
     sourceEvent: RuntimeV2Event,
   ): Promise<void> {
     const state = this.requireAggregate();
-    for (const draft of runtimeV2SubagentHandoffApplicationDrafts({
-      state,
-      sourceEvent,
-    })) {
-      await this.apply(asEvent({
-        ...this.eventBase(),
-        ...draft,
-      }));
+    for (const draft of runtimeV2SubagentHandoffApplicationDrafts({ state, sourceEvent })) {
+      await this.apply(asEvent({ ...this.eventBase(), ...draft }));
     }
   }
 
   async driveOnce(input: RuntimeV2DecisionInput = {}): Promise<boolean> {
     if (this.abortSignal?.aborted) {
+      if (this.options?.isExternalCancellationPending?.()) throw new Error("RUNTIME_V2_EXTERNAL_CANCELLATION_PENDING");
       if (this.aggregate?.run && !this.aggregate.terminalOutcome) {
         await this.finishTerminal("canceled", "用户已停止本轮执行；已保留此前已提交的证据和修改。");
       }
@@ -499,6 +483,7 @@ export class RuntimeV2Controller {
       }
     } catch (error) {
       if (this.abortSignal?.aborted) {
+        if (this.options?.isExternalCancellationPending?.()) throw new Error("RUNTIME_V2_EXTERNAL_CANCELLATION_PENDING");
         await this.settleScheduledCommand(command, "canceled");
         if (!this.requireAggregate().terminalOutcome) {
           await this.finishTerminal("canceled", "用户已停止本轮执行；已保留此前已提交的证据和修改。");
@@ -511,6 +496,9 @@ export class RuntimeV2Controller {
 
   /** Resume one durable in-flight command without inventing a new decision. */
   async resumeScheduled(): Promise<boolean> {
+    if (this.abortSignal?.aborted && this.options?.isExternalCancellationPending?.()) {
+      throw new Error("RUNTIME_V2_EXTERNAL_CANCELLATION_PENDING");
+    }
     const state = this.requireAggregate();
     const command = state.scheduledCommands[0];
     if (!command || state.terminalOutcome) return false;
@@ -568,6 +556,7 @@ export class RuntimeV2Controller {
   private async settleScheduledCommand(
     command: RuntimeV2Command,
     status: "succeeded" | "failed" | "canceled",
+    failureReasonCode?: string,
   ): Promise<void> {
     const state = this.requireAggregate();
     if (!state.run || !state.scheduledCommands.some((item) => item.idempotencyKey === command.idempotencyKey)) return;
@@ -577,6 +566,7 @@ export class RuntimeV2Controller {
       run: state.run.identity,
       idempotencyKey: command.idempotencyKey,
       status,
+      ...(failureReasonCode ? { failureReasonCode } : {}),
     }));
   }
 
@@ -586,9 +576,14 @@ export class RuntimeV2Controller {
       command,
       error,
     });
+    const rawFailureCode = error && typeof error === "object" && "failureReasonCode" in error
+      ? (error as { failureReasonCode?: unknown }).failureReasonCode
+      : undefined;
+    const failureReasonCode = typeof rawFailureCode === "string" && rawFailureCode.trim() ? rawFailureCode.trim() : undefined;
     await this.settleScheduledCommand(
       command,
       decision.kind === "lifecycle_boundary" ? "canceled" : "failed",
+      decision.kind === "lifecycle_boundary" ? undefined : failureReasonCode,
     );
     const state = this.requireAggregate();
     if (

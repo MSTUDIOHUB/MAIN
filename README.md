@@ -25,9 +25,9 @@ MAIN 是一个基于 Tauri 2、React、TypeScript 与 Rust 构建的本地优先
 
 - 连接本地模型：LM Studio、Ollama、OMLX。
 - 连接云端模型：OpenAI Compatible、OpenAI Responses API、Anthropic、Gemini 等协议。
-- 用自然语言提出任务；需要先确认方案时使用 `/计划`，维护项目约束时使用 `/规则`。
+- 用自然语言提出任务。使用 `/计划` 先审阅方案，使用 `/grill-me` 先讨论关键取舍，使用 `/规则` 维护项目约束。
 - 使用文件、终端、PTY、浏览器验证、知识库和 MCP 工具完成任务。
-- 在写文件、执行命令和高风险操作前显示审批与 Diff。
+- 按当前权限策略展示需要确认的操作。文件变更可通过 Diff 审阅。
 - 持久化 Workspace、Session、Turn 和 Run，支持暂停、恢复和结构化结论。
 - 用 Trace、Replay、Golden 与测试夹具验证 Agent 行为，而不只验证最终文本。
 - 通过 Skills、协议包、Hooks 和工作区规则扩展专用工作流。
@@ -40,8 +40,8 @@ MAIN 已在多个版本中使用 Codex 参与架构重构、测试补强和文�
 
 | 你想改什么 | 主要入口 |
 | --- | --- |
-| 接入新的模型或本地推理服务 | `src/lib/providerCompatibility.ts`、`src/lib/modelDiscovery.ts`、`src/lib/cloudProtocol.ts` |
-| 修改 Agent 循环、计划与恢复策略 | `src/lib/orchestrator/`、`src/lib/planLifecycle.ts`、`src/store/submitAsyncWorkflowRun.ts` |
+| 接入新的模型或本地推理服务 | [设置中的本地模型扫描](src/components/SettingsModal.tsx)、[Provider 兼容](src/lib/providerCompatibility.ts)、[云端协议](src/lib/cloudProtocol.ts) |
+| 修改 Agent 循环、计划与恢复策略 | [提交接纳](src/store/submitAsyncWorkflowRun.ts)、[运行入口](src/store/submitRuntimeRunner.ts)、[生产 Runner](src/store/runtimeV2/)、[Runtime v2 核心](src/lib/runtime-v2/) |
 | 增加或约束工具 | `src/lib/toolSchemas.ts`、`src/lib/runtimeTools.ts`、`src/lib/toolExecutor.ts` |
 | 加强文件、Shell、网络与进程安全 | `src-tauri/src/trusted_execution.rs`、`src-tauri/src/network_guard.rs` |
 | 定制桌面交互、Diff、计划和终端 | `src/components/`、`src/store/` |
@@ -149,7 +149,7 @@ npm run build:windows
 
 - [快速开始](docs/main-manual/quickstart.md)
 - [本地模型](docs/main-manual/local-models.md) / [云端模型](docs/main-manual/cloud-models.md)
-- [任务入口与计划](docs/main-manual/run-modes.md)
+- [任务入口](docs/main-manual/run-modes.md) / [计划与结构化访谈](docs/main-manual/plan-mode.md)
 - [权限与审批](docs/main-manual/permissions-and-approval.md)
 - [MCP 服务器](docs/main-manual/mcp.md)
 - [架构与唯一所有权](docs/ARCHITECTURE.md)
@@ -157,6 +157,7 @@ npm run build:windows
 - [Session 持久化](docs/SESSION_PERSISTENCE.md)
 - [受信任执行边界](docs/TRUSTED_EXECUTION.md)
 - [测试、Trace 与 Replay](docs/TESTING_AND_REPLAY.md)
+- [历史设计与排障归档](docs/archive/README.md)
 
 ## 参与贡献
 

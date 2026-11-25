@@ -21,6 +21,8 @@ export interface RuntimeV2SubmissionContext {
   readonly networkRead?: import("../../lib/networkRead").NetworkReadPolicy;
   readonly knowledgeContext?: import("../../lib/knowledgeReferences").KnowledgeContextPacket;
   readonly planPurpose?: "plan" | "rules";
+  readonly planInterviewMode?: "grill";
+  readonly allowVoluntaryPlanQuestions?: boolean;
   readonly sourcePlanDraft?: import("../../lib/planDrafts").PlanDraftRecord;
   readonly approvedPlanContinuation?: import("../../lib/runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   readonly turnId: string;

@@ -1,4 +1,12 @@
-import { approvedRuntimeV2PlanContinuation, deriveRuntimeV2PlanExecutionFrontier, resolveRuntimeV2PlanMutationScope, resolveRuntimeV2PlanValidationScope } from "../../lib/runtime-v2";
+import {
+  approvedRuntimeV2PlanContinuation,
+  deriveRuntimeV2PlanExecutionFrontier,
+  deriveRuntimeV2ReviewDispositionLedger,
+  isApprovedSameTurnDefectCorrection,
+  resolveRuntimeV2PlanMutationScope,
+  resolveRuntimeV2PlanValidationScope,
+  validateResolveReviewFindingCall,
+} from "../../lib/runtime-v2";
 import { getShellToolCwd } from "../../lib/toolExecutionContract";
 import { normalizeValidationWorkspaceCwd, unityValidationInvocations } from "../../lib/validationContract";
 import { isWorkspaceMutationToolName, resolveWorkspaceMutationRequests, UNITY_CREATE_SCENE_TOOL } from "../../lib/workspaceMutationTools";
@@ -70,7 +78,14 @@ export function validateToolAgainstApprovedPlan(input: {
       return target !== null && target !== "." && (ready.some(step =>
         (unresolvedWrite ? step.operation === "create" || step.operation === "modify" : step.operation === request.operation) &&
         step.targets.some(path => normalizeValidationWorkspaceCwd(path, workspace) === target)) ||
-        (request.operation === "modify" || unresolvedWrite) && isApprovedUnityCorrection(input.aggregate, target));
+        (request.operation === "modify" || unresolvedWrite) && (
+          isApprovedUnityCorrection(input.aggregate, target) ||
+          isApprovedSameTurnDefectCorrection({
+            aggregate: input.aggregate,
+            targetPath: target,
+            operation: "modify",
+          })
+        ));
     });
     if (!scoped) return { allowed: false, reason: "A continued Plan allows only the exact pending, dependency-ready file operations in its approval.",
       failureKind: "not_authorized", reasonCode: "continued_plan_mutation_scope" };
@@ -116,27 +131,108 @@ export function validateToolAgainstApprovedPlan(input: {
   if (input.toolName === "write_file" && input.writeFileTarget) {
     const scope = resolveRuntimeV2PlanMutationScope({
       plan: approved.plan,
+      aggregate: input.aggregate,
       requestedTargets: [input.writeFileTarget.path],
       requestedMutations: [{ target: input.writeFileTarget.path, operation: input.writeFileTarget.exists ? "modify" : "create" }],
     });
-    if (!scope.allowed && !(input.writeFileTarget.exists && isApprovedUnityCorrection(input.aggregate, input.writeFileTarget.path))) return {
+    if (!scope.allowed && !(input.writeFileTarget.exists && (
+      isApprovedUnityCorrection(input.aggregate, input.writeFileTarget.path) ||
+      isApprovedSameTurnDefectCorrection({
+        aggregate: input.aggregate,
+        targetPath: input.writeFileTarget.path,
+        operation: "modify",
+      })
+    ))) return {
       allowed: false, reason: "The actual write_file operation does not match the approved Plan's exact target and create/modify scope.",
       failureKind: "not_authorized", reasonCode: "approved_plan_write_file_operation_scope",
     };
   }
+  const hasFailedUnityCheck = [deriveUnityCompilation(input.aggregate), deriveUnityShaderImport(input.aggregate)]
+    .some(check => check?.receipt?.result.status === "failed");
+  const hasReviewFindings = deriveRuntimeV2ReviewDispositionLedger(input.aggregate).findings.length > 0;
   if (!continued && input.toolName !== "write_file" && input.command.kind === "execute_tool" &&
       isWorkspaceMutationToolName(input.toolName) &&
-      [deriveUnityCompilation(input.aggregate), deriveUnityShaderImport(input.aggregate)]
-        .some(check => check?.receipt?.result.status === "failed")) {
+      (hasFailedUnityCheck || hasReviewFindings)) {
     const workspace = input.aggregate.turn.workspaceKey;
     const requests = resolveWorkspaceMutationRequests(input.toolName, input.args, input.target);
-    if (requests.some(request => unityCompilationTarget(request.target, workspace) || unityShaderImportTarget(request.target, workspace)) &&
-        !requests.every(request => resolveRuntimeV2PlanMutationScope({
-          plan: approved.plan, requestedTargets: [request.target], requestedMutations: [request],
-        }).allowed || request.operation === "modify" && isApprovedUnityCorrection(input.aggregate, request.target))) {
-      return { allowed: false, reason: "Editor diagnostic fixes must stay within the exact reviewed Plan changes.",
+    const shouldEnforce = (hasFailedUnityCheck && requests.some(request =>
+      unityCompilationTarget(request.target, workspace) || unityShaderImportTarget(request.target, workspace))) ||
+      hasReviewFindings;
+    if (shouldEnforce && !requests.every(request => resolveRuntimeV2PlanMutationScope({
+      plan: approved.plan,
+      aggregate: input.aggregate,
+      requestedTargets: [request.target],
+      requestedMutations: [request],
+    }).allowed || (request.operation === "modify" && (
+      isApprovedUnityCorrection(input.aggregate, request.target) ||
+      isApprovedSameTurnDefectCorrection({
+        aggregate: input.aggregate,
+        targetPath: request.target,
+        operation: "modify",
+      })
+    )))) {
+      return { allowed: false, reason: "Fixes must stay within the exact reviewed Plan changes or pre-authorized same-turn repair scope.",
         failureKind: "not_authorized", reasonCode: "approved_plan_mutation_scope" };
     }
   }
   return { allowed: true, reason: null, failureKind: null, reasonCode: null };
+}
+
+export function validateResolveReviewFindingToolAuthorization(
+  aggregate: TurnAggregateV1 | null,
+  args: Readonly<Record<string, unknown>>,
+): RuntimeV2PlanToolAuthorizationResult {
+  if (!aggregate) {
+    return {
+      allowed: false,
+      reason: "Missing Turn aggregate for resolve_review_finding.",
+      failureKind: "not_authorized",
+      reasonCode: "review_finding_aggregate_missing",
+    };
+  }
+  const validation = validateResolveReviewFindingCall({ aggregate, args });
+  return validation.ok
+    ? { allowed: true, reason: null, failureKind: null, reasonCode: null }
+    : {
+        allowed: false,
+        reason: validation.message,
+        failureKind: "protocol_invalid",
+        reasonCode: "review_finding_disposition_invalid",
+      };
+}
+
+export function executeResolveReviewFindingReceiptJson(
+  aggregate: TurnAggregateV1 | null | undefined,
+  executionArgs: Readonly<Record<string, unknown>>,
+): string {
+  if (!aggregate) throw new Error("Missing Turn aggregate for resolve_review_finding.");
+  const res = validateResolveReviewFindingCall({ aggregate, args: executionArgs });
+  if (!res.ok) throw new Error(res.message);
+  return JSON.stringify({
+    status: "review_finding_resolved",
+    finding_id: res.finding.findingId,
+    disposition: res.disposition,
+    summary: res.summary,
+    verification_evidence_ids: res.verificationEvidenceIds,
+    target_paths: res.targetPaths,
+    criterion_ids: res.criterionIds,
+    breaks_acceptance: res.breaksAcceptance,
+    target_hashes: res.targetHashes,
+    effect: "no_workspace_change",
+  });
+}
+
+export function requiresApprovedPlanRepairLease(
+  aggregate: TurnAggregateV1,
+  toolName: string,
+  args: Readonly<Record<string, unknown>>,
+  target: string,
+): boolean {
+  return isWorkspaceMutationToolName(toolName) &&
+    resolveWorkspaceMutationRequests(toolName, { ...args }, target).some((request) =>
+      request.operation === "modify" && (
+        isApprovedUnityCorrection(aggregate, request.target) ||
+        isApprovedSameTurnDefectCorrection({ aggregate, targetPath: request.target, operation: "modify" })
+      ),
+    );
 }

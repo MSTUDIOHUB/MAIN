@@ -6,12 +6,16 @@ import { WORK_PLAN_V1_SCHEMA_VERSION, isRuntimeV2ProviderTransportsUnavailableEr
 import { bootstrapRuntimeV2Plan } from "./planBootstrap";
 import { executeReadOnlyPlanTool, settlePlanTool } from "./planEvidencePort";
 import { requestPlanModel } from "./planProviderPort";
-import { handleRuntimeV2PlanProviderAdmissionRejection } from "./planProviderAdmission";
+import {
+  derivePlanAdmissionRejectionRecovery,
+  handleRuntimeV2PlanProviderAdmissionRejection,
+  narrowedPlanSubmissionTools,
+} from "./planProviderAdmission";
 import { requiredPlanCollaborationFailure, type RuntimeV2PlanTerminalFailure } from "./planRequirement";
 import { handleRequiredPlanCollaborationProviderTimeout, requiredPlanCollaborationProviderTimeoutFailure, restoreRequiredPlanCollaborationProviderTimeoutGuidance } from "./planCollaborationAcquisition";
 import { createRuntimeV2PlanCollaboration } from "./planCollaboration";
 import { completeRuntimeV2Plan, recoverRuntimeV2PlanFailure, settleRuntimeV2PlanCompletion } from "./planCompletion";
-import { SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlanArguments, type PlanModelStage, type PlanProviderTransport } from "./planModelProtocol";
+import { SUBMIT_WORK_PLAN_TOOL_NAME, isPlanSubmissionStage, decodeStructuredPlanArguments, planModelTools, type PlanModelStage, type PlanProviderTransport } from "./planModelProtocol";
 import { runtimeV2ParallelReadCount } from "./executionText";
 import type { RuntimeV2PlanRunnerInput } from "./planRunnerTypes";
 import { assessPlanSubmission } from "./planSubmissionAssessment";
@@ -174,18 +178,27 @@ export async function runSubmitRuntimeV2Plan(
       const draftOnlyRecovery = recoveredSubmission?.draftOnly;
       try {
         const collaboration = planCollaboration.current().payload;
+        const admissionRecovery = !(recoveredQuestion?.result ?? recoveredSubmission?.result)
+          ? derivePlanAdmissionRejectionRecovery({ aggregate: ledger.snapshot(), run: identity.run, collaboration, submissionRepairPending })
+          : { consecutiveRejections: 0, action: "none" as const };
+        if (admissionRecovery.action === "exhausted") {
+          if (planCollaboration.activeChildCount() > 0) { await planCollaboration.joinActive("plan_recovery_waits_for_active_children"); continue; }
+          terminalFailure = { resultKind: "error", reason: "模型连续返回当前阶段不可用的工具调用，切换为收窄范围的方案生成请求后仍未产出可审阅的计划。", detailCode: "runtime_v2_plan_admission_rejection_exhausted" };
+          break;
+        }
         repeatedArgumentRejections = (ledger.snapshot()?.events || []).filter((entry) =>
           recovery && entry.at >= recovery.startedAt && entry.type === "provider.responded" &&
-          entry.result.diagnostics?.some((diagnostic) =>
-            diagnostic.code === "tool_arguments_rejected"
-          )
-        ).length >= 2;
+          entry.result.diagnostics?.some((diagnostic) => diagnostic.code === "tool_arguments_rejected")).length >= 2;
+        const narrowRejectionSynthesis = admissionRecovery.action === "narrow_to_synthesis" && !submissionRepairPending && !validationRepair;
+        if (narrowRejectionSynthesis && planCollaboration.activeChildCount() > 0) { await planCollaboration.joinActive("plan_recovery_waits_for_active_children"); continue; }
+        if (narrowRejectionSynthesis) stage = "synthesis";
         compactRecovery = stage === "synthesis" &&
-          (compactRecoveryStarted || (!submissionRepairPending && synthesisRecoveryCount > 0) || repeatedArgumentRejections);
-        if (compactRecovery && !compactRecoveryStarted) {
-          synthesisTransport = "structured_response";
-          compactRecoveryStarted = true;
-        }
+          (compactRecoveryStarted || (!submissionRepairPending && synthesisRecoveryCount > 0) || repeatedArgumentRejections || narrowRejectionSynthesis);
+        if (compactRecovery && !compactRecoveryStarted) { synthesisTransport = "structured_response"; compactRecoveryStarted = true; }
+        if (narrowRejectionSynthesis && admissionRecovery.consecutiveRejections >= 3) synthesisTransport = "native_tool";
+        const narrowedTools = narrowRejectionSynthesis && synthesisTransport === "native_tool"
+          ? narrowedPlanSubmissionTools(planModelTools({ ...input.context, networkRead: ledger.snapshot()?.networkRead, knowledgeContext: ledger.snapshot()?.knowledgeContext }), { submissionRepairPending: false })
+          : undefined;
         if (repetition?.kind === "alternate" || validationRepair) {
           stage = "synthesis";
           compactRecovery = compactRecoveryStarted = true;
@@ -223,6 +236,7 @@ export async function runSubmitRuntimeV2Plan(
           explicitFallback,
           repetitionFallback: !validationRepair && repetition?.kind === "alternate",
           validationRepair,
+          ...(narrowedTools?.length ? { customTools: narrowedTools } : {}),
           logStoreEvent: input.logStoreEvent,
         });
         recoveredQuestion = null;

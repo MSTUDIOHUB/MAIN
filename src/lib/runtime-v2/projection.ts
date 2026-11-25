@@ -6,9 +6,11 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
-import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
-import { runtimeV2DirectExecuteMutationTargets } from "./validationReceipt";
-import { deriveUnityCompilation, deriveUnityShaderImport } from "./unityCompilation";
+import {
+  buildRuntimeV2DeterministicPlanSummary,
+  deriveRuntimeV2TerminalAcceptanceFacts,
+  renderRuntimeV2AcceptanceSection,
+} from "./terminalFacts";
 
 function markdownCode(value: unknown, language: "zh" | "en" = "zh"): string {
   const text = String(value || "").trim().replace(/`/g, "");
@@ -227,74 +229,107 @@ export function buildRuntimeV2FinalProjection(
   language: "zh" | "en" = "zh",
 ): RuntimeV2Projection {
   const trimmedFinal = finalMarkdown?.trim();
-  if (trimmedFinal) {
-    return projection(
-      aggregate,
-      "final",
-      id,
-      trimmedFinal,
-      "final",
-      `final:${resultKind}:${reason}`,
+  const facts = deriveRuntimeV2TerminalAcceptanceFacts(aggregate);
+  const hasLedgerFacts =
+    facts.hasApprovedWorkPlan ||
+    facts.deliveredFiles.length > 0 ||
+    facts.automatedValidations.totalCount > 0 ||
+    facts.unityChecks.length > 0 ||
+    facts.reviewLedger.findings.length > 0;
+  if (
+    aggregate.strategy === "chat" ||
+    aggregate.strategy === "analyze" ||
+    (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan) ||
+    !hasLedgerFacts
+  ) {
+    if (trimmedFinal) {
+      return projection(
+        aggregate,
+        "final",
+        id,
+        trimmedFinal,
+        "final",
+        `final:${resultKind}:${reason}`,
+      );
+    }
+    if (
+      aggregate.strategy === "chat" ||
+      aggregate.strategy === "analyze" ||
+      (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan)
+    ) {
+      return projection(
+        aggregate,
+        "final",
+        id,
+        `### ${terminalTitle(resultKind, language)}\n\n${reason}`,
+        "final",
+        `final:${resultKind}:${reason}`,
+      );
+    }
+    const isEn = language === "en";
+    const manualChecks = (aggregate.sealedWorkPlan?.draft.validations || []).filter(
+      (validation) => !validation.required,
     );
-  }
-  if (aggregate.strategy === "chat" || aggregate.strategy === "analyze" || (aggregate.strategy === "plan" && !aggregate.sealedWorkPlan)) {
-    return projection(
-      aggregate,
-      "final",
-      id,
-      `### ${terminalTitle(resultKind, language)}\n\n${reason}`,
-      "final",
-      `final:${resultKind}:${reason}`,
-    );
-  }
-  const mutationTargets = runtimeV2DirectExecuteMutationTargets(aggregate);
-  const validations = aggregate.events.filter(
-    isRuntimeV2ValidationAttempt,
-  );
-  const passedValidations = validations.filter((event) => event.passed).length;
-  const failedValidations = validations.length - passedValidations;
-  const isEn = language === "en";
-  const mutationLine = mutationTargets.length > 0
-    ? isEn
-      ? `- Modified: ${mutationTargets.map((t) => markdownCode(t, "en")).join(", ")}.`
-      : `- 已修改：${mutationTargets.map((t) => markdownCode(t, "zh")).join("、")}。`
-    : isEn
-      ? "- No committed file changes in this turn."
-      : "- 本轮没有已提交的文件修改。";
-  const manualChecks = validations.length === 0
-    ? (aggregate.sealedWorkPlan?.draft.validations || []).filter(validation => !validation.required)
-    : [];
-  const validationLine = validations.length > 0
-    ? isEn
-      ? `- Verification: ${passedValidations} passed, ${failedValidations} failed.`
-      : `- 验证结果：${passedValidations} 次通过，${failedValidations} 次未通过。`
-    : manualChecks.length > 0
+    const emptyValidationLine = manualChecks.length > 0
       ? isEn
-        ? `- Automated tests: not run (manual / external verification confirmed).\n- Manual / external verification checklist:\n${manualChecks.map(item => `  - ${item.expectedOutcome}`).join("\n")}`
-        : `- 自动测试：未运行（已按用户确认采用人工/外部验证）。\n- 待你人工/外部确认：\n${manualChecks.map(item => `  - ${item.expectedOutcome}`).join("\n")}`
-    : isEn
-      ? "- No confirmed verification run completed in this turn."
-      : "- 本轮没有完成可确认的验证。";
-  const editorChecks = [
-    [isEn ? "C# compilation" : "C# 编译", deriveUnityCompilation(aggregate)?.receipt],
-    [isEn ? "Shader import" : "Shader 导入", deriveUnityShaderImport(aggregate)?.receipt],
-  ] as const;
-  const editorLines = editorChecks.flatMap(([name, receipt]) => receipt && receipt.result.status !== "not_unity_project" ? [
-    isEn
-      ? `- ${name} ${receipt.result.status === "passed" ? "passed" : receipt.result.status === "failed" ? "has remaining errors" : "is pending verification"}.`
-      : `- ${name}${receipt.result.status === "passed" ? "通过" : receipt.result.status === "failed" ? "仍有错误" : "待验证"}。`,
-  ] : []);
+        ? `- Automated tests: not run (manual / external verification confirmed).\n- Manual / external verification checklist:\n${manualChecks.map((item) => `  - ${item.expectedOutcome}`).join("\n")}`
+        : `- 自动测试：未运行（已按用户确认采用人工/外部验证）。\n- 待你人工/外部确认：\n${manualChecks.map((item) => `  - ${item.expectedOutcome}`).join("\n")}`
+      : isEn
+        ? "- No confirmed verification run completed in this turn."
+        : "- 本轮没有完成可确认的验证。";
+    return projection(
+      aggregate,
+      "final",
+      id,
+      [
+        `### ${terminalTitle(resultKind, language)}`,
+        isEn
+          ? "- No committed file changes in this turn."
+          : "- 本轮没有已提交的文件修改。",
+        emptyValidationLine,
+        /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
+      ].filter(Boolean).join("\n\n"),
+      "final",
+      `final:${resultKind}:${reason}`,
+    );
+  }
+  const sectionHeading = language === "en"
+    ? "#### Delivery & Acceptance Facts"
+    : "#### 验收与交付事实";
+  if (trimmedFinal) {
+    const appendedReason = trimmedFinal.includes(reason) ? undefined : reason;
+    return projection(
+      aggregate,
+      "final",
+      id,
+      [
+        trimmedFinal,
+        sectionHeading,
+        renderRuntimeV2AcceptanceSection(facts, language, appendedReason),
+      ].join("\n\n"),
+      "final",
+      `final:${resultKind}:${reason}`,
+    );
+  }
+  if (facts.hasApprovedWorkPlan) {
+    return projection(
+      aggregate,
+      "final",
+      id,
+      buildRuntimeV2DeterministicPlanSummary(aggregate, facts, resultKind, reason, language),
+      "final",
+      `final:${resultKind}:${reason}`,
+    );
+  }
   return projection(
     aggregate,
     "final",
     id,
     [
       `### ${terminalTitle(resultKind, language)}`,
-      mutationLine,
-      ...(validations.length > 0 || editorLines.length === 0 ? [validationLine] : []),
-      ...editorLines,
-      /^[a-z][a-z0-9_:-]*$/.test(reason) ? "" : `- ${reason}`,
-    ].filter(Boolean).join("\n\n"),
+      sectionHeading,
+      renderRuntimeV2AcceptanceSection(facts, language, reason),
+    ].join("\n\n"),
     "final",
     `final:${resultKind}:${reason}`,
   );

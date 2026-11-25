@@ -121,6 +121,7 @@ import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { selectCapsuleLiveGuidance } from "../lib/capsuleCommentary";
 import { getCapsuleLiveActivitySnapshot, subscribeCapsuleLiveActivity } from "../lib/capsuleLiveActivity";
+import { formatCapsuleModelDetailWithProgress } from "../lib/capsuleModelContext";
 import { buildCapsuleActivityHistory } from "../lib/capsuleActivityHistory";
 import { describeCapsuleToolActivity } from "../lib/capsuleToolActivity";
 import CapsuleActivityPopover, { CapsuleActivityText, type CapsuleActivityLine } from "./CapsuleActivityPopover";
@@ -1904,7 +1905,7 @@ function TurnArchiveStepCard({
         <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap break-words text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
           {renderCompactMarkdownText(primaryText)}
         </span>
-        {isLive && summaryText && summaryText !== primaryText && (
+        {(isLive || step.status === "failed" || step.status === "blocked" || step.status === "not_executed") && summaryText && summaryText !== primaryText && (
           <span className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-muted)]">
             {renderCompactMarkdownText(summaryText)}
           </span>
@@ -2909,8 +2910,9 @@ export default function ChatArea({
     return resolvePinnedConversationTurn(visibleConversationTurns, currentTurnId);
   }, [visibleConversationTurns, currentTurnId]);
   const composerHasLiveTurnOwner = Boolean(
-    currentWorkspace &&
     pinnedTurn &&
+    activeSessionKey &&
+    activeSessionEpoch &&
     !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
     (
       (
@@ -4356,6 +4358,20 @@ export default function ChatArea({
               />
             </React.Fragment>
           )}
+          {isTurnExpanded &&
+            isActiveRunningTurn &&
+            requestStage &&
+            !blocks.some((block) => block.type === "agent" && block.isStreaming && String(block.content || "").trim().length > 0) && (
+            <div
+              data-testid="chat-area-live-model-progress"
+              className="ml-9 flex min-w-0 max-w-[calc(100%-2.25rem)] items-start gap-2 rounded-xl border border-[var(--surface-border-soft)] bg-[var(--surface-1)] px-3 py-2 text-[12px] text-[var(--surface-text)]"
+            >
+              <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-[var(--accent)]" />
+              <div className="min-w-0 flex-1">
+                <CapsuleActivityText line={capsuleActivityLine} language={language} />
+              </div>
+            </div>
+          )}
 
           {!isTurnExpanded ? (
             <React.Fragment key="collapsed-process-visible-messages">
@@ -4635,8 +4651,14 @@ export default function ChatArea({
       waiting: { zh: "等待模型响应", en: "Waiting for the model" },
       receiving: { zh: "正在接收模型输出", en: "Receiving model output" },
     };
+    const modelContext = currentModelRequest?.kind === "model" ? currentModelRequest.context : undefined;
+    const modelPromptProgress = currentModelRequest?.kind === "model" ? currentModelRequest.promptProgress : undefined;
+    const modelDetail = modelContext
+      ? formatCapsuleModelDetailWithProgress(modelContext, modelPromptProgress, language)
+      : undefined;
     capsuleActivityLine = {
       title: modelStatus[requestStage][language],
+      ...(modelDetail ? { detail: modelDetail } : {}),
       live: true,
       waitingSince: requestStage === "waiting" ? currentModelRequest?.startedAt : undefined,
     };

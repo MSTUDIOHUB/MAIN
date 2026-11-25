@@ -176,4 +176,4 @@ Unity 界面读取被工具明确拒绝：`Computer Use was not approved to use 
 
 文件还原与 Editor 状态验证分开：用户处理弹窗后，主线程阻塞已解除；延迟回写的测试文件已归档清理，还原项目的新一轮编译与域重载通过，当前 Console 为 0 错误。未强制退出 Editor 或绕过 UI 权限。实际游戏完整验收仍未通过，两轮原始失败证据和结论保持不变。
 
-未打包、发布或替换已安装 MAIN。工作区源码及回归测试保留；`.MAIN` 存储设计仅做分析，未执行迁移，详见 `WORKSPACE_STORAGE_DESIGN_2026-10-23_ZH.md`。
+未打包、发布或替换已安装 MAIN。工作区源码及回归测试保留；`.MAIN` 存储设计仅做分析，未执行迁移，详见[工作区隐藏目录的设计取舍](WORKSPACE_STORAGE_DESIGN_2026-10-23_ZH.md)。

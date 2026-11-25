@@ -36,6 +36,7 @@ import {
   buildProjectRulesPreview,
   updateProjectRulesPreview,
 } from "../lib/projectInit";
+import { parseGrillMeCommand } from "../lib/grillMe";
 import type { ProjectInitPreview } from "../lib/projectInit";
 import { projectInitIpcIo } from "../lib/projectInitIpc";
 import {
@@ -402,6 +403,7 @@ export default function Composer({
     contextMentions.length > 0 || attachedFiles.length > 0 || pendingImages.length > 0;
   const draftHasExplicitTurnIntent = Boolean(
     parseProjectInitCommand(draftInput) ||
+    parseGrillMeCommand(draftInput) ||
     lockedComposerIntent ||
     parseMainDebugShortcut(draftInput) ||
     parseMainIntentShortcutForMode(draftInput, "main_mode"),
@@ -620,26 +622,44 @@ export default function Composer({
   }, [language, mainIntentShortcuts, slashQuery]);
 
   const projectInitSlashItems = useMemo(() => {
-
-    const item = {
-      kind: "workspace_command" as const,
-      key: "workspace:rules",
-      command: language === "en" ? "/rules" : "/规则",
-      label: language === "en" ? "Write project rules" : "编写项目规则",
-      description: !currentWorkspace
-        ? (language === "en" ? "Open a project to write AGENTS.md rules." : "请先打开项目，再编写 AGENTS.md 规则。")
-        : composerRunActive
+    const commands = [
+      {
+        kind: "workspace_command" as const,
+        key: "workspace:grill-me",
+        optionId: "grill-me",
+        command: "/grill-me",
+        label: language === "en" ? "Grill-Me Plan Interview" : "追问式规划访谈",
+        description: composerRunActive
           ? (language === "en" ? "Available after the current run stops." : "当前执行结束后可用。")
-          : (language === "en" ? "Investigate, choose constraints, then review and save AGENTS.md." : "调查项目、确认约束，审阅并保存 AGENTS.md。"),
-      aliases: ["rules", "agents", "规则", "约束"],
-      disabled: !currentWorkspace || composerRunActive,
-    };
+          : (language === "en"
+            ? "Interview me on design tradeoffs and edge cases before finalizing the plan."
+            : "先围绕设计取舍与边界问题向我追问，对齐后再生成方案。"),
+        aliases: ["grill-me", "grill", "追问", "深度追问", "访谈", "interview"],
+        disabled: composerRunActive,
+      },
+      {
+        kind: "workspace_command" as const,
+        key: "workspace:rules",
+        optionId: "rules",
+        command: language === "en" ? "/rules" : "/规则",
+        label: language === "en" ? "Write project rules" : "编写项目规则",
+        description: !currentWorkspace
+          ? (language === "en" ? "Open a project to write AGENTS.md rules." : "请先打开项目，再编写 AGENTS.md 规则。")
+          : composerRunActive
+            ? (language === "en" ? "Available after the current run stops." : "当前执行结束后可用。")
+            : (language === "en" ? "Investigate, choose constraints, then review and save AGENTS.md." : "调查项目、确认约束，审阅并保存 AGENTS.md。"),
+        aliases: ["rules", "agents", "规则", "约束"],
+        disabled: !currentWorkspace || composerRunActive,
+      },
+    ];
     const query = slashQuery.trim().toLowerCase();
-    if (!query) return [item];
-    const haystack = [item.command, item.label, item.description, ...item.aliases]
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(query) ? [item] : [];
+    if (!query) return commands;
+    return commands.filter((item) => {
+      const haystack = [item.command, item.label, item.description, ...item.aliases]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
   }, [composerRunActive, currentWorkspace, language, slashQuery]);
 
   const mainIntentSlashGroups = useMemo(() => {
@@ -1146,7 +1166,7 @@ export default function Composer({
       const slashAnchor = slashAnchorRef.current;
       const after = slashAnchor >= 0
         ? removeSlashSessionToken(before, slashAnchor)
-        : parseProjectInitCommand(before)
+        : (parseProjectInitCommand(before) || parseGrillMeCommand(before))
           ? ""
           : before;
       const next = `${entry.command}${after.trim() ? ` ${after.trim()}` : " "}`;
@@ -1543,7 +1563,7 @@ export default function Composer({
         e.key === "Enter" &&
         !e.altKey &&
         !e.shiftKey &&
-        parseProjectInitCommand(draftInput)
+        (parseProjectInitCommand(draftInput) || parseGrillMeCommand(draftInput))
       ) {
         e.preventDefault();
         void handleSubmitComposerMessage();
@@ -1786,7 +1806,7 @@ export default function Composer({
                 showSkillMenu && !isSkillsLoading && visibleSkillItems[highlightedSkillIndex]
                   ? `main-skill-picker-option-${highlightedSkillIndex}`
                   : showSlashMenu && visibleSlashItems[highlightedSlashIndex]
-                  ? `main-shortcut-option-${visibleSlashItems[highlightedSlashIndex].kind === "workspace_command" ? "rules" : visibleSlashItems[highlightedSlashIndex].item.intent}`
+                  ? `main-shortcut-option-${visibleSlashItems[highlightedSlashIndex].kind === "workspace_command" ? (visibleSlashItems[highlightedSlashIndex].optionId || "rules") : visibleSlashItems[highlightedSlashIndex].item.intent}`
                   : undefined
               }
               aria-autocomplete={showSkillMenu || showSlashMenu ? "list" : undefined}
@@ -1983,7 +2003,7 @@ export default function Composer({
                           const displayItem = item.kind === "main_intent" ? item.item : item;
                           const index = visibleSlashItems.findIndex((candidate) => candidate.key === item.key);
                           const isActive = index === highlightedSlashIndex;
-                          const optionId = item.kind === "workspace_command" ? "rules" : displayItem.intent;
+                          const optionId = item.kind === "workspace_command" ? (item.optionId || "rules") : displayItem.intent;
                           return (
                             <button
                               key={item.key}
@@ -2303,57 +2323,53 @@ export default function Composer({
               {/* Send / Stop button */}
               {!activeDiffTask && (
                 composerRunActive ? (
-                  (
-                                                          <>
-                                                            {hasDraftPayload && (
-                                                              <>
-                                                                {composerGuidanceAvailable && (
-                                                                  <button
-                                                                    type="button"
-                                                                    data-testid="composer-guidance-button"
-                                                                    disabled={!guidanceEligible}
-                                                                    onClick={handleGuideCurrentRun}
-                                                                    className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
-                                                                      isLightTheme
-                                                                        ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
-                                                                        : "border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] text-[#bbf7d0] hover:bg-[rgba(16,185,129,0.18)]"
-                                                                    }`}
-                                                                    title={guidanceButtonTitle}
-                                                                  >
-                                                                    <IconZap className="h-3.5 w-3.5" />
-                                                                    {language === "en" ? "Guide" : "引导"}
-                                                                  </button>
-                                                                )}
-                                                                <button
-                                                                  type="button"
-                                                                  data-testid="composer-queue-button"
-                                                                  disabled={isSubmitPending}
-                                                                  onClick={handleSubmitComposerMessage}
-                                                                  className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:opacity-50 ${
-                                                                    isLightTheme
-                                                                      ? "border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100"
-                                                                      : "border-[rgba(96,165,250,0.30)] bg-[rgba(37,99,235,0.10)] text-[#bfdbfe] hover:bg-[rgba(37,99,235,0.18)]"
-                                                                  }`}
-                                                                  title={concurrentSubmitButtonTitle}
-                                                                >
-                                                                  <IconArrowUp className="h-3.5 w-3.5" />
-                                                                  {language === "en" ? "Queue" : "排队"}
-                                                                </button>
-                                                              </>
-                                                            )}
-                                                            {composerCanStop && (
-                                                              <button
-                                                                type="button"
-                                                                data-testid="composer-stop-button"
-                                                                onClick={onStopGeneration}
-                                                                className="flex h-8 w-8 items-center justify-center rounded-md border border-[#7f1d1d] bg-[#09090b] text-[#f48771] shadow-sm transition-colors hover:bg-[#7f1d1d] hover:text-white"
-                                                                title={language === "en" ? "Stop current run" : "停止当前执行"}
-                                                              >
-                                                                <IconStop className="h-4 w-4" />
-                                                              </button>
-                                                            )}
-                                                          </>
-                                                        )
+                  <>
+                    {hasDraftPayload && composerGuidanceAvailable && (
+                      <button
+                        type="button"
+                        data-testid="composer-guidance-button"
+                        disabled={!guidanceEligible}
+                        onClick={handleGuideCurrentRun}
+                        className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                          isLightTheme
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
+                            : "border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] text-[#bbf7d0] hover:bg-[rgba(16,185,129,0.18)]"
+                        }`}
+                        title={guidanceButtonTitle}
+                      >
+                        <IconZap className="h-3.5 w-3.5" />
+                        {language === "en" ? "Guide" : "引导"}
+                      </button>
+                    )}
+                    {(hasDraftPayload || !composerCanStop) && (
+                      <button
+                        type="button"
+                        data-testid="composer-queue-button"
+                        disabled={isSubmitPending || !hasDraftPayload}
+                        onClick={handleSubmitComposerMessage}
+                        className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold shadow-sm transition-colors disabled:opacity-50 ${
+                          isLightTheme
+                            ? "border-blue-200 bg-blue-50 text-blue-800 hover:bg-blue-100"
+                            : "border-[rgba(96,165,250,0.30)] bg-[rgba(37,99,235,0.10)] text-[#bfdbfe] hover:bg-[rgba(37,99,235,0.18)]"
+                        }`}
+                        title={concurrentSubmitButtonTitle}
+                      >
+                        <IconArrowUp className="h-3.5 w-3.5" />
+                        {language === "en" ? "Queue" : "排队"}
+                      </button>
+                    )}
+                    {composerCanStop && (
+                      <button
+                        type="button"
+                        data-testid="composer-stop-button"
+                        onClick={onStopGeneration}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-[#7f1d1d] bg-[#09090b] text-[#f48771] shadow-sm transition-colors hover:bg-[#7f1d1d] hover:text-white"
+                        title={language === "en" ? "Stop current run" : "停止当前执行"}
+                      >
+                        <IconStop className="h-4 w-4" />
+                      </button>
+                    )}
+                  </>
                 ) : (
                   <button
                     data-testid="composer-send-button"

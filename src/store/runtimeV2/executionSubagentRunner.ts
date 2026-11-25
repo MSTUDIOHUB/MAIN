@@ -47,6 +47,10 @@ import {
 } from "./executionSubagentContext";
 import { stageRuntimeV2ChildMutation } from "./executionSubagentMutation";
 import {
+  allAllowedTargetsStaged,
+  upsertStagedChildMutation,
+} from "./executionSubagentStaging";
+import {
   normalizedRuntimeV2SubagentPath,
 } from "./executionSubagentWriteScope";
 import {
@@ -291,8 +295,10 @@ async function runRuntimeV2Child(input: {
         ? `Expected output: ${input.job.expectedOutput}`
         : "",
       input.job.taskKind === "implement"
-        ? "You may submit exactly one provided mutation tool call matching the assigned operation and exclusive paths. Runtime stages it without changing the live workspace; after CHILD_MUTATION_STAGED, cite its evidence id and conclude. Do not broaden or redesign the parent plan."
-        : "This child is read-only. Never request or simulate file changes.",
+        ? "You may stage coherent mutation calls matching the assigned operation and exclusive allowed_paths (one multi-file patch or one staged call per target file). Runtime stages each transaction without changing the live workspace; once every target is staged after CHILD_MUTATION_STAGED, cite its evidence ids and conclude. Do not broaden or redesign the parent plan."
+        : input.job.taskKind === "review"
+          ? "This child is read-only. Never request or simulate file changes. Format each distinct finding on its own line starting with [BLOCKING] for compile/type/inheritance/acceptance-breaking defects or [ADVISORY] for clean confirmations and minor notes, citing exact file paths or evidence ids."
+          : "This child is read-only. Never request or simulate file changes.",
       "Use the parent context as current context; do not reread an unchanged fact merely to reconstruct the task.",
       input.job.taskKind === "validate" && !input.job.proactiveKey
         ? "You may use the provided finite validation tools. Your result is advisory until the parent validates the final mutation."
@@ -355,7 +361,7 @@ async function runRuntimeV2Child(input: {
         result = await requestRuntimeV2ChildStep({
           ...input,
           messages,
-          tools: stagedMutations.length > 0
+          tools: allAllowedTargetsStaged(input.job.allowedPaths, stagedMutations)
             ? []
             : tools,
           responseMode: "action_or_final",
@@ -492,15 +498,6 @@ async function runRuntimeV2Child(input: {
           continue;
         }
         if (MUTATION_CHILD_TOOL_NAMES.has(call.name)) {
-          if (stagedMutations.length > 0) {
-            messages.push({
-              role: "tool",
-              tool_call_id: call.id,
-              content:
-                "CHILD_MUTATION_REJECTED: this implementation child already staged its one transaction. Cite the retained evidence id and conclude.",
-            });
-            continue;
-          }
           const evidenceId = runtimeV2ChildEvidenceId(
             input.job,
             ++ordinal,
@@ -520,7 +517,19 @@ async function runRuntimeV2Child(input: {
             });
             continue;
           }
-          stagedMutations.push(stage.staged);
+          const upsert = upsertStagedChildMutation(stagedMutations, stage.staged);
+          if (!upsert.ok) {
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: upsert.message,
+            });
+            continue;
+          }
+          if (upsert.replacedEvidenceId) {
+            const oldIndex = evidence.findIndex((item) => item.id === upsert.replacedEvidenceId);
+            if (oldIndex >= 0) evidence.splice(oldIndex, 1);
+          }
           const stagedEvidence: RuntimeV2EvidenceReference = {
             id: evidenceId,
             kind: "subagent",

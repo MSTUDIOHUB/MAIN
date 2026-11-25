@@ -3,9 +3,13 @@ import { isStreamOutputLimited, type OpenAiToolChoice, type StreamResult, type S
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import { detectResponseLanguageMismatch } from "../../lib/workflowModels";
 import {
+  deriveRuntimeV2PlanExecutionCoverage,
   RuntimeV2ProviderProtocolError,
+  runtimeV2CommandTaskReadyForConclusion,
+  runtimeV2DirectExecuteReadyForConclusion,
   type RuntimeV2Command,
   type RuntimeV2ProviderRecoveryPressure,
+  type TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import type {
   RuntimeV2ExecutionPortsInput,
@@ -228,7 +232,50 @@ export function buildRuntimeV2ConcludePrompt(language: "zh" | "en"): string {
   return "工具调用已结束。请直接基于本轮对话和已确认的真实证据，用简体中文输出清晰、完整、结构化的最终 Markdown 总结（按任务复杂度自适应详略，说明关键改动/结论、原因与验证结果），不要输出 <tool_call> 标签。";
 }
 
-export function buildRuntimeV2LanguageRetryFeedback(language: "zh" | "en"): string {
+export function canRuntimeV2RequestConcludeWithProse(input: {
+  readonly aggregate: TurnAggregateV1 | null;
+  readonly requestMode: string;
+  readonly readOnly?: boolean;
+}): boolean {
+  if (
+    input.readOnly === true ||
+    input.requestMode === "conclude" ||
+    input.aggregate?.phase === "finalizing" ||
+    input.aggregate?.strategy === "chat" ||
+    input.aggregate?.strategy === "analyze"
+  ) {
+    return true;
+  }
+  if (input.requestMode === "validate" || input.requestMode === "observe") {
+    return false;
+  }
+  if (input.requestMode === "execute") {
+    if (!input.aggregate) return false;
+    if (input.aggregate.strategy === "plan") {
+      const coverage = deriveRuntimeV2PlanExecutionCoverage(input.aggregate);
+      return Boolean(
+        coverage &&
+          coverage.allMutationTargetsCovered &&
+          coverage.allRequiredValidationsPassed,
+      );
+    }
+    return (
+      runtimeV2DirectExecuteReadyForConclusion(input.aggregate) ||
+      runtimeV2CommandTaskReadyForConclusion(input.aggregate)
+    );
+  }
+  return true;
+}
+
+export function buildRuntimeV2LanguageRetryFeedback(
+  language: "zh" | "en",
+  options?: { readonly hasToolsAvailable?: boolean },
+): string {
+  if (options?.hasToolsAvailable) {
+    return language === "en"
+      ? "The previous reply used the wrong natural language. If actions remain, call the next required structured tool directly; otherwise rewrite the complete, well-structured final Markdown answer in English while keeping code, paths, identifiers, and commands unchanged, without mentioning the retry."
+      : "上一次回复使用了错误的自然语言（英文）。如果仍有待执行步骤，请直接调用所需的工具；若已可收尾，请用简体中文重新输出完整、结构清晰的最终 Markdown 答复，并保留代码、路径、标识符和命令原样，不要提及语言纠错。";
+  }
   if (language === "en") {
     return "The previous reply used the wrong natural language. Rewrite the complete, well-structured final Markdown answer in English; keep code, paths, identifiers, and commands unchanged, and do not mention the retry.";
   }
@@ -242,6 +289,7 @@ export function evaluateRuntimeV2LanguageRetry(input: {
   readonly toolCallCount: number;
   readonly hasProtocolViolation: boolean;
   readonly outputTruncated: boolean;
+  readonly proseConclusionAllowed?: boolean;
 }): {
   readonly shouldRetry: boolean;
   readonly detectedLanguage: "zh" | "en" | null;
@@ -254,6 +302,7 @@ export function evaluateRuntimeV2LanguageRetry(input: {
     input.toolCallCount > 0 ||
     input.hasProtocolViolation ||
     input.outputTruncated ||
+    input.proseConclusionAllowed === false ||
     !candidate
   ) {
     return { shouldRetry: false, detectedLanguage: null, hanCount: 0, latinWords: 0 };

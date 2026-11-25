@@ -12,6 +12,54 @@ import {
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
 } from "./executionContract";
+import { RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME } from "../../lib/runtime-v2";
+
+const RESOLVE_REVIEW_FINDING_TOOL: ToolDefinition = {
+  type: "function",
+  function: {
+    name: RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
+    description:
+      "Record the parent's verified disposition for a review subagent finding. Use 'repaired' only after committed post-finding workspace mutation evidence fixes the defect; 'falsified' only with current-hash source or passing validation evidence refuting it; 'deferred_unresolved' with explicit breaks_acceptance boolean when leaving it unresolved.",
+    parameters: {
+      type: "object",
+      properties: {
+        finding_id: {
+          type: "string",
+          description: "Exact findingId from the review ledger or child anchor (for example, child-1:f1).",
+        },
+        disposition: {
+          type: "string",
+          enum: ["repaired", "falsified", "deferred_unresolved"],
+          description: "Verified parent disposition outcome for the finding.",
+        },
+        summary: {
+          type: "string",
+          description: "Concise explanation tying the disposition to observed source, mutation, or validation facts.",
+        },
+        verification_evidence_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Evidence IDs backing this disposition (mutation evidence for repaired; current-hash source or passing validation evidence for falsified).",
+        },
+        target_paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Workspace-relative file paths covered by this disposition.",
+        },
+        criterion_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Acceptance criterion IDs affected by this finding.",
+        },
+        breaks_acceptance: {
+          type: "boolean",
+          description: "Required when disposition is deferred_unresolved: true if this unresolved defect prevents approved acceptance criteria from holding.",
+        },
+      },
+      required: ["finding_id", "disposition", "summary"],
+    },
+  },
+};
 
 const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "list_directory",
@@ -39,6 +87,7 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "spawn_subagent",
   "wait_subagents",
   "record_execution_contract",
+  RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
   "load_skill",
   "tool_search",
   UNITY_CREATE_SCENE_TOOL,
@@ -73,6 +122,7 @@ export function runtimeV2ToolDefinitions(
     ...unityMcpObservationTools(state),
     UNITY_SCENE_DEFINITION,
     RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
+    RESOLVE_REVIEW_FINDING_TOOL,
     ...(loadSkillDefinition ? [loadSkillDefinition] : []),
   ].filter((definition) => {
     const name = definition.function.name;

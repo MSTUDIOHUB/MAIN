@@ -11,7 +11,7 @@
 
 在工作区会话中，每条进入模型执行管线的用户提交都会先获得稳定的提交身份、接纳凭证和 `turnId`，然后才进入意图与执行策略。`Chat` 只是 Turn 的一种策略，不能绕过 Turn 接纳、持久化、取消或结论投影。
 
-`/规则` 和隐藏兼容别名 `/init` 都走普通 Turn 接纳，进入 Plan Run 调查项目和根 `AGENTS.md`，通过结构化问答确认约束，再保存版本化规则草稿。用户随后编辑、审阅 diff 并确认保存时，才由固定目标的专用 CAS 写入边界更新根 `AGENTS.md`。访谈确认不等于执行批准，取消草稿审阅也不会撤销已经存在的 Turn 记录。
+`/计划`、`/grill-me`、`/规则` 和隐藏兼容别名 `/init` 都走普通 Turn 接纳。显式命令确定 Plan 能力上界，Main 模式通过语义预检保留本轮的读取限制和逐次审批要求。`/规则` 与 `/init` 调查项目和根 `AGENTS.md`，记录结构化问答后保存版本化规则草稿。更新根文件需要用户另行编辑、审阅并确认，再由固定目标的 CAS 写入边界提交。
 
 接纳同时创建用户块与非空回合标题；标题可以随后语义优化，但第一轮日志、侧栏和执行投影不能因为尚未取得模型标题而退化成无 Turn 的聊天消息。
 
@@ -28,7 +28,7 @@ active Run 存在时，Composer 输入有两条不同的 ingress，不能用一�
 
 `src/lib/turnRuntimeContract.ts` 的 `decideTurnIngress()` 定义 canonical 决策：普通 `submit` 遇到 open Turn 时必须拒绝为 `active_run_requires_explicit_ingress`；`queue` 始终接纳新 Turn；`guidance` 只可附着于 exact running Run。UI 的两个按钮和 Store 的 FIFO/`activeGuidance` 是该语义的产品适配，不能把 Guide 伪装成历史 user Turn，也不能让 Queue 修改当前 Run 的上下文。
 
-Guide 在 `iterationStreamPreparation.ts` 中被消费后以明确的 runtime-guidance user message 注入，语义是“高优先级下一步方向，不重启任务”。它不改变原 Turn 的 objective、identity 或 terminal contract。Guide 的接纳与当前 Run 终态提交使用同一个 exact-owner fence：若 guidance 在当前 provider 请求期间被接纳，runtime 必须执行一次有界的额外模型迭代再尝试收口；若终态 CAS 已先获胜，Guide 接纳必须失败并保留输入，让用户可改为 Queue，不能静默清除迟到 guidance。
+Guide 以 `guidance.admitted` 写入所属 Run。`src/lib/runtime-v2/guidance.ts` 依据完整 Run 身份和事件顺序，在下一次模型请求中追加带 `runtimeGuidanceId` 的 user message，并维护 `waiting`、`applied`、`unapplied` 投影。引导沿用原目标、Turn 身份和结论契约。`src/store/runtimeV2/checkpointPort.ts` 用同一归属检查协调接纳与正常收口。先到达的引导进入下一次有界模型迭代。终态先提交时，保留未接纳的输入供用户选择 Queue。
 
 ## Canonical Turn/Run 状态
 
@@ -110,10 +110,9 @@ turn.completed(resultKind=error)
 
 ## Plan authoring 与审核态
 
-Plan Run 保留原始 objective，先用只读工具形成带版本的
-`WorkPlanRuntimeEvidence`，再让模型提交 `WorkPlanDraftV1`。后续校验只能指出
-同一 draft 的结构、证据引用、目标、依赖或验证问题；修正版必须重新进入同一个
-WorkPlan compiler，不能只留在 hidden reasoning 或过程文本中。
+审批前的 Plan 由 `planRunner.ts` 和 `PlanLedger` 推进。普通工作区 `/计划`（`/plan`）保留原始目标，使用获准的只读工具收集带版本的 `WorkPlanRuntimeEvidence`，可在遇到实质取舍时调用 `ask_plan_questions`，再提交 `WorkPlanDraftV1`。修订后的候选仍经过同一个 WorkPlan compiler。
+
+`/grill-me` 或明确要求访谈时，计划文档路径先用获准的资料缩小问题，再收集结构化答复。保存前要求有效的用户决策记录。没有工作区的普通 Plan 也使用文档路径，可按需提问或直接提交概念文档。答复与文档保存只完成规划阶段，WorkPlan 的实施权由独立审批授予。
 
 Plan authoring 没有默认总时限，也不会将父线程年龄换算成 child 剩余预算。模型流和正在执行的工具可以跨越十分钟；只有调用方明确提供的 `lifecycleDeadlineAt` 才写入 `run.started` 并成为父子共享硬边界，拒绝或恢复都不得延长它。旧 checkpoint 没有该字段时按无默认硬限恢复。
 
@@ -169,7 +168,7 @@ provider 的下一动作目录有一个不改变授权的短暂收敛窗口。�
 
 `mutation_committed` 只表示当前 `acting` phase 内出现了新的成功 mutation。若新提议被阻止、但更早的 mutation 尚未得到验证，状态机用独立的 `unvalidated_mutation_pending` 返回验证边界；不得把历史 evidence 冒充成本次工具成功。源码租约缺失、源码文本不匹配和目标范围不匹配都以结构化失败原因持久化。一个被 workset 淘汰但没有被同目标 mutation 失效的真实标准读取可在纠正轮重新物化；缓存 replay 本身仍不产生 source evidence，同目标 mutation 后的旧版本也永远不能恢复写入权。
 
-浏览器、桌面和长驻进程生命周期保留各自的结构化启动、观察、交互和清理边界，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。它们不能被普通文件阶段用来重新引入 `read-only -> mutation-only -> validation-only` 振荡。调查 child 的 finding 只是带 provenance 的参考；实现 child 的写入权也必须由父线程当前版本读取和明确方案建立，并在 join 时重新校验，不能从 child 摘要或另造 `context_restore` lease 获得。
+浏览器、桌面和长驻进程生命周期保留各自的结构化启动、观察、交互和清理边界，因为 `launch -> observe -> interact/assert` 的顺序是真实安全与因果约束。它们不能被普通文件阶段用来重新引入 `read-only -> mutation-only -> validation-only` 振荡。调查 child 提供带来源的参考。实现 child 所获授权与符合操作要求的源码事实在 join 时重新校验。
 
 每批工具结果先形成真实 source、mutation、validation、browser/desktop evidence，再考虑重复和协议软信号。软信号可以要求换动作、刷新事实或压缩上下文，但不得暂停、锁死目标或生成终态。修改目标的排他依据只有 exact path 的当前版本读取和 mutation preflight；不存在从模糊诊断猜出的 transaction lock。
 
@@ -209,11 +208,11 @@ typed validation primitive 的完成语义如下：
 
 用户允许或偏好子智能体时，协作方法在 Turn admission 就进入执行模型上下文：模型先识别用户目标中的独立工作、依赖关系和责任范围，而不是等看到 `spawn_subagent` 才临时决定如何拆分。hidden intent router 只分类本轮主意图，不替执行模型伪造派生决策。用户明确选择“偏好协作”后，只要当前目标包含至少两个可独立、边界明确且能与主体重叠的工作包，并且 provider lane 仍有 child 容量、工具实际可见，执行提示就应优先在容量内派生有用的 child，同时要求父线程继续推进不依赖 child 的工作；普通“允许协作”仍由模型按收益判断。该偏好不制造强制阶段，可在读取、修改或验证任一阶段使用；简单或线性任务直接执行，协作也不是 mutation、validation 或 completion 的 effect-boundary 前置。child 获得的是自包含目标、相关精确源码/证据、约束和现行实施契约组成的有界胶囊，不继承父模型私有推理或完整对话。
 
-`explore`、`review`、`validate` 保持只读，适合并行调查、独立评审和有限验证。`implement/write` 只在父线程已经通过版本化源码形成证据化方案后可用：调用必须指定 create/modify/delete、具体 `implementation_plan`、成功标准和每个精确文件目标；不能只授权目录再让 child 自行选择写入文件。多个实现 child 的写入范围必须互不重叠；modify/delete 的每个目标还必须在创建请求中拥有当前版本源码权威。实现 child 可以读取自己的范围并形成一个修改事务，但事务先保存在进程内，不立即改变共享工作区。父线程继续处理不依赖子结果的工作，只在结果成为依赖或最终收口时 join。
+`explore`、`review`、`validate` 保持只读，适合并行调查、独立评审和有限验证。`implement/write` 依赖父线程当前实施契约、明确的修正授权或已批准 WorkPlan。调用指定 create/modify/delete、具体 `implementation_plan`、成功标准和互斥的精确文件目标，按当前路径和操作校验源码依据。实现 child 在进程内暂存修改，共享工作区写入由父线程在 join 时执行。父线程可先处理独立工作。
 
-join 是提交边界：runtime 再检查 child 所有权、父 WorkPlan scope、源版本、工具权限、单次破坏性审批和源码语法预检，然后顺序提交事务并产生普通 mutation evidence。任一版本漂移、越权、审批拒绝或预检失败都会丢弃该事务，不留下部分共享写入。child 持有写范围期间，父线程和其他 child 对重叠路径的修改会被拒绝；最终 validation 也必须等所有实现事务完成或丢弃后再运行，防止验证旧工作区。恢复 action window 仍不把协作当作逃生分支，父线程必须先完成当前闭合动作。普通 Execute 不因总耗时关闭父 Run 或 child；只有用户取消、显式调用方预算或真实停滞/资源边界可以收口。
+join 先检查整个暂存批次，包括 child 所有权、WorkPlan scope、当前版本、工具权限、单次破坏性审批和语法。预检拒绝会阻止该批次写入。预检通过后运行时顺序执行文件操作并记录变更，任一步 I/O 异常可能留下已提交的前缀。恢复应检查实际工作区和已有回执，再决定剩余动作。child 持有写范围期间，父线程和其他 child 的重叠写入受限，最终验证在相关实现任务汇合后执行。恢复 action window 优先收束父线程的当前动作。普通 Execute 与 child 的退出由用户取消、显式预算或真实停滞及资源边界决定。
 
-provider 未显式声明并发容量时，模型 lane 先开放“父线程 + 一个 probe child”，再以真实首 chunk 重叠证明按 2 → 3 → 4 逐级增长；本地 lane 每次重叠准入前还必须通过当前设备内存保留量采样。产品总上限是四个模型请求，即一个父线程加最多三个 child；轮流占用同一 lane 不会被记作并行能力。显式配置可选择更小上限，OOM、HTTP 429、明确并发限制或持续内存压力会收缩 lane，并优先释放最新 child。child 每个 provider 步骤最多生成 8192 tokens（无预算事实时 4096），随后仍可读取工具并继续下一步；这是防止单次生成独占本地 lane 的步骤边界，不是整个复杂任务的时间或 token 上限。普通 child 的 deadline 为无穷大，只有调用方真的提供有限生命周期预算并到点时，终态才允许写成“显式生命周期截止”。
+自动 lane 起步最多允许一个父请求和一个探针，实际本地内存可进一步收紧。两个在途请求都有正文、推理或工具增量后，本地 lane 可开放到当前内存估算上限，云端自动 lane 可开放到 lane 上限。总上限为 8 个模型请求，包含父请求。显式配置选择该上限内的基准容量，本地重叠仍受 prefill、发起间隔和内存保留量准入限制。OOM、HTTP 429、明确的并发拒绝或持续内存压力可收缩 lane，必要时优先释放最新 child。child 单次 provider 步骤的输出上限为 8192 tokens，缺少预算时使用 4096。单次生成完成后仍可继续使用工具。只有调用方提供的有限生命周期预算耗尽时，终态才记录显式截止。
 
 显式要求 Plan 使用 child 时，协作获取是 discovery 中的独立硬门：未 admission 前只能请求精确 `spawn_subagent`，不能提前合成或封印 WorkPlan。该请求无活动超时后只在同一实际 transport/surface 上恢复一次；90 秒约束无活动间隔，只有显式调用方截止才约束总时长；失败 command 的稳定 reason code 随 checkpoint 持久化，因此冷启动不能重置次数。第二次同面超时直接 `blocked`，日志必须记录真实 attempted/effective transport，不能把名义 stage 切换冒充 wire fallback。
 
@@ -228,14 +227,14 @@ compact recovery 的输出预算与传输选择独立：首次收敛采用 struc
 ```text
 spawn_subagent
   -> queued / running
-  -> read/search/(finite validation | one staged mutation)
+  -> read/search/(finite validation | stage a mutation batch)
   -> ordinary final text citing evidence
   -> parent wait 或终态 join
-  -> revalidate + commit/discard staged mutation
+  -> batch preflight, then sequential writes for staged mutations
   -> completed / degraded / failed / canceled
 ```
 
-runtime 只在普通最终文本和至少一条真实或合法继承 evidence 同时存在时编译合法结构化报告并接受 `completed`；实现 child 还必须在 join 后拥有真正提交的 mutation evidence。已有 evidence 但收口或提交失败时写入 `degraded`，明确由主体接管；没有 evidence 才写入 `failed`，父任务取消则为 `canceled`。child summary、协调工具成功、暂存但未提交的事务和未 join output 都不算验收。父线程始终拥有跨文件整合、最终验证和完成权威；child 非 completed 后父线程继续原目标。
+runtime 只在普通最终文本和至少一条真实或合法继承 evidence 同时存在时编译合法结构化报告。实现 child 还需要 join 后的真实提交证据才可记为 `completed`。未形成报告或未通过提交预检时，已有新证据的 child 以 `degraded` 交回，缺少新证据则记为 `failed`，父任务取消时记为 `canceled`。验收使用已提交的修改及验证回执。父线程负责跨文件整合、最终验证和完成。
 
 ## 事件接受与幂等
 

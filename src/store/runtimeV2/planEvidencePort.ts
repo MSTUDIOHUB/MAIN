@@ -2,6 +2,7 @@ import { knowledgeSearchTraceFields } from "../../lib/knowledgeReferences";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { getFileMetadata } from "../../lib/ipc";
 import { beginCapsuleToolActivity } from "../../lib/capsuleLiveActivity";
+import { classifyWorkspaceReadFailure, describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 import { runtimeV2BuiltinCapabilityRestriction, runtimeV2KnowledgeMayFetch } from "./executionCapabilityRestrictions";
 import { UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
@@ -59,7 +60,7 @@ export async function settlePlanTool(input: {
   readonly call: RuntimeV2NormalizedProviderResult["toolCalls"][number];
   readonly status: "succeeded" | "failed" | "blocked";
   readonly evidence?: readonly RuntimeV2EvidenceReference[];
-  readonly failureKind?: "protocol_invalid";
+  readonly failureKind?: Extract<import("../../lib/runtime-v2").RuntimeV2Event, { type: "tool.completed" }>["failureKind"];
   readonly failureReasonCode?: string;
   readonly modelContent?: string;
   readonly receiptOrigin?: "executed" | "replayed";
@@ -394,12 +395,24 @@ export async function executeReadOnlyPlanTool(input: {
     return;
   } catch (error) {
     input.context.abortCtrl?.signal.throwIfAborted();
-    const content = `PLAN_READ_FAILED: ${error instanceof Error ? error.message : String(error)}`;
+    const rawError = error instanceof Error ? error.message : String(error);
+    const classified = classifyWorkspaceReadFailure(rawError);
+    const described = describeWorkspaceToolFailure(classified.code, input.context.phaseLanguage);
+    const targetLabel = String(args.path || args.pattern || input.call.name);
+    const content = `PLAN_READ_FAILED [code=${classified.code}]: ${rawError}${described?.modelHint ? ` (${described.modelHint})` : ""}`;
     await settlePlanTool({
       ledger: input.ledger,
       run: input.run,
       call: input.call,
       status: "failed",
+      failureKind: classified.failureKind,
+      failureReasonCode: classified.code,
+      modelContent: content,
+      presentation: {
+        toolName: input.call.name,
+        target: targetLabel,
+        ...(described?.cardMessage ? { message: described.cardMessage } : {}),
+      },
     });
     appendPlanToolResult(input.messages, input.call.id, content);
     await input.ledger.recordSoftSignal(

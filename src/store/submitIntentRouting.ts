@@ -1,4 +1,6 @@
 import type { MainModeKey } from "../lib/mainModes";
+import { parseProjectInitCommand } from "../lib/projectInit";
+import { parseGrillMeCommand } from "../lib/grillMe";
 import {
   inferCommandDirective,
   resolveTurnRunIntent,
@@ -137,13 +139,26 @@ export function resolveAndApplySubmitIntentRouting<
     shouldReuseExistingTurnIntent: input.shouldReuseExistingTurnIntent,
     shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
   });
-  const effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
+  const hasExplicitPlanShortcut = Boolean(
+    input.mainIntentShortcut?.intent === "plan" ||
+    input.lockedComposerIntent === "plan" ||
+    input.options?.explicitIntent === "plan" ||
+    parseProjectInitCommand(input.text) ||
+    parseGrillMeCommand(input.text),
+  );
+  const effectiveRunIntent: ResolvedRunIntent =
+    !input.options?.resolvedIntent && hasExplicitPlanShortcut
+      ? "plan"
+      : initialIntentDecision.effectiveRunIntent;
   let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
   let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
 
   // Natural language is interpreted once before choosing a capability surface.
   // Explicit modes remain ceilings; only typed controls and trusted resumptions
   // bypass this handoff. Lexical resolution supplies context, never authority.
+  // Explicit slash commands (/plan, /grill-me, /rules) STILL flow through
+  // semantic preflight so per-turn operational constraints (e.g. "do not read
+  // workspace files" or "ask before every file read") populate structured guards.
   const trustedSubmission = input.isHidden || !!input.mainDebugShortcut ||
     input.options?.skipIntentResolution === true || !!input.options?.resolvedIntent ||
     input.shouldExecuteOnceFromReplyOption;
@@ -163,11 +178,16 @@ export function resolveAndApplySubmitIntentRouting<
     // The semantic classifier needs the preceding objective to decide whether
     // this is a follow-up. A lexical continuation route cannot gate that
     // context, and the prior route itself never becomes current authority.
+    const explicitIntent =
+      input.options?.explicitIntent ||
+      input.lockedComposerIntent ||
+      input.mainIntentShortcut?.intent ||
+      (parseProjectInitCommand(input.text) || parseGrillMeCommand(input.text) ? "plan" : undefined);
     const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
       resolution,
       currentMainModeKey: input.currentMainModeKey,
       hasWorkspace: input.hasWorkspace,
-      explicitIntent: input.options?.explicitIntent || input.lockedComposerIntent || input.mainIntentShortcut?.intent || undefined,
+      explicitIntent,
       previousRequest,
       planContinuationCandidates: input.planContinuationCandidates,
       text: input.text,

@@ -51,6 +51,7 @@ export function buildDurableTurnContext(input: {
   turnId: string;
   turnBlocks: TaskBlock[];
   fallbackAssistantText?: string;
+  inspectedFiles?: string[];
   artifactPaths?: string[];
   unfinished?: string[];
   advisories?: string[];
@@ -70,6 +71,7 @@ export function buildDurableTurnContext(input: {
 
   const execution = collectDurableTurnExecutionSummary({
     turnBlocks: input.turnBlocks,
+    inspectedFiles: input.inspectedFiles,
     artifactPaths: input.artifactPaths,
     unfinished: input.unfinished,
     advisories: input.advisories,
@@ -92,12 +94,14 @@ export function buildDurableTurnContext(input: {
  */
 export function collectDurableTurnExecutionSummary(input: {
   turnBlocks: TaskBlock[];
+  inspectedFiles?: string[];
   artifactPaths?: string[];
   unfinished?: string[];
   advisories?: string[];
 }): DurableTurnExecutionSummary {
   const decisions: string[] = [];
   const modifiedFiles: string[] = [];
+  const rawInspectedFiles: string[] = [...(input.inspectedFiles || [])];
   const validations: string[] = [];
   const persistentFailures: string[] = [];
   const unresolvedToolFailures = new Map<string, string>();
@@ -129,6 +133,17 @@ export function collectDurableTurnExecutionSummary(input: {
       String(block.executionName || block.toolName || "").trim().toLowerCase(),
       String(block.target || "").trim().replace(/\s+/g, " ").toLowerCase(),
     ].join("::");
+    if (
+      block.toolStatus === "executed" &&
+      !noOp &&
+      block.toolName === "read_file" &&
+      target &&
+      target !== "." &&
+      target !== "read_file" &&
+      !isEphemeralPlanArtifactPath(target)
+    ) {
+      rawInspectedFiles.push(target);
+    }
     if (
       block.toolStatus === "executed" &&
       !noOp &&
@@ -164,9 +179,23 @@ export function collectDurableTurnExecutionSummary(input: {
     }
   }
 
+  const dedupedModifiedFiles = unique(modifiedFiles);
+  const modifiedSet = new Set(dedupedModifiedFiles);
+  const inspectedFiles = unique(
+    rawInspectedFiles.filter((path) =>
+      path &&
+      path !== "." &&
+      !isEphemeralPlanArtifactPath(path) &&
+      !path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase().startsWith(".main/plans/") &&
+      !modifiedSet.has(path)
+    ),
+    48,
+  );
+
   return {
     decisions: unique(decisions),
-    modifiedFiles: unique(modifiedFiles),
+    modifiedFiles: dedupedModifiedFiles,
+    ...(inspectedFiles.length > 0 ? { inspectedFiles } : {}),
     validations: unique(validations),
     failures: unique([
       ...persistentFailures,
@@ -183,13 +212,18 @@ export function serializeDurableTurnContextForModel(
 ): string {
   if (!context) return "";
   const execution = context.execution;
-  const hasStructuredExecution = Object.values(execution).some((values) => values.length > 0);
+  const hasStructuredExecution = Object.values(execution).some(
+    (values) => Array.isArray(values) && values.length > 0,
+  );
   if (!hasStructuredExecution) return "";
   return [
     "[durable_turn_context]",
     `turnId: ${context.turnId}`,
     `decisions: ${JSON.stringify(execution.decisions)}`,
     `modifiedFiles: ${JSON.stringify(execution.modifiedFiles)}`,
+    ...(execution.inspectedFiles?.length
+      ? [`inspectedFiles: ${JSON.stringify(execution.inspectedFiles)}`]
+      : []),
     `validations: ${JSON.stringify(execution.validations)}`,
     `failures: ${JSON.stringify(execution.failures)}`,
     `unfinished: ${JSON.stringify(execution.unfinished)}`,

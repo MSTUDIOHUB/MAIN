@@ -3,7 +3,10 @@ import { RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES } from "../../lib/runtime-v2/works
 import { type ToolDefinition } from "../../lib/toolSchemas";
 import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName, UNITY_CREATE_SCENE_TOOL } from "../../lib/workspaceMutationTools";
-import { type RuntimeV2Command } from "../../lib/runtime-v2";
+import {
+  RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
+  type RuntimeV2Command,
+} from "../../lib/runtime-v2";
 import {
   RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES,
   RUNTIME_V2_SKILL_READ_TOOL_NAMES,
@@ -167,14 +170,18 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   // Execute & Validate modes: keep a consistent, static tool surface across
   // steps so local models never lose their KV cache or get trapped in a
   // tool-confiscated recovery window.
+  const hasCompletedReviewSubagent = Boolean(
+    aggregate?.subagents.some((job) => job.taskKind === "review" && job.status === "completed"),
+  );
   const unitySceneApproved = aggregate?.workPlan?.status === "approved" &&
     aggregate.sealedWorkPlan?.draft.steps.some(step => step.operation === "create" &&
       step.targets.some(target => target.endsWith(".unity")));
   const executeCandidates = input.available.filter((definition) => {
     const name = definition.function.name;
     if (name === UNITY_CREATE_SCENE_TOOL) return unitySceneApproved === true;
+    if (name === RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME) return hasCompletedReviewSubagent;
     if (name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) {
-      return true;
+      return aggregate?.strategy === "execute";
     }
     return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
       (!hasWorkspace && RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(name)) ||
@@ -191,7 +198,9 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const selected = filterToCoreAndUnlockedTools(executeCandidates, {
     sessionKey,
     prompt: objectiveText,
-    alwaysInclude: new Set([...collaboration, RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME, ...globalNetworkTools, ...activeKnowledgeTools,
+    alwaysInclude: new Set([...collaboration, ...(aggregate?.strategy === "execute" ? [RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME] : []),
+      ...(hasCompletedReviewSubagent ? [RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME] : []),
+      ...globalNetworkTools, ...activeKnowledgeTools,
       ...visibleObservations, ...executeCandidates.map(tool => tool.function.name).filter(isMcpEffect),
       ...(unitySceneApproved ? [UNITY_CREATE_SCENE_TOOL] : [])]),
   });

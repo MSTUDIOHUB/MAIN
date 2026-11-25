@@ -5,7 +5,7 @@ description: "配置 LM Studio、Ollama 和 OMLX。"
 category: "platforms-integrations"
 order: 10
 status: "draft"
-sourceFeature: "Settings Local Setup、LM Studio、Ollama、OMLX、modelDiscovery"
+sourceFeature: "SettingsModal 本地模型扫描、LM Studio、Ollama、OMLX"
 ---
 
 # 本地模型

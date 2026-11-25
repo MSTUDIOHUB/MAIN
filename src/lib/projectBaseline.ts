@@ -244,13 +244,21 @@ function resolveLimits(input?: Partial<ProjectBaselineLimits>): ProjectBaselineL
   };
 }
 
-async function safeList(io: ProjectBaselineIo, workspace: string, path: string): Promise<readonly ProjectBaselineDirectoryEntry[]> {
+async function safeListWithStatus(
+  io: ProjectBaselineIo,
+  workspace: string,
+  path: string,
+): Promise<{ readonly ok: boolean; readonly entries: readonly ProjectBaselineDirectoryEntry[] }> {
   try {
     const entries = await io.listDirectory({ workspace, path });
-    return Array.isArray(entries) ? entries : [];
+    return Array.isArray(entries) ? { ok: true, entries } : { ok: false, entries: [] };
   } catch {
-    return [];
+    return { ok: false, entries: [] };
   }
+}
+
+async function safeList(io: ProjectBaselineIo, workspace: string, path: string): Promise<readonly ProjectBaselineDirectoryEntry[]> {
+  return (await safeListWithStatus(io, workspace, path)).entries;
 }
 
 async function scanTopology(io: ProjectBaselineIo, workspace: string, limits: ProjectBaselineLimits, omissions: ProjectBaselineOmission[]) {
@@ -279,8 +287,22 @@ async function scanTopology(io: ProjectBaselineIo, workspace: string, limits: Pr
 }
 
 async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omissions: ProjectBaselineOmission[], metadataOnly: boolean): Promise<AnchorCandidate[]> {
-  const candidates = metadataOnly ? [] : [...STATIC_ANCHORS];
-  const rootEntries = await safeList(io, workspace, "");
+  const rootListing = await safeListWithStatus(io, workspace, "");
+  const rootEntries = rootListing.entries;
+  const rootHasEntries = rootListing.ok && rootEntries.length > 0;
+  const rootFileNames = rootHasEntries
+    ? new Set(rootEntries.filter(entry => entry.kind === "file").map(entry => String(entry.name || "").toLowerCase()))
+    : null;
+  const rootDirectoryNames = rootHasEntries
+    ? new Set(rootEntries.filter(entry => entry.kind === "directory").map(entry => String(entry.name || "").toLowerCase()))
+    : null;
+  const staticAnchorMatchesRoot = (candidatePath: string): boolean => {
+    if (!rootFileNames || !rootDirectoryNames) return true;
+    const slash = candidatePath.indexOf("/");
+    if (slash < 0) return rootFileNames.has(candidatePath.toLowerCase());
+    return rootDirectoryNames.has(candidatePath.slice(0, slash).toLowerCase());
+  };
+  const candidates = metadataOnly ? [] : STATIC_ANCHORS.filter(candidate => staticAnchorMatchesRoot(candidate.path));
   for (const entry of rootEntries) {
     const path = joinRelative("", String(entry?.name || ""));
     if (!path || entry.kind !== "file") continue;
@@ -295,6 +317,8 @@ async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omis
     if (entries.some(entry => entry.name === fileName && entry.kind === "file")) candidates.push(candidate);
   }
   for (const directory of metadataOnly ? [] : DYNAMIC_RULE_DIRECTORIES) {
+    const topDirectory = directory.split("/")[0] || "";
+    if (rootDirectoryNames && topDirectory && !rootDirectoryNames.has(topDirectory.toLowerCase())) continue;
     for (const entry of await safeList(io, workspace, directory)) {
       const path = joinRelative(directory, String(entry?.name || ""));
       if (!path || path.length > DEFAULT_PROJECT_BASELINE_LIMITS.maxPathLength) {

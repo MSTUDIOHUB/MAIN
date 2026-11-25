@@ -54,36 +54,42 @@ export function hasCanceledTurnTerminalProjection(input: {
     visibility?: string;
   }>;
 }): boolean {
-  const abortedRunIndex = input.runtimeEvents.findIndex((event) =>
-    event.type === "run.aborted" &&
-    event.threadId === input.sessionKey &&
-    event.turnId === input.turnId
-  );
-  const abortedRunId = abortedRunIndex >= 0
-    ? input.runtimeEvents[abortedRunIndex]?.runId
-    : undefined;
-  const canceledRunIndex = input.runtimeEvents.findIndex((event, index) =>
-    index > abortedRunIndex &&
-    event.type === "run.completed" &&
-    event.threadId === input.sessionKey &&
-    event.turnId === input.turnId &&
-    event.resultKind === "canceled" &&
-    (!abortedRunId || event.runId === abortedRunId)
-  );
-  const canceledTurnIndex = input.runtimeEvents.findIndex((event, index) =>
-    index > canceledRunIndex &&
-    event.type === "turn.completed" &&
-    event.threadId === input.sessionKey &&
-    event.turnId === input.turnId &&
-    event.resultKind === "canceled"
-  );
   const hasVisibleFinal = input.taskFlow.some((block) =>
     block.type === "agent" &&
     block.turnId === input.turnId &&
     block.visibility === "assistant_final"
   );
-  return abortedRunIndex >= 0 && canceledRunIndex > abortedRunIndex &&
-    canceledTurnIndex > canceledRunIndex && hasVisibleFinal;
+  if (!hasVisibleFinal) return false;
+  for (let abortedRunIndex = 0; abortedRunIndex < input.runtimeEvents.length; abortedRunIndex += 1) {
+    const abortedEvent = input.runtimeEvents[abortedRunIndex];
+    if (
+      !abortedEvent ||
+      abortedEvent.type !== "run.aborted" ||
+      abortedEvent.threadId !== input.sessionKey ||
+      abortedEvent.turnId !== input.turnId
+    ) {
+      continue;
+    }
+    const abortedRunId = abortedEvent.runId;
+    const canceledRunIndex = input.runtimeEvents.findIndex((event, index) =>
+      index > abortedRunIndex &&
+      event.type === "run.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      event.resultKind === "canceled" &&
+      (!abortedRunId || event.runId === abortedRunId)
+    );
+    if (canceledRunIndex <= abortedRunIndex) continue;
+    const canceledTurnIndex = input.runtimeEvents.findIndex((event, index) =>
+      index > canceledRunIndex &&
+      event.type === "turn.completed" &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      event.resultKind === "canceled"
+    );
+    if (canceledTurnIndex > canceledRunIndex) return true;
+  }
+  return false;
 }
 
 const pendingBySessionKey = new Map<string, PendingSessionCancellation>();

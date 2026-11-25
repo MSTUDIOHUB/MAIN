@@ -1,3 +1,5 @@
+import { compactDebugString } from "../../lib/debugLog";
+import { classifyWorkspaceReadFailure, describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 import { knowledgeSearchTraceFields } from "../../lib/knowledgeReferences";
 import {
   runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2KnowledgeMayFetch,
@@ -14,9 +16,11 @@ import { runUnityEditorOperation } from "../../lib/ipc";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import {
   isRuntimeV2LifecycleDeadlineError,
+  RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
   type RuntimeV2ExecutionValidationAuthority,
   type ToolPort,
 } from "../../lib/runtime-v2";
+import { executeResolveReviewFindingReceiptJson } from "./executionPlanAuthorization";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RUNTIME_V2_VALIDATION_TOOL_NAMES,
@@ -316,7 +320,9 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
                 next:
                   "Advance only a listed exact change or validation; revise explicitly if new evidence changes scope.",
               })
-            : await executeRuntimeV2ToolWithDeadline({
+            : toolName === RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME
+              ? executeResolveReviewFindingReceiptJson(aggregateForCurrentTurn(input), executionArgs)
+              : await executeRuntimeV2ToolWithDeadline({
                 toolName,
                 toolTimeoutMs: unityTimeout ? unityTimeout + 3_000 : undefined,
                 activity: activity(toolName, target),
@@ -488,35 +494,20 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
         return completion;
       } catch (error) {
         if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
-        const failureContent =
-          `TOOL_ERROR: ${error instanceof Error ? error.message : String(error)}`;
-        recordToolResultHistory({
-          ports: input,
-          command,
-          toolName,
-          target: failureContextTarget,
-          status: "failed",
-          content: failureContent,
-        });
+        const rawErr = error instanceof Error ? error.message : String(error);
+        const isReadTool = RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName) || /^(?:list_directory|glob_search|grep_search|get_file_outline|get_project_skeleton)$/.test(toolName);
+        const classified = isReadTool ? classifyWorkspaceReadFailure(rawErr) : undefined;
+        const described = classified ? describeWorkspaceToolFailure(classified.code, input.context.phaseLanguage) : undefined;
+        const failureContent = classified ? `TOOL_ERROR: [code=${classified.code}] ${rawErr}${described?.modelHint ? ` (${described.modelHint})` : ""}` : `TOOL_ERROR: ${rawErr}`;
+        recordToolResultHistory({ ports: input, command, toolName, target: failureContextTarget, status: "failed", content: failureContent });
         input.logStoreEvent("runtime_v2_tool_execution_failed", {
-          turnId: command.run.turnId,
-          runId: command.run.runId,
-          commandKind: command.kind,
-          toolName,
-          commandKey: command.idempotencyKey,
-          sessionKey: command.run.sessionKey,
-          target: /^(?:run_command|knowledge_search|web_search|web_fetch)$/.test(toolName) ? null : target || null,
-          errorType: error instanceof Error ? error.name : typeof error,
+          turnId: command.run.turnId, runId: command.run.runId, commandKind: command.kind, toolName, commandKey: command.idempotencyKey,
+          sessionKey: command.run.sessionKey, target: /^(?:run_command|knowledge_search|web_search|web_fetch)$/.test(toolName) ? null : target || null,
+          errorType: error instanceof Error ? error.name : typeof error, errorMessage: compactDebugString(rawErr, 320), ...(classified ? { failureReasonCode: classified.code } : {}),
         });
         return toolCompletionFor(
-          input,
-          command,
-          toolName,
-          args,
-          failureContextTarget,
-          failureContent,
-          "failed",
-          "execution_failed",
+          input, command, toolName, args, failureContextTarget, failureContent,
+          "failed", classified?.failureKind || "execution_failed", undefined, undefined, classified?.code,
         );
       }
     },

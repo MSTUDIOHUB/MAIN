@@ -4,6 +4,7 @@ import type { ToolDiffPreview } from "../../lib/toolDiff";
 import { isRuntimeV2UnexecutedToolReceipt } from "../../lib/runtime-v2/toolReceipt";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { buildToolResultPresentation } from "../../lib/toolResultPresentation";
+import { describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 
 type Completion = Extract<RuntimeV2Event, { type: "tool.completed" | "validation.completed" }>;
 
@@ -28,7 +29,17 @@ export function runtimeV2ToolOutcomePresentation(completion: Completion, languag
     : toolOutcome === "blocked"
     ? language === "zh" ? "本操作被阻止，未执行。请根据权限或前置条件调整后续操作。" : "This operation was blocked before execution. Adjust the next action to its permissions and prerequisites."
     : toolOutcome === "failed" && completion.type === "tool.completed"
-    ? language === "zh" ? "执行失败，原始输出已保留在调试详情中。" : "Execution failed. The original output is available in debug details."
+    ? (() => {
+        const described = describeWorkspaceToolFailure(completion.failureReasonCode, language);
+        if (described) {
+          return language === "zh" ? `执行失败：${described.cardMessage}` : `Execution failed: ${described.cardMessage}`;
+        }
+        return completion.modelContent && /(?:at most 6|最多\s*6|exceeds?.*limit|allowed_paths.*6)/i.test(completion.modelContent)
+          ? language === "zh"
+            ? "执行失败：子智能体单次路径超出 6 个上限，需按模块拆分后派发。"
+            : "Execution failed: Subagent path scope exceeded the 6-path limit; split across multiple subagents."
+          : language === "zh" ? "执行失败，原始输出已保留在调试详情中。" : "Execution failed. The original output is available in debug details.";
+      })()
     : readableRead ? readMessage || "" : presentation?.message || (failed
       ? language === "zh" ? "验证未通过，请检查失败输出。" : "Validation did not pass; inspect the failure output."
       : "");

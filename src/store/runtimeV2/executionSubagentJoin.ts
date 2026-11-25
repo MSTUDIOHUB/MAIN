@@ -6,7 +6,7 @@ import {
 } from "../../lib/runtime-v2";
 import { upsertRuntimeV2ContextAnchor } from "./executionProviderAnchors";
 import { closeCollaborationToolCall } from "./executionSchedulerAdmission";
-import { commitRuntimeV2StagedChildMutation } from "./executionSubagentMutation";
+import { commitRuntimeV2StagedChildBatch } from "./executionSubagentMutation";
 import type {
   RuntimeV2ChildResult,
   RuntimeV2ExecutionPortsInput,
@@ -34,15 +34,26 @@ export function recordRuntimeV2JoinedChildAnchor(
 } {
   const contextEntryId = `child:${result.job.id}`;
   const evidenceIds = [...new Set(result.evidence.map((evidence) => evidence.id))];
+  const reviewFindingLines = result.job.taskKind === "review" && result.status === "completed" && result.report?.findings.length
+    ? result.report.findings.map((finding, index) => {
+        const findingId = finding.id?.trim() || `${result.job.id}:f${index + 1}`;
+        const severity = finding.severity || (/\[BLOCKING\]/i.test(finding.statement) ? "blocking" : "advisory");
+        return `- finding_id=${findingId} [${severity.toUpperCase()}]: ${finding.statement}`;
+      })
+    : [];
   const content = [
     `Scope: ${result.job.scopeKey} (${result.job.allowedPaths.join(", ")})`,
     `Status: ${result.status}`,
     `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
     `Report: ${result.summary}`,
+    ...(reviewFindingLines.length > 0 ? ["Findings:", ...reviewFindingLines] : []),
     evidenceIds.length > 0
       ? "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer."
       : "No child evidence id is available for parent adoption; continue the objective directly.",
-  ].join("\n");
+    reviewFindingLines.some((line) => line.includes("[BLOCKING]"))
+      ? "Action required: verify each [BLOCKING] finding against current source/validation, repair within authorized scope if confirmed, and settle every blocking finding with resolve_review_finding."
+      : "",
+  ].filter(Boolean).join("\n");
   upsertRuntimeV2ContextAnchor(live, { key: contextEntryId, content });
   const delivered = live.messages.some((message) =>
     message.role === "system" &&
@@ -124,37 +135,35 @@ export async function commitCompletedRuntimeV2ChildTransaction(input: {
   ) {
     return input.result;
   }
-  if (staged.length !== 1) {
-    const retained = input.result.evidence.filter((evidence) =>
-      !staged.some((item) => item.evidenceId === evidence.id)
-    );
+  if (staged.length === 0) {
     return {
       ...input.result,
-      status: retained.length > 0 ? "degraded" : "failed",
+      status: input.result.evidence.length > 0 ? "degraded" : "failed",
       summary:
-        "实现子任务没有形成唯一、可提交的修改事务；未改变工作区，父线程继续接管。",
+        "实现子任务没有形成可提交的修改暂存；未改变工作区，父线程继续接管。",
       report: null,
-      evidence: retained,
+      evidence: input.result.evidence,
       stagedMutations: [],
     };
   }
-  const commit = await commitRuntimeV2StagedChildMutation({
+  const commit = await commitRuntimeV2StagedChildBatch({
     ports: input.ports,
     parentCommand: input.command,
     job: input.result.job,
-    staged: staged[0]!,
+    stagedList: staged,
     signal: input.signal,
   });
   if (!commit.committed) {
+    const stagedIds = new Set(staged.map((item) => item.evidenceId));
     const retained = input.result.evidence.filter((evidence) =>
-      evidence.id !== staged[0]!.evidenceId
+      !stagedIds.has(evidence.id)
     );
     input.ports.logStoreEvent("runtime_v2_subagent_mutation_discarded", {
       turnId: input.command.run.turnId,
       runId: input.command.run.runId,
       jobId: input.result.job.id,
       reason: commit.message,
-      targets: staged[0]!.targets,
+      targets: [...new Set(staged.flatMap((item) => item.targets))],
     });
     return {
       ...input.result,

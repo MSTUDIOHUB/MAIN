@@ -2,6 +2,7 @@ import type { TaskBlock } from "../../lib/taskTypes";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { withTurnRuntimePhaseStatus } from "../../lib/turnPhase";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
+import { describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 import { runtimeV2ToolOutcomePresentation } from "./toolOutcomePresentation";
 
 /** Derive settled timeline rows from canonical command and effect receipts.
@@ -66,6 +67,12 @@ export function reconcileRuntimeV2TimelineBlocks(
       const outcome = completion ? runtimeV2ToolOutcomePresentation(completion, language) : undefined;
       const notExecuted = outcome?.toolOutcome === "not_executed";
       const blocked = outcome?.toolOutcome === "blocked";
+      const scheduledArgs = block.toolCallId
+        ? aggregate.events.find((event): event is Extract<typeof event, { type: "command.scheduled" }> =>
+            event.type === "command.scheduled" && event.command.idempotencyKey === block.toolCallId)?.command.payload.arguments as Record<string, unknown> | undefined
+        : undefined;
+      const subagentPathLimitHit = terminalFailed && scheduledArgs && [scheduledArgs.allowed_paths, scheduledArgs.required_paths]
+        .some((value) => typeof value === "string" && value.split(",").map((s) => s.trim()).filter(Boolean).length > 6);
       const fallbackMessage = notExecuted
         ? language === "zh" ? "该验证未执行，没有产生通过或失败结果。" : "This validator was not executed and produced no pass or failure result."
         : terminalFailed
@@ -73,9 +80,13 @@ export function reconcileRuntimeV2TimelineBlocks(
           ? language === "zh"
             ? "有限验证未通过；运行时已保留真实失败输出供后续修复。"
             : "Validation did not pass; Runtime retained the real failure output for the next repair."
-          : language === "zh"
-            ? "该结构化工具动作未成功完成。"
-            : "The structured tool action did not complete successfully."
+          : subagentPathLimitHit
+            ? language === "zh"
+              ? "子智能体单次路径超出 6 个上限，需按模块拆分后派发。"
+              : "Subagent path scope exceeded the 6-path limit; split across multiple subagents."
+            : language === "zh"
+              ? "该结构化工具动作未成功完成。"
+              : "The structured tool action did not complete successfully."
         : "";
       return [{
         ...block,
@@ -106,6 +117,27 @@ export function reconcileRuntimeV2TimelineBlocks(
       }];
     }
     if (!blockRunning) return [block];
+    const progressFailureHint = failed && block.toolCallId && (() => {
+      const completedEvt = [...aggregate.events].reverse().find(
+        (event): event is Extract<typeof event, { type: "command.completed" | "tool.completed" }> =>
+          (event.type === "command.completed" || event.type === "tool.completed") &&
+          event.idempotencyKey === block.toolCallId,
+      );
+      const fromCode = describeWorkspaceToolFailure(completedEvt?.failureReasonCode, language)?.cardMessage;
+      if (fromCode) return fromCode;
+      const cmd = aggregate.events.find((event): event is Extract<typeof event, { type: "command.scheduled" }> =>
+        event.type === "command.scheduled" && event.command.idempotencyKey === block.toolCallId)?.command;
+      const rawTasks = Array.isArray(cmd?.payload.tasks) ? cmd.payload.tasks : [];
+      const overLimit = rawTasks.some((task: any) =>
+        Array.isArray(task?.allowedPaths) && task.allowedPaths.length > 6
+      );
+      if (overLimit) {
+        return language === "zh"
+          ? "子智能体单次路径超出 6 个上限，需按模块拆分后派发。"
+          : "Subagent path scope exceeded the 6-path limit; split across multiple subagents.";
+      }
+      return undefined;
+    })();
     return [{
       ...block,
       status: failed ? "failed" as const : "done" as const,
@@ -115,9 +147,9 @@ export function reconcileRuntimeV2TimelineBlocks(
           ? language === "zh"
             ? "有限验证未通过；运行时将根据已保留的失败证据继续修复。"
             : "Validation did not pass; Runtime will continue from the retained failure evidence."
-        : language === "zh"
+        : progressFailureHint || (language === "zh"
           ? "该结构化动作已记录为失败，运行时将从已保留的证据继续恢复。"
-          : "The structured action was recorded as failed; recovery will continue from retained evidence.",
+          : "The structured action was recorded as failed; recovery will continue from retained evidence."),
       updatedAt: timestampMs,
     }];
   });

@@ -29,6 +29,9 @@ MAIN 的公开版本说明保存在 `docs/releases/`，网站手册可以把这�
 
 版本说明按新到旧排列。安装包是否已发布，以公开 Releases 页面为准：
 
+- [2.4.1](../releases/Release_Notes_2.4.1_ZH.md)
+- [2.4.0](../releases/Release_Notes_2.4.0_ZH.md)
+- [2.3.9](../releases/Release_Notes_2.3.9_ZH.md)
 - [2.3.8](../releases/Release_Notes_2.3.8_ZH.md)
 - [2.3.7](../releases/Release_Notes_2.3.7_ZH.md)
 - [2.3.5](../releases/Release_Notes_2.3.5_ZH.md)

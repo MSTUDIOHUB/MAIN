@@ -450,6 +450,8 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (toolName === "run_command" || toolName === "execute_command") return `ran ${rawTarget}`;
     if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
     if (toolName === "computer_use") return `controlled ${rawTarget}`;
+    if (toolName === "spawn_subagent" || toolName === "schedule_subagents") return `spawned subagent ${rawTarget}`;
+    if (toolName === "wait_subagents" || toolName === "join_subagents") return `joined subagent ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
   }
   if (toolName === "load_skill") return `读取技能 ${rawTarget}`;
@@ -463,6 +465,8 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
   if (toolName === "run_command" || toolName === "execute_command") return `运行 ${rawTarget}`;
   if (toolName === "browser_evaluate") return `验证 ${rawTarget}`;
   if (toolName === "computer_use") return `控制 ${rawTarget}`;
+  if (toolName === "spawn_subagent" || toolName === "schedule_subagents") return `派发子智能体 ${rawTarget}`;
+  if (toolName === "wait_subagents" || toolName === "join_subagents") return `汇合子智能体 ${rawTarget}`;
   return toolName ? `${toolName} ${rawTarget}` : "";
 }
 
@@ -601,9 +605,18 @@ function classifyToolActivityKind(
   if (isStoppedStepStatus(status)) {
     // A rejected edit is still an edit attempt even when the preflight
     // correctly prevented a diff. Calling it a generic blocked/paused step
-    // falsely implies that the whole Turn stopped.
+    // falsely implies that the whole Turn stopped. Failed tool calls likewise
+    // retain their tool family (e.g. command / message -> 动作受阻) instead of "paused".
     if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return "edit";
-    return isExploringToolName(toolName) ? "exploring" : "blocked";
+    if (isExploringToolName(toolName)) return "exploring";
+    if (status === "failed") {
+      if (toolName === "browser_evaluate") return "browser";
+      if (toolName === "computer_use" || toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input" || TERMINAL_READ_TOOL_NAMES.has(toolName)) {
+        return "command";
+      }
+      return "message";
+    }
+    return "blocked";
   }
   if (isExploringToolName(toolName)) return "exploring";
   if (toolName === "browser_evaluate") return "browser";
@@ -884,7 +897,6 @@ function makeUniqueExplorationMetricParts(items: any[], metrics: ActivityMetrics
 function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, language: ToolPresentationLanguage): string {
   if (status === "not_executed") return language === "zh" ? "未执行" : "Not executed";
   if (status === "blocked") return language === "zh" ? "被阻止" : "Blocked";
-  if (status === "failed" && kind !== "edit") return language === "zh" ? "执行失败" : "Execution failed";
   const running = status === "running";
   const failed = status === "failed" || status === "rejected";
   if (language === "en") {
@@ -896,7 +908,7 @@ function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, lan
     if (kind === "approval") return "Awaiting approval";
     if (kind === "blocked") return "Paused";
     if (kind === "thinking") return "Thinking";
-    return running ? "Working" : "Recorded";
+    return running ? "Working" : failed ? "Action blocked" : "Recorded";
   }
   if (kind === "exploring") return failed ? "探索受阻" : running ? "正在探索" : "已探索";
   if (kind === "edit") return failed ? "修改未应用" : running ? "正在编辑" : "已编辑";
@@ -906,7 +918,7 @@ function activityVerb(kind: ActivityCellKind, status: TurnArchiveStepStatus, lan
   if (kind === "approval") return "等待审批";
   if (kind === "blocked") return "已暂停";
   if (kind === "thinking") return "正在思考";
-  return running ? "正在处理" : "已记录";
+  return running ? "正在处理" : failed ? "动作受阻" : "已记录";
 }
 
 function makeActivitySummary(activity: Pick<ActivityCell, "kind" | "targets" | "metrics"> & { items?: any[] }, language: ToolPresentationLanguage): string {
@@ -941,7 +953,7 @@ function makeActivityTitle(activity: Pick<ActivityCell, "kind" | "status" | "met
     if (activity.kind === "exploring") {
       return compactLine(`${verb}：${actionSummary}`, 150);
     }
-    if (activity.kind === "edit" || activity.kind === "command" || activity.kind === "browser") {
+    if (activity.kind === "edit" || activity.kind === "command" || activity.kind === "browser" || (activity.kind === "message" && (activity.status === "failed" || activity.status === "rejected"))) {
       return compactLine(`${verb}：${actionSummary}`, 150);
     }
   }
@@ -979,13 +991,17 @@ function buildActivityCellFromItems(
 ): ActivityCell {
   const metrics = emptyActivityMetrics();
   for (const item of items) addActivityMetricsFromBlock(metrics, item);
-  const firstKind = items.map(classifyBlockActivityKind).find((kind) => kind !== "message") ||
-    (fallbackKind === "thinking" ? "thinking" : fallbackKind === "blocked" ? "blocked" : "message");
   const status = items.reduce<TurnArchiveStepStatus>((current, item) => {
     if (isToolBlock(item)) return mergeActivityStatus(current, mapToolStatus(item));
     if (isProgressBlock(item)) return mergeActivityStatus(current, mapProgressStatus(item));
     return current;
   }, "done");
+  const firstKind = items.map(classifyBlockActivityKind).find((kind) => kind !== "message") ||
+    (fallbackKind === "thinking"
+      ? "thinking"
+      : fallbackKind === "blocked" && status !== "failed"
+      ? "blocked"
+      : "message");
   const targets = uniqueTargets(items, language);
   const latestEvidence = compactLine([...items].reverse().map(item => getBlockResultLine(item, language)).find(Boolean) || "", 180);
   const planRuntimePhase = getFirstPlanRuntimeArchivePhase(items);

@@ -17,6 +17,7 @@ import {
 } from "../lib/turnIntake";
 import type { WorkspaceJsonObject } from "../lib/workspaceInstruction";
 import { parseProjectInitCommand } from "../lib/projectInit";
+import { parseGrillMeCommand } from "../lib/grillMe";
 
 /**
  * Immutable UI facts captured by the exact Composer submit event. They must
@@ -75,6 +76,27 @@ export function buildWorkspaceComposerIntentDispatchHints(
     subagentPreference, explicitIntent: "plan", planPurpose: "rules",
     turnTitle: input.language === "en" ? "Write project rules" : "编写项目规则",
   };
+  const grillMeCommand = parseGrillMeCommand(input.text);
+  if (grillMeCommand) {
+    const label = grillMeCommand.request
+      ? buildLocalTurnTitle(grillMeCommand.request, "plan", input.language)
+      : input.language === "en" ? "Grill-Me Plan" : "深度追问规划";
+    return {
+      subagentPreference,
+      explicitIntent: "plan",
+      planPurpose: "plan",
+      planInterviewMode: "grill",
+      turnTitle: label,
+      intentSummary: buildRunIntentSummary({
+        input: grillMeCommand.request || input.text,
+        intent: "plan",
+        language: input.language,
+        reason: input.language === "en"
+          ? "The user explicitly requested a structured /grill-me design interview before finalizing the plan."
+          : "用户明确要求通过 /grill-me 先进行设计取舍追问，再形成规划。",
+      }),
+    };
+  }
   const mainDebugShortcut = mainModeKey === "main_mode"
     ? parseMainDebugShortcut(input.text)
     : null;

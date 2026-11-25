@@ -1,4 +1,5 @@
 import { normalizeNetworkRead } from "../../lib/networkRead";
+import { awaitCanceledTurnTerminalProjection, getPendingSessionCancellation } from "../sessionCancellationBarrier";
 import type { SubmitSessionPersistence } from "../persistSubmitRuntimeProjection";
 import { buildLoadSkillToolDefinition } from "../../lib/agentSkills";
 import { runRuntimeV2ReadOnlyLoop } from "../../lib/runtime-v2/readOnly";
@@ -209,7 +210,9 @@ export async function runSubmitRuntimeV2ReadOnly(
       ), networkRead: input.context.networkRead, knowledgeContext: input.context.knowledgeContext,
       workspaceInstructionContext: input.context.workspaceInstructionContext,
       allowSkillLoad: !!buildLoadSkillToolDefinition(input.context.skillCatalog),
-      signal: input.context.abortCtrl.signal, now, deadlineMs: input.deadlineMs,
+      signal: input.context.abortCtrl.signal,
+      isExternalCancellationPending: () => getPendingSessionCancellation(identity.turn.sessionKey)?.turnId === identity.turn.turnId,
+      now, deadlineMs: input.deadlineMs,
       initial: existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined,
       blocked: () => live.permissionRejection,
       decisionInput: () => {
@@ -226,5 +229,20 @@ export async function runSubmitRuntimeV2ReadOnly(
       providerResponses: result.aggregate.events.filter((event) => event.type === "provider.responded").length,
     });
     return settlement(input.context, result.resultKind === "canceled" ? abortedAgentLoopOutcome(result.reason) : completedAgentLoopOutcome(result.reason, result.resultKind));
+  } catch (error) {
+    if (
+      input.context.abortCtrl.signal.aborted &&
+      await awaitCanceledTurnTerminalProjection({
+        sessionKey: identity.turn.sessionKey,
+        turnId: identity.turn.turnId,
+        getProjection: () => {
+          const state = input.get();
+          return { runtimeEvents: state.runtimeEvents || [], taskFlow: state.taskFlow || [] };
+        },
+      })
+    ) {
+      return settlement(input.context, abortedAgentLoopOutcome("用户已停止本轮执行；取消事务已完成唯一终态收口。"));
+    }
+    throw error;
   } finally { clearInterval(input.context.timerInterval as ReturnType<typeof setInterval>); }
 }

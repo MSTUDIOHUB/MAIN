@@ -1,10 +1,11 @@
 import { parseProjectInitCommand } from "../lib/projectInit";
+import { parseGrillMeCommand } from "../lib/grillMe";
 import { parseMainDebugShortcut, parseMainIntentShortcutForMode } from "../lib/runIntent";
 import type { WorkspaceTurnQueueEntry } from "../lib/workspaceInstruction";
 
 export function isWorkspaceGuidanceText(text: string): boolean {
-  return !!text.trim() && !parseProjectInitCommand(text) && !parseMainDebugShortcut(text) &&
-    !parseMainIntentShortcutForMode(text, "main_mode");
+  return !!text.trim() && !parseProjectInitCommand(text) && !parseGrillMeCommand(text) &&
+    !parseMainDebugShortcut(text) && !parseMainIntentShortcutForMode(text, "main_mode");
 }
 
 export function isQueuedWorkspaceGuidanceEligible(entry: WorkspaceTurnQueueEntry): boolean {

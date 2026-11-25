@@ -21,6 +21,12 @@ import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "
 import { getGitStatus, getGitDiff, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
 import { generateGitCommitMessage } from "../lib/gitCommitMessage";
 import { safeConfirmAsync } from "../lib/safeConfirm";
+import {
+  clampSidebarChatSectionHeight,
+  DEFAULT_SIDEBAR_CHAT_HEIGHT,
+  readStoredSidebarChatSectionHeight,
+  SIDEBAR_CHAT_HEIGHT_STORAGE_KEY,
+} from "../lib/sidebarLayout";
 
 interface GitMenuState {
   workspacePath: string;
@@ -180,8 +186,12 @@ export default function Sidebar({
   onStartResizing,
 }: SidebarProps) {
   const sidebarRef = useRef<HTMLDivElement | null>(null);
+  const sidebarSplitContainerRef = useRef<HTMLDivElement | null>(null);
   const gitMenuRef = useRef<HTMLDivElement | null>(null);
   const [chatExpanded, setChatExpanded] = useState(true);
+  const [chatSectionHeight, setChatSectionHeight] = useState<number>(() => readStoredSidebarChatSectionHeight());
+  const [isResizingChatSection, setIsResizingChatSection] = useState(false);
+  const chatResizeCleanupRef = useRef<(() => void) | null>(null);
   const [expandedWorkspaces, setExpandedWorkspaces] = useState<Record<string, boolean>>({});
   const [gitStatuses, setGitStatuses] = useState<Record<string, GitStatus>>({});
   const [gitLoading, setGitLoading] = useState<Record<string, boolean>>({});
@@ -193,6 +203,60 @@ export default function Sidebar({
   const [gitFeedback, setGitFeedback] = useState<GitFeedbackState | null>(null);
   const [generatingCommitMessage, setGeneratingCommitMessage] = useState(false);
   const [gitMenuCachedTime, setGitMenuCachedTime] = useState<number | null>(null);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_CHAT_HEIGHT_STORAGE_KEY, String(chatSectionHeight));
+    } catch {
+      // Ignore storage quota or sandbox failures when persisting layout preference.
+    }
+  }, [chatSectionHeight]);
+
+  useEffect(() => {
+    return () => {
+      chatResizeCleanupRef.current?.();
+      chatResizeCleanupRef.current = null;
+    };
+  }, []);
+
+  const handleStartResizingChatSection = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!chatExpanded) return;
+    event.preventDefault();
+    chatResizeCleanupRef.current?.();
+    const startY = event.clientY;
+    const startHeight = chatSectionHeight;
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    setIsResizingChatSection(true);
+
+    const handleMove = (moveEvent: PointerEvent) => {
+      const containerHeight = sidebarSplitContainerRef.current?.clientHeight;
+      const nextHeight = clampSidebarChatSectionHeight(
+        startHeight + (startY - moveEvent.clientY),
+        containerHeight,
+      );
+      setChatSectionHeight(nextHeight);
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", cleanup);
+      window.removeEventListener("pointercancel", cleanup);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+      setIsResizingChatSection(false);
+      if (chatResizeCleanupRef.current === cleanup) {
+        chatResizeCleanupRef.current = null;
+      }
+    };
+
+    chatResizeCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", cleanup);
+    window.addEventListener("pointercancel", cleanup);
+  }, [chatExpanded, chatSectionHeight]);
   const openGitDiffPreview = useAppStore((s) => s.openGitDiffPreview);
   const clearGitDiffPreview = useAppStore((s) => s.clearGitDiffPreview);
   const setShowDiff = useAppStore((s) => s.setShowDiff);
@@ -861,8 +925,8 @@ export default function Sidebar({
         )}
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col px-3 pb-4 pt-3">
-        <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+      <div ref={sidebarSplitContainerRef} className="flex min-h-0 flex-1 flex-col px-3 pb-4 pt-3">
+        <div className="min-h-[120px] flex-1 overflow-y-auto pr-1">
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2 px-1">
               <div className="text-[11px] font-bold uppercase tracking-wider text-[#71717a]">{projectChatsLabel}</div>
@@ -986,7 +1050,29 @@ export default function Sidebar({
           </div>
         </div>
 
-        <div className="mt-4 shrink-0 border-t border-[#18181b] pt-4">
+        <div className="mt-2 shrink-0 pt-1">
+          {chatExpanded ? (
+            <div
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label={config.language === "en" ? "Resize chat list height" : "拖动调整聊天列表高度"}
+              title={config.language === "en" ? "Drag to resize chat list height (double-click to reset)" : "上下拖动调整聊天列表高度（双击恢复默认）"}
+              data-testid="sidebar-chat-resizer"
+              onPointerDown={handleStartResizingChatSection}
+              onDoubleClick={() => setChatSectionHeight(DEFAULT_SIDEBAR_CHAT_HEIGHT)}
+              className={`group -mx-1 mb-2 flex h-3 cursor-row-resize items-center justify-center rounded transition-colors ${
+                isResizingChatSection ? "bg-[#27272a]" : "hover:bg-[#18181b]"
+              }`}
+            >
+              <div
+                className={`h-[2px] w-10 rounded-full transition-colors ${
+                  isResizingChatSection ? "bg-[var(--accent)]" : "bg-[#27272a] group-hover:bg-[#52525b]"
+                }`}
+              />
+            </div>
+          ) : (
+            <div className="mb-3 border-t border-[#18181b]" />
+          )}
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2 px-1">
               <div className="text-[11px] font-bold uppercase tracking-wider text-[#71717a]">{chatLabel}</div>
@@ -1000,7 +1086,10 @@ export default function Sidebar({
               </button>
             </div>
 
-            <div className="max-h-52 overflow-y-auto pr-1">
+            <div
+              className="overflow-y-auto pr-1"
+              style={chatExpanded ? { height: `${chatSectionHeight}px` } : undefined}
+            >
               <div className="space-y-0.5">
                 <button
                   data-testid="sidebar-global-chat-row"
