@@ -672,6 +672,7 @@ export function isConversationTurnRuntimeClosed(
 export interface DurableTurnExecutionSummary {
   decisions: string[];
   modifiedFiles: string[];
+  inspectedFiles?: string[];
   validations: string[];
   failures: string[];
   unfinished: string[];

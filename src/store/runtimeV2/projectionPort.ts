@@ -10,7 +10,7 @@ import type { ProgressTaskBlock, TaskBlock } from "../../lib/taskTypes";
 import {
   deriveTurnRuntimePhaseForTool,
 } from "../../lib/turnPhase";
-import { runtimeV2StructuredActionMarkdown } from "../../lib/runtime-v2";
+import { isRuntimeV2FileVersion, runtimeV2StructuredActionMarkdown } from "../../lib/runtime-v2";
 import type {
   ProjectionPort,
   RuntimeV2Command,
@@ -528,6 +528,9 @@ export function createRuntimeV2ProjectionPort(
                         updatedAt: timestampMs,
                       },
                     };
+                    const inspectedFiles = aggregate.evidence
+                      .filter((evidence) => evidence.kind === "source" && isRuntimeV2FileVersion(evidence.version))
+                      .map((evidence) => evidence.target);
                     const durableContext = buildDurableTurnContext({
                       turnId: run.turnId,
                       turnBlocks: taskFlow.filter(
@@ -535,6 +538,7 @@ export function createRuntimeV2ProjectionPort(
                           candidate.turnId === run.turnId,
                       ),
                       fallbackAssistantText: visibleProjection.markdown,
+                      inspectedFiles,
                       now: timestampMs,
                     });
                     return durableContext

@@ -2909,8 +2909,9 @@ export default function ChatArea({
     return resolvePinnedConversationTurn(visibleConversationTurns, currentTurnId);
   }, [visibleConversationTurns, currentTurnId]);
   const composerHasLiveTurnOwner = Boolean(
-    currentWorkspace &&
     pinnedTurn &&
+    activeSessionKey &&
+    activeSessionEpoch &&
     !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
     (
       (
@@ -4635,8 +4636,11 @@ export default function ChatArea({
       waiting: { zh: "等待模型响应", en: "Waiting for the model" },
       receiving: { zh: "正在接收模型输出", en: "Receiving model output" },
     };
+    const modelContext = currentModelRequest?.kind === "model" ? currentModelRequest.context : undefined;
+    const modelDetail = modelContext ? (language === "zh" ? modelContext.detailZh : modelContext.detailEn) : undefined;
     capsuleActivityLine = {
       title: modelStatus[requestStage][language],
+      ...(modelDetail ? { detail: modelDetail } : {}),
       live: true,
       waitingSince: requestStage === "waiting" ? currentModelRequest?.startedAt : undefined,
     };

@@ -16,7 +16,10 @@ export function admittedPlanQuestionPurpose(aggregate: TurnAggregateV1 | null | 
   if (aggregate?.planPurpose) return aggregate.planPurpose;
   if (aggregate?.events?.some(event =>
     (event.type === "turn.admitted" && event.sourcePlanDraft) ||
-    (event.type === "run.paused" && event.blocker.questionnaire?.purpose === "plan_confirmation")
+    (event.type === "run.paused" && (
+      event.blocker.questionnaire?.purpose === "plan_confirmation" ||
+      event.blocker.questionnaire?.purpose === "plan_interview"
+    ))
   )) return "plan";
   return undefined;
 }

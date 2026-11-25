@@ -181,7 +181,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     if (name === UNITY_CREATE_SCENE_TOOL) return unitySceneApproved === true;
     if (name === RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME) return hasCompletedReviewSubagent;
     if (name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) {
-      return true;
+      return aggregate?.strategy === "execute";
     }
     return RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES.has(name) ||
       (!hasWorkspace && RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES.has(name)) ||
@@ -198,7 +198,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const selected = filterToCoreAndUnlockedTools(executeCandidates, {
     sessionKey,
     prompt: objectiveText,
-    alwaysInclude: new Set([...collaboration, RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
+    alwaysInclude: new Set([...collaboration, ...(aggregate?.strategy === "execute" ? [RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME] : []),
       ...(hasCompletedReviewSubagent ? [RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME] : []),
       ...globalNetworkTools, ...activeKnowledgeTools,
       ...visibleObservations, ...executeCandidates.map(tool => tool.function.name).filter(isMcpEffect),

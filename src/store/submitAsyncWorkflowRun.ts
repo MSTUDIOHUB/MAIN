@@ -1,4 +1,5 @@
 import { normalizeAttachedFile, type AttachedFile } from "../lib/attachments";
+import { parseGrillMeCommand, requestsExplicitPlanInterview } from "../lib/grillMe";
 import { saveProjectSession } from "../lib/ipc";
 import { withSubmitSessionPersistenceOwner } from "./persistSubmitRuntimeProjection";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
@@ -1703,7 +1704,7 @@ export async function runSubmitAsyncWorkflowRun<
   const submissionRunId = String(input.runIdOverride || "").trim() ||
     createSubmitHarnessRunId(input.nowMs());
   const initialRuntimeOwnerToken = input.getSessionRuntimeOwnerToken();
-  const expectedHarnessRunMarker = input.readHarnessRunMarker();
+  const initialExpectedHarnessRunMarker = input.readHarnessRunMarker();
   let submissionParentRunId = String(input.parentRunIdOverride || "").trim() || null;
   let acquiredRunOwner: SubmitBootstrapRunOwner | null = null;
   let dispatchedPlanExecutionLeaseId = String(input.planExecutionLeaseId || "").trim();
@@ -1994,6 +1995,15 @@ export async function runSubmitAsyncWorkflowRun<
     return;
   }
 
+  const latestHarnessRunMarker = input.readHarnessRunMarker();
+  const currentHarnessInstanceId = input.getCurrentHarnessInstanceId();
+  const expectedHarnessRunMarker =
+    latestHarnessRunMarker &&
+    latestHarnessRunMarker.instanceId === currentHarnessInstanceId &&
+    latestHarnessRunMarker.sessionKey !== input.runSessionKey
+      ? latestHarnessRunMarker
+      : initialExpectedHarnessRunMarker;
+
   const runLease = (phaseRunners.startRunLease || startSubmitRunLease)({
     userContent,
     canonicalUserText: input.text,
@@ -2119,7 +2129,26 @@ export async function runSubmitAsyncWorkflowRun<
     workspaceInstructionContext: renderResolvedInstructionContext(
       resolvedInstructionSnapshot,
     ),
-    planPurpose: (input.options as { planPurpose?: unknown } | undefined)?.planPurpose === "rules" ? "rules" : undefined,
+    planPurpose: (() => {
+      const explicitPurpose = (input.options as { planPurpose?: unknown } | undefined)?.planPurpose;
+      if (explicitPurpose === "rules") return "rules" as const;
+      if (explicitPurpose === "plan") return "plan" as const;
+      if (input.runtimeRunIntent === "plan") {
+        const turnPrompt = input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.userPrompt || "";
+        if (parseGrillMeCommand(turnPrompt) || requestsExplicitPlanInterview(turnPrompt)) {
+          return "plan" as const;
+        }
+      }
+      return undefined;
+    })(),
+    planInterviewMode: (() => {
+      const explicitMode = (input.options as { planInterviewMode?: unknown } | undefined)?.planInterviewMode;
+      if (explicitMode === "grill") return "grill" as const;
+      const turnPrompt = input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.userPrompt || "";
+      return parseGrillMeCommand(turnPrompt) ? "grill" as const : undefined;
+    })(),
+    allowVoluntaryPlanQuestions: input.runtimeRunIntent === "plan" &&
+      (input.options as { planPurpose?: unknown } | undefined)?.planPurpose !== "rules",
     sourcePlanDraft: input.sessionGet().conversationTurns.find((turn: ConversationTurn) => turn.id === input.turnId)?.sourcePlanDraft ||
       (input.options as { sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord } | undefined)?.sourcePlanDraft,
     approvedPlanContinuation,

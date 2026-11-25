@@ -26,15 +26,35 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
   if (existing?.aggregate.sealedWorkPlan) return null;
   const questions = (existing?.aggregate.events || []).filter(event => event.type === "run.paused" && event.blocker.questionnaire);
   const interviewQuestions = questions.filter(event => event.type === "run.paused" && event.blocker.questionnaire?.purpose !== "plan_verification_confirmation");
-  // Existing pre-interview WorkPlan checkpoints retain their original contract.
-  if (existing && !existing.aggregate.planPurpose && !interviewQuestions.length) return null;
-  input = { ...input, context: { ...input.context, planPurpose: existing ? existing.aggregate.planPurpose || "plan" : input.context.planPurpose || "plan", workspaceInstructionContext: existing?.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext, knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext } };
+  // Existing pre-interview WorkPlan checkpoints retain their original contract,
+  // including workspace WorkPlan turns that voluntarily asked questions.
+  if (existing && !existing.aggregate.planPurpose && (input.context.runWorkspace || !interviewQuestions.length)) return null;
+  const hasExplicitInterview = Boolean(
+    existing?.aggregate.planPurpose ||
+    input.context.planPurpose ||
+    interviewQuestions.length > 0,
+  );
+  // Ordinary workspace /plan runs go directly to the unified WorkPlan runner,
+  // where the model decides whether genuine ambiguity warrants ask_plan_questions.
+  if (!hasExplicitInterview && input.context.runWorkspace) return null;
+  const resolvedPurpose = existing
+    ? existing.aggregate.planPurpose || (interviewQuestions.length > 0 ? "plan" : undefined)
+    : input.context.planPurpose;
+  input = {
+    ...input,
+    context: {
+      ...input.context,
+      ...(resolvedPurpose ? { planPurpose: resolvedPurpose } : { planPurpose: undefined }),
+      workspaceInstructionContext: existing?.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext,
+      knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext,
+    },
+  };
   const ledger = new PlanLedger(identity.turn, createRuntimeV2CheckpointPort({ ...input, scopeKey: input.context.runScopeKey, sessionId: input.context.runSessionId }),
     createRuntimeV2ProjectionPort({ ...input, language: input.context.phaseLanguage, nextTaskId: () => input.get()._nextTaskId() }), existing || null, input.logStoreEvent);
   try {
   if (!existing) {
     const admission = resolveRuntimeV2ObjectiveAdmission(input.context, turn.userPrompt);
-    await ledger.append({ type: "turn.admitted", turn: identity.turn, strategy: "plan", planPurpose: input.context.planPurpose || "plan", ...(typeof input.context.workspaceInstructionContext === "string" ? { workspaceInstructionContext: input.context.workspaceInstructionContext } : {}), ...(input.context.knowledgeContext ? { knowledgeContext: input.context.knowledgeContext } : {}), networkRead: normalizeNetworkRead(input.context.networkRead),
+    await ledger.append({ type: "turn.admitted", turn: identity.turn, strategy: "plan", ...(input.context.planPurpose ? { planPurpose: input.context.planPurpose } : {}), ...(typeof input.context.workspaceInstructionContext === "string" ? { workspaceInstructionContext: input.context.workspaceInstructionContext } : {}), ...(input.context.knowledgeContext ? { knowledgeContext: input.context.knowledgeContext } : {}), networkRead: normalizeNetworkRead(input.context.networkRead),
       objective: admission.objective, constraints: admission.constraints, ...(admission.capabilityRestrictions !== undefined ? { capabilityRestrictions: admission.capabilityRestrictions } : {}), ...(admission.approvalRequiredCapabilities !== undefined ? { approvalRequiredCapabilities: admission.approvalRequiredCapabilities } : {}),
       acceptanceCriteria: admission.acceptanceCriteria.map(item => item.text), acceptanceCriterionIds: admission.acceptanceCriteria.map(item => item.id),
       ...(admission.acceptanceCriteria.some(item => item.evidenceRequirement) ? { acceptanceEvidenceRequirements: admission.acceptanceCriteria.map(item => item.evidenceRequirement ?? null) } : {}),

@@ -610,6 +610,7 @@ type SessionTranscriptCacheEntry = {
   taskFlow: TaskBlock[];
   conversationTurns: any[];
   runtimeSnapshot?: any;
+  runtimeRef?: unknown;
   hasMore: boolean;
   nextBeforeTurnIndex: number | null;
   totalTurns: number;
@@ -1027,6 +1028,9 @@ export default function App() {
       state.updateSession(scopeKey, state.currentSessionId, { planLifecycleEpoch });
     }
     state.saveCurrentRuntimeToSession();
+    const savedRuntimeRef = sessionKey
+      ? useAppStore.getState().runtimeBySessionKey?.[sessionKey]
+      : undefined;
     const storedSnapshot = buildStoredSessionSnapshot(
       state,
       scopeKey,
@@ -1055,6 +1059,7 @@ export default function App() {
         taskFlow: taskFlowSnapshot,
         conversationTurns: snapshot.runtimeSnapshot.conversationTurns || [],
         runtimeSnapshot: snapshot.runtimeSnapshot,
+        runtimeRef: savedRuntimeRef,
         hasMore: snapshot.transcriptPartial === true,
         nextBeforeTurnIndex: snapshot.transcriptPartial === true
           ? previousCachedTranscript?.nextBeforeTurnIndex ?? null
@@ -1914,6 +1919,10 @@ export default function App() {
     syncTaskIdCounterFromBlocks(patch.taskFlow);
     useAppStore.setState(patch);
     useAppStore.getState().saveCurrentRuntimeToSession();
+    cacheSessionTranscript(sessionKey, {
+      ...nextEntry,
+      runtimeRef: useAppStore.getState().runtimeBySessionKey?.[sessionKey],
+    });
   }, [cacheSessionTranscript, getCachedSessionTranscript]);
 
   // --- Workspace & Session Management ---
@@ -2008,6 +2017,16 @@ export default function App() {
     };
     const saveRestoredRuntimeToSession = () => {
       useAppStore.getState().saveCurrentRuntimeToSession();
+      if (expectedSessionKey) {
+        const existingCache = sessionTranscriptCacheRef.current.get(expectedSessionKey);
+        if (existingCache) {
+          sessionTranscriptCacheRef.current.set(expectedSessionKey, {
+            ...existingCache,
+            runtimeRef: useAppStore.getState().runtimeBySessionKey?.[expectedSessionKey],
+            lastAccessedAt: Date.now(),
+          });
+        }
+      }
       // Advancing after our own synchronous publication preserves the fence
       // for finishRestore without accepting a competing Session revision.
       refreshRestoreRevisionFence();
@@ -2037,30 +2056,6 @@ export default function App() {
       finishRestore();
       return;
     }
-    // liveRuntime is already resolved at the start of this function
-    const shouldUseLiveRuntime =
-      !!liveRuntime &&
-      (
-        !targetHasPersistedTranscript ||
-        target?.storageStatus === "temporary" ||
-        liveRuntime.isGenerating === true ||
-        liveRuntime.agentStatus === "running" ||
-        liveRuntime.agentStatus === "pending_review"
-      );
-    if (shouldUseLiveRuntime && canPublishRestore("live_runtime") && useAppStore.getState().restoreRuntimeForSession(liveSessionKey, {
-      resetPanels: true,
-      requireTranscript: targetHasPersistedTranscript,
-    })) {
-      appendDebugLog("info", "session.restore", {
-        sessionId: id,
-        scopeKey,
-        mode: "live_runtime",
-        elapsedMs: Math.round(performance.now() - startedAt),
-      });
-      finishRestore();
-      return;
-    }
-
     const cachedTranscriptCandidate = getCachedSessionTranscript(liveSessionKey);
     const cachedTranscript = cachedTranscriptCandidate?.planLifecycleEpoch === expectedSessionEpoch
       ? cachedTranscriptCandidate
@@ -2074,6 +2069,37 @@ export default function App() {
         mode: "stale_transcript_cache_discarded",
       });
     }
+    const liveRuntimeAdvancedSinceCache =
+      !!liveRuntime &&
+      (!cachedTranscript || cachedTranscript.runtimeRef !== liveRuntime);
+    // liveRuntime is already resolved at the start of this function
+    const shouldUseLiveRuntime =
+      !!liveRuntime &&
+      (
+        !targetHasPersistedTranscript ||
+        target?.storageStatus === "temporary" ||
+        liveRuntime.isGenerating === true ||
+        liveRuntime.agentStatus === "running" ||
+        liveRuntime.agentStatus === "pending_review" ||
+        liveRuntimeAdvancedSinceCache
+      );
+    if (shouldUseLiveRuntime && canPublishRestore("live_runtime") && useAppStore.getState().restoreRuntimeForSession(liveSessionKey, {
+      resetPanels: true,
+      requireTranscript: targetHasPersistedTranscript,
+    })) {
+      if (liveSessionKey && cachedTranscriptCandidate && cachedTranscriptCandidate.runtimeRef !== liveRuntime) {
+        sessionTranscriptCacheRef.current.delete(liveSessionKey);
+      }
+      appendDebugLog("info", "session.restore", {
+        sessionId: id,
+        scopeKey,
+        mode: "live_runtime",
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      finishRestore();
+      return;
+    }
+
     if (cachedTranscript && (cachedTranscript.taskFlow.length > 0 || cachedTranscript.conversationTurns.length > 0 || !targetHasPersistedTranscript)) {
       if (!canPublishRestore("transcript_cache")) return;
       const patch = buildPagedRuntimePatch(cachedTranscript, useAppStore.getState());
@@ -2119,6 +2145,7 @@ export default function App() {
           taskFlow: merged.taskFlow,
           conversationTurns: merged.conversationTurns,
           runtimeSnapshot: meta.runtimeSnapshot,
+          runtimeRef: useAppStore.getState().runtimeBySessionKey?.[liveSessionKey!],
           hasMore: page.hasMore,
           nextBeforeTurnIndex: page.nextBeforeTurnIndex ?? null,
           totalTurns: page.totalTurns,

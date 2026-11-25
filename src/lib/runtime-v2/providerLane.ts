@@ -45,7 +45,8 @@ export class RuntimeV2ProviderProtocolError extends Error {
       | "output_truncated"
       | "tool_surface_rejected"
       | "tool_arguments_rejected"
-      | "repeated_action_rejected",
+      | "repeated_action_rejected"
+      | "provider_response_rejected",
     message: string,
   ) {
     super(message);

@@ -1,3 +1,4 @@
+import { compactDebugString } from "../../lib/debugLog";
 import type { RuntimeV2Command, RuntimeV2EventDraft, RuntimeV2ExecutionValidationAuthority } from "../../lib/runtime-v2";
 import { runtimeV2ToolApprovalCapability, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
 import { recordToolResultHistory, toolCompletionFor } from "./executionEvidence";
@@ -136,6 +137,29 @@ export function unityPlayModePreExecutionReceipt(input: {
     : receipt;
 }
 
+function summarizeGateToolArguments(
+  toolName: string,
+  args: Record<string, unknown>,
+  target: string,
+): string | null {
+  if (toolName === "record_execution_contract") {
+    const rawChanges = Array.isArray(args.changes) ? args.changes : [];
+    const targets = rawChanges.flatMap((entry: any) =>
+      Array.isArray(entry?.targets) ? entry.targets.map((item: unknown) => String(item || "").trim()).filter(Boolean) : []
+    ).slice(0, 6);
+    const rawValidations = Array.isArray(args.validations) ? args.validations : [];
+    const commands = rawValidations
+      .map((entry: any) => String(entry?.command || "").trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    return compactDebugString(JSON.stringify({ changesCount: rawChanges.length, targets, validationCommands: commands }), 220);
+  }
+  if (typeof args.command === "string" && args.command.trim()) {
+    return compactDebugString(args.command, 160);
+  }
+  return target ? compactDebugString(target, 160) : null;
+}
+
 /** The same causal rejection receipt is used before approval and after
  * trusted mutation preparation has resolved the actual file operation. */
 export function runtimeV2ToolAuthorizationRejectionReceipt(input: {
@@ -149,6 +173,7 @@ export function runtimeV2ToolAuthorizationRejectionReceipt(input: {
 }): RuntimeV2EventDraft {
   const { ports, command, toolName, args, target, failureContextTarget, rejection } = input;
   const content = `TOOL_BLOCKED: ${rejection.reason}`;
+  const argSummary = summarizeGateToolArguments(toolName, args, target);
   recordToolResultHistory({ ports, command, toolName, target: failureContextTarget, status: "blocked", content });
   ports.logStoreEvent("runtime_v2_tool_execution_blocked", {
     turnId: command.run.turnId,
@@ -157,6 +182,8 @@ export function runtimeV2ToolAuthorizationRejectionReceipt(input: {
     toolName,
     target: target || null,
     reason: rejection.reasonCode,
+    detail: compactDebugString(rejection.reason || "", 320),
+    ...(argSummary ? { argSummary } : {}),
   });
   const receipt = toolCompletionFor(ports, command, toolName, args, failureContextTarget, content,
     "blocked", rejection.failureKind || "not_authorized", undefined, undefined, rejection.reasonCode || undefined);

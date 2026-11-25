@@ -2,16 +2,13 @@ import { runtimeV2ProviderOmittedKnowledgeCanReplay } from "./providerReadReceip
 import { runtimeV2BoundEditorObservation } from "./executionAuthorizationContext";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
-import { isNativeToolCompatibilityErrorMessage } from "../../lib/providerCompatibility";
 import {
   providerActionEpochExhausted,
   recordProviderTransportAttempt,
   isRuntimeV2ProviderProtocolError,
-  RuntimeV2ProviderProtocolError,
   RuntimeV2ProviderTransportsUnavailableError,
   isRuntimeV2LifecycleDeadlineError,
   runtimeV2ProviderAttemptFailure,
-  runtimeV2ProviderProtocolErrorAllowsTransportFallback,
   selectNextProviderTransportAttempt,
   type ProviderPort,
   type RuntimeV2TransportVariant,
@@ -41,8 +38,8 @@ import {
 import {
   assertRuntimeV2ProviderRequestDeadline,
   executeRuntimeV2ProviderWithDeadline,
-  isRuntimeV2ExecutionProviderTimeout,
 } from "./executionProviderDeadline";
+import { classifyAndRecordRuntimeV2ProviderAttemptError } from "./executionProviderErrorClassification";
 import { requestRuntimeV2ProviderWithEmptySurface } from "./executionProviderEmptySurface";
 import {
   requestRuntimeV2ProviderOnce,
@@ -484,57 +481,19 @@ export function createRuntimeV2ProviderPort(
             lastError = error;
             break;
           }
-          const requestTimedOut =
-            isRuntimeV2ExecutionProviderTimeout(error);
-          const errorMessage = error instanceof Error
-            ? error.message
-            : String(error);
-          const nativeCapabilityError =
-            !attempt.textEnvelope &&
-            isNativeToolCompatibilityErrorMessage(errorMessage)
-              ? new RuntimeV2ProviderProtocolError(
-                  "native_tools_unsupported",
-                  errorMessage,
-                )
-              : error;
-          lastError = requestTimedOut
-            ? new Error("RUNTIME_V2_EXECUTION_PROVIDER_REQUEST_TIMEOUT")
-            : nativeCapabilityError;
-          const protocolFallbackAllowed =
-            runtimeV2ProviderProtocolErrorAllowsTransportFallback(
-              lastError,
-              {
-                activeTransportProven:
-                  input.live.provenStructuredToolTransports.has(
-                    attempt.variant,
-                  ),
-              },
-            );
-          input.logStoreEvent(
-            isRuntimeV2ProviderProtocolError(lastError)
-              ? "runtime_v2_provider_protocol_failed"
-              : "runtime_v2_provider_transport_failed",
-            {
-              turnId: command.run.turnId,
-              runId: command.run.runId,
-              commandKey: command.idempotencyKey,
-              transport: attempt.variant,
-              error: lastError instanceof Error
-                ? lastError.message
-                : String(lastError),
-              ...(isRuntimeV2ProviderProtocolError(lastError)
-                ? {
-                    protocolCode: lastError.code,
-                    transportFallbackAllowed:
-                      protocolFallbackAllowed,
-                  }
-                : {}),
-            },
-          );
+          const classified = classifyAndRecordRuntimeV2ProviderAttemptError({
+            error,
+            textEnvelope: attempt.textEnvelope,
+            attemptVariant: attempt.variant,
+            command,
+            live: input.live,
+            logStoreEvent: input.logStoreEvent,
+          });
+          lastError = classified.lastError;
           // Changing the tool-call wire format is capability negotiation,
           // not a generic retry. A timeout, network failure, or semantic
           // rejection says nothing about whether text envelopes are safer.
-          if (!protocolFallbackAllowed) {
+          if (!classified.protocolFallbackAllowed) {
             break;
           }
         }

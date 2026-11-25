@@ -35,7 +35,9 @@ export interface CreateSubmitRuntimeContextInput {
   remoteFeishu: FeishuRemoteContext | undefined;
   workspaceTree: string | null;
   workspaceInstructionContext?: string;
-  planPurpose?: "rules";
+  planPurpose?: "plan" | "rules";
+  planInterviewMode?: "grill";
+  allowVoluntaryPlanQuestions?: boolean;
   sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
   approvedPlanContinuation?: import("../lib/runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   projectBaselineContext?: ProjectBaselineContext | null;
@@ -87,6 +89,8 @@ export function createSubmitRuntimeContext(
       input.workspaceInstructionContext || "",
     ),
     planPurpose: input.planPurpose,
+    planInterviewMode: input.planInterviewMode,
+    allowVoluntaryPlanQuestions: input.allowVoluntaryPlanQuestions,
     sourcePlanDraft: input.sourcePlanDraft,
     approvedPlanContinuation: input.approvedPlanContinuation,
     projectBaselineContext: input.projectBaselineContext || null,

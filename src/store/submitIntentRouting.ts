@@ -1,4 +1,6 @@
 import type { MainModeKey } from "../lib/mainModes";
+import { parseProjectInitCommand } from "../lib/projectInit";
+import { parseGrillMeCommand } from "../lib/grillMe";
 import {
   inferCommandDirective,
   resolveTurnRunIntent,
@@ -137,7 +139,23 @@ export function resolveAndApplySubmitIntentRouting<
     shouldReuseExistingTurnIntent: input.shouldReuseExistingTurnIntent,
     shouldExecuteOnceFromReplyOption: input.shouldExecuteOnceFromReplyOption,
   });
-  const effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
+  const hasExplicitPlanShortcut = Boolean(
+    input.mainIntentShortcut?.intent === "plan" ||
+    input.lockedComposerIntent === "plan" ||
+    input.options?.explicitIntent === "plan" ||
+    parseProjectInitCommand(input.text) ||
+    parseGrillMeCommand(input.text),
+  );
+  const needsPlanContinuationDisambiguation = Boolean(
+    input.hasWorkspace &&
+    (input.planContinuationCandidates?.length ?? 0) > 0 &&
+    !parseProjectInitCommand(input.text) &&
+    !parseGrillMeCommand(input.text),
+  );
+  const effectiveRunIntent: ResolvedRunIntent =
+    !input.options?.resolvedIntent && hasExplicitPlanShortcut && !needsPlanContinuationDisambiguation
+      ? "plan"
+      : initialIntentDecision.effectiveRunIntent;
   let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
   let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
 
@@ -146,7 +164,8 @@ export function resolveAndApplySubmitIntentRouting<
   // bypass this handoff. Lexical resolution supplies context, never authority.
   const trustedSubmission = input.isHidden || !!input.mainDebugShortcut ||
     input.options?.skipIntentResolution === true || !!input.options?.resolvedIntent ||
-    input.shouldExecuteOnceFromReplyOption;
+    input.shouldExecuteOnceFromReplyOption ||
+    (hasExplicitPlanShortcut && !needsPlanContinuationDisambiguation);
   if (input.currentMainModeKey === "main_mode" && !trustedSubmission) {
     const resolution = resolveTurnRunIntent(input.text, {
       language: input.preferredLanguage,

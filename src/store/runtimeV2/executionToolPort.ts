@@ -1,3 +1,4 @@
+import { compactDebugString } from "../../lib/debugLog";
 import { knowledgeSearchTraceFields } from "../../lib/knowledgeReferences";
 import {
   runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2KnowledgeMayFetch,
@@ -511,6 +512,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
           sessionKey: command.run.sessionKey,
           target: /^(?:run_command|knowledge_search|web_search|web_fetch)$/.test(toolName) ? null : target || null,
           errorType: error instanceof Error ? error.name : typeof error,
+          errorMessage: compactDebugString(error instanceof Error ? error.message : String(error), 320),
         });
         return toolCompletionFor(
           input,

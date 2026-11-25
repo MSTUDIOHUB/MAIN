@@ -37,7 +37,7 @@ import {
   type ProtocolChatMessage,
   type ReasoningRequestMode,
 } from "./cloudProtocol";
-import { applyStreamResponseFormat, isUnsupportedStreamResponseFormat } from "./streamResponseFormat";
+import { applyStreamResponseFormat, isUnsupportedStreamResponseFormat, isUnsupportedStreamUsageOption } from "./streamResponseFormat";
 import { computeContextBudgets } from "./contextTrim";
 import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
@@ -68,6 +68,11 @@ function emitStreamingConsole(
   } else {
     writer(`[${source}] ${message}`, data);
   }
+}
+
+function visibleRepetitionSamplePreview(content: string, cycleChars: number): string {
+  const windowSize = Math.min(240, Math.max(80, cycleChars));
+  return content.slice(-windowSize).replace(/\s+/g, " ").trim().slice(0, 160);
 }
 
 function createVisibleTextRepetitionError(match: VisibleTextRepetitionMatch): Error {
@@ -140,6 +145,8 @@ export type OpenAiToolChoice =
 export interface StreamRequestOptions {
   toolChoice?: OpenAiToolChoice;
   responseFormat?: Record<string, unknown>;
+  /** Include stream_options: { include_usage: true } on OpenAI-compatible SSE requests (defaults true). */
+  includeStreamUsage?: boolean;
   visualTransportBinding?: VisualTransportRequestBinding;
   timeoutMs?: number;
   /** Optional per-request guard for reasoning-only output before any semantic
@@ -1770,6 +1777,7 @@ async function streamViaRustProxy(
               settings.preserveAssistantReasoning === true,
           }))),
           stream: true,
+          ...(options.includeStreamUsage !== false ? { stream_options: { include_usage: true } } : {}),
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
@@ -2102,7 +2110,10 @@ async function streamViaRustProxy(
       "streaming",
       "warn",
       "Visible stream repetition detected; cancelling before further duplicate output.",
-      match,
+      {
+        ...match,
+        samplePreview: visibleRepetitionSamplePreview(semanticProgress.semanticContent, match.cycleChars),
+      },
     );
     callbacks.onLifecycle?.({
       phase: "stream_error",
@@ -2508,7 +2519,9 @@ export async function streamChatCompletion(
   signal?: AbortSignal, tools?: ToolDefinition[], maxTokensOverride?: number,
   options: StreamRequestOptions = {},
 ): Promise<StreamResult> {
-  if (!options.responseFormat || isAnthropicProvider(settings) || isGeminiProvider(settings)) {
+  const needsResponseFormatGuard = Boolean(options.responseFormat);
+  const needsStreamUsageGuard = !isOllamaProvider(settings) && options.includeStreamUsage !== false;
+  if ((!needsResponseFormatGuard && !needsStreamUsageGuard) || isAnthropicProvider(settings) || isGeminiProvider(settings)) {
     return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, options);
   }
   let outputStarted = false;
@@ -2528,11 +2541,16 @@ export async function streamChatCompletion(
   try {
     result = await streamChatCompletionAttempt(messages, settings, guarded, signal, tools, maxTokensOverride, options);
   } catch (error) {
-    if (!signal?.aborted && !outputStarted && isUnsupportedStreamResponseFormat(error instanceof Error ? error.message : String(error))) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (!signal?.aborted && !outputStarted && options.responseFormat && isUnsupportedStreamResponseFormat(errorMessage)) {
       emitStreamingConsole("streaming", "info", "optional response format unsupported; retrying the same request without that field");
       callbacks.onLifecycle?.({ phase: "response_format_downgraded", status: "unsupported_response_format" });
       const { responseFormat: _format, ...remaining } = options;
-      return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, remaining);
+      return streamChatCompletion(messages, settings, callbacks, signal, tools, maxTokensOverride, remaining);
+    }
+    if (!signal?.aborted && !outputStarted && needsStreamUsageGuard && isUnsupportedStreamUsageOption(errorMessage)) {
+      emitStreamingConsole("streaming", "info", "stream_options.include_usage unsupported; retrying the same request without that field");
+      return streamChatCompletion(messages, settings, callbacks, signal, tools, maxTokensOverride, { ...options, includeStreamUsage: false });
     }
     terminalLifecycle.forEach((event) => callbacks.onLifecycle?.(event));
     callbacks.onError(toError(error, "Structured output request failed."));
@@ -2616,6 +2634,7 @@ async function streamChatCompletionAttempt(
               settings.preserveAssistantReasoning === true,
           }))),
           stream: true,
+          ...(options.includeStreamUsage !== false ? { stream_options: { include_usage: true } } : {}),
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
@@ -2851,7 +2870,10 @@ async function streamChatCompletionAttempt(
       "streaming",
       "warn",
       "Visible stream repetition detected; cancelling before further duplicate output.",
-      match,
+      {
+        ...match,
+        samplePreview: visibleRepetitionSamplePreview(semanticProgress.semanticContent, match.cycleChars),
+      },
     );
     onToken("__ESCALATION_RESET__:");
     reader.cancel().catch(() => {});

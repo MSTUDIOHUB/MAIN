@@ -184,7 +184,11 @@ export function planModelToolCandidates(
 }
 
 export function planModelTools(context: RuntimeV2SubmissionContext): ToolDefinition[] {
-  const canAskPlanQuestions = !!(context.planPurpose || context.sourcePlanDraft);
+  const canAskPlanQuestions = Boolean(
+    context.planPurpose ||
+    context.sourcePlanDraft ||
+    context.allowVoluntaryPlanQuestions,
+  );
   return filterToCoreAndUnlockedTools([...planModelToolCandidates(context), ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL] : []), SUBMIT_WORK_PLAN_TOOL], {
     sessionKey: context.runSessionKey,
     alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...UNITY_MCP_OBSERVATION_NAMES,
@@ -209,6 +213,7 @@ function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
       ...source.function,
       description: [
         "Create one bounded read-only planning child for independent investigation, review, or validation design.",
+        "Each child accepts at most 6 narrow workspace-relative paths in required_paths and allowed_paths (never '.' or '*'); split larger module reviews across multiple spawn_subagent calls.",
         "The parent must continue unrelated discovery and later join the child before submitting the WorkPlan.",
         "Planning children cannot modify or stage workspace files.",
       ].join(" "),
@@ -386,7 +391,8 @@ export function providerPlanMessages(input: {
         `Workspace: ${input.context.runWorkspace || "global"}`,
         `Respond in: ${language}`,
         "You are in Plan Mode: inspect relevant files with read-only tools and then submit a clear plan via submit_runtime_v2_work_plan.",
-        "Do not invent file paths or modify project files during planning.",
+        "Do not invent file paths or modify project files during planning. Never guess unverified filenames from a folder name; list the subdirectory or search first when its files are not yet in workspace overview.",
+        "Keep subagent fan-out compact (typically up to 2 focused subagents on disjoint modules with <= 6 paths each; never re-read files in the parent that a subagent already inspected, and never spawn a subagent for files already read).",
         "Use prior read receipts as evidence. Inspect the smallest missing fact about a test entry point, fixture, or interaction capability. Use a relevant admitted Skill when it can identify the check. If adding a test is in scope and the project has a suitable runner, plan that test as a change and bind the runnable check to it. Design the check yourself; ask only for a consequential scope, constraint, or acceptance decision that safe inspection cannot resolve.",
         ...(input.context.projectBaselineContext?.facts.runtimes.some(runtime => ["unity", "tuanjie"].includes(runtime.name)) ? [
           "For Unity or Tuanjie tests, check the project's existing test and runtime assembly definitions and references. Include each necessary .asmdef in the reviewed changes, with dependencies. A PlayMode test using yield must return IEnumerator. Bind PlayMode to a named suite with useProjectEditor and expectedTestCases so the same reviewed check can use the exact Editor or batch mode.",
@@ -397,7 +403,9 @@ export function providerPlanMessages(input: {
         collaborationRequired
           ? "[REQUIRED COLLABORATION]\nThe user explicitly requires a planning child. Before submitting, admit at least one bounded read-only child through spawn_subagent, later join it, assess its result, and cite any adopted exact evidence ID. This is a hard admission condition, not a collaboration preference."
           : "",
-        input.context.planPurpose || input.context.sourcePlanDraft ? PLAN_CLARIFICATION_GUIDANCE : "Use questions only for a real user-owned decision.",
+        input.context.planPurpose || input.context.sourcePlanDraft
+          ? PLAN_CLARIFICATION_GUIDANCE
+          : "Decide whether to call ask_plan_questions based on real ambiguity: if the goal, scope, and implementation approach can be determined from the user's request and workspace inspection, do NOT ask unnecessary questions—submit the complete WorkPlan directly via submit_runtime_v2_work_plan. Call ask_plan_questions ONLY when a consequential design, scope, or acceptance tradeoff genuinely requires the user's choice.",
         collaborationGuidance
           ? `[COLLABORATION METHOD]\n${collaborationGuidance}`
           : "",

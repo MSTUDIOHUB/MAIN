@@ -1,6 +1,7 @@
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
+import { buildCapsuleModelActivityContext } from "../../lib/capsuleModelContext";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { computeContextBudgets, estimateMessagesTokens, estimateTokens, type TrimMessage } from "../../lib/contextTrim";
 import {
@@ -208,7 +209,11 @@ async function performRuntimeV2ProviderRequest(
     toolNames.has("replace_in_file") ||
     toolNames.has("apply_patch") ||
     toolNames.has("write_file");
+  const trailingRepetitionFeedback =
+    typeof input.live.messages[input.live.messages.length - 1]?.content === "string" &&
+    String(input.live.messages[input.live.messages.length - 1]?.content).includes("[runtime-v2 provider feedback: visible_stream_repetition]");
   const structuredActionRequired = !readOnly && (
+    trailingRepetitionFeedback ||
     !!actionWindow ||
     executionContractAdvance.required ||
     validationCorrection.active ||
@@ -405,6 +410,7 @@ async function performRuntimeV2ProviderRequest(
     phase: input.command.phase,
     mode: String(input.command.payload.mode || ""),
     sourceReadAvailable: toolNames.has("read_file"),
+    sourceEvidenceCount: (aggregate?.evidence || []).filter((entry) => entry.kind === "source" && Boolean(entry.version)).length,
     mutationToolAvailable: hasMutationTool,
     conversationHistoryMessages: boundedConversation.length,
     unboundedConversationHistoryMessages: history.historyMessages,
@@ -501,6 +507,12 @@ async function performRuntimeV2ProviderRequest(
       stage,
       ...data,
     });
+  activity.setContext(buildCapsuleModelActivityContext({
+    aggregate,
+    mode: String(input.command.payload.mode || ""),
+    estimatedInputTokens,
+    objectiveText: aggregate?.objective.text,
+  }));
   activity.acquiringLane();
   const laneStartedAt = Date.now();
   logRequestTiming("lane_requested");

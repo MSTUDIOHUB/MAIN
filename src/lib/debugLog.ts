@@ -98,7 +98,7 @@ function stableDebugHash(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
-function compactDebugString(value: string, maxChars = 900): string {
+export function compactDebugString(value: string, maxChars = 900): string {
   const normalized = redactSecrets(value)
     .replace(/\[MAIN_TOOL_FEEDBACK_V1\]\{[^\n]*\}/g, "[tool-feedback-envelope]")
     .replace(/READ_FILE_RESULT[\s\S]{300,}/gi, "READ_FILE_RESULT...[digest-truncated]")

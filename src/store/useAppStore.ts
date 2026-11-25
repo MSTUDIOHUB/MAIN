@@ -55,6 +55,7 @@ import { buildShellPermissionApproval, suggestedShellPermissionRules } from "../
 import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
+import { resolveStoreEventLogLevel } from "../lib/storeLogLevel";
 import {
   acquireHarnessRunMarker,
   consumePendingUncleanRestartDiagnostic,
@@ -90,6 +91,7 @@ import {
   refreshApprovedProjectInitBlock,
   type ManagedProjectRulesPreference,
 } from "../lib/projectInit";
+import { parseGrillMeCommand, requestsExplicitPlanInterview } from "../lib/grillMe";
 import { projectInitIpcIo } from "../lib/projectInitIpc";
 import {
   loadHooksConfig,
@@ -470,6 +472,7 @@ import {
 } from "../lib/workspaceInstruction";
 import {
   GLOBAL_CHAT_KEY,
+  parseSessionRuntimeKey,
   resolveGlobalChatSessionKey,
   resolveSessionRuntimeKey,
   resolveSessionWorkspaceKey,
@@ -551,7 +554,7 @@ export type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 
 export function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
-    appendDebugLog("info", `store.${event}`, data);
+    appendDebugLog(resolveStoreEventLogLevel(event, data), `store.${event}`, data);
   } catch {
     // Diagnostics must never affect user workflows.
   }
@@ -919,12 +922,7 @@ const UNBOUND_PLAN_SESSION_EPOCH = "__MAIN_UNBOUND_PLAN_EPOCH__";
 function resolveWorkspaceKeyFromBoundSessionKey(
   sessionKey: string | null | undefined,
 ): string | null {
-  const normalized = String(sessionKey || "").trim();
-  const separatorIndex = normalized.lastIndexOf(":");
-  if (separatorIndex <= 0 || separatorIndex === normalized.length - 1) return null;
-  const sessionId = Number(normalized.slice(separatorIndex + 1));
-  if (!Number.isSafeInteger(sessionId) || sessionId <= 0) return null;
-  return normalized.slice(0, separatorIndex);
+  return parseSessionRuntimeKey(sessionKey)?.workspaceKey ?? null;
 }
 
 function createEmptyPlanLifecycleForSession(
@@ -1611,7 +1609,8 @@ export interface AppState {
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: Array<AttachedFile | string>;
     knowledgeReferencesSnapshot?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
-    planPurpose?: "rules";
+    planPurpose?: "plan" | "rules";
+    planInterviewMode?: "grill";
     sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
     approvedPlanContinuation?: ApprovedWorkPlanContinuationReference;
 
@@ -5949,6 +5948,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
       };
     }
 
+    const ownerCurrentWorkspace = input.scopeKey === GLOBAL_CHAT_KEY ? "" : input.scopeKey;
     let ownerRuntime = targetWasActive
       ? createSessionRuntimeFromState(latest)
       : latest.runtimeBySessionKey[input.sessionKey];
@@ -5965,6 +5965,8 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
       ownerRuntime = createSessionRuntimeFromState({
         ...latest,
         ...restoredSnapshot,
+        currentWorkspace: ownerCurrentWorkspace,
+        currentSessionId: input.sessionId,
       });
     }
     if (!ownerRuntime) return {};
@@ -5974,6 +5976,8 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
       : {
           ...latest,
           ...ownerRuntime,
+          currentWorkspace: ownerCurrentWorkspace,
+          currentSessionId: input.sessionId,
           runtimeEvents: ownerRuntime.runtimeEvents || [],
         }) as AppState;
     const targetAlreadyTerminal = hasTurnTerminalEvent(
@@ -6280,9 +6284,19 @@ export function buildRestoredSessionRuntimePatch(input: {
     restoredReviewCheckpoint.canonical.run.pause?.subject === "plan"
       ? "pending_review"
       : "idle";
+  const parsedExpectedOwner = parseSessionRuntimeKey(input.expectedSessionKey);
   const runtime = createSessionRuntimeFromState({
     ...input.fallbackState,
     ...normalized,
+    ...(input.workspacePath !== undefined
+      ? {
+          currentWorkspace:
+            !input.workspacePath || input.workspacePath === GLOBAL_CHAT_KEY
+              ? ""
+              : input.workspacePath,
+        }
+      : {}),
+    ...(parsedExpectedOwner ? { currentSessionId: parsedExpectedOwner.sessionId } : {}),
     taskFlow,
     conversationTurns,
     currentTurnId: normalized.currentTurnId ?? null,
@@ -12818,6 +12832,7 @@ export const useAppStore = create<AppState>()(
       return { accepted: false, reason: "workspace_required", retryable: false };
     }
     if (parseProjectInitCommand(text)) input = { ...input, dispatchHints: { ...input.dispatchHints, explicitIntent: "plan", planPurpose: "rules" } };
+    else if (parseGrillMeCommand(text)) input = { ...input, dispatchHints: { ...input.dispatchHints, explicitIntent: "plan", planPurpose: "plan", planInterviewMode: "grill" } };
     const requestedAt = Date.now();
     const clientSubmissionId = String(input.clientSubmissionId || "").trim() ||
       createWorkspaceRuntimeIdentity("workspace-submission", requestedAt);
@@ -14437,7 +14452,8 @@ export const useAppStore = create<AppState>()(
           : [],
         knowledgeReferencesSnapshot: (head.instruction.payload.knowledgeReferences || []).map(reference => ({ ...reference })),
         submissionOriginSessionKey: sessionKey,
-        ...(hints.planPurpose === "rules" ? { planPurpose: "rules" as const } : {}),
+        ...(hints.planPurpose === "rules" || hints.planPurpose === "plan" ? { planPurpose: hints.planPurpose } : {}),
+        ...(hints.planInterviewMode === "grill" ? { planInterviewMode: "grill" as const } : {}),
         ...(sourcePlanDraft ? { sourcePlanDraft } : {}),
         ...(approvedPlanContinuation ? { approvedPlanContinuation } : {}),
         turnIdOverride: head.receipt.turnId,
@@ -15034,7 +15050,8 @@ export const useAppStore = create<AppState>()(
     contextMentionsSnapshot?: string[];
     attachedFilesSnapshot?: Array<AttachedFile | string>;
     knowledgeReferencesSnapshot?: readonly import("../lib/knowledgeReferences").KnowledgeReference[];
-    planPurpose?: "rules";
+    planPurpose?: "plan" | "rules";
+    planInterviewMode?: "grill";
     sourcePlanDraft?: import("../lib/planDrafts").PlanDraftRecord;
     approvedPlanContinuation?: ApprovedWorkPlanContinuationReference;
 
@@ -15131,6 +15148,10 @@ export const useAppStore = create<AppState>()(
     if (parseProjectInitCommand(text)) {
       if (!String(state.currentWorkspace || "").trim()) return false;
       options = { ...options, explicitIntent: "plan", planPurpose: "rules" };
+    } else if (parseGrillMeCommand(text)) {
+      options = { ...options, explicitIntent: "plan", planPurpose: "plan", planInterviewMode: "grill" };
+    } else if (requestsExplicitPlanInterview(text) && !options?.planPurpose) {
+      options = { ...options, planPurpose: "plan" };
     }
     const suppliedSubmissionOriginSessionKey = String(
       options?.submissionOriginSessionKey || "",

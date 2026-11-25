@@ -1,5 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
-import type { RuntimeV2RunIdentity } from "../../lib/runtime-v2";
+import type { RuntimeV2NormalizedProviderResult, RuntimeV2RunIdentity } from "../../lib/runtime-v2";
 import type { PlanLedger } from "./planLedger";
 import type { RuntimeV2PlanLog } from "./planEvidencePort";
 import type { PlanModelStage } from "./planModelProtocol";
@@ -71,4 +71,67 @@ export async function handleRuntimeV2PlanProviderAdmissionRejection(input: {
     effect: "none",
   });
   return true;
+}
+
+/** Build the sanitized assistant/tool rejection messages appended when the
+ * provider emits an unadvertised tool or schema-invalid arguments. */
+export function buildPlanToolAdmissionRejectionMessages(input: {
+  readonly toolCalls: RuntimeV2NormalizedProviderResult["toolCalls"];
+  readonly unexpectedToolNames: readonly string[];
+  readonly argumentViolation: { readonly call: { readonly id: string; readonly name: string }; readonly reason: string } | null;
+  readonly advertisedToolNames: readonly string[];
+  readonly activeSubagentCount: number;
+}): AgentMessage[] {
+  const out: AgentMessage[] = [{
+    role: "assistant",
+    content: "",
+    tool_calls: input.toolCalls.map((call) => ({
+      id: call.id,
+      type: "function" as const,
+      function: {
+        name: call.name,
+        arguments: JSON.stringify({ runtime_v2_rejected_tool_surface: true, effect: "none" }),
+      },
+    })),
+  }];
+  for (const call of input.toolCalls) {
+    const argumentRejection = !!input.argumentViolation;
+    const waitedWhenIdle = !argumentRejection &&
+      input.unexpectedToolNames.includes("wait_subagents") &&
+      input.activeSubagentCount === 0;
+    const rejection = argumentRejection
+      ? {
+          schemaVersion: "runtime-v2.plan-tool-rejection.v1",
+          code: call.id === input.argumentViolation!.call.id
+            ? "PLAN_TOOL_ARGUMENTS_REJECTED"
+            : "PLAN_TOOL_BATCH_REJECTED",
+          effect: "none",
+          requestedTool: call.name,
+          rejectedTool: input.argumentViolation!.call.name,
+          reason: input.argumentViolation!.reason,
+          allowedToolNames: input.advertisedToolNames,
+          responseDisposition: "rejected_before_dispatch",
+          instruction: "Submit exactly one currently advertised structured tool action with schema-valid arguments next.",
+        }
+      : {
+          schemaVersion: "runtime-v2.plan-tool-rejection.v1",
+          code: input.unexpectedToolNames.includes(call.name)
+            ? "PLAN_TOOL_SURFACE_REJECTED"
+            : "PLAN_TOOL_BATCH_REJECTED",
+          effect: "none",
+          requestedTool: call.name,
+          unexpectedToolNames: input.unexpectedToolNames,
+          allowedToolNames: input.advertisedToolNames,
+          responseDisposition: "rejected_before_dispatch",
+          instruction: waitedWhenIdle
+            ? "All spawned planning subagents have ALREADY completed and their reports are already in your context above (activeSubagentCount = 0). Do NOT call wait_subagents again. Call an advertised tool such as ask_plan_questions, a targeted read, or submit_plan_document / submit_runtime_v2_work_plan next."
+            : "Submit exactly one currently advertised structured tool action next.",
+        };
+    out.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content: `${argumentRejection ? "PLAN_TOOL_ARGUMENTS_REJECTED" : "PLAN_TOOL_NOT_ADVERTISED"}: ${JSON.stringify(rejection)}`,
+    });
+  }
+  return out;
 }

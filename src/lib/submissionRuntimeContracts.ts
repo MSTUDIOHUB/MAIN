@@ -80,7 +80,9 @@ export interface SubmissionRuntimeContext {
   /** Exact live workspace instructions captured before Run admission.
    * Conversation summaries and legacy session memory never populate it. */
   workspaceInstructionContext?: string;
-  planPurpose?: "rules";
+  planPurpose?: "plan" | "rules";
+  planInterviewMode?: "grill";
+  allowVoluntaryPlanQuestions?: boolean;
   sourcePlanDraft?: import("./planDrafts").PlanDraftRecord;
   approvedPlanContinuation?: import("./runtime-v2/contracts").ApprovedWorkPlanContinuationReference;
   knowledgeReferences?: readonly import("./knowledgeReferences").KnowledgeReference[];

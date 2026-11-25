@@ -1,3 +1,4 @@
+import { parseSessionRuntimeKey } from "../../lib/sessionTypes";
 import type { TurnAggregateV1 } from "../../lib/runtime-v2";
 import { appendRuntimeV2Checkpoint, normalizeRuntimeV2Checkpoint } from "../../lib/runtime-v2/checkpoint";
 import type { UserChoiceActionRequest, UserChoiceResolutionIdentity } from "../../lib/actionRequest";
@@ -96,11 +97,13 @@ export async function resolveRuntimeV2ExecutionBlocker(input: {
   const projected = { ...state, taskFlow: markResolvedChoiceBlock(state.taskFlow || []), runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint } };
   const persisted: any = await input.persist(projected, current);
   if (!current()) return false;
+  const ownerSessionId =
+    parseSessionRuntimeKey(aggregate.turn.sessionKey)?.sessionId ?? state.currentSessionId;
   input.set((latest: any) => ({
     taskFlow: markResolvedChoiceBlock(latest.taskFlow || []),
     runtimeV2Checkpoints: { ...latest.runtimeV2Checkpoints, [request.turnId]: appended.checkpoint },
     ...(persisted?.sessionsByWorkspace ? { sessionsByWorkspace: Object.fromEntries(Object.entries(latest.sessionsByWorkspace || {}).map(([scope, records]) => [scope,
-      (records as any[]).map(record => scope === aggregate.turn.workspaceKey && record.id === state.currentSessionId ?
+      (records as any[]).map(record => scope === aggregate.turn.workspaceKey && record.id === ownerSessionId ?
         { ...record, ...(persisted.sessionsByWorkspace[scope] || []).find((saved: any) => saved.id === record.id) } : record)])) } : {}) }));
   if (choice === "stop") input.stop(request.turnId);
   else {

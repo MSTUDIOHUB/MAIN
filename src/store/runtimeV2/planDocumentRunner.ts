@@ -71,6 +71,7 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
   }
   await collaboration.restoreProactive();
   let recoveryCalls = await recoverPlanDocumentInvocations(ledger, run);
+  let rejectedAdmissionStreak = 0;
   while (true) {
     if (input.context.abortCtrl.signal.aborted) throw new Error("PLAN_DOCUMENT_CANCELED");
     if (Date.now() >= deadlineAt) throw new Error("PLAN_DOCUMENT_CALLER_DEADLINE");
@@ -84,7 +85,7 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
     }
     const recovered = recoveryCalls;
     recoveryCalls = null;
-    let response: { visibleText?: string; toolCalls: import("../../lib/runtime-v2").RuntimeV2NormalizedProviderResult["toolCalls"] };
+    let response: { visibleText?: string; toolCalls: import("../../lib/runtime-v2").RuntimeV2NormalizedProviderResult["toolCalls"]; rejectedAdmission?: boolean; unexpectedToolNames?: readonly string[] };
     try {
       response = recovered ? { visibleText: "", toolCalls: recovered.calls } : await requestPlanModel({ get: input.get, context: input.context, ledger, run, messages, deadlineAt,
         stage: "discovery", evidence, evidenceContents, collaboration: collaboration.current().payload,
@@ -96,11 +97,29 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
       continue;
     }
     input.context.abortCtrl.signal.throwIfAborted();
+    if (!recovered && response.rejectedAdmission) {
+      rejectedAdmissionStreak += 1;
+      await ledger.recordSoftSignal(run, "protocol_drift");
+      if (rejectedAdmissionStreak >= 4) {
+        throw new Error("PLAN_DOCUMENT_ADMISSION_REJECTION_LOOP");
+      }
+      if (rejectedAdmissionStreak >= 2) {
+        const waitedWhenIdle = response.unexpectedToolNames?.includes("wait_subagents") && collaboration.activeChildCount() === 0;
+        const recoveryDirective = waitedWhenIdle
+          ? "STOP calling wait_subagents: all subagents have already completed and their reports are in context. Your next call MUST be an advertised tool (ask_plan_questions or submit_plan_document)."
+          : "STOP calling unadvertised or invalid tools. Your next call MUST use only the currently advertised tool schema (ask_plan_questions, a targeted read, or submit_plan_document).";
+        if (!messages.some(message => message.role === "system" && message.content === recoveryDirective)) {
+          messages.push({ role: "system", content: recoveryDirective });
+        }
+      }
+      continue;
+    }
     if (!response.toolCalls.length) {
       await ledger.recordSoftSignal(run, response.visibleText?.trim() ? "no_tool_call" : "empty_response");
       messages.push({ role: "system", content: "No document has been saved. Ask a specific user-owned question, read one missing fact, or submit the completed document through submit_plan_document." });
       continue;
     }
+    rejectedAdmissionStreak = 0;
     for (const call of response.toolCalls) {
       const feedback = async (content: string) => {
         await settlePlanTool({ ledger, run, call, status: "failed", evidence: [], modelContent: content, failureKind: "protocol_invalid" });
@@ -118,7 +137,8 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
         continue;
       }
       if (call.name === SUBMIT_PLAN_DOCUMENT) {
-        if (!ledger.snapshot()!.events.some(event => event.type === "run.decision_recorded" && event.answer && event.choice !== "stop")) { await feedback("No user confirmation has been received. Investigate and ask the consequential user-owned questions before saving a plan."); continue; }
+        const requiresInterviewConfirmation = input.context.planPurpose === "plan" || input.context.planPurpose === "rules";
+        if (requiresInterviewConfirmation && !ledger.snapshot()!.events.some(event => event.type === "run.decision_recorded" && event.answer && event.choice !== "stop")) { await feedback("No user confirmation has been received. Investigate and ask the consequential user-owned questions before saving a plan."); continue; }
         if (input.context.planPurpose === "rules" && !inspection) { await feedback("The captured AGENTS.md base is missing. No rules draft can be saved without its original review base."); continue; }
         const rawTitle = typeof call.arguments.title === "string" ? call.arguments.title.trim() : "";
         const title = rawTitle ? planDocumentDisplayTitle(rawTitle) : "";

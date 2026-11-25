@@ -80,20 +80,26 @@ export function selectTurnIngressAvailability(input: {
     : null;
   if (runtimeV2 && !runtimeV2.terminalOutcome) {
     const run = runtimeV2.run;
-    const target = input.runtimeOwnerObserved && run?.status === "running" &&
-      run.phase !== "reviewing" && run.phase !== "finalizing" ? run.identity : null;
-    return {
-      mode: target ? "guidance_or_queue" : "queue_only",
-      activeTurn: null,
-      guidanceTarget: target,
-      runtimeV2Guidance: true,
-      guidancePending: !!runtimeV2PendingGuidance(runtimeV2),
-      submitDecision: { kind: "reject", createsTurn: false, reason: "active_run_requires_explicit_ingress" },
-      queueDecision,
-      guidanceDecision: target
-        ? { kind: "attach_guidance", createsTurn: false, admission: "active_run", target }
-        : { kind: "reject", createsTurn: false, reason: "active_run_not_guidable" },
-    };
+    const pausedForUserAction =
+      runtimeV2.phase === "reviewing" ||
+      run?.status === "paused" ||
+      Boolean(run?.blocker);
+    if (input.runtimeOwnerObserved || pausedForUserAction) {
+      const target = input.runtimeOwnerObserved && run?.status === "running" &&
+        run.phase !== "reviewing" && run.phase !== "finalizing" ? run.identity : null;
+      return {
+        mode: target ? "guidance_or_queue" : "queue_only",
+        activeTurn: null,
+        guidanceTarget: target,
+        runtimeV2Guidance: true,
+        guidancePending: !!runtimeV2PendingGuidance(runtimeV2),
+        submitDecision: { kind: "reject", createsTurn: false, reason: "active_run_requires_explicit_ingress" },
+        queueDecision,
+        guidanceDecision: target
+          ? { kind: "attach_guidance", createsTurn: false, admission: "active_run", target }
+          : { kind: "reject", createsTurn: false, reason: "active_run_not_guidable" },
+      };
+    }
   }
 
   if (submitDecision.kind === "reject") {

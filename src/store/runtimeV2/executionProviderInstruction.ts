@@ -167,12 +167,22 @@ export function providerModeInstruction(
       ? "All spawned subagents have finished and settled; no active subagents remain. Do NOT call wait_subagents again; continue directly from the delivered results or conclude."
       : "",
     toolSurface.hasSpawnSubagent && remainingSubagentCapacity > 0
-      ? [
-          command.payload.collaborationPreferred === true
-            ? `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, and independent tasks may queue. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
-            : "Delegation is optional.",
-          "Use read-only children for parallel investigation. Use implement/write only under an approved WorkPlan ready frontier (even during initial observing) or a recorded parent execution contract: provide an explicit operation, implementation_plan, success criteria, and exact non-overlapping file targets; never grant a directory and let the child choose writes. The child stages coherent write transactions within its exclusive targets and Runtime atomically validates and commits them at join; the parent still owns cross-file integration, dependency order, and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
-        ].join(" ")
+      ? (() => {
+          const requestMode = typeof command.payload.collaborationRequestMode === "string"
+            ? command.payload.collaborationRequestMode
+            : "";
+          const serializedLane = remainingSubagentCapacity <= 1 || requestMode === "serialized";
+          return [
+            command.payload.collaborationPreferred === true
+              ? serializedLane
+                ? `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity} (${requestMode || "serialized"}, sequential model lane), so child requests run sequentially rather than concurrently. Keep each child objective and success criteria within the user's requested deliverable and depth. Prefer one focused child or direct parent execution unless bounded context isolation justifies queuing.`
+                : `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, and independent tasks may queue. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
+              : serializedLane
+                ? `Delegation is optional. Current child-request capacity is ${remainingSubagentCapacity} (${requestMode || "serialized"}, sequential model lane), so child requests run sequentially rather than concurrently; prefer direct parent execution unless bounded context isolation justifies queuing.`
+                : "Delegation is optional.",
+            "Use read-only children for parallel investigation. Use implement/write only under an approved WorkPlan ready frontier (even during initial observing) or a recorded parent execution contract: provide an explicit operation, implementation_plan, success criteria, and exact non-overlapping file targets; never grant a directory and let the child choose writes. The child stages coherent write transactions within its exclusive targets and Runtime atomically validates and commits them at join; the parent still owns cross-file integration, dependency order, and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
+          ].join(" ");
+        })()
       : toolSurface.hasSpawnSubagent && remainingSubagentCapacity === 0
         ? "Child-request capacity is currently 0; continue directly without calling spawn_subagent."
         : "",
@@ -236,7 +246,7 @@ export function providerModeInstruction(
         toolSurface.hasMaterializedSourceEvidence
           ? "For modifications to an existing file, use only its exact current source visible in this decision request. Each existing target needs its own versioned source lease; observing one file does not authorize edits to another."
           : command.payload.hasVersionedSourceEvidence === true
-            ? "Existing-file source is cached but is not visible in this decision request; this does not authorize edits to those files. Request the exact missing target window so Runtime can replay it without another disk read."
+            ? "Existing-file source is cached but is not visible in this decision request; this does not authorize edits to those files. Request the exact missing target window so Runtime can replay it without another disk read (unchanged carried-over source already supports execution contracts and child delegation)."
             : "Read the exact current target before modifying an existing file.",
         runtimeV2EditableSourceAnchor(toolSurface.materializedSourceCoverage || []),
       ].filter(Boolean).join(" ")

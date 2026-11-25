@@ -29,7 +29,7 @@ import { approvedPlanExecutionRepair, retryableUnityEditorCheck, unresolvedUnity
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
-import { awaitCanceledTurnTerminalProjection } from "../sessionCancellationBarrier";
+import { awaitCanceledTurnTerminalProjection, getPendingSessionCancellation } from "../sessionCancellationBarrier";
 import {
   createRuntimeV2CheckpointPort,
   getRuntimeV2Checkpoint,
@@ -60,6 +60,7 @@ import { projectFiniteValidationCommands } from "./executionProviderContext";
 import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import { pausedAgentLoopOutcome } from "../../lib/runOutcome";
 import { projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
+import { admitExecuteSessionSourceCarryover } from "./sessionSourceCarryover";
 import { createRuntimeV2PlanReviewCommit, resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import { deriveProactiveCollaboration } from "./proactiveSubagents";
 import { isRuntimeV2EditorDiagnosticRepair } from "../../lib/runtime-v2/editorConsoleEvidence";
@@ -188,20 +189,11 @@ export async function runSubmitRuntimeV2Execute(
     provider: createRuntimeV2ProviderPort(executionPorts),
     tool: createRuntimeV2ToolPort(executionPorts),
     scheduler: createRuntimeV2SchedulerPort(executionPorts),
-    projection: createRuntimeV2ProjectionPort({
-      get: input.get,
-      set: input.set,
-      nextTaskId: () => input.get()._nextTaskId(),
-      language: input.context.phaseLanguage,
-      logStoreEvent: input.logStoreEvent,
-    }),
-    clockId: {
-      now: Date.now,
-      nextId,
-      nextIdempotencyKey: ({ run, kind }) => `${run.runId}:${kind}:${nextId("idempotency")}`,
-    },
+    projection: createRuntimeV2ProjectionPort({ get: input.get, set: input.set, nextTaskId: () => input.get()._nextTaskId(), language: input.context.phaseLanguage, logStoreEvent: input.logStoreEvent }),
+    clockId: { now: Date.now, nextId, nextIdempotencyKey: ({ run, kind }) => `${run.runId}:${kind}:${nextId("idempotency")}` },
   }, existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined, {
     abortSignal: input.context.abortCtrl.signal,
+    isExternalCancellationPending: () => getPendingSessionCancellation(identity.turn.sessionKey)?.turnId === identity.turn.turnId,
     logEvent: input.logStoreEvent,
   });
   let providerRecoveryLease: RuntimeV2ProviderRecoveryStallLease | null = null;
@@ -245,6 +237,7 @@ export async function runSubmitRuntimeV2Execute(
           ),
         initialPhase: continuationReference ? "planning" : isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "") || admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
       });
+      await admitExecuteSessionSourceCarryover({ state: input.get(), sessionKey: identity.turn.sessionKey, workspaceKey: identity.turn.workspaceKey, turnId: identity.turn.turnId, runId: identity.run.runId, capabilityRestrictions: admission.capabilityRestrictions, approvalRequiredCapabilities: admission.approvalRequiredCapabilities, live, signal: input.context.abortCtrl.signal, recordObservation: (evidence) => controller.recordObservation(evidence), logStoreEvent: input.logStoreEvent });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
       await controller.resumeTerminalProjection();

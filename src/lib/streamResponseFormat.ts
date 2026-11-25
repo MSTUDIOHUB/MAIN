@@ -31,3 +31,20 @@ export function isUnsupportedStreamResponseFormat(message: string): boolean {
       ["unsupported_parameter", "unknown_parameter", "unrecognized_parameter", "unsupported_field"].includes(error.code);
   } catch { return false; }
 }
+
+/** Retry without optional stream usage reporting when a server rejects stream_options. */
+export function isUnsupportedStreamUsageOption(message: string): boolean {
+  const text = String(message || "").toLowerCase();
+  if (!/^http\s+(?:400|422)\b/.test(text.trim())) return false;
+  const field = "(?:[\"']?stream_options(?:\\.include_usage)?[\"']?|[\"']include_usage[\"'])(?![\\w.\\[])";
+  const rejectsField = new RegExp(`(?:unsupported|unknown|unrecognized|extra\\s+inputs?\\s+(?:are\\s+)?not\\s+permitted)\\s*(?:for\\s+|[:=]?\\s*)?(?:(?:request\\s+)?(?:parameter|field|argument)(?:\\s+supplied)?\\s*[:=]?\\s*)?${field}`);
+  const fieldRejected = new RegExp(`${field}\\s+(?:(?:parameter|field)\\s+)?(?:(?:is|are)\\s+)?(?:not supported|unsupported|unknown|unrecognized|not permitted|forbidden)\\b`);
+  const cannotSupportField = new RegExp(`(?:does not|doesn't|cannot)\\s+support\\s+${field}`);
+  if (rejectsField.test(text) || fieldRejected.test(text) || cannotSupportField.test(text)) return true;
+  try {
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    const error = json.error || json;
+    return ["stream_options", "stream_options.include_usage", "include_usage"].includes(error.param) &&
+      ["unsupported_parameter", "unknown_parameter", "unrecognized_parameter", "unsupported_field", "extra_forbidden"].includes(error.code);
+  } catch { return false; }
+}

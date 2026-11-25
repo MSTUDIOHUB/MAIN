@@ -7,6 +7,7 @@ type Language = "zh" | "en";
 export interface CapsuleActivityLine {
   title: string;
   target?: string;
+  detail?: string;
   waitingSince?: number;
   count?: number;
   live?: boolean;
@@ -29,6 +30,11 @@ export function CapsuleActivityText({ line, language, announce }: { line: Capsul
       <span aria-live={announce ? "polite" : undefined} aria-atomic={announce || undefined} className="min-w-0 font-medium [overflow-wrap:anywhere]">
         {line.title}{line.target && <> <code className="rounded bg-[var(--surface-2)] px-1 py-0.5 text-[0.92em]">{line.target}</code></>}
       </span>
+      {line.detail && (
+        <span className="min-w-0 text-[0.88em] text-[var(--surface-text-muted)] [overflow-wrap:anywhere]">
+          · {line.detail}
+        </span>
+      )}
       {(line.waitingSince !== undefined || (line.count || 0) > 1) && (
         <span className="text-[0.85em] text-[var(--surface-text-muted)]">
           {line.waitingSince !== undefined

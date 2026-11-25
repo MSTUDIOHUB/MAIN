@@ -14,6 +14,7 @@ import {
   getRuntimeV2Checkpoint,
 } from "./checkpointPort";
 import { PlanLedger } from "./planLedger";
+import { admitPlanSessionSourceCarryover } from "./sessionSourceCarryover";
 import {
   boundedPlanContent,
   providerPlanMessages,
@@ -379,6 +380,18 @@ export async function bootstrapRuntimeV2Plan(
   });
   if (collected.settlement) {
     return { settlement: collected.settlement };
+  }
+  if (!existing && !draftSource && !revisionSource && canCollectWorkspace) {
+    await admitPlanSessionSourceCarryover({
+      state: input.get(),
+      run: identity.run,
+      workspaceKey: input.context.runWorkspace?.trim() || identity.turn.workspaceKey,
+      ledger,
+      evidence,
+      evidenceContents,
+      signal: input.context.abortCtrl?.signal,
+      logStoreEvent: input.logStoreEvent,
+    });
   }
   const messages = providerPlanMessages({ turn, context: input.context, objective,
     overview: collected.overview, subagentRequirement: ledger.snapshot()?.subagentRequirement,

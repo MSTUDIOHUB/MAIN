@@ -394,12 +394,30 @@ export async function executeReadOnlyPlanTool(input: {
     return;
   } catch (error) {
     input.context.abortCtrl?.signal.throwIfAborted();
-    const content = `PLAN_READ_FAILED: ${error instanceof Error ? error.message : String(error)}`;
+    const rawError = error instanceof Error ? error.message : String(error);
+    const missingTarget = /(?:no such file|not found|does not exist|ENOENT|os error 2|系统找不到|不存在|找不到)/i.test(rawError);
+    const targetLabel = String(args.path || args.pattern || input.call.name);
+    const content = missingTarget
+      ? `PLAN_READ_FAILED: ${rawError} (Hint: call list_directory or search_files on the parent folder instead of guessing file names.)`
+      : `PLAN_READ_FAILED: ${rawError}`;
+    const firstLine = rawError.split(/\r?\n/)[0]?.trim().slice(0, 120) || "";
+    const friendlyMessage = missingTarget
+      ? input.context.phaseLanguage === "en"
+        ? "Target path does not exist; inspect the directory listing to confirm the actual file name."
+        : "目标路径不存在，需先通过目录列表确认真实文件名。"
+      : firstLine || undefined;
     await settlePlanTool({
       ledger: input.ledger,
       run: input.run,
       call: input.call,
       status: "failed",
+      ...(missingTarget ? { failureReasonCode: "target_not_found" } : {}),
+      modelContent: content,
+      presentation: {
+        toolName: input.call.name,
+        target: targetLabel,
+        ...(friendlyMessage ? { message: friendlyMessage } : {}),
+      },
     });
     appendPlanToolResult(input.messages, input.call.id, content);
     await input.ledger.recordSoftSignal(

@@ -2,6 +2,7 @@ import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
+import { buildCapsuleModelActivityContext } from "../../lib/capsuleModelContext";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
 import { normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
@@ -48,6 +49,7 @@ import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } f
 import { planRequestMetrics } from "./planRequestMetrics";
 import { adaptPlanBlockingQuestions, admittedPlanQuestionPurpose, ASK_PLAN_QUESTIONS } from "./planQuestionTool";
 import { isPlanStreamRepetition, PLAN_REPETITION_FALLBACK_FAILED, PLAN_STREAM_REPETITION_CODE } from "./planRepetitionRecovery";
+import { buildPlanToolAdmissionRejectionMessages } from "./planProviderAdmission";
 import { PLAN_VALIDATION_REPAIR_FAILED } from "./planValidationRecovery";
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (event: string, data?: Record<string, unknown>) => void;
@@ -56,6 +58,8 @@ export interface RuntimeV2PlanProviderResult extends RuntimeV2NormalizedProvider
   /** Request-local admission surface shared by all provider transports. */
   readonly advertisedToolNames: readonly string[];
   readonly transport: PlanProviderTransport;
+  readonly rejectedAdmission?: boolean;
+  readonly unexpectedToolNames?: readonly string[];
 }
 export async function requestPlanModel(input: {
   readonly get: StoreGet;
@@ -203,6 +207,12 @@ export async function requestPlanModel(input: {
         })
       : projectPlanSkillGuidance(unboundedRequestMessages);
     const requestMetrics = planRequestMetrics({ messages: requestMessages, tools: offeredTools, responseFormat });
+    activity.setContext(buildCapsuleModelActivityContext({
+      aggregate: input.ledger.snapshot(),
+      mode: input.validationRepair ? "validation_repair" : input.submissionRepairPending ? "submission_repair" : input.stage,
+      estimatedInputTokens: requestMetrics.estimatedInputTokens,
+      objectiveText: input.ledger.snapshot()?.objective.text,
+    }));
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
       ...requestTrace,
       sessionKey: input.run.sessionKey,
@@ -429,59 +439,13 @@ export async function requestPlanModel(input: {
       result: admitted,
     });
     if (unexpectedToolNames.length > 0 || argumentViolation) {
-      input.messages.push({
-        role: "assistant",
-        content: "",
-        tool_calls: normalized.toolCalls.map((call) => ({
-          id: call.id,
-          type: "function" as const,
-          function: {
-            name: call.name,
-            arguments: JSON.stringify({
-              runtime_v2_rejected_tool_surface: true,
-              effect: "none",
-            }),
-          },
-        })),
-      });
-      for (const call of normalized.toolCalls) {
-        const argumentRejection = !!argumentViolation;
-        const rejection = argumentRejection
-          ? {
-              schemaVersion: "runtime-v2.plan-tool-rejection.v1",
-              code: call.id === argumentViolation.call.id
-                ? "PLAN_TOOL_ARGUMENTS_REJECTED"
-                : "PLAN_TOOL_BATCH_REJECTED",
-              effect: "none",
-              requestedTool: call.name,
-              rejectedTool: argumentViolation.call.name,
-              reason: argumentViolation.reason,
-              allowedToolNames: advertisedToolNames,
-              responseDisposition: "rejected_before_dispatch",
-              instruction:
-                "Submit exactly one currently advertised structured tool action with schema-valid arguments next.",
-            }
-          : {
-              schemaVersion: "runtime-v2.plan-tool-rejection.v1",
-              code: unexpectedToolNames.includes(call.name)
-                ? "PLAN_TOOL_SURFACE_REJECTED"
-                : "PLAN_TOOL_BATCH_REJECTED",
-              effect: "none",
-              requestedTool: call.name,
-              unexpectedToolNames,
-              allowedToolNames: advertisedToolNames,
-              responseDisposition: "rejected_before_dispatch",
-              instruction:
-                "Submit exactly one currently advertised structured tool action next.",
-            };
-        input.messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: `${argumentRejection
-            ? "PLAN_TOOL_ARGUMENTS_REJECTED"
-            : "PLAN_TOOL_NOT_ADVERTISED"}: ${JSON.stringify(rejection)}`,
-        });
-      }
+      input.messages.push(...buildPlanToolAdmissionRejectionMessages({
+        toolCalls: normalized.toolCalls,
+        unexpectedToolNames,
+        argumentViolation,
+        advertisedToolNames,
+        activeSubagentCount: activeSubagents.length,
+      }));
     } else {
       input.messages.push({
         role: "assistant",
@@ -504,6 +468,7 @@ export async function requestPlanModel(input: {
       ...admitted,
       advertisedToolNames,
       transport,
+      ...(unexpectedToolNames.length > 0 || argumentViolation ? { rejectedAdmission: true, unexpectedToolNames } : {}),
     };
   } catch (error) {
     activity.finish();
