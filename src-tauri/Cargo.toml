@@ -39,7 +39,7 @@ regex = "1"
 quick-xml = "0.38"
 walkdir = "2"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.9"
 sha2 = "0.10"
 url = "2"
 
@@ -55,7 +55,7 @@ tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "sync", "
 # System memory info for VRAM pressure estimation
 sysinfo = "0.34"
 # Protocol Package ZIP extraction
-zip = "2.3"
+zip = "4.6"
 tempfile = "3"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
