@@ -1,5 +1,6 @@
 import type { ResolvedRunIntent } from "./runIntent";
 import type { RuntimeEngineVersion } from "./runtime-v2/contracts";
+import type { TurnCapability } from "./turnCapabilities";
 
 /**
  * The kernel is selected once at Turn admission and never inferred from
@@ -59,32 +60,24 @@ export function resolveRuntimeV2VisibleRunnerKind(input: {
   readonly runWorkspace: string | null | undefined;
   readonly hasAttachedFiles?: boolean;
   readonly webSearchEnabled?: boolean;
+  readonly requiredCapabilities?: readonly TurnCapability[];
+  readonly checkpointStrategy?: "chat" | "analyze";
 }): RuntimeV2VisibleRunnerKind | null {
   // runtimeIntent is the immutable admission authority. effectiveIntent is
   // retained only as diagnostic input; a later UI projection must never
   // redirect the admitted Turn or force it back to another executor.
   if (input.runtimeIntent === "execute") return "execute";
   if (input.runtimeIntent === "plan") return "plan";
-  if (
-    isRuntimeV2ChatIntent(input.runtimeIntent) &&
-    String(input.runWorkspace || "").trim().length === 0 &&
-    input.hasAttachedFiles === true
-  ) {
-    return "workspace_read";
-  }
-  if (isRuntimeV2GlobalChatTurn(input.runtimeIntent, input.runWorkspace, {
-    webSearchEnabled: input.webSearchEnabled,
-    hasAttachedFiles: input.hasAttachedFiles,
-  })) {
-    return "chat";
-  }
-  if (isRuntimeV2WorkspaceReadTurn(input.runtimeIntent, input.runWorkspace, {
-    webSearchEnabled: input.webSearchEnabled,
-    hasAttachedFiles: input.hasAttachedFiles,
-  })) {
-    return "workspace_read";
-  }
-  return null;
+  if (!isRuntimeV2ChatIntent(input.runtimeIntent)) return null;
+  if (input.checkpointStrategy) return input.checkpointStrategy === "analyze" ? "workspace_read" : "chat";
+  if (input.hasAttachedFiles === true) return "workspace_read";
+  if (!String(input.runWorkspace || "").trim()) return "chat";
+  // Older submissions did not capture semantic capabilities and used the
+  // project-bound strategy for every read-only turn.
+  return input.requiredCapabilities === undefined ||
+    input.requiredCapabilities.includes("workspace_read") || input.runtimeIntent === "analyze"
+    ? "workspace_read"
+    : "chat";
 }
 
 /** Persisted pre-v2 turns stay readable without a history rewrite. */

@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use glob::glob;
+use glob::{glob, MatchOptions, Pattern};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
 use regex::Regex;
@@ -59,6 +59,7 @@ pub mod task_graph;
 pub mod trusted_execution;
 mod unity_editor;
 pub mod web_search;
+mod workspace_engine;
 
 // region: 全局常量与状态
 
@@ -1392,7 +1393,20 @@ fn remove_workspace_symlink(path: &Path) -> Result<(), String> {
     }
 }
 
-fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(), String> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletedWorkspaceEntry {
+    changed: bool,
+    previous_version: String,
+}
+
+impl DeletedWorkspaceEntry {
+    fn absent() -> Self {
+        Self { changed: false, previous_version: "deleted".into() }
+    }
+}
+
+fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<DeletedWorkspaceEntry, String> {
     if raw_path == workspace {
         return Err("禁止删除工作区根目录".to_string());
     }
@@ -1404,13 +1418,13 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
         .parent()
         .ok_or_else(|| "待删除路径没有有效父目录".to_string())?;
     let Some(canonical_parent) = resolve_workspace_delete_parent(parent, workspace)? else {
-        return Ok(());
+        return Ok(DeletedWorkspaceEntry::absent());
     };
     let delete_path = canonical_parent.join(file_name);
 
     let metadata = match fs::symlink_metadata(&delete_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DeletedWorkspaceEntry::absent()),
         Err(error) => return Err(format!("无法访问待删除路径: {error}")),
     };
 
@@ -1438,11 +1452,12 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
 
     let metadata = match fs::symlink_metadata(&delete_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DeletedWorkspaceEntry::absent()),
         Err(error) => return Err(format!("删除前无法访问目标路径: {error}")),
     };
     if metadata.file_type().is_symlink() {
-        return remove_workspace_symlink(&delete_path);
+        remove_workspace_symlink(&delete_path)?;
+        return Ok(DeletedWorkspaceEntry { changed: true, previous_version: "present".into() });
     }
 
     let canonical_target = delete_path
@@ -1453,6 +1468,15 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
         return Err("禁止删除工作区根目录".to_string());
     }
 
+    let previous_version = if metadata.is_file() && metadata.len() <= 1024 * 1024 {
+        File::open(&canonical_target).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() <= 1024 * 1024).then(|| format!("sha256-{:x}", Sha256::digest(&bytes)))
+        }).unwrap_or_else(|| "present".into())
+    } else {
+        "present".into()
+    };
     if metadata.is_dir() {
         // std::fs::remove_dir_all does not follow symlinks encountered while
         // walking. The final entry was also checked with symlink_metadata above.
@@ -1461,7 +1485,7 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
         fs::remove_file(&delete_path).map_err(|error| format!("删除文件失败: {error}"))?;
     }
 
-    Ok(())
+    Ok(DeletedWorkspaceEntry { changed: true, previous_version })
 }
 
 fn resolve_existing_path(input: &str, workspace: &Path) -> Result<PathBuf, String> {
@@ -1537,6 +1561,25 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
         return Err("glob 模式不允许包含 ..".to_string());
     }
     Ok(())
+}
+
+fn portable_relative_path(path: &Path) -> Option<String> {
+    let components: Option<Vec<_>> = path
+        .components()
+        .map(|component| {
+            let Component::Normal(part) = component else {
+                return None;
+            };
+            let part = part.to_str()?;
+            (!part.contains('\\') && !part.chars().any(char::is_control)).then_some(part)
+        })
+        .collect();
+    let components = components?;
+    Some(if components.is_empty() {
+        ".".into()
+    } else {
+        components.join("/")
+    })
 }
 
 // endregion
@@ -3717,6 +3760,22 @@ fn canonicalize_workspace_path(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn inspect_workspace_engine_profile(
+    workspace: String,
+    context_paths: Vec<String>,
+    project_root_hint: Option<String>,
+) -> Result<Option<workspace_engine::EngineProfile>, String> {
+    run_file_read_io(move || {
+        Ok(workspace_engine::inspect(
+            Path::new(workspace.trim()),
+            &context_paths,
+            project_root_hint.as_deref(),
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn read_file(
     app: AppHandle,
     state: State<'_, WorkspaceState>,
@@ -4021,6 +4080,26 @@ fn get_file_metadata(
         size_bytes: metadata.len(),
         modified_ms,
     })
+}
+
+fn observe_missing_workspace_paths(workspace: &Path, paths: &[String]) -> Vec<String> {
+    paths.iter().take(32).filter_map(|path| {
+        let trusted = trusted_execution::resolve_workspace_path(
+            workspace, path, trusted_execution::WorkspacePathMode::AllowMissing,
+        ).ok()?;
+        match fs::symlink_metadata(trusted.path()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(path.clone()),
+            _ => None,
+        }
+    }).collect()
+}
+
+#[tauri::command]
+async fn observe_worktree_absence(workspace: String, paths: Vec<String>) -> Result<Vec<String>, String> {
+    run_file_read_io(move || {
+        let workspace = canonicalize_workspace_dir(&workspace)?;
+        Ok(observe_missing_workspace_paths(&workspace, &paths))
+    }).await
 }
 
 const PROJECT_INIT_TARGET_NAME: &str = "AGENTS.md";
@@ -5784,10 +5863,21 @@ const SKELETON_IGNORED_DIRS: &[&str] = &[
     "PackageCache",
     ".protocols",
 ];
+const ENGINE_GENERATED_SEARCH_DIRS: &[&str] = &[
+    ".godot",
+    "Binaries",
+    "DerivedDataCache",
+    "Intermediate",
+    "Saved",
+];
 const CS_COLLAPSE_THRESHOLD: usize = 12;
 
 fn should_skip_recursive_search_dir(name: &str) -> bool {
     SKELETON_IGNORED_DIRS.contains(&name) || LIST_DIRECTORY_IGNORED_DIRS.contains(&name)
+}
+
+fn should_skip_source_search_dir(name: &str) -> bool {
+    should_skip_recursive_search_dir(name) || ENGINE_GENERATED_SEARCH_DIRS.contains(&name)
 }
 
 fn ext_in_list(name: &str, list: &[&str]) -> bool {
@@ -6101,13 +6191,21 @@ fn get_project_skeleton(
 }
 
 #[tauri::command]
-fn glob_search(
-    state: State<WorkspaceState>,
+async fn glob_search(
+    state: State<'_, WorkspaceState>,
     pattern: String,
     workspace: Option<String>,
+    source_search: Option<bool>,
 ) -> Result<Vec<String>, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
-    glob_search_in_workspace(&workspace, &pattern)
+    run_file_read_io(move || {
+        if source_search == Some(true) {
+            source_glob_search(&workspace, &pattern)
+        } else {
+            glob_search_in_workspace(&workspace, &pattern)
+        }
+    })
+    .await
 }
 
 fn glob_search_in_workspace(workspace: &Path, pattern: &str) -> Result<Vec<String>, String> {
@@ -6139,22 +6237,91 @@ fn glob_search_in_workspace(workspace: &Path, pattern: &str) -> Result<Vec<Strin
     Ok(hits)
 }
 
+fn source_glob_search(workspace: &Path, pattern: &str) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    let windows_pattern = pattern.replace('\\', "/");
+    #[cfg(windows)]
+    let pattern = windows_pattern.as_str();
+    let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+    validate_glob_pattern(pattern)?;
+    let components: Vec<_> = pattern
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let compiled =
+        Pattern::new(&components.join("/")).map_err(|error| format!("glob 模式错误: {error}"))?;
+    let literal_count = components
+        .iter()
+        .take_while(|part| !part.contains(['*', '?', '[']))
+        .count();
+    let literal = components[..literal_count].join("/");
+    let start = if literal.is_empty() { "." } else { &literal };
+    let Ok(start_path) = resolve_existing_path(start, workspace) else {
+        return Ok(Vec::new());
+    };
+    if literal_count == components.len() {
+        return Ok(portable_relative_path(Path::new(&literal))
+            .into_iter()
+            .collect());
+    }
+    let depth = if components[literal_count..].contains(&"**") {
+        usize::MAX
+    } else {
+        components.len() - literal_count
+    };
+    let options = MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    let mut hits = Vec::new();
+    for entry in WalkDir::new(&start_path)
+        .min_depth(1)
+        .max_depth(depth)
+        .into_iter()
+        .filter_entry(|entry| {
+            !entry.file_type().is_dir()
+                || !should_skip_source_search_dir(&entry.file_name().to_string_lossy())
+        })
+        .filter_map(Result::ok)
+    {
+        let Ok(suffix) = entry.path().strip_prefix(&start_path) else {
+            continue;
+        };
+        let Some(relative) = portable_relative_path(&Path::new(&literal).join(suffix)) else {
+            continue;
+        };
+        if compiled.matches_with(&relative, options)
+            && (!entry.file_type().is_symlink()
+                || resolve_existing_path(&relative, workspace).is_ok())
+        {
+            hits.push(relative);
+        }
+    }
+    hits.sort();
+    Ok(hits)
+}
+
 #[tauri::command]
-fn grep_search(
-    state: State<WorkspaceState>,
+async fn grep_search(
+    state: State<'_, WorkspaceState>,
     query: String,
     path: String,
     workspace: Option<String>,
 ) -> Result<String, String> {
-    let regex = Regex::new(&query).map_err(|e| format!("无效正则表达式: {e}"))?;
     let workspace = resolve_workspace_root(&state, workspace)?;
-    let target = resolve_existing_path(&path, &workspace)?;
+    run_file_read_io(move || grep_search_in_workspace(&workspace, &query, &path)).await
+}
+
+fn grep_search_in_workspace(workspace: &Path, query: &str, path: &str) -> Result<String, String> {
+    let regex = Regex::new(query).map_err(|e| format!("无效正则表达式: {e}"))?;
+    let target = resolve_existing_path(path, workspace)?;
 
     let mut output = String::new();
     let mut matched = 0_usize;
 
     if target.is_file() {
-        grep_file(&workspace, &target, &regex, &mut output, &mut matched)?;
+        grep_file(workspace, &target, &regex, &mut output, &mut matched)?;
     } else if target.is_dir() {
         for entry in WalkDir::new(&target)
             .follow_links(false)
@@ -6164,7 +6331,7 @@ fn grep_search(
                     return true;
                 }
                 let name = entry.file_name().to_string_lossy();
-                !should_skip_recursive_search_dir(name.as_ref())
+                !should_skip_source_search_dir(name.as_ref())
             })
         {
             let entry = match entry {
@@ -6180,7 +6347,7 @@ fn grep_search(
                 continue;
             }
 
-            let _ = grep_file(&workspace, file_path, &regex, &mut output, &mut matched);
+            let _ = grep_file(workspace, file_path, &regex, &mut output, &mut matched);
             if matched >= GREP_MATCH_LIMIT || output.len() >= GREP_OUTPUT_LIMIT_BYTES {
                 break;
             }
@@ -12880,7 +13047,7 @@ fn delete_protocol_package_at(workspace: &Path, local_path: &str) -> Result<(), 
     let canonical_workspace = workspace
         .canonicalize()
         .map_err(|error| format!("无法解析协议包工作区: {error}"))?;
-    delete_path_within_workspace(&canonical_workspace.join(relative), &canonical_workspace)
+    delete_path_within_workspace(&canonical_workspace.join(relative), &canonical_workspace).map(|_| ())
 }
 
 #[tauri::command]
@@ -12899,7 +13066,7 @@ fn delete_workspace_path(
     state: State<WorkspaceState>,
     path: String,
     workspace: Option<String>,
-) -> Result<(), String> {
+) -> Result<DeletedWorkspaceEntry, String> {
     let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let raw_path = if Path::new(&path).is_absolute() {
@@ -13710,12 +13877,14 @@ pub fn run() {
             get_workspace_root,
             set_workspace_root,
             canonicalize_workspace_path,
+            inspect_workspace_engine_profile,
             list_directory,
             get_project_skeleton,
             get_file_outline,
             read_file,
             read_file_window,
             get_file_metadata,
+            observe_worktree_absence,
             inspect_project_init_target,
             commit_project_init,
             open_file_external,
@@ -15861,6 +16030,65 @@ fn legacy_snapshot_enumeration_discovers_unlisted_owners_and_fails_closed_on_unk
         assert!(should_skip_recursive_search_dir(".protocols"));
         assert!(!should_skip_recursive_search_dir(".MAIN"));
         assert!(!should_skip_recursive_search_dir("Scripts"));
+    }
+
+    #[test]
+    fn source_search_skips_generated_subtrees_unless_scoped_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        for path in [
+            "Script.gd",
+            "Game/Source/Player.gd",
+            "Game/.godot/Noise.gd",
+            "Game/Intermediate/Build.gd",
+            "Game/Library/Cache.gd",
+        ] {
+            let path = workspace.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "engine_fixture_symbol\n").unwrap();
+        }
+        assert_eq!(
+            super::source_glob_search(&workspace, "**/*.gd").unwrap(),
+            vec!["Game/Source/Player.gd", "Script.gd"]
+        );
+        assert_eq!(
+            super::source_glob_search(&workspace, "*.gd").unwrap(),
+            vec!["Script.gd"]
+        );
+        assert_eq!(
+            super::source_glob_search(&workspace, "Game/Intermediate/*.gd").unwrap(),
+            vec!["Game/Intermediate/Build.gd"]
+        );
+        assert_eq!(
+            super::source_glob_search(&workspace, "Game/.godot/Noise.gd").unwrap(),
+            vec!["Game/.godot/Noise.gd"]
+        );
+        assert!(super::source_glob_search(&workspace, "../*.gd").is_err());
+        let ordinary =
+            super::grep_search_in_workspace(&workspace, "engine_fixture_symbol", ".").unwrap();
+        assert!(ordinary.contains("Game/Source/Player.gd"));
+        assert!(!ordinary.contains("Game/Intermediate/Build.gd"));
+        assert!(super::grep_search_in_workspace(
+            &workspace,
+            "engine_fixture_symbol",
+            "Game/Intermediate"
+        )
+        .unwrap()
+        .contains("Game/Intermediate/Build.gd"));
+    }
+
+    #[test]
+    fn worktree_absence_observes_only_contained_paths_and_retains_existing_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        fs::create_dir(root.join("Assets")).unwrap();
+        fs::write(root.join("Assets/Existing.cs"), "class Existing {}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("missing-target"), root.join("Assets/BrokenLink.cs")).unwrap();
+        let mut paths = vec!["Assets/Removed.cs".into(), "Assets/Existing.cs".into(), "../outside.cs".into()];
+        #[cfg(unix)]
+        paths.push("Assets/BrokenLink.cs".into());
+        assert_eq!(super::observe_missing_workspace_paths(&root, &paths), ["Assets/Removed.cs"]);
     }
 
     #[test]

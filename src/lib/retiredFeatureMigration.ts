@@ -46,6 +46,30 @@ export function mergeCommittedStartupSessions<T>(
   return result;
 }
 
+export async function withSessionMigrationStage<T>(stage: string, work: () => Promise<T>, owner?: string): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${stage}${owner ? ` (${owner})` : ""}: ${message}`);
+  }
+}
+
+/** Storage owns these top-level fields. All remaining content must match. */
+export function matchesCommittedStartupSession(local: RecordValue, native: RecordValue): boolean {
+  const content = (snapshot: RecordValue) => {
+    const {
+      projectId: _projectId, workspaceRoot: _workspaceRoot, storageVersion: _storageVersion,
+      storageRevision: _storageRevision, storageStatus: _storageStatus, updatedAtMs: _updatedAtMs,
+      ...body
+    } = retireRemovedFeatures(snapshot);
+    return JSON.stringify(body, (_key, value) => record(value)
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
+      : value);
+  };
+  return content(local) === content(native);
+}
+
 const RETIRED_FIELDS = new Set([
   "imageStudio", "selectedMainModeKey", "selectedNexusModeKey", "selectedAgentKey", "sessionModeAffinity", "showAgentPicker",
   "activeGoal", "goalProgress", "goalStatus", "goalIterationBudget", "goalRuntime",
@@ -208,21 +232,30 @@ export function cleanLegacySessionFiles(files: readonly LegacyMigrationFile[]): 
  * A CAS conflict aborts the pass; the next pass re-enumerates current revisions.
  */
 export async function migrateRetiredFeatureSnapshots(port: RetiredFeatureMigrationPort): Promise<{ scanned: number; changed: number }> {
-  const snapshots = await port.list();
+  const snapshots = await withSessionMigrationStage("list_native_snapshots", () => port.list());
   const committed: Array<{ workspace: string; sessionId: string; revision: number; snapshot: RecordValue }> = [];
   let changed = 0;
   for (const entry of snapshots) {
     const snapshot = retireRemovedFeatures(entry.snapshot);
     if (JSON.stringify(snapshot) === JSON.stringify(entry.snapshot)) { committed.push(entry); continue; }
-    const saved = await port.compareAndSwap({ workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, snapshot });
+    const saved = await withSessionMigrationStage("rewrite_native_snapshot", () => port.compareAndSwap({
+      workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, snapshot,
+    }), `${entry.workspace}:${entry.sessionId}@${entry.revision}`);
     committed.push({ ...entry, revision: saved.revision, snapshot: saved.snapshot });
     changed++;
   }
-  for (const file of cleanLegacySessionFiles(await port.listLegacyFiles())) {
+  const legacyFiles = await withSessionMigrationStage("list_legacy_copies", () => port.listLegacyFiles());
+  for (const file of cleanLegacySessionFiles(legacyFiles)) {
     const { contentHash, ...payload } = file;
-    await port.compareAndSwapLegacyFile({ ...payload, expectedHash: contentHash });
+    await withSessionMigrationStage("rewrite_legacy_copy", () => port.compareAndSwapLegacyFile({
+      ...payload, expectedHash: contentHash,
+    }), `${file.workspace}:${file.sessionId}/${file.fileName}`);
   }
-  for (const entry of committed) await port.finalizeLegacyCopy({ workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, expectedSnapshot: entry.snapshot });
-  await port.cleanupOutputs();
+  for (const entry of committed) {
+    await withSessionMigrationStage("finalize_legacy_copy", () => port.finalizeLegacyCopy({
+      workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, expectedSnapshot: entry.snapshot,
+    }), `${entry.workspace}:${entry.sessionId}@${entry.revision}`);
+  }
+  await withSessionMigrationStage("cleanup_retired_outputs", () => port.cleanupOutputs());
   return { scanned: snapshots.length, changed };
 }

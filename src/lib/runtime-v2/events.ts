@@ -152,6 +152,11 @@ export type RuntimeV2Event =
         readonly target: string;
         readonly operation: "create" | "modify" | "delete";
       }[];
+      /** Native post-command absence observations for Run-created paths. */
+      readonly observedWorkspaceRemovals?: readonly {
+        readonly target: string;
+        readonly priorMutationVersion: string;
+      }[];
       /** A replay closes the provider tool pair with an already committed
        * same-version receipt. It is not a new observation or progress
        * boundary and therefore carries no new evidence. */

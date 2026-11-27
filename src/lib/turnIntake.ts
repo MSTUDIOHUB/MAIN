@@ -150,8 +150,8 @@ export function buildSubagentDelegationGuidance(input: {
       : "本轮允许按需协作。";
   if (input.scope === "read_only") {
     const method = input.language === "en"
-      ? "When spawn_subagent is available, delegate a bounded read-only investigation, design review, or validation question if an independent result can overlap useful parent work. Give the child a specific objective, success criteria, relevant evidence, and exact read scope. Continue unrelated discovery and join the result before submitting the plan."
-      : "当 spawn_subagent 可用且独立结果可与父线程的工作并行时，委派范围明确的只读调查、设计评审或验证设计。为子智能体明确目标、成功标准、相关证据及读取范围。父线程继续推进其他调查，提交计划前汇合结果。";
+      ? "When spawn_subagent is available, delegate a bounded read-only question if an independent result can overlap useful parent work. Use observed project evidence, current available capacity, exact paths, a specific objective, and success criteria. Continue the parent investigation and incorporate relevant child evidence before replying."
+      : "当 spawn_subagent 可用时，依据已观察到的项目证据，主动委派可与父线程工作并行的独立只读问题。按当前可用并发容量，为子智能体指定精确路径、目标和成功标准。父线程继续调查，并在答复前纳入相关子任务证据。";
     return `${availability} ${method}`;
   }
   const preferenceMethod = input.requirement === "required"
@@ -159,8 +159,8 @@ export function buildSubagentDelegationGuidance(input: {
       ? "Delegate the requested bounded outcome within the user's requested deliverable and depth, dependencies, and exact ownership. Keep the child objective and success criteria within that scope; the parent owns integration and completion."
       : "按用户要求的交付范围与深度、依赖关系和精确责任范围委派所需结果；子目标和成功标准必须保持在该范围内，父线程负责整合与完成。"
     : input.language === "en"
-      ? "Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when it benefits the requested outcome enough to justify coordination. The parent continues non-dependent work in parallel. Delegation remains optional at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly."
-      : "子目标和成功标准保持在用户要求的交付范围与深度内；仅在所需独立结果对交付的收益足以抵偿协作成本时委派。父线程继续推进不依赖子结果的工作。读取、修改或验证任一阶段均可按需协作，但不是强制生命周期阶段；简单或线性任务直接执行。";
+      ? "Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an evidence-backed independent result only when it benefits the requested outcome enough to justify coordination and can overlap useful parent work. Match the available lane capacity. Delegation remains optional at inspect, edit, or verify. For a simple or linear task, proceed directly."
+      : "子目标和成功标准保持在用户要求的交付范围与深度内。只有证据支持的独立结果能带来足够收益，且父线程还有可并行推进的工作时，才按当前通道容量主动委派。读取、修改或验证任一阶段均可按需协作，但不是强制生命周期阶段。简单或线性任务直接执行。";
   return input.language === "en"
     ? [
         availability,

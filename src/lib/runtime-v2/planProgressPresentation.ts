@@ -49,7 +49,8 @@ export function projectRuntimeV2PlanProgress(
     ? deriveRuntimeV2PlanValidationCorrectionScope(aggregate)
     : null;
   const rawCompilation = deriveUnityCompilation(aggregate)?.receipt?.result.status;
-  const compilation = rawCompilation === "not_unity_project"
+  const compilation = rawCompilation === "project_fragment" ? "unavailable"
+    : rawCompilation === "not_unity_project"
     ? "not_applicable"
     : rawCompilation && rawCompilation !== "deferred_closed"
       ? rawCompilation

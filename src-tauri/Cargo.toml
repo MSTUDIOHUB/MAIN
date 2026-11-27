@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "2.4.1"
+version = "2.4.2"
 description = "MAIN open-source local-first desktop agent workbench"
 authors = ["The MAIN Contributors"]
 license = "Apache-2.0"

@@ -62,6 +62,7 @@ import {
   closeHarnessRunMarkerForSessionDeletion,
   getHarnessActionRunId,
   getCurrentHarnessInstanceId,
+  matchesHarnessTerminalNotice,
   normalizeHarnessRunMarker,
   persistHarnessRunMarkerIfOwned,
   readHarnessRunMarker,
@@ -417,6 +418,8 @@ import {
   normalizeApprovedPlanTaskStatuses,
 } from "./submitApprovedPlanExecution";
 import { runIntentPreflight } from "../lib/intentPreflight";
+import { runIntentFirstResponse, supportsOmlxFirstResponse } from "../lib/intentFirstResponse";
+import { hasExplicitSkillInvocation } from "../lib/agentSkills";
 import { scheduleRuntimeTask } from "../lib/runtimeScheduling";
 import {
   cancelSubagentRun,
@@ -1090,6 +1093,8 @@ export interface Session {
   runtimeSnapshot?: SessionRuntimeSnapshot;
   /** SQLite-owned CAS revision returned by Project Session persistence. */
   storageRevision?: number;
+  /** Retains legacy browser details until their exact native import commits. */
+  _retirementMigrationPending?: boolean;
   storageStatus?: "ok" | "missing" | "temporary";
   transcriptPartial?: boolean;
   transcriptLoadedTurns?: number;
@@ -1594,6 +1599,9 @@ export interface AppState {
       resolvedIntent?: ResolvedUserIntent;
       explicitIntent?: ResolvedUserIntent;
       semanticIntent?: SemanticTaskIntent;
+      preparedChatAnswer?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+      preparedWorkspaceRead?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+      sourceInvestigationTurnId?: string;
       runtimeIntentOverride?: ResolvedUserIntent;
       forceExecuteRecoveryMode?: ExecuteRecoveryMode;
       forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -5770,10 +5778,7 @@ function settleCanceledTurnHarnessProjection(
   if (
     latestMarker.status !== "running" &&
     latestMarker.status !== "paused" &&
-    (
-      latestMarker.status !== projectedMarker.status ||
-      latestMarker.closeReason !== projectedMarker.closeReason
-    )
+    !matchesHarnessTerminalNotice(latestMarker, projectedMarker)
   ) {
     logStoreEvent("canceled_turn_harness_terminal_conflict", {
       expected: exactOwner,
@@ -7996,11 +8001,13 @@ async function hydrateExistingPlanArtifactsForWorkspace(
       const fileName = path.split("/").pop()?.toLowerCase() || "";
       return fileNames.has(fileName);
     });
-    if (availablePaths.length === 0) {
+  } catch {
+    try {
+      await listDirectory("", workspace || undefined);
+      availablePaths = [];
+    } catch {
       availablePaths = [...PLAN_ARTIFACT_PATHS];
     }
-  } catch {
-    availablePaths = [...PLAN_ARTIFACT_PATHS];
   }
 
   return hydratePlanArtifactsFromReader(
@@ -9732,7 +9739,6 @@ export const useAppStore = create<AppState>()(
           },
         }));
         invalidateWorkspaceTreeCache();
-        void get().refreshMcpDiscovery();
         return get().refreshManagedProjectRules(stablePath)
           .then(() => get().refreshInstructionAndHookState())
           .finally(() => {
@@ -15035,6 +15041,9 @@ export const useAppStore = create<AppState>()(
     resolvedIntent?: ResolvedRunIntent;
     explicitIntent?: ResolvedUserIntent;
     semanticIntent?: SemanticTaskIntent;
+    preparedChatAnswer?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+    preparedWorkspaceRead?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+    sourceInvestigationTurnId?: string;
     runtimeIntentOverride?: ResolvedRunIntent;
     forceExecuteRecoveryMode?: ExecuteRecoveryMode;
     forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -15917,14 +15926,44 @@ export const useAppStore = create<AppState>()(
       startBlockingPreflight: (blockingPreflightEffect) => {
         void startSubmitBlockingPreflightEffect({
           effect: blockingPreflightEffect,
-          runIntentPreflight: (request) => runIntentPreflight({
-            ...request,
-            onDiagnostic: (diagnostic) => logStoreEvent("intent_preflight_rejected", {
+          runIntentPreflight: async (request) => {
+            const turnId = blockingPreflightEffect.originalOptions?.workspaceInstructionClaim?.turnId ?? null;
+            const onDiagnostic: NonNullable<Parameters<typeof runIntentPreflight>[0]["onDiagnostic"]> = (diagnostic) => logStoreEvent("intent_preflight_rejected", {
               sessionKey: blockingPreflightEffect.sendOriginSessionKey,
-              turnId: blockingPreflightEffect.originalOptions?.workspaceInstructionClaim?.turnId ?? null,
+              turnId,
               ...diagnostic,
-            }),
-          }),
+            });
+            const turnNetworkRead = state.conversationTurns.find((turn) => turn.id === turnId)?.networkRead;
+            const preceding = state.conversationTurns.slice().reverse().find((turn) => turn.id !== turnId && turn.uiVisibility !== "internal");
+            const findings = preceding?.durableContext?.finalAssistantAnswer || preceding?.summary;
+            const previousInvestigation = preceding && findings && ["success", "done"].includes(preceding.status) &&
+              resolveConversationTurnIntent(preceding) === "analyze"
+              ? { turnId: preceding.id, request: preceding.userPrompt, findings } : undefined;
+            if (supportsOmlxFirstResponse(request.config) && !request.explicitIntent && !remoteFeishu &&
+                !images?.length && !attachedFilesSnapshot.length &&
+                !options?.knowledgeReferencesSnapshot?.length &&
+                !hasExplicitSkillInvocation(request.input) &&
+                !(turnNetworkRead?.enabled ?? state.webSearchEnabled)) {
+              const recentConversation = state.conversationTurns.filter((turn) =>
+                turn.id !== turnId && turn.uiVisibility !== "internal" &&
+                (turn.durableContext?.finalAssistantAnswer || ["success", "done", "completed_with_changes"].includes(turn.status))
+              ).slice(-2).flatMap((turn) => [
+                { role: "user" as const, content: turn.userPrompt.slice(0, 1500) },
+                { role: "assistant" as const, content: (turn.durableContext?.finalAssistantAnswer || turn.summary || "").slice(0, 1500) },
+              ].filter(({ content }) => !!content.trim()));
+              const first = await runIntentFirstResponse({
+                ...request,
+                previousInvestigation,
+                recentConversation,
+                mentionedPaths: mentionSnapshot,
+                offerWorkspaceReads: !!mentionSnapshot.length || blockingPreflightEffect.resolution.intent === "analyze",
+                replyLanguage: preferredLanguage,
+                onOutcome: (outcome) => logStoreEvent("intent_first_response", { turnId, outcome }),
+              });
+              if (first || request.signal?.aborted) return first;
+            }
+            return runIntentPreflight({ ...request, previousInvestigation, onDiagnostic });
+          },
           getState: get,
           setState: set,
           isSessionRuntimeActive,
@@ -16400,6 +16439,9 @@ export const useAppStore = create<AppState>()(
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       effectiveRunIntent,
       semanticIntent: options?.semanticIntent,
+      preparedChatAnswer: options?.preparedChatAnswer,
+      preparedWorkspaceRead: options?.preparedWorkspaceRead,
+      sourceInvestigationTurnId: options?.sourceInvestigationTurnId,
       runtimeRunIntent,
 
 
@@ -16447,7 +16489,7 @@ export const useAppStore = create<AppState>()(
       getWorkspaceTree,
       refreshWorkspaceAdmission: async (workspace, userPrompt, options) => {
         if (workspace) await get().refreshManagedProjectRules(workspace);
-        const discovery = get().refreshMcpDiscovery();
+        const discovery = options?.includeMcp !== false ? get().refreshMcpDiscovery() : null;
         const admissionState = get();
         const freezeMcp = () => resolveWorkspaceMcpView({
           workspace,
@@ -16468,7 +16510,7 @@ export const useAppStore = create<AppState>()(
               { workspace, projectToUi: false, userPrompt },
             ),
             baseline: null,
-            mcpSnapshot: await bindWorkspaceUnityMcpView(freezeMcp(), undefined),
+            mcpSnapshot: discovery ? await bindWorkspaceUnityMcpView(freezeMcp(), undefined) : null,
             warnings: [],
           };
         }
@@ -16482,6 +16524,12 @@ export const useAppStore = create<AppState>()(
           includeProjectBaseline: options?.includeProjectBaseline,
           io: workspaceAdmissionIpcIo,
         });
+        if (!discovery) return {
+          instructions: snapshot.instructions,
+          baseline: snapshot.baseline,
+          mcpSnapshot: { workspace, mcpServers: [], mcpDiscoveredTools: [], mcpToolServerMap: {} },
+          warnings: snapshot.warnings.map((warning) => `${warning.code}: ${warning.message}`),
+        };
         await Promise.race([discovery, new Promise<void>(resolve => setTimeout(resolve, 800))]);
         const refreshedMetadata = options?.includeProjectBaseline === false
           ? await buildProjectBaselineContext({ workspace, io: projectBaselineIpcIo, metadataOnly: true }).catch(() => null)
@@ -16787,6 +16835,7 @@ export const useAppStore = create<AppState>()(
           mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
           sessionRecordingEnabled: (persistedConfig as any).sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           debugRecordFullTurnProcess: (persistedConfig as any).debugRecordFullTurnProcess === true,
+          experimentalOmlxFirstResponse: persistedConfig.experimentalOmlxFirstResponse === true,
           eventStreamMode: normalizeEventStreamMode(
             (persistedConfig as any).eventStreamMode,
             current.config.eventStreamMode,

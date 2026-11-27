@@ -781,6 +781,15 @@ test("Harness settlement cannot close a reused logical id from another generatio
       terminalResultKind: "success",
     }, exactOwner), null, "a retry cannot rewrite one terminal result into another");
     assert.equal(readHarnessRunMarker().terminalResultKind, "partial");
+
+    const canceledTerminal = { ...exactTerminal, terminalResultKind: "canceled", closeReason: "user_cancelled" };
+    persistHarnessRunMarker({ ...settled, closeReason: "runtime_v2_terminal" });
+    assert.equal(settleHarnessRunMarkerIfOwned(canceledTerminal, exactOwner), null);
+    persistHarnessRunMarker({ ...canceledTerminal, closeReason: "runtime_v2_terminal" });
+    assert.equal(settleHarnessRunMarkerIfOwned(canceledTerminal, { ...exactOwner, startedAt: 100 }), null);
+    assert.equal(readHarnessRunMarker().closeReason, "runtime_v2_terminal");
+    assert.equal(settleHarnessRunMarkerIfOwned(canceledTerminal, exactOwner)?.closeReason, "user_cancelled");
+    assert.equal(readHarnessRunMarker().terminalResultKind, "canceled");
   } finally {
     if (previousWindow === undefined) {
       delete globalThis.window;

@@ -42,6 +42,7 @@ export interface SubmitAttachmentContextInput {
   runSessionKey: string;
   runWorkspace: string;
   preferredLanguage: "zh" | "en";
+  referenceCodeMentionsOnly?: boolean;
   markUserContextItemFailed: (path: string | undefined | null) => void;
   ingestAttachmentFile: (sessionKey: string, sourcePath: string) => Promise<AttachmentIngestResult>;
   readFile: (path: string, workspace?: string) => Promise<string>;
@@ -218,6 +219,7 @@ export async function buildSubmitAttachmentContext(
 
   for (const mentionPath of input.mentions) {
     const kind = classifyAttachment(mentionPath);
+    if (input.referenceCodeMentionsOnly && /\.(?:cs|asmdef|gd|gdshader|cpp|cxx|cc|h|hpp|verse|js|jsx|tsx?|rs|py|go|java|kt)$/i.test(mentionPath)) continue;
     attachmentRefs.push({
       path: mentionPath,
       displayName: getAttachmentDisplayName(mentionPath),
@@ -233,7 +235,8 @@ export async function buildSubmitAttachmentContext(
     return true;
   });
 
-  if (allFileRefs.length === 0 && failedAttachmentParts.length === 0) {
+  const mentionContext = buildMentionContext(input.mentions, input.preferredLanguage);
+  if (allFileRefs.length === 0 && failedAttachmentParts.length === 0 && !mentionContext) {
     return {
       userContent: input.text,
       attachmentRefs: allFileRefs,
@@ -242,7 +245,6 @@ export async function buildSubmitAttachmentContext(
   }
 
   const parts: string[] = [];
-  const mentionContext = buildMentionContext(input.mentions, input.preferredLanguage);
   if (mentionContext) parts.push(mentionContext);
   parts.push(...failedAttachmentParts);
 

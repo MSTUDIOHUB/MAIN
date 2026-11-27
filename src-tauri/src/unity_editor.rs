@@ -1010,6 +1010,21 @@ fn compile_closed(
 const EDITOR_CHECK_TARGET_LIMIT: usize = 24;
 const EDITOR_CHECK_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+fn is_unity_asset_path(path: &Path) -> bool {
+    let Some(std::path::Component::Normal(first)) = path.components().next() else { return false };
+    first.to_str().is_some_and(|part| {
+        if cfg!(windows) {
+            part.eq_ignore_ascii_case("Assets") || part.eq_ignore_ascii_case("Packages")
+        } else {
+            matches!(part, "Assets" | "Packages")
+        }
+    })
+}
+
+fn same_lexical_path(left: &Path, right: &Path) -> bool {
+    left == right || cfg!(windows) && left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
 fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value>, String> {
     if targets.len() > EDITOR_CHECK_TARGET_LIMIT {
         return Err("UNITY_CHECK_TARGET_LIMIT".to_string());
@@ -1023,7 +1038,7 @@ fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value
                 .and_then(|ext| ext.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if !(relative.starts_with("Assets") || relative.starts_with("Packages"))
+            if !is_unity_asset_path(relative)
                 || !relative
                     .components()
                     .all(|part| matches!(part, std::path::Component::Normal(_)))
@@ -1037,7 +1052,7 @@ fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value
             let resolved =
                 resolve_workspace_path(project, relative, WorkspacePathMode::AllowMissing)
                     .map_err(|_| "UNITY_CHECK_TARGET_UNAVAILABLE".to_string())?;
-            if resolved.path() != project.join(relative) {
+            if !same_lexical_path(resolved.path(), &project.join(relative)) {
                 return Err("UNITY_INVALID_CHECK_TARGET".to_string());
             }
             let version = match fs::File::open(resolved.path()) {
@@ -1059,7 +1074,128 @@ fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value
         .collect()
 }
 
+fn unity_fragment_source(project: &Path, targets: &[String]) -> bool {
+    // Check the admitted sources, since Assets is also common outside Unity.
+    static UNITY_SOURCE: OnceLock<Regex> = OnceLock::new();
+    let unity_source = UNITY_SOURCE.get_or_init(|| {
+        Regex::new(r"(?m)(?:^\s*(?:global\s+)?using\s+Unity(?:Engine|Editor)\b|\bUnity(?:Engine|Editor)\.|:\s*(?:MonoBehaviour|ScriptableObject)\b|^\s*Shader\s+\x22)").unwrap()
+    });
+    targets.iter().take(32).any(|target| {
+        let path = Path::new(target);
+        if !is_unity_asset_path(path) {
+            return false;
+        }
+        let Ok(source) = resolve_workspace_path(project, path, WorkspacePathMode::Existing) else {
+            return false;
+        };
+        if !source.path().is_file() {
+            return false;
+        }
+        let Ok(file) = fs::File::open(source.path()) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file.take(32 * 1024).read_to_end(&mut bytes).is_err() {
+            return false;
+        }
+        let source = String::from_utf8_lossy(&bytes);
+        if matches!(path.extension().and_then(|ext| ext.to_str()), Some("asmdef" | "asmref")) {
+            return serde_json::from_str::<Value>(&source).is_ok_and(|descriptor| {
+                descriptor.get("name").is_some() || descriptor.get("reference").is_some()
+            });
+        }
+        unity_source.is_match(&source)
+    })
+}
+
+fn csharp_target_project(workspace: &Path, target: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(target);
+    if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return Err("UNITY_INVALID_CHECK_TARGET".into());
+    }
+    let trusted = resolve_workspace_path(workspace, relative, WorkspacePathMode::AllowMissing)
+        .map_err(|_| "UNITY_CHECK_TARGET_UNAVAILABLE".to_string())?;
+    if !same_lexical_path(trusted.path(), &workspace.join(relative)) {
+        return Err("UNITY_INVALID_CHECK_TARGET".into());
+    }
+    let mut fragment_root = None;
+    for ancestor in trusted.path().ancestors().skip(1).take_while(|path| path.starts_with(workspace)) {
+        let inside = trusted.path().strip_prefix(ancestor).map_err(|_| "UNITY_INVALID_CHECK_TARGET")?;
+        if !is_unity_asset_path(inside) {
+            continue;
+        }
+        if ProjectEditor::read(ancestor)?.is_some() {
+            return Ok(ancestor.to_path_buf());
+        }
+        fragment_root.get_or_insert_with(|| ancestor.to_path_buf());
+    }
+    fragment_root.ok_or_else(|| "UNITY_INVALID_CHECK_TARGET".into())
+}
+
+fn run_scoped_csharp_check(
+    workspace: &Path,
+    defer_closed: bool,
+    targets: &[String],
+    expected_versions: &HashMap<String, Option<String>>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Value, String> {
+    available_time(deadline_at, canceled, 1)?;
+    if targets.len() > EDITOR_CHECK_TARGET_LIMIT {
+        return Err("UNITY_CHECK_TARGET_LIMIT".into());
+    }
+    let mut projects = targets.iter().map(|target| csharp_target_project(workspace, target));
+    let project = projects.next().transpose()?.unwrap_or_else(|| workspace.to_path_buf());
+    for candidate in projects {
+        if candidate? != project {
+            return Ok(json!({"status": "unavailable", "kind": "csharp",
+                "message": "UNITY_MULTIPLE_PROJECT_TARGETS: C# changes span multiple Unity project roots. Verify each admitted project separately."}));
+        }
+    }
+    let root = super::portable_relative_path(project.strip_prefix(workspace).map_err(|_| "UNITY_INVALID_PROJECT_ROOT")?)
+        .ok_or_else(|| "UNITY_INVALID_PROJECT_ROOT".to_string())?;
+    let root = if cfg!(windows) { root.to_ascii_lowercase() } else { root };
+    let relative = |target: &str| -> Result<String, String> {
+        let path = if root == "." { Some(target) } else { target.strip_prefix(&root).and_then(|suffix| suffix.strip_prefix('/')) };
+        path.map(str::to_string).ok_or_else(|| "UNITY_INVALID_CHECK_TARGET".to_string())
+    };
+    let local_targets = targets.iter().map(|target| relative(target)).collect::<Result<Vec<_>, _>>()?;
+    let local_versions = expected_versions.iter().map(|(target, version)| {
+        Ok((relative(target)?, version.clone()))
+    }).collect::<Result<HashMap<_, _>, String>>()?;
+    let mut output = run_editor_check_in_workspace(workspace, &project, defer_closed, "csharp", &local_targets, &local_versions, None, deadline_at, canceled)
+        .unwrap_or_else(|message| json!({"status": "unavailable", "kind": "csharp", "message": message}));
+    if root != "." {
+        for (list, field) in [("targets", "path"), ("diagnostics", "file")] {
+            if let Some(items) = output.get_mut(list).and_then(Value::as_array_mut) {
+                for item in items {
+                    if let Some(path) = item.get(field).and_then(Value::as_str).filter(|path| is_unity_asset_path(Path::new(path))) {
+                        item[field] = json!(format!("{root}/{path}"));
+                    }
+                }
+            }
+        }
+    }
+    output["projectRoot"] = json!(root);
+    Ok(output)
+}
+
 fn run_editor_check(
+    project: &Path,
+    defer_closed: bool,
+    kind: &str,
+    targets: &[String],
+    expected_versions: &HashMap<String, Option<String>>,
+    shader_import_targets: Option<&[String]>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Value, String> {
+    run_editor_check_in_workspace(project, project, defer_closed, kind, targets, expected_versions,
+        shader_import_targets, deadline_at, canceled)
+}
+
+fn run_editor_check_in_workspace(
+    workspace: &Path,
     project: &Path,
     defer_closed: bool,
     kind: &str,
@@ -1071,6 +1207,12 @@ fn run_editor_check(
 ) -> Result<Value, String> {
     available_time(deadline_at, canceled, 1)?;
     let Some(editor) = ProjectEditor::read(project)? else {
+        if unity_fragment_source(project, targets) {
+            return Ok(json!({
+                "status": "project_fragment", "kind": kind,
+                "message": "UNITY_PROJECT_FRAGMENT: Unity source is present, but ProjectSettings/ProjectVersion.txt is missing from the admitted workspace. No Editor compilation or import was run."
+            }));
+        }
         return Ok(json!({"status":"not_unity_project", "kind":kind}));
     };
     let before = editor_check_versions(project, targets)?;
@@ -1084,6 +1226,10 @@ fn run_editor_check(
             "status":"unavailable", "kind":kind,
             "message":"UNITY_CHECK_TARGET_CHANGED: checked bytes differ from the committed mutation."
         }));
+    }
+    if workspace != project {
+        inspect_editor_check_permission(workspace, "unity status")?;
+        inspect_editor_check_permission(project, "unity status")?;
     }
     let route = editor_route(project, &editor, deadline_at, canceled)?;
     let pid = match route {
@@ -1134,12 +1280,19 @@ fn run_editor_check(
             "unity run ."
         };
         inspect_editor_check_permission(project, operation)?;
+        if workspace != project {
+            inspect_editor_check_permission(workspace, operation)?;
+        }
         match pid {
             Some(_) => compile_connected(project, deadline_at, canceled),
             None => compile_closed(project, &editor, deadline_at, canceled),
         }
     };
     let mut result = match outcome {
+        Ok(_) if !ProjectEditor::read(project)?.is_some_and(|current|
+            current.version == editor.version && current.tuanjie_version == editor.tuanjie_version) => {
+            json!({"status":"unavailable", "message":"UNITY_PROJECT_VERSION_CHANGED: the project's Editor version changed during validation."})
+        }
         Ok(result) if editor_check_versions(project, targets)? == before => {
             if let Some(pid) = pid {
                 if !matches!(editor_route(project, &editor, deadline_at, canceled), Ok(EditorRoute::Connected { pid: current }) if current == pid)
@@ -1701,21 +1854,35 @@ pub async fn unity_create_scene(
 pub async fn unity_probe_editor(
     state: State<'_, WorkspaceState>,
     workspace: String,
+    project_root: Option<String>,
     operation_id: String,
     deadline_at: u64,
 ) -> Result<Value, String> {
     if workspace.trim().is_empty() {
         return Err("UNITY_PROJECT_REQUIRED".to_string());
     }
-    let project = resolve_workspace_root(&state, Some(workspace))?;
+    let workspace = resolve_workspace_root(&state, Some(workspace))?;
     let canceled = editor_cancellation(&operation_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let result = (|| {
-            let Some(editor) = ProjectEditor::read(&project)? else {
+            let requested = Path::new(project_root.as_deref().unwrap_or("."));
+            if requested.is_absolute() {
+                return Err("UNITY_INVALID_PROJECT_ROOT".into());
+            }
+            let project = resolve_workspace_path(&workspace, requested, WorkspacePathMode::Existing)
+                .map_err(|_| "UNITY_INVALID_PROJECT_ROOT".to_string())?;
+            let project = project.path();
+            if !same_lexical_path(project, &workspace.join(requested)) {
+                return Err("UNITY_INVALID_PROJECT_ROOT".into());
+            }
+            let Some(editor) = ProjectEditor::read(project)? else {
                 return Ok(json!({"route": "unavailable"}));
             };
-            inspect_editor_check_permission(&project, "unity status")?;
-            let route = editor_route(&project, &editor, deadline_at, &canceled)?;
+            inspect_editor_check_permission(&workspace, "unity status")?;
+            if project != workspace {
+                inspect_editor_check_permission(project, "unity status")?;
+            }
+            let route = editor_route(project, &editor, deadline_at, &canceled)?;
             Ok(match route {
                 EditorRoute::Connected { pid } => json!({"route": "connected", "pid": pid, "version": editor.version}),
                 EditorRoute::Closed => json!({"route": "closed", "version": editor.version}),
@@ -1750,7 +1917,15 @@ pub async fn unity_compile_project(
     tauri::async_runtime::spawn_blocking(move || {
         let kind = check_kind.as_deref().unwrap_or("csharp");
         let result = match kind {
-            "csharp" | "shader_import" => run_editor_check(
+            "csharp" => run_scoped_csharp_check(
+                &project,
+                defer_closed,
+                targets.as_deref().unwrap_or_default(),
+                &expected_versions.unwrap_or_default(),
+                deadline_at,
+                &canceled,
+            ),
+            "shader_import" => run_editor_check(
                 &project,
                 defer_closed,
                 kind,
@@ -1810,6 +1985,47 @@ mod tests {
 <test-run total="1" passed="1" failed="0" skipped="0" inconclusive="0" result="Passed">
   <test-suite><test-case result="Passed" fullname="Fixture.SceneLoads" /></test-suite>
 </test-run>"#;
+
+    #[test]
+    fn unity_source_fragment_returns_no_compiler_verdict_for_service_base_fixture() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        fs::create_dir_all(root.join("Assets")).unwrap();
+        let source = "Assets/ServiceBase.cs".to_string();
+        fs::write(root.join(&source), "namespace Fixture { class ServiceBase : MonoBehaviour {} }").unwrap();
+        let canceled = AtomicBool::new(false);
+        let result = run_editor_check(&root, false, "csharp", std::slice::from_ref(&source), &HashMap::new(), None, u64::MAX, &canceled).unwrap();
+        assert_eq!(result["status"], "project_fragment");
+        assert!(result.get("editor").is_none());
+        assert!(result.get("errorCount").is_none());
+        fs::write(root.join(&source), "namespace Fixture { class ServiceBase {} }").unwrap();
+        let ordinary = run_editor_check(&root, false, "csharp", &[source], &HashMap::new(), None, u64::MAX, &canceled).unwrap();
+        assert_eq!(ordinary["status"], "not_unity_project");
+    }
+
+    #[test]
+    fn nested_unity_check_binds_the_exact_project_before_editor_dispatch() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let target = "Game/Assets/Player.cs".to_string();
+        let other = "Other/Assets/Player.cs".to_string();
+        for project in ["Game", "Other"] {
+            fs::create_dir_all(root.join(project).join("ProjectSettings")).unwrap();
+            fs::create_dir_all(root.join(project).join("Assets")).unwrap();
+            fs::write(root.join(project).join("ProjectSettings/ProjectVersion.txt"), "m_EditorVersion: 6000.6.5f1\n").unwrap();
+            fs::write(root.join(project).join("Assets/Player.cs"), "using UnityEngine; class Player : MonoBehaviour {}").unwrap();
+        }
+        assert_eq!(csharp_target_project(&root, &target).unwrap(), root.join("Game"));
+        let canceled = AtomicBool::new(false);
+        let stale = HashMap::from([(target.clone(), Some(format!("sha256-{}", "a".repeat(64))))]);
+        let bound = run_scoped_csharp_check(&root, false, std::slice::from_ref(&target), &stale, u64::MAX, &canceled).unwrap();
+        assert_eq!(bound["projectRoot"], "Game");
+        assert_eq!(bound["status"], "unavailable");
+        assert!(bound["message"].as_str().unwrap().starts_with("UNITY_CHECK_TARGET_CHANGED:"));
+        let mixed = run_scoped_csharp_check(&root, false, &[target, other], &HashMap::new(), u64::MAX, &canceled).unwrap();
+        assert!(mixed["message"].as_str().unwrap().starts_with("UNITY_MULTIPLE_PROJECT_TARGETS:"));
+        assert!(csharp_target_project(&root, "../Game/Assets/Player.cs").is_err());
+    }
 
     #[test]
     fn engine_and_exact_editor_version_come_from_the_project() {

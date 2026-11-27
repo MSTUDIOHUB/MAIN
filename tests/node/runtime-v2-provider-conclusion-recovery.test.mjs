@@ -39,6 +39,7 @@ const runtime = loadTs("src/lib/runtime-v2/index.ts");
 const actionWindows = loadTs("src/store/runtimeV2/executionProviderActionWindow.ts");
 const requestPolicy = loadTs("src/store/runtimeV2/executionProviderRequestPolicy.ts");
 const admission = loadTs("src/store/runtimeV2/executionProviderSurfaceRejection.ts");
+const outcome = loadTs("src/store/runtimeV2/executionOutcome.ts");
 
 test("a failed shell predecessor cannot be filtered away to release a later command", () => {
   const p = ports(); let id = 0; p.nextId = prefix => `${prefix}-${++id}`;
@@ -155,9 +156,9 @@ async function withStreamFixture(provider, responseFactory, task) {
   const originalStream = streaming.streamChatCompletion;
   const originalLane = lanes.acquireModelLane;
   const calls = [];
-  streaming.streamChatCompletion = async (messages, settings, _callbacks, _signal, tools, maxOutputTokens, options) => {
+  streaming.streamChatCompletion = async (messages, settings, callbacks, _signal, tools, maxOutputTokens, options) => {
     calls.push({ messages, settings, tools, maxOutputTokens, options });
-    return responseFactory(calls.length);
+    return responseFactory(calls.length, callbacks);
   };
   lanes.acquireModelLane = async () => ({ markFirstToken() {}, reportFailure() {}, release() {} });
   try { await task(ports(provider), calls); }
@@ -166,6 +167,27 @@ async function withStreamFixture(provider, responseFactory, task) {
 
 const truncatedStream = () => ({ content: "##", semanticContent: "##", finishReason: "length", toolCalls: [], reasoningContent: "r".repeat(8097), usage: null });
 const completedStream = () => ({ content: "A complete answer from SOURCE_RECEIPT.", semanticContent: "A complete answer from SOURCE_RECEIPT.", finishReason: "stop", toolCalls: [], usage: null });
+
+test("action drafts stay internal while chat and formal conclusions can stream", async () => {
+  for (const mode of ["execute", "validate", "chat", "conclude"]) {
+    const canStream = mode === "chat" || mode === "conclude";
+    await withStreamFixture("omlx", (_attempt, callbacks) => {
+      callbacks.onRequestDispatched?.();
+      assert.equal(typeof callbacks.onPublicText === "function", canStream, mode);
+      callbacks.onPublicText?.("A complete answer from the source receipt.");
+      return completedStream();
+    }, async (fixture) => {
+      const timings = [];
+      fixture.logStoreEvent = (event, data) => { if (event === "runtime_v2_provider_request_timing") timings.push(data.stage); };
+      const result = await request.requestRuntimeV2ProviderOnce({
+        live: fixture.live, ports: fixture, command: command(mode), tools: [], textEnvelope: false,
+        toolChoice: null, signal: new AbortController().signal,
+      });
+      assert.equal(timings.includes("first_public_text"), canStream);
+      assert.equal(result.visibleText, completedStream().content, "durable intent and action handling still receive the provider response");
+    });
+  }
+});
 
 function assertOutboundRecoveryPair(messages, draft) {
   const drafts = messages.filter((message) => message.role === "assistant" && message.content === draft);
@@ -621,6 +643,26 @@ test("provider feedback only coalesces an identical response and feedback pair",
   assert.equal(live.messages.length, 6);
 });
 
+test("the outbound transcript omits superseded no-action drafts with identical feedback", async () => {
+  await withStreamFixture("omlx", completedStream, async (fixture, calls) => {
+    fixture.context.runtimeRunIntent = "execute";
+    for (const visibleText of ["Obsolete first summary", "Obsolete second summary", "Latest summary"]) {
+      history.rememberRuntimeV2ProviderResult(fixture, {
+        visibleText, toolCalls: [], diagnostics: [],
+      }, command("validate"));
+    }
+    const canonical = structuredClone(fixture.live.messages);
+    await request.requestRuntimeV2ProviderOnce({
+      live: fixture.live, ports: fixture, command: command("validate"), tools: [],
+      textEnvelope: false, toolChoice: null, signal: new AbortController().signal,
+    });
+    const wire = calls[0].messages;
+    assert.equal(wire.some(message => String(message.content).startsWith("Obsolete ")), false);
+    assert.equal(wire.filter(message => message.content === "Latest summary").length, 1);
+    assert.deepEqual(fixture.live.messages, canonical);
+  });
+});
+
 test("a truly empty Execute reply retains its own feedback and required decoding on the actual wire", async () => {
   const tools = [{ type: "function", function: { name: "read_file", description: "read", parameters: { type: "object", properties: {} } } }];
   await withStreamFixture("ollama", completedStream, async (fixture, calls) => {
@@ -659,4 +701,55 @@ test("repeated complete no-action replies keep the canonical recovery lease and 
   assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(state), false);
   const lease = runtime.advanceRuntimeV2ProviderRecoveryStallLease({ current: null, pressure: window.pressure, startedAt: window.startedAt, now: window.startedAt });
   assert.equal(runtime.runtimeV2ProviderRecoveryStallExpired(lease, window.startedAt + runtime.RUNTIME_V2_PROVIDER_RECOVERY_STALL_MS), true, "the existing stall boundary still prevents indefinite no-progress recovery");
+});
+
+test("the final validation recovery hands off a verified source-only project once", () => {
+  const version = "sha256-" + "a".repeat(64);
+  const target = "Assets/MFramework/Core/ServiceBase.cs";
+  let state = executeReplyAggregate({
+    toolCalls: [{ id: "edit", name: "replace_in_file", arguments: { path: target } }],
+  }, "acting");
+  const run = state.run.identity;
+  const append = (type, fields) => {
+    state = runtime.transition(state, {
+      schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence: state.nextSequence, eventId: `fragment-${state.nextSequence}`,
+      at: state.updatedAt + 1, run, type, ...fields,
+    });
+  };
+  const schedule = (options = {}) => {
+    const next = runtime.decideNextCommands(state, options)[0];
+    append("command.scheduled", { command: next });
+    return next;
+  };
+  const edit = schedule();
+  append("tool.completed", { idempotencyKey: edit.idempotencyKey, status: "succeeded",
+    evidence: [{ id: "edit-evidence", kind: "mutation", target, version, previousVersion: "absent" }],
+  });
+  append("phase.changed", { phase: "validating", reason: "mutation_committed" });
+  const compile = schedule({ checkUnityCompilation: true });
+  append("tool.completed", { idempotencyKey: compile.idempotencyKey, status: "blocked",
+    modelContent: JSON.stringify({ status: "project_fragment", kind: "csharp" }), evidence: [],
+  });
+  assert.equal(outcome.runtimeV2ValidationRecoveryDecision({ aggregate: state, hasProjectValidation: false }), null);
+  const summarize = () => {
+    const request = schedule();
+    assert.equal(request.payload.mode, "validate");
+    append("provider.responded", { idempotencyKey: request.idempotencyKey,
+      result: { visibleText: "P0 完成。", toolCalls: [], diagnostics: [] },
+    });
+  };
+  summarize();
+  const decision = outcome.runtimeV2ValidationRecoveryDecision({ aggregate: state, hasProjectValidation: false });
+  assert.equal(decision.resultKind, "partial");
+  assert.match(decision.resultReason, /完整工程/);
+  assert.equal(outcome.runtimeV2ValidationRecoveryDecision({ aggregate: state, hasProjectValidation: true }), null);
+  // If a project validation method exists, its presence does not grant an
+  // acceptance receipt or allow the final equivalent retry to run forever.
+  summarize();
+  summarize();
+  summarize();
+  assert.match(outcome.runtimeV2ValidationRecoveryDecision({ aggregate: state, hasProjectValidation: true }).pauseMessage, /可核验/);
+  append("observation.recorded", { evidence: { id: "new-source", kind: "source", target, version } });
+  assert.equal(outcome.runtimeV2ValidationRecoveryDecision({ aggregate: state, hasProjectValidation: true }), null);
 });

@@ -192,7 +192,7 @@ test("Plan tool_search discovers only admitted read-only candidates and unlocks 
       assert.ok(candidates.includes("web_search"), "discovery must receive the admitted Plan catalog");
       assert.equal(candidates.includes("write_file"), false);
       assert.equal(candidates.includes("submit_runtime_v2_work_plan"), false);
-      return discovery.executeToolSearch(args, { sessionKey, toolCatalog: options.toolCatalog });
+      return discovery.executeToolSearch(args, { sessionKey, toolCatalog: options.toolCatalog, advertisedToolNames: options.advertisedToolNames });
     } }],
   ]));
   await planEvidence.executeReadOnlyPlanTool({ context,
@@ -201,7 +201,7 @@ test("Plan tool_search discovers only admitted read-only candidates and unlocks 
     messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
   });
   assert.equal(settlements[0].status, "succeeded");
-  assert.equal(settlements[0].evidence[0].kind, "tool");
+  assert.deepEqual(settlements[0].evidence, [], "discovering capability does not observe a fact about the project");
   assert.ok(discovery.getUnlockedToolsForSession(context.runSessionKey).has("web_search"));
 });
 
@@ -958,6 +958,7 @@ async function runProductionPlanScenario(
   let taskId = 0;
   const logs = [];
   const savedDocuments = [];
+  const projections = [];
   const runSessionKey = options.runSessionKey || turn.sessionKey;
   const revision = options.revision;
   let state = {
@@ -1002,6 +1003,9 @@ async function runProductionPlanScenario(
   const checkpointPort = {
     getRuntimeV2Checkpoint(current, owner) {
       return current.runtimeV2Checkpoints?.[owner.turnId] || null;
+    },
+    getRuntimeV2EmergencyTerminalEnvelope(current, owner) {
+      return current.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null;
     },
     createRuntimeV2CheckpointPort() {
       return {
@@ -1147,7 +1151,7 @@ async function runProductionPlanScenario(
     ["../../lib/runtime-v2", runtime],
     ["./checkpointPort", checkpointPort],
     ["./projectionPort", {
-      createRuntimeV2ProjectionPort: () => ({ async publish() {} }),
+      createRuntimeV2ProjectionPort: () => ({ async publish(value) { projections.push(value.projection); } }),
     }],
     ["./workPlanAdapter", adapter],
   ]);
@@ -1215,6 +1219,7 @@ async function runProductionPlanScenario(
     state,
     checkpoint: state.runtimeV2Checkpoints[turn.turnId],
     logs,
+    projections,
   };
 }
 
@@ -3990,10 +3995,11 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
   assert.equal(resolved.commit.artifact.content, writtenPlan);
   assert.equal(resolved.commit.artifact.documentRef.contentHash, createHash("sha256").update(writtenPlan).digest("hex"));
   assert.equal(resolved.commit.artifact.path, result.state.activeActionRequest.documentRef.path);
-  assert.ok(result.checkpoint.aggregate.events.some((event) =>
+  assert.ok(result.projections.some((projection) => projection.audience === "capsule_live"));
+  assert.equal(result.checkpoint.aggregate.events.some((event) =>
     event.type === "projection.published" &&
     event.audience === "capsule_live"
-  ));
+  ), false);
   const acceptedSubmissionText = acceptedSubmissionRequest
     .map((message) => String(message.content || ""))
     .join("\n");
@@ -6433,28 +6439,22 @@ test("advisory Plan validation reports its unsupported required coverage instead
   });
 });
 
-test("incident advisory-only Plan saves a reviewable draft once and concludes partial without regeneration", async () => {
+test("ordinary advisory-only Plan seals as reviewable once without blocking on draft approval", async () => {
   const candidate = simplePlanSubmission();
   candidate.planMarkdown = "# Collector game plan\n\nUse Player, Coin_1/Coin_2/Coin_3 and CollectorGame with read-only Score/Won.\n";
   candidate.validations = ["Move with WASD", "Collect coins", "Show score", "Show victory", "Reset with R"].map(expectedOutcome => ({ kind: "advisory", required: true, expectedOutcome }));
   let requests = 0;
   const result = await runProductionPlanScenario(async () => {
     requests++;
-    if (requests > 1) throw new Error("semantic validation gaps must preserve the draft instead of requesting another whole plan");
+    if (requests > 1) throw new Error("ordinary advisory Plan must seal on first valid submission");
     return planProviderReply("incident-advisory-plan", "submit_runtime_v2_work_plan", candidate);
   }, planFixtureTool);
   assert.equal(requests, 1);
-  assert.equal(result.settlement.outcome.resultKind, "partial");
-  assert.equal(result.savedDocuments.length, 1);
-  assert.match(result.savedDocuments[0].markdown, /Collector game plan/);
-  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
-  assert.equal(result.state.activeActionRequest?.kind === "plan_review", false);
-  const record = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
-  assert.ok(record);
-  assert.ok(record.diagnostics.some(item => item.criterionIds.includes("criterion-user-objective")));
-  assert.equal(record.source.toolCallId, "incident-advisory-plan");
-  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "run.completed").length, 1);
-  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "turn.completed").length, 1);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.ok(result.checkpoint.aggregate.sealedWorkPlan);
+  assert.equal(result.state.activeActionRequest?.kind, "plan_review");
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "run.completed").length, 0);
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "turn.completed").length, 0);
 });
 
 for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan responds to first pre-action ${firstStop} with bounded recovery and safe reads`, async () => {
@@ -6474,7 +6474,7 @@ for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan respond
     }
       : planProviderReply("bounded-recovery-draft", "submit_runtime_v2_work_plan", candidate);
   }, planFixtureTool, options);
-  assert.equal(completed.settlement.outcome.resultKind, "partial");
+  assert.equal(completed.checkpoint.aggregate.phase, "reviewing");
   assert.equal(requests[0].maxTokens, 8192);
   assert.equal(requests[0].options.reasoningOnlyTimeoutMs, 60_000);
   assert.equal(requests[1].maxTokens, 4096);
@@ -6488,7 +6488,7 @@ for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan respond
     assert.ok(tools.some(tool => tool.function.name === "read_file"));
     return planProviderReply("bounded-recovery-restored-draft", "submit_runtime_v2_work_plan", candidate);
   }, planFixtureTool, { ...options, initialCheckpoint: checkpointThrough(completed.checkpoint, truncated.sequence) });
-  assert.equal(restored.settlement.outcome.resultKind, "partial");
+  assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
 });
 
 test("a sealed Plan with a downgraded advisory check survives the Session JSON boundary", async () => {

@@ -9,6 +9,7 @@ import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions 
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { boundKnowledgeToolResult, normalizeKnowledgeReferences } from "../../lib/knowledgeReferences";
 import { buildToolCatalog } from "../../lib/toolCatalog";
+import { TOOL_SEARCH_TOOL_NAME } from "../../lib/toolSearch";
 import { readOnlyEvidenceVersion, webEvidenceVersions } from "../../lib/runtime-v2/readOnlyProgress";
 import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { getToolTarget } from "../../lib/toolTarget";
@@ -16,6 +17,7 @@ import { executeTool } from "../../lib/toolExecutor";
 import { isAbsoluteWorkspacePath, workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import { extractReadFileWindowMetadata, replayReadFileWindowFromResult } from "../../lib/readFileWindow";
 import {
+  runtimeV2CheckpointWriteFailureReason,
   type RuntimeV2EvidenceReference,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2RunIdentity,
@@ -25,7 +27,7 @@ import { PlanLedger } from "./planLedger";
 import {
   PLAN_CONTEXT_RESULT_CHARS,
   PLAN_READ_ONLY_TOOL_NAMES,
-  planModelToolCandidates,
+  planToolSearchCandidates,
 } from "./planModelProtocol";
 import {
   boundedRuntimeV2ToolContent,
@@ -140,6 +142,7 @@ export async function executeReadOnlyPlanTool(input: {
   readonly evidence: WorkPlanRuntimeEvidence[];
   readonly evidenceContents: Map<string, string>;
   readonly parallelReadCount: number;
+  readonly advertisedToolNames?: readonly string[];
   readonly logStoreEvent: RuntimeV2PlanLog;
   readonly reuseRetainedRead?: { readonly historicalReads: readonly PlanDraftWorkspaceRead[] };
 }): Promise<void> {
@@ -148,12 +151,10 @@ export async function executeReadOnlyPlanTool(input: {
   const knowledgeTool = input.call.name === "knowledge_search" || input.call.name === "knowledge_get_excerpt";
   const knowledgeReferences = normalizeKnowledgeReferences(input.ledger.snapshot()?.knowledgeContext?.references);
   const networkRead = normalizeNetworkRead(input.ledger.snapshot()?.networkRead);
-  const restriction = runtimeV2BuiltinCapabilityRestriction(
-    normalizeTurnCapabilityRestrictions(input.ledger.snapshot()?.objective.capabilityRestrictions), input.call.name,
-  );
-  const review = runtimeV2BuiltinCapabilityRestriction(
-    normalizeTurnApprovalCapabilities(input.ledger.snapshot()?.objective.approvalRequiredCapabilities), input.call.name,
-  );
+  const restrictions = normalizeTurnCapabilityRestrictions(input.ledger.snapshot()?.objective.capabilityRestrictions);
+  const approvalRequirements = normalizeTurnApprovalCapabilities(input.ledger.snapshot()?.objective.approvalRequiredCapabilities);
+  const restriction = runtimeV2BuiltinCapabilityRestriction(restrictions, input.call.name);
+  const review = runtimeV2BuiltinCapabilityRestriction(approvalRequirements, input.call.name);
   if (restriction || review ||
     (UNITY_MCP_OBSERVATION_NAMES.has(input.call.name) && !input.context.workspaceMcpSnapshot?.planObservationsAllowed) ||
     (knowledgeTool && (!knowledgeReferences?.length || ["stale", "error"].includes(input.ledger.snapshot()?.knowledgeContext?.state || ""))) ||
@@ -208,6 +209,8 @@ export async function executeReadOnlyPlanTool(input: {
     }
   };
   try {
+    const toolDiscovery = input.call.name === TOOL_SEARCH_TOOL_NAME;
+    const advertisedToolNames = toolDiscovery ? new Set(input.advertisedToolNames) : undefined;
     const output = await runTool(input.call.name, () => executeTool(
       input.call.name,
       runtimeV2ContextBoundToolArguments(
@@ -232,12 +235,10 @@ export async function executeReadOnlyPlanTool(input: {
             signal: input.context.abortCtrl?.signal,
           },
         } : {}),
-        ...(input.call.name === "tool_search" ? { toolCatalog: buildToolCatalog({
-          builtInDefinitions: planModelToolCandidates({ ...input.context, networkRead, knowledgeContext: input.ledger.snapshot()?.knowledgeContext }).filter((tool) =>
-            !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
-              input.ledger.snapshot()?.objective.capabilityRestrictions,
-            ), tool.function.name)
-          ),
+        ...(advertisedToolNames ? { advertisedToolNames, toolCatalog: buildToolCatalog({
+          builtInDefinitions: planToolSearchCandidates({ ...input.context, networkRead, knowledgeContext: input.ledger.snapshot()?.knowledgeContext }, advertisedToolNames).filter((tool) =>
+            !runtimeV2BuiltinCapabilityRestriction(restrictions, tool.function.name) &&
+            !runtimeV2BuiltinCapabilityRestriction(approvalRequirements, tool.function.name)),
         }) } : {}),
       },
     ));
@@ -248,6 +249,22 @@ export async function executeReadOnlyPlanTool(input: {
       output,
       input.context.runtimeContextBudget,
     );
+    if (toolDiscovery) {
+      const commandKey = await settlePlanTool({ ledger: input.ledger, run: input.run, call: input.call,
+        status: "succeeded", modelContent: content, receiptOrigin: "executed" });
+      appendPlanToolResult(input.messages, input.call.id, content);
+      let result: { type?: string; matchedCount?: number; matchedAdvertised?: unknown[]; alreadyAvailable?: unknown[]; newlyUnlocked?: unknown[] } = {};
+      try { result = JSON.parse(String(output)) || {}; } catch { /* Older tool adapters may omit structured discovery results. */ }
+      const matchedCount = result.matchedCount ?? 0;
+      const newlyUnlockedCount = result.newlyUnlocked?.length ?? 0;
+      input.logStoreEvent("runtime_v2_plan_tool_discovery_completed", {
+        turnId: input.run.turnId, runId: input.run.runId, commandKey, matchedCount,
+        matchedAdvertisedCount: result.matchedAdvertised?.length ?? 0,
+        alreadyAvailableCount: result.alreadyAvailable?.length ?? 0, newlyUnlockedCount,
+        outcome: result.type !== "tool_search.result" ? "unknown" : newlyUnlockedCount ? "unlocked" : matchedCount ? "already_available" : "no_match",
+      });
+      return;
+    }
     // A successful HTTP reader response can still lack a usable source. Keep
     // its exact diagnostic receipt, without manufacturing Plan/source evidence.
     const knowledgeResult = knowledgeTool ? JSON.parse(content) : null;
@@ -305,7 +322,7 @@ export async function executeReadOnlyPlanTool(input: {
       entry.version === version
     );
     const evidenceEntry = existingEvidence || {
-      id: `E${1 + input.evidence.reduce((max, entry) => Math.max(max, /^E\d+$/.test(entry.id) ? Number(entry.id.slice(1)) : 0), 0)}`,
+      id: `E${1 + [...input.evidence, ...(aggregate?.evidence || [])].reduce((max, entry) => Math.max(max, /^E\d+$/.test(entry.id) ? Number(entry.id.slice(1)) : 0), 0)}`,
       target: evidenceTarget,
       version,
       statement: input.call.name === "load_skill"
@@ -356,7 +373,7 @@ export async function executeReadOnlyPlanTool(input: {
       receiptOrigin: "executed",
       evidence: repeatedObservation ? [] : [{
         id: evidenceEntry.id,
-        kind: input.call.name === "load_skill" || input.call.name === "tool_search" || networkTool || knowledgeTool ? "tool" : "source",
+        kind: input.call.name === "load_skill" || networkTool || knowledgeTool ? "tool" : "source",
         target: evidenceTarget,
         version,
       }],
@@ -394,6 +411,7 @@ export async function executeReadOnlyPlanTool(input: {
     });
     return;
   } catch (error) {
+    if (runtimeV2CheckpointWriteFailureReason(error)) throw error;
     input.context.abortCtrl?.signal.throwIfAborted();
     const rawError = error instanceof Error ? error.message : String(error);
     const classified = classifyWorkspaceReadFailure(rawError);

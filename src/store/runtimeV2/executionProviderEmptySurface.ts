@@ -21,6 +21,8 @@ import {
 import type {
   RuntimeV2ExecutionPortsInput,
 } from "./executionTypes";
+import type { RuntimeV2PreparedChatAnswer } from "../../lib/submissionRuntimeContracts";
+import { readPreparedChatAnswer } from "./preparedReadOnlyResponse";
 import {
   scopeRuntimeV2ProviderToolCallIds,
 } from "./providerToolSurface";
@@ -36,6 +38,7 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
   readonly command: RuntimeV2Command;
   readonly requestDeadlineAt?: number;
   readonly signal: AbortSignal;
+  readonly preparedChatAnswer?: RuntimeV2PreparedChatAnswer;
 }): Promise<RuntimeV2NormalizedProviderResult> {
   let result: RuntimeV2NormalizedProviderResult;
   try {
@@ -45,7 +48,16 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
       requestDeadlineAt: input.requestDeadlineAt,
       transport: null,
       signal: input.signal,
-      task: (request) => {
+      task: async (request) => {
+        if (input.preparedChatAnswer) {
+          const prepared = await readPreparedChatAnswer({
+            prepared: input.preparedChatAnswer,
+            ports: input.ports,
+            command: input.command,
+            signal: request.signal,
+          });
+          if (prepared) return prepared;
+        }
         input.ports.logStoreEvent("runtime_v2_provider_request_opened", {
           turnId: input.command.run.turnId, runId: input.command.run.runId,
           commandKey: input.command.idempotencyKey,
@@ -55,14 +67,14 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
           maxOutputTokens: runtimeV2ExecutionProviderOutputTokenLimit(input.command, false, input.ports.context.runtimeContextBudget),
         });
         return requestRuntimeV2ProviderOnce({
-        live: input.ports.live,
-        ports: input.ports,
-        command: input.command,
-        tools: [],
-        textEnvelope: false,
-        toolChoice: null,
-        signal: request.signal,
-        timeoutMs: request.timeoutMs,
+          live: input.ports.live,
+          ports: input.ports,
+          command: input.command,
+          tools: [],
+          textEnvelope: false,
+          toolChoice: null,
+          signal: request.signal,
+          timeoutMs: request.timeoutMs,
         });
       },
     });

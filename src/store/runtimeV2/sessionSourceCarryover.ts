@@ -57,6 +57,8 @@ export function collectPriorSessionVersionedSources(input: {
   readonly sessionKey: string;
   readonly workspaceKey: string;
   readonly excludeTurnId: string;
+  readonly sourceTurnId?: string;
+  readonly sessionEpoch?: string;
   readonly maxFiles?: number;
 }): readonly CarriedSessionSourceCandidate[] {
   const sessionKey = String(input.sessionKey || "").trim();
@@ -66,8 +68,9 @@ export function collectPriorSessionVersionedSources(input: {
     return [];
   }
   const normalizedCheckpoints = Object.entries(checkpoints as Record<string, unknown>)
+    .filter(([turnId]) => !input.sourceTurnId || input.sourceTurnId === turnId)
     .map(([turnId, raw]) =>
-      normalizeRuntimeV2Checkpoint(raw, { sessionKey, turnId }),
+      normalizeRuntimeV2Checkpoint(raw, { sessionKey, turnId, ...(input.sessionEpoch ? { sessionEpoch: input.sessionEpoch } : {}) }),
     )
     .filter((cp): cp is NonNullable<typeof cp> =>
       Boolean(
@@ -180,6 +183,8 @@ export async function carryOverPriorSessionSources(input: {
   readonly workspaceKey: string;
   readonly turnId: string;
   readonly runId: string;
+  readonly sourceTurnId?: string;
+  readonly sessionEpoch?: string;
   readonly signal?: AbortSignal;
   readonly readFileVersion?: (target: string, workspaceKey: string) => Promise<string | null>;
   readonly recordObservation: (evidence: {
@@ -196,6 +201,9 @@ export async function carryOverPriorSessionSources(input: {
     sessionKey: input.sessionKey,
     workspaceKey: input.workspaceKey,
     excludeTurnId: input.turnId,
+    sourceTurnId: input.sourceTurnId,
+    sessionEpoch: input.sessionEpoch,
+    ...(input.sourceTurnId ? { maxFiles: 12 } : {}),
   });
   if (candidates.length === 0) return { admittedCount: 0, skippedStaleCount: 0 };
   const result = await admitReverifiedSessionSources({
@@ -222,6 +230,8 @@ export async function admitExecuteSessionSourceCarryover(input: {
   readonly workspaceKey: string;
   readonly turnId: string;
   readonly runId: string;
+  readonly sourceTurnId?: string;
+  readonly sessionEpoch?: string;
   readonly capabilityRestrictions?: readonly string[];
   readonly approvalRequiredCapabilities?: readonly string[];
   readonly live: RuntimeV2LiveExecutionState;
@@ -247,6 +257,8 @@ export async function admitExecuteSessionSourceCarryover(input: {
     workspaceKey: input.workspaceKey,
     turnId: input.turnId,
     runId: input.runId,
+    sourceTurnId: input.sourceTurnId,
+    sessionEpoch: input.sessionEpoch,
     signal: input.signal,
     recordObservation: input.recordObservation,
     nextEvidenceId: () => nextEvidenceId(input.live),

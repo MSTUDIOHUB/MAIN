@@ -1,7 +1,7 @@
 <div align="center">
   <img src="public/LogoM.png" width="104" alt="MAIN logo" />
   <h1>MAIN</h1>
-  <p><strong>面向本地模型与多模型生态的开源桌面 Agent 工作台</strong></p>
+  <p><strong>面向本地模型与多模型生态的开源桌面编码工作台</strong></p>
   <p>在一个可审阅的桌面界面中完成理解、规划、执行、审批与验证，也为开发自己的本地智能体工具提供可运行的参考实现。</p>
 
   <p>
@@ -19,13 +19,14 @@
 
 ## MAIN 是什么
 
-MAIN 是一个基于 Tauri 2、React、TypeScript 与 Rust 构建的本地优先桌面智能体。它既是可以直接使用的 AI 工作台，也是一个用于研究和二次开发本地 Agent 的完整工程样本。
+MAIN 是一个基于 Tauri 2、React、TypeScript 与 Rust 构建的本地优先桌面编码助手。它在同一个对话中处理普通聊天、工作区代码检查和修改。用户明确要求先审阅方案时，MAIN 使用可审批的计划流程。
 
 与只提供聊天窗口的应用不同，MAIN 把真实任务所需的关键环节放进同一条可观察工作流：
 
 - 连接本地模型：LM Studio、Ollama、OMLX。
 - 连接云端模型：OpenAI Compatible、OpenAI Responses API、Anthropic、Gemini 等协议。
 - 用自然语言提出任务。使用 `/计划` 先审阅方案，使用 `/grill-me` 先讨论关键取舍，使用 `/规则` 维护项目约束。
+- 使用 `@` 指定源码，或在检查之后直接说「修复」。Unity、Godot 和 Unreal 使用同一套源码工具，项目资料和验证按任务加载。
 - 使用文件、终端、PTY、浏览器验证、知识库和 MCP 工具完成任务。
 - 按当前权限策略展示需要确认的操作。文件变更可通过 Diff 审阅。
 - 持久化 Workspace、Session、Turn 和 Run，支持暂停、恢复和结构化结论。

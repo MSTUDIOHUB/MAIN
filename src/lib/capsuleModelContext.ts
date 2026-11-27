@@ -102,7 +102,7 @@ export function formatCapsuleModelDetailWithProgress(
   progress: CapsulePromptProgress | undefined,
   language: "zh" | "en",
 ): string | undefined {
-  if (!context) return undefined;
+  if (!context) return formatPromptProgressSuffix(progress, undefined, language) || undefined;
   const base = (language === "zh" ? context.detailZh : context.detailEn).replace(/(?:（[^）]*tok）|\s*\([^)]*tok\))$/, "").trim();
   const suffix = formatPromptProgressSuffix(progress, context.estimatedInputTokens, language);
   return suffix
@@ -270,7 +270,7 @@ export function buildCapsuleModelActivityContext(input: {
     if (event.type === "tool.completed" && event.status === "succeeded") {
       const cmd = commandMap.get(event.idempotencyKey);
       const toolName = String(event.presentation?.toolName || cmd?.payload.toolName || "");
-      if (toolName === "save_plan_document" || toolName === "submit_runtime_v2_work_plan") continue;
+      if (toolName === "tool_search" || toolName === "save_plan_document" || toolName === "submit_runtime_v2_work_plan") continue;
       const toolCallId = typeof cmd?.payload.toolCallId === "string"
         ? cmd.payload.toolCallId
         : event.idempotencyKey;

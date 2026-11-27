@@ -37,7 +37,7 @@ import {
   type ProtocolChatMessage,
   type ReasoningRequestMode,
 } from "./cloudProtocol";
-import { applyStreamResponseFormat, isUnsupportedStreamResponseFormat, isUnsupportedStreamUsageOption } from "./streamResponseFormat";
+import { applyStreamResponseFormat, isUnsupportedPromptProgressOption, isUnsupportedStreamResponseFormat, isUnsupportedStreamUsageOption } from "./streamResponseFormat";
 import { computeContextBudgets } from "./contextTrim";
 import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
@@ -147,6 +147,8 @@ export interface StreamRequestOptions {
   responseFormat?: Record<string, unknown>;
   /** Include stream_options: { include_usage: true } on OpenAI-compatible SSE requests (defaults true). */
   includeStreamUsage?: boolean;
+  /** Opt out after an endpoint rejects oMLX's optional prefill telemetry. */
+  includePromptProgress?: boolean;
   visualTransportBinding?: VisualTransportRequestBinding;
   timeoutMs?: number;
   /** Optional per-request guard for reasoning-only output before any semantic
@@ -515,6 +517,9 @@ interface StreamCallbacks {
   onToken: (token: string) => void;
   onDone: (result: StreamResult) => void;
   onError: (err: Error) => void;
+  /** Whole public text as decoded so far. This can shrink when protocol or
+   * mirrored reasoning is recognized. Never carries tool argument deltas. */
+  onPublicText?: (text: string) => void;
   /** Presentation observer for a transport attempt. The returned callback
    * observes decoded model output, separate from connection bytes or pings. */
   onRequestDispatched?: () => (() => void);
@@ -1812,6 +1817,7 @@ async function streamViaRustProxy(
           }))),
           stream: true,
           ...(options.includeStreamUsage !== false ? { stream_options: { include_usage: true } } : {}),
+          ...(isOmlxProvider(settings) && options.includePromptProgress !== false ? { return_progress: true } : {}),
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
@@ -1890,7 +1896,11 @@ async function streamViaRustProxy(
 
   let onModelOutput: (() => void) | undefined;
   const anthropicProcessor = isAnthropic
-    ? createAnthropicStreamProcessor(onToken, () => onModelOutput?.()) : null;
+    ? createAnthropicStreamProcessor((token) => {
+        fullContent += token;
+        refreshSemanticProgress();
+        onToken(token);
+      }, () => onModelOutput?.()) : null;
 
   // Accumulate results
   let fullContent = "";
@@ -1900,6 +1910,7 @@ async function streamViaRustProxy(
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
   let providerTokenUsage: StreamResult["usage"] | undefined;
   let semanticProgress = analyzeSemanticStreamProgress({ content: "", reasoningContent: "" });
+  let lastPublicText = "";
   let firstSemanticVisibleAt: number | null = null;
   let firstToolAt: number | null = null;
   let emittedMirrorSemanticContent = "";
@@ -1948,6 +1959,10 @@ async function streamViaRustProxy(
     });
     if (semanticProgress.semanticVisibleChars > 0 && firstSemanticVisibleAt === null) {
       firstSemanticVisibleAt = Date.now();
+    }
+    if (callbacks.onPublicText && semanticProgress.semanticContent !== lastPublicText) {
+      lastPublicText = semanticProgress.semanticContent;
+      callbacks.onPublicText(lastPublicText);
     }
   };
 
@@ -2566,7 +2581,8 @@ export async function streamChatCompletion(
 ): Promise<StreamResult> {
   const needsResponseFormatGuard = Boolean(options.responseFormat);
   const needsStreamUsageGuard = !isOllamaProvider(settings) && options.includeStreamUsage !== false;
-  if ((!needsResponseFormatGuard && !needsStreamUsageGuard) || isAnthropicProvider(settings) || isGeminiProvider(settings)) {
+  const needsPromptProgressGuard = isOmlxProvider(settings) && options.includePromptProgress !== false;
+  if ((!needsResponseFormatGuard && !needsStreamUsageGuard && !needsPromptProgressGuard) || isAnthropicProvider(settings) || isGeminiProvider(settings)) {
     return streamChatCompletionAttempt(messages, settings, callbacks, signal, tools, maxTokensOverride, options);
   }
   let outputStarted = false;
@@ -2596,6 +2612,10 @@ export async function streamChatCompletion(
     if (!signal?.aborted && !outputStarted && needsStreamUsageGuard && isUnsupportedStreamUsageOption(errorMessage)) {
       emitStreamingConsole("streaming", "info", "stream_options.include_usage unsupported; retrying the same request without that field");
       return streamChatCompletion(messages, settings, callbacks, signal, tools, maxTokensOverride, { ...options, includeStreamUsage: false });
+    }
+    if (!signal?.aborted && !outputStarted && needsPromptProgressGuard && isUnsupportedPromptProgressOption(errorMessage)) {
+      emitStreamingConsole("streaming", "info", "return_progress unsupported; retrying the same request without that field");
+      return streamChatCompletion(messages, settings, callbacks, signal, tools, maxTokensOverride, { ...options, includePromptProgress: false });
     }
     terminalLifecycle.forEach((event) => callbacks.onLifecycle?.(event));
     callbacks.onError(toError(error, "Structured output request failed."));
@@ -2680,6 +2700,7 @@ async function streamChatCompletionAttempt(
           }))),
           stream: true,
           ...(options.includeStreamUsage !== false ? { stream_options: { include_usage: true } } : {}),
+          ...(isOmlxProvider(settings) && options.includePromptProgress !== false ? { return_progress: true } : {}),
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
@@ -2804,7 +2825,11 @@ async function streamChatCompletionAttempt(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const anthropicProcessor = isAnthropic
-    ? createAnthropicStreamProcessor(onToken, onModelOutput) : null;
+    ? createAnthropicStreamProcessor((token) => {
+        fullContent += token;
+        refreshSemanticProgress();
+        onToken(token);
+      }, onModelOutput) : null;
   let buffer = "";
 
   // Accumulate text content
@@ -2815,6 +2840,7 @@ async function streamChatCompletionAttempt(
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
   let providerTokenUsage: StreamResult["usage"] | undefined;
   let semanticProgress = analyzeSemanticStreamProgress({ content: "", reasoningContent: "" });
+  let lastPublicText = "";
   let firstSemanticVisibleAt: number | null = null;
   let firstToolAt: number | null = null;
   let emittedMirrorSemanticContent = "";
@@ -2849,6 +2875,10 @@ async function streamChatCompletionAttempt(
     });
     if (semanticProgress.semanticVisibleChars > 0 && firstSemanticVisibleAt === null) {
       firstSemanticVisibleAt = Date.now();
+    }
+    if (callbacks.onPublicText && semanticProgress.semanticContent !== lastPublicText) {
+      lastPublicText = semanticProgress.semanticContent;
+      callbacks.onPublicText(lastPublicText);
     }
   };
 

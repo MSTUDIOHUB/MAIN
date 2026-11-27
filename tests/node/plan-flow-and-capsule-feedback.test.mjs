@@ -351,7 +351,7 @@ test("planDocumentRunner does not inject duplicate prose on rejectedAdmission wa
     currentTurnId: "t-loop",
     currentSessionId: 1,
     conversationTurns: [{ id: "t-loop", clientSubmissionId: "s-loop", userPrompt: "Plan something" }],
-    config: {},
+    config: { activeProfile: "local", local: { provider: "OMLX", endpoint: "http://fixture.invalid/v1", model: "fixture-model" }, cloud: {}, cloudServers: [] },
     planLifecycle: { sessionKey: "/fixture:1", sessionEpoch: "e1" },
     runtimeV2Checkpoints: {},
     taskFlow: [],
@@ -380,6 +380,7 @@ test("planDocumentRunner does not inject duplicate prose on rejectedAdmission wa
     },
     "./checkpointPort": {
       getRuntimeV2Checkpoint: (_s, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      getRuntimeV2EmergencyTerminalEnvelope: (_s, owner) => state.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null,
       createRuntimeV2CheckpointPort: () => ({
         append: async (input) => {
           const result = runtimeLib.appendRuntimeV2Checkpoint({
@@ -570,7 +571,7 @@ test("requestsExplicitPlanInterview matches 先询问我几个关键问题 and G
     currentTurnId: "t-global-restore",
     currentSessionId: 1,
     conversationTurns: [{ id: "t-global-restore", clientSubmissionId: "s-gr", userPrompt: "/计划 整理架构目标" }],
-    config: {},
+    config: { activeProfile: "local", local: { provider: "OMLX", endpoint: "http://fixture.invalid/v1", model: "fixture-model" }, cloud: {}, cloudServers: [] },
     planLifecycle: { sessionKey: "__MAIN_GLOBAL_CHAT__:1", sessionEpoch: "e1" },
     runtimeV2Checkpoints: {},
     taskFlow: [],
@@ -630,6 +631,7 @@ test("requestsExplicitPlanInterview matches 先询问我几个关键问题 and G
     },
     "./checkpointPort": {
       getRuntimeV2Checkpoint: (_s, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      getRuntimeV2EmergencyTerminalEnvelope: (_s, owner) => state.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null,
       createRuntimeV2CheckpointPort: () => ({
         append: async (input) => {
           const result = runtimeLib.appendRuntimeV2Checkpoint({
@@ -721,7 +723,7 @@ test("WorkPlan planRunner switches to narrowed synthesis after repeated wait_sub
     currentTurnId: "t-wp-loop",
     currentSessionId: 1,
     conversationTurns: [{ id: "t-wp-loop", clientSubmissionId: "s-wp", userPrompt: "/计划 设计重构方案" }],
-    config: {},
+    config: { activeProfile: "local", local: { provider: "OMLX", endpoint: "http://fixture.invalid/v1", model: "fixture-model" }, cloud: {}, cloudServers: [] },
     planLifecycle: { sessionKey: "/fixture:1", sessionEpoch: "e1" },
     runtimeV2Checkpoints: {},
     taskFlow: [],
@@ -759,6 +761,7 @@ test("WorkPlan planRunner switches to narrowed synthesis after repeated wait_sub
     },
     "./checkpointPort": {
       getRuntimeV2Checkpoint: (_s, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      getRuntimeV2EmergencyTerminalEnvelope: (_s, owner) => state.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null,
       createRuntimeV2CheckpointPort: () => ({
         append: async (input) => {
           const result = runtimeLib.appendRuntimeV2Checkpoint({
@@ -832,4 +835,234 @@ test("WorkPlan planRunner switches to narrowed synthesis after repeated wait_sub
   assert.equal(calls[2].tools.length, 0);
   assert.ok(!calls[3].tools.includes("wait_subagents"));
   assert.ok(!calls[3].tools.includes("read_file"));
+});
+
+test("normalizeRuntimeV2ProviderToolCalls recovers spilled parameter JSON and strips pseudo closing tags", () => {
+  const { normalizeRuntimeV2ProviderToolCalls } = load("src/store/runtimeV2/executionProviderToolSchema.ts");
+  const { SUBMIT_WORK_PLAN_TOOL } = load("src/store/runtimeV2/planModelProtocol.ts");
+  const spilledChanges = [{
+    title: "修复对象池核心实现",
+    operation: "modify",
+    targets: ["Assets/MFramework/Pool/ObjectPoolManager.cs"],
+    change: "重写 ObjectPoolBase",
+  }];
+
+  const fromXmlSpill = normalizeRuntimeV2ProviderToolCalls([{
+    id: "call-xml-spill",
+    name: SUBMIT_WORK_PLAN_TOOL.function.name,
+    arguments: {
+      planMarkdown: "2. 对象池测试正常工作\n3. 计时器无泄漏*/planMarkdown*\n<parameter=changes>\n" + JSON.stringify(spilledChanges) + "\n</parameter>",
+      validations: [{ kind: "assertion", expectedOutcome: "手动核对编译" }],
+    },
+  }], [SUBMIT_WORK_PLAN_TOOL]);
+  assert.deepEqual(fromXmlSpill[0].arguments.changes, spilledChanges);
+  assert.equal(fromXmlSpill[0].arguments.planMarkdown, "2. 对象池测试正常工作\n3. 计时器无泄漏");
+
+  const fromStrippedSpill = normalizeRuntimeV2ProviderToolCalls([{
+    id: "call-stripped-spill",
+    name: SUBMIT_WORK_PLAN_TOOL.function.name,
+    arguments: {
+      planMarkdown: "4. 代码审查已完成*/planMarkdown*\n\n" + JSON.stringify(spilledChanges),
+      validations: [{ kind: "assertion", expectedOutcome: "手动核对编译" }],
+    },
+  }], [SUBMIT_WORK_PLAN_TOOL]);
+  assert.deepEqual(fromStrippedSpill[0].arguments.changes, spilledChanges);
+  assert.equal(fromStrippedSpill[0].arguments.planMarkdown, "4. 代码审查已完成");
+});
+
+test("ordinary workspace Plan with advisory validations seals directly, repairs missing changes once, and suppresses English commentary", async () => {
+  let state = {
+    currentTurnId: "t-adapt",
+    currentSessionId: 1,
+    conversationTurns: [{ id: "t-adapt", clientSubmissionId: "s-adapt", userPrompt: "/计划 评估 Unity 框架代码", blockIds: [] }],
+    config: { activeProfile: "local", local: { provider: "OMLX", endpoint: "http://fixture.invalid/v1", model: "fixture-model" }, cloud: {}, cloudServers: [] },
+    planLifecycle: { sessionKey: "/fixture:1", sessionEpoch: "e1" },
+    taskFlow: [],
+    runtimeEvents: [],
+    runtimeV2Checkpoints: {},
+    harnessRunMarker: { sessionKey: "/fixture:1", turnId: "t-adapt", runId: "r-adapt", status: "running", startedAt: 1, instanceId: "i1" },
+    _nextTaskId: () => state.taskFlow.length + 1,
+  };
+  const calls = [];
+  const logEvents = [];
+  let runtimeLib;
+  let customLoad;
+  customLoad = createTsModuleLoader({
+    "@tauri-apps/api/core": { invoke: async () => null },
+    "@tauri-apps/api/event": { listen: async () => () => {} },
+    "@tauri-apps/plugin-dialog": { open: async () => null },
+    "@tauri-apps/plugin-opener": { open: async () => null },
+    "@tauri-apps/plugin-process": { relaunch: async () => {}, exit: async () => {} },
+    "@tauri-apps/plugin-updater": { check: async () => null },
+    "../../lib/streaming": {
+      isStreamOutputLimited: () => false,
+      streamChatCompletion: async (messages, _settings, callbacks, _signal, tools) => {
+        const turnCount = calls.length + 1;
+        calls.push({ messages: structuredClone(messages), tools: tools.map((t) => t.function.name) });
+        const englishCommentary = "I'll start by reviewing the framework structure before submitting.";
+        callbacks.onPublicText?.(englishCommentary);
+        if (turnCount === 1) {
+          return {
+            content: englishCommentary,
+            semanticContent: englishCommentary,
+            toolCalls: [{
+              id: "wp-missing-changes",
+              name: "submit_runtime_v2_work_plan",
+              arguments: JSON.stringify({
+                planMarkdown: "## 整改方案\n\n1. 修复对象池。",
+                validations: [{ kind: "assertion", expectedOutcome: "Unity 编辑器编译通过。" }],
+              }),
+            }],
+            protocolViolation: null,
+          };
+        }
+        return {
+          content: "",
+          semanticContent: "",
+          toolCalls: [{
+            id: "wp-repaired",
+            name: "submit_runtime_v2_work_plan",
+            arguments: JSON.stringify({
+              planMarkdown: "## 整改方案\n\n1. 修复对象池。",
+              changes: [{
+                title: "修复对象池",
+                operation: "modify",
+                targets: ["Assets/MFramework/Pool/ObjectPoolManager.cs"],
+                change: "重写基类实现",
+                basis: ["E1"],
+              }],
+              validations: [{
+                kind: "assertion",
+                expectedOutcome: "在 Unity Editor 中编译无报错并完成手测。",
+                stepIndexes: [0],
+              }],
+            }),
+          }],
+          protocolViolation: null,
+        };
+      },
+    },
+    "../../lib/modelLaneCoordinator": {
+      acquireModelLane: async () => ({ release() {}, markFirstToken() {}, reportFailure() {}, setPressureHandler() {} }),
+    },
+    "../../lib/providerLaneSettings": {
+      deriveBudgetedStreamSettings: () => ({ provider: "fixture", toolProtocol: "auto" }),
+      deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }),
+    },
+    "../../lib/toolExecutor": {
+      executeTool: async () => "Assets/MFramework/Pool/ObjectPoolManager.cs",
+    },
+    "../../lib/ipc": {
+      inspectProjectInitTarget: async () => ({ canonicalWorkspace: "/fixture", targetPath: "/fixture/AGENTS.md", exists: false }),
+      savePlanDocument: async (input) => {
+        const { sha256Hex } = load("src/lib/sha256.ts");
+        return { owner: input.owner, documentId: input.documentId, revision: 1, contentHash: sha256Hex(input.markdown), path: `/fixture/.MAIN/plans/${input.documentId}/rev-1.md`, title: input.title, kind: input.kind };
+      },
+    },
+    "./checkpointPort": {
+      getRuntimeV2Checkpoint: (_s, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      getRuntimeV2EmergencyTerminalEnvelope: (_s, owner) => state.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null,
+      createRuntimeV2CheckpointPort: () => ({
+        append: async (input) => {
+          const result = runtimeLib.appendRuntimeV2Checkpoint({
+            checkpoint: state.runtimeV2Checkpoints[input.owner.turnId] || null,
+            owner: input.owner,
+            expectedRevision: input.expectedRevision,
+            event: input.event,
+          });
+          state = { ...state, runtimeV2Checkpoints: { ...state.runtimeV2Checkpoints, [input.owner.turnId]: result.checkpoint } };
+          return result;
+        },
+      }),
+    },
+  });
+  runtimeLib = customLoad("src/lib/runtime-v2/index.ts");
+  const { runSubmitRuntimeV2Plan } = customLoad("src/store/runtimeV2/planRunner.ts");
+  const { createRuntimeV2ProjectionPort } = customLoad("src/store/runtimeV2/projectionPort.ts");
+  const { prepareAdaptiveWorkPlanCandidate } = load("src/store/runtimeV2/planVerificationControl.ts");
+  const explicitHard = prepareAdaptiveWorkPlanCandidate({
+    candidate: {
+      planMarkdown: "## Plan",
+      changes: [{ targets: ["a.ts"], change: "update" }],
+      validations: [{ kind: "advisory", expectedOutcome: "Manual check" }],
+    },
+    aggregate: null,
+    executablePlanSelected: false,
+    explicitAdmissionRequirements: ["behavioral"],
+    verificationPolicy: null,
+    phaseLanguage: "zh",
+  });
+  assert.equal(explicitHard.allowManualAdvisoryValidation, false);
+  assert.equal(explicitHard.requireBehavioralValidation, true);
+
+  const realProjection = createRuntimeV2ProjectionPort({
+    get: () => state,
+    set: (patch) => { state = { ...state, ...(typeof patch === "function" ? patch(state) : patch) }; },
+    nextTaskId: () => state.taskFlow.length + 1,
+    language: "zh",
+    logStoreEvent: (event, data) => logEvents.push({ event, data }),
+  });
+  await realProjection.publish({
+    aggregate: {
+      turn: { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "e1", clientSubmissionId: "s-adapt", turnId: "t-adapt" },
+      run: { identity: { sessionKey: "/fixture:1", sessionEpoch: "e1", turnId: "t-adapt", runId: "r-adapt", parentRunId: null, attemptId: "r-adapt" } },
+      strategy: "plan",
+      phase: "planning",
+      events: [],
+      evidence: [],
+      subagents: [],
+      scheduledCommands: [],
+      completedCommands: [],
+    },
+    audience: "chat_milestone",
+    projection: { id: "m1", kind: "progress", markdown: "I'll start by exploring the framework structure to understand what we're working with.", dedupeKey: "k-en" },
+  });
+  assert.equal(state.taskFlow.some((b) => b.visibility === "assistant_update"), false);
+  assert.ok(logEvents.some((e) => e.event === "runtime_v2_commentary_language_suppressed"));
+
+  const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "e1", clientSubmissionId: "s-adapt", turnId: "t-adapt" };
+  const run = { sessionKey: "/fixture:1", sessionEpoch: "e1", turnId: "t-adapt", runId: "r-adapt", parentRunId: null, attemptId: "r-adapt" };
+  let seededCheckpoint = null;
+  for (const event of [
+    { schemaVersion: runtimeLib.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: "a1", sequence: 0, at: 1, type: "turn.admitted", turn, strategy: "plan", objective: "/计划 评估 Unity 框架代码", constraints: [], acceptanceCriteria: ["评估完成"] },
+    { schemaVersion: runtimeLib.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: "a2", sequence: 1, at: 2, type: "run.started", run, phase: "planning" },
+    { schemaVersion: runtimeLib.RUNTIME_V2_EVENT_SCHEMA_VERSION, eventId: "a3", sequence: 2, at: 3, type: "observation.recorded", run, evidence: { id: "E1", kind: "source", target: "Assets/MFramework/Pool/ObjectPoolManager.cs", version: "sha256-1" } },
+  ]) {
+    const res = runtimeLib.appendRuntimeV2Checkpoint({ checkpoint: seededCheckpoint, owner: turn, expectedRevision: seededCheckpoint?.revision || 0, event });
+    seededCheckpoint = res.checkpoint;
+  }
+  state.runtimeV2Checkpoints["t-adapt"] = seededCheckpoint;
+
+  const settlement = await runSubmitRuntimeV2Plan({
+    get: () => state,
+    set: (patch) => { state = { ...state, ...(typeof patch === "function" ? patch(state) : patch) }; },
+    context: {
+      turnId: "t-adapt",
+      uiDisplayTurnId: "t-adapt",
+      runWorkspace: "/fixture",
+      runScopeKey: "/fixture",
+      runSessionKey: "/fixture:1",
+      runSessionEpoch: "e1",
+      runSessionId: 1,
+      harnessRunId: "r-adapt",
+      phaseLanguage: "zh",
+      planPurpose: undefined,
+      abortCtrl: new AbortController(),
+      turnInputContextSignals: { subagentPreference: "preferred", subagentRequirement: "optional", attachedFilePaths: [] },
+      runtimeContextBudget: { contextLimit: 32768, outputBudget: 4096, inputBudget: 28672, readWindowChars: 16000 },
+    },
+    getSessionRevisionToken: () => 1,
+    sanitizeTaskBlocksForPersist: (x) => x,
+    buildSessionRuntimeSnapshot: (x) => x,
+    publishOwnerScopedRuntimeProjection: () => ({ published: true }),
+    persistSessionRecord: async () => undefined,
+    logStoreEvent: (event, data) => logEvents.push({ event, data }),
+  });
+
+  assert.equal(calls.length, 2, "missing changes must trigger one repair round instead of immediate partial draft");
+  assert.ok(logEvents.some((e) => e.event === "runtime_v2_commentary_language_suppressed"));
+  assert.ok(calls[1].messages.some((m) => String(m.content || "").includes("[runtime-v2 context: language-contract]")));
+  assert.equal(settlement.outcome.status, "paused");
+  assert.equal(state.runtimeV2Checkpoints["t-adapt"].aggregate.phase, "reviewing");
+  assert.equal(state.activeActionRequest?.kind, "plan_review");
 });

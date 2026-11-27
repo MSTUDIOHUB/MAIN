@@ -47,6 +47,8 @@ import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerToolSurface";
 import { runtimeV2MutationFailureContextTarget } from "./correctiveMutationPolicy";
+import { MUTATION_SOURCE_CHANGED_REASON, runtimeV2MutationSourceRefreshInstruction } from "./executionMutationRejection";
+import { WorkspaceMutationSourceMismatch } from "../../lib/workspaceMutationPreflight";
 import { resolveRuntimeV2ToolAuthorization } from "./executionExternalLocalRead";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
@@ -54,7 +56,7 @@ import {
   parseRuntimeV2ExecutionContractArguments,
 } from "./executionContract";
 import { logRuntimeV2SkillLoad } from "./executionToolDefinitions";
-import { boundUnityWorkspaceWriteVersions, recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
+import { boundUnityWorkspaceWriteVersions, observeRuntimeV2CreatedPathRemovals, recordRuntimeV2CommittedToolEffect } from "./executionEffectEvidence";
 import { continuedPlanDriftReceipt, projectValidationManifestDriftReceipt, runtimeV2ToolPreExecutionReceipt, runtimeV2ToolAuthorizationRejectionReceipt, unityPlayModePreExecutionReceipt } from "./executionToolGateReceipt";
 import { runtimeV2StructuredToolOutcome, unityValidationToolTimeoutMs } from "./executionToolOutcome";
 import { runtimeV2BoundEditorObservation, runtimeV2CatalogToolSource, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
@@ -309,7 +311,7 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
               )
             : null;
         const ioStartedAt = input.now();
-        let verifiedMcpWriteVersions: readonly { target: string; version: string }[] = [];
+        let verifiedMcpWriteVersions: readonly { target: string; version: string; previousVersion: string }[] = [];
         const rawOutput =
           toolName === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME
             ? JSON.stringify({
@@ -420,6 +422,10 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
             id: nextEvidenceId(input.live), kind: "mutation", ...item,
           })) };
         }
+        if (toolName === "run_command" && completion.type === "tool.completed" && completion.status === "succeeded") {
+          const observedWorkspaceRemovals = await observeRuntimeV2CreatedPathRemovals(input);
+          if (observedWorkspaceRemovals.length) completion = { ...completion, observedWorkspaceRemovals };
+        }
         if (completion.type === "tool.completed" && completion.status === "succeeded" && editorObservation?.kind === "console") {
           const editorConsole = runtimeV2EditorConsoleEvidence({ workspace: input.context.runWorkspace || "",
             binding: editorObservation.binding, args: toolName === "unity_mcp_console"
@@ -495,19 +501,24 @@ export function createRuntimeV2ToolPort(input: RuntimeV2ExecutionPortsInput): To
       } catch (error) {
         if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
         const rawErr = error instanceof Error ? error.message : String(error);
+        const sourceMismatch = error instanceof WorkspaceMutationSourceMismatch ? error : null;
         const isReadTool = RUNTIME_V2_SOURCE_READ_TOOL_NAMES.has(toolName) || /^(?:list_directory|glob_search|grep_search|get_file_outline|get_project_skeleton)$/.test(toolName);
         const classified = isReadTool ? classifyWorkspaceReadFailure(rawErr) : undefined;
         const described = classified ? describeWorkspaceToolFailure(classified.code, input.context.phaseLanguage) : undefined;
-        const failureContent = classified ? `TOOL_ERROR: [code=${classified.code}] ${rawErr}${described?.modelHint ? ` (${described.modelHint})` : ""}` : `TOOL_ERROR: ${rawErr}`;
-        recordToolResultHistory({ ports: input, command, toolName, target: failureContextTarget, status: "failed", content: failureContent });
+        const failureTarget = sourceMismatch?.target || failureContextTarget;
+        const failureReasonCode = sourceMismatch ? MUTATION_SOURCE_CHANGED_REASON : classified?.code;
+        const failureContent = sourceMismatch
+          ? `MUTATION_SOURCE_CHANGED: ${rawErr} The edit was rejected before writing.\n${runtimeV2MutationSourceRefreshInstruction(sourceMismatch)}`
+          : classified ? `TOOL_ERROR: [code=${classified.code}] ${rawErr}${described?.modelHint ? ` (${described.modelHint})` : ""}` : `TOOL_ERROR: ${rawErr}`;
+        recordToolResultHistory({ ports: input, command, toolName, target: failureTarget, status: "failed", content: failureContent });
         input.logStoreEvent("runtime_v2_tool_execution_failed", {
           turnId: command.run.turnId, runId: command.run.runId, commandKind: command.kind, toolName, commandKey: command.idempotencyKey,
           sessionKey: command.run.sessionKey, target: /^(?:run_command|knowledge_search|web_search|web_fetch)$/.test(toolName) ? null : target || null,
-          errorType: error instanceof Error ? error.name : typeof error, errorMessage: compactDebugString(rawErr, 320), ...(classified ? { failureReasonCode: classified.code } : {}),
+          errorType: error instanceof Error ? error.name : typeof error, errorMessage: compactDebugString(rawErr, 320), ...(failureReasonCode ? { failureReasonCode } : {}),
         });
         return toolCompletionFor(
-          input, command, toolName, args, failureContextTarget, failureContent,
-          "failed", classified?.failureKind || "execution_failed", undefined, undefined, classified?.code,
+          input, command, toolName, args, failureTarget, failureContent,
+          "failed", sourceMismatch ? "source_mismatch" : classified?.failureKind || "execution_failed", undefined, undefined, failureReasonCode,
         );
       }
     },

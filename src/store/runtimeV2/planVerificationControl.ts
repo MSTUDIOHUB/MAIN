@@ -340,6 +340,72 @@ export async function maybePauseForPlanVerificationConfirmation(input: {
   });
 }
 
+function hasPopulatedPlanField(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return value.trim().length > 0;
+  return Boolean(value && typeof value === "object");
+}
+
+/**
+ * Aligns ordinary workspace `/plan` acceptance with Antigravity: when the user
+ * did not request automated behavioral/interaction checks, valid manual or
+ * static checks seal for direct user approval instead of saving a blocked draft.
+ */
+export function prepareAdaptiveWorkPlanCandidate(input: {
+  readonly candidate: Record<string, unknown>;
+  readonly aggregate: TurnAggregateV1 | null;
+  readonly executablePlanSelected: boolean;
+  readonly hasSourcePlanDraft?: boolean;
+  readonly hasPlanPurpose?: boolean;
+  readonly explicitAdmissionRequirements?: readonly ("static" | "behavioral" | "interaction" | undefined)[];
+  readonly verificationPolicy: PlanVerificationPolicyDecision;
+  readonly phaseLanguage: "zh" | "en";
+}): {
+  readonly candidate: Record<string, unknown>;
+  readonly allowManualAdvisoryValidation: boolean;
+  readonly requireBehavioralValidation: boolean;
+} {
+  const hasExplicitUpstreamHardRequirement = Boolean(
+    input.explicitAdmissionRequirements?.some(
+      (req) => req === "behavioral" || req === "interaction",
+    ),
+  );
+  const hasExplicitHardValidationRequirement =
+    input.verificationPolicy?.policy !== "manual_advisory" &&
+    (input.executablePlanSelected ||
+      input.hasSourcePlanDraft === true ||
+      input.hasPlanPurpose === true ||
+      hasExplicitUpstreamHardRequirement);
+  const allowManualAdvisoryValidation = !hasExplicitHardValidationRequirement;
+  const requireBehavioralValidation = hasExplicitHardValidationRequirement;
+  if (!allowManualAdvisoryValidation) {
+    return { candidate: input.candidate, allowManualAdvisoryValidation, requireBehavioralValidation };
+  }
+  const hasMarkdown = typeof input.candidate.planMarkdown === "string" && input.candidate.planMarkdown.trim().length > 0;
+  const hasChanges = ["changes", "steps", "changesJson", "stepsJson"].some((field) =>
+    hasPopulatedPlanField(input.candidate[field]),
+  );
+  const hasValidations = ["validations", "validationJson", "validationsJson"].some((field) =>
+    hasPopulatedPlanField(input.candidate[field]),
+  );
+  if (!hasMarkdown || !hasChanges || hasValidations) {
+    return { candidate: input.candidate, allowManualAdvisoryValidation, requireBehavioralValidation };
+  }
+  return {
+    candidate: {
+      ...input.candidate,
+      validations: [{
+        kind: "advisory",
+        expectedOutcome: input.phaseLanguage === "en"
+          ? "Verify the planned changes against the verification section in the plan."
+          : "按计划文档中的验证方式核对修改结果与运行表现。",
+      }],
+    },
+    allowManualAdvisoryValidation,
+    requireBehavioralValidation,
+  };
+}
+
 /** Records a rejected WorkPlan candidate and pauses for user confirmation or saves a draft when appropriate. */
 export async function handleWorkPlanDraftRejection(input: {
   runner: RuntimeV2PlanRunnerInput;
@@ -365,6 +431,29 @@ export async function handleWorkPlanDraftRejection(input: {
       diagnostics: [...input.diagnostics],
     });
   }
+  const hasCompileRepairCandidate =
+    !input.executablePlanSelected &&
+    !input.priorReceipt &&
+    input.diagnostics.some((diagnostic) =>
+      diagnostic.code === "plan_submission_compile_invalid" ||
+      (diagnostic.code === "plan_structure_invalid" &&
+        diagnostic.fieldPath === "summary" &&
+        /protocol markup/i.test(diagnostic.message)),
+    );
+  const compileRepairCount = hasCompileRepairCandidate
+    ? (input.ledger.snapshot()?.events || []).filter((event) =>
+        event.type === "tool.completed" &&
+        samePlanRun(event.run, input.run) &&
+        event.status === "failed" &&
+        event.failureKind === "protocol_invalid" &&
+        event.failureReasonCode === PLAN_SUBMISSION_VALIDATION_REJECTION_CODE &&
+        parseRejectionDiagnostics(event.modelContent || event.presentation?.message).some((item) =>
+          item.code === "plan_submission_compile_invalid" ||
+          (item.code === "plan_structure_invalid" && item.fieldPath === "summary" && /protocol markup/i.test(item.message)),
+        ),
+      ).length
+    : 0;
+  const shouldRepairOnce = hasCompileRepairCandidate && compileRepairCount <= 1;
   input.runner.logStoreEvent("runtime_v2_plan_submission_rejected", {
     turnId: input.run.turnId,
     runId: input.run.runId,
@@ -373,8 +462,15 @@ export async function handleWorkPlanDraftRejection(input: {
     normalizationReasons: input.normalizationReasons,
     submissionChars: JSON.stringify(input.candidate).length,
     candidateHash: hashPlanDraftCandidate(input.call.arguments),
-    disposition: input.executablePlanSelected ? "continue_validation_readiness" : "save_reviewable_draft",
+    disposition: input.executablePlanSelected
+      ? "continue_validation_readiness"
+      : shouldRepairOnce
+        ? "repair_compile_invalid_once"
+        : "save_reviewable_draft",
   });
+  if (shouldRepairOnce) {
+    return null;
+  }
   if (input.executablePlanSelected) {
     return await maybePauseForPlanVerificationConfirmation({
       runner: input.runner,

@@ -627,3 +627,18 @@ test("chat feedback normalizes statuses and classifies common errors", () => {
   assert.equal(mcp.category, "mcp");
   assert.equal(mcp.settingsTab, "mcp");
 });
+
+test("markdown display preserves ordered list newlines after CJK lines while joining plain prose soft breaks", () => {
+  const normalized = normalizeMarkdownForDisplay([
+    "第一行",
+    "第二行",
+    "",
+    "1. **编译验证**：确保代码通过 Unity 编译（无缺失类型引用）",
+    "2. **对象池测试**：验证流程正常工作",
+    "3. **计时器测试**：验证行为无泄漏",
+    "4. **代码审查**：确认所有 P0/P1 问题已修复",
+  ].join("\n"));
+
+  assert.match(normalized, /第一行第二行/);
+  assert.match(normalized, /2\. \*\*对象池测试\*\*：验证流程正常工作\n3\. \*\*计时器测试\*\*：验证行为无泄漏\n4\. \*\*代码审查\*\*：确认所有/);
+});

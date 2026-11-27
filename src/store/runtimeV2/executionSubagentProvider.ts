@@ -1,4 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { buildRuntimeLanguageDirective } from "../../lib/languageContract";
 import { acquireModelLane, ModelLaneResourceInterruption } from "../../lib/modelLaneCoordinator";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
@@ -75,6 +76,10 @@ export async function requestRuntimeV2ChildStep(input: {
     try {
       const requestMessages: AgentMessage[] = [
         ...input.messages,
+        {
+          role: "system" as const,
+          content: buildRuntimeLanguageDirective(input.ports.context.phaseLanguage),
+        },
         ...(input.responseMode === "action_or_final" &&
             input.recoveryOccurrence > 0
           ? [{

@@ -229,3 +229,19 @@ test("engine binding requires a matching installed preset and preserves explicit
   assert.deepEqual(explicit.references, explicitReferences);
   assert.deepEqual(explicit.activePresetIds, []);
 });
+
+test("engine knowledge binding honors the admitted workspace profile, including an absent one", async () => {
+  const { resolveActiveEngineKnowledgeReferences } = load("src/lib/engineManualBinding.ts");
+  const unity = { id: "unity", enabled: true, sourceCount: 1, presetId: "unity6", indexRevision: "index-u" };
+  const dependencies = {
+    detect: async () => assert.fail("the admitted profile must suppress repeat detection"),
+    listBases: async () => [unity],
+  };
+  const input = { workspace: "/fixture", knowledgeBases: [] };
+  const absent = await resolveActiveEngineKnowledgeReferences({ ...input, workspaceEngineProfile: null }, dependencies);
+  assert.equal(absent.detectedPresetId, null);
+  const workspaceEngineProfile = { kind: "unity", projectRoot: ".", descriptorPath: "ProjectSettings/ProjectVersion.txt", projectVersion: "6000.0.32f1", manualPresetId: "unity6" };
+  const matched = await resolveActiveEngineKnowledgeReferences({ ...input, workspaceEngineProfile }, dependencies);
+  assert.deepEqual(matched.activePresetIds, ["unity6"]);
+  assert.equal(matched.references[0].kbId, "unity");
+});

@@ -1,6 +1,6 @@
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import { getUnlockedToolsForSession } from "../../lib/toolSearch";
-import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { isChatContext, isReadOnlyContext, readOnlyNetworkPolicy, runtimeV2ChatToolNames } from "./readOnlyPolicy";
 import { runtimeV2ApprovalRequiredCapabilities, runtimeV2CapabilityRestrictions, runtimeV2ForbiddenToolCapability } from "./executionCapabilityRestrictions";
 import {
   buildToolCapabilityRegistry,
@@ -307,12 +307,15 @@ export function authorizationFor(
   input: RuntimeV2ExecutionPortsInput,
 ): RuntimeV2ExecutionAuthorization {
   if (!input.live.authorization) {
-    const state = { ...input.get(), ...(input.context.workspaceMcpSnapshot || {}) };
+    const chat = isChatContext(input);
+    const state = { ...input.get(), ...(chat
+      ? { mcpServers: [], mcpDiscoveredTools: [], mcpToolServerMap: {}, unityBindings: {} }
+      : input.context.workspaceMcpSnapshot || {}) };
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
       { ...state, webSearchEnabled: readOnlyNetworkPolicy(input).enabled },
       input.context.skillCatalog,
       input.context.knowledgeContext,
-      String(input.context.runWorkspace || ""),
+      chat ? "" : String(input.context.runWorkspace || ""),
     );
   }
   return input.live.authorization;
@@ -359,6 +362,8 @@ export function providerToolDefinitionsForCommand(
   const aggregate = aggregateForCurrentTurn(input);
   if (isReadOnlyContext(input)) {
     input.live.latestProviderActionWindow = null;
+    if (command.payload.conclusionKind === "read_only" ||
+      ((command.payload.mode === "chat" || isChatContext(input)) && !runtimeV2ChatToolNames(input).size)) return [];
     const authorization = authorizationFor(input);
     const available = filterRuntimeV2CapabilityRestrictedTools(input, runtimeV2ProviderToolDefinitionsForPrompt(
       authorization, aggregate?.objective?.text || "", input.context.runSessionKey));

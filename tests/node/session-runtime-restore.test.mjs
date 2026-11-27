@@ -983,13 +983,13 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
   const defaultDateNow = Date.now;
   let fixtureNow = defaultDateNow();
   const localStorageValues = new Map();
-  let signalTreeStarted;
-  const treeStarted = new Promise((resolve) => {
-    signalTreeStarted = resolve;
+  let signalAdmissionStarted;
+  const admissionStarted = new Promise((resolve) => {
+    signalAdmissionStarted = resolve;
   });
-  let releaseTree;
-  const treeGate = new Promise((resolve) => {
-    releaseTree = resolve;
+  let releaseAdmission;
+  const admissionGate = new Promise((resolve) => {
+    releaseAdmission = resolve;
   });
   const streamInvocations = [];
   const semanticRequests = [];
@@ -1018,10 +1018,10 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     };
     Date.now = () => fixtureNow;
     tauriInvoke = async (command, args) => {
-      if (command === "get_project_skeleton") {
-        signalTreeStarted();
-        await treeGate;
-        return "src/\n  main.ts";
+      if (command === "canonicalize_workspace_path") {
+        signalAdmissionStarted();
+        await admissionGate;
+        return args.path;
       }
       if (command === "start_chat_stream") {
         streamInvocations.push(args);
@@ -1082,7 +1082,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
     }, true);
 
     assert.equal(useAppStore.getState().dispatchNextWorkspaceInstruction(sessionKey), true);
-    await treeStarted;
+    await admissionStarted;
     assert.equal(semanticRequests.length, 1, "the admitted FIFO head is interpreted exactly once");
     assert.equal(streamInvocations.length, 0, "the runtime failure fixture starts only after semantic admission and discovery");
     assert.equal(
@@ -1090,7 +1090,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
       0,
       "FIFO ACK must be saved while workspace discovery is still pending",
     );
-    releaseTree();
+    releaseAdmission();
 
     const settled = await waitForStoreState((state) =>
       streamInvocations.length > 0 &&
@@ -1144,7 +1144,7 @@ test("delayed FIFO bootstrap keeps its owner through ACK and truthfully closes a
       1,
     );
   } finally {
-    releaseTree?.();
+    releaseAdmission?.();
     semanticPreflightStream = null;
     Date.now = defaultDateNow;
     tauriInvoke = defaultTauriInvoke;

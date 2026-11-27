@@ -391,7 +391,5 @@ test("Chat adapter has no legacy runtime, external tool executor, or prose lifec
   );
   assert.doesNotMatch(source, /orchestrator|workflowEngine|AgentOrchestrator|WorkflowContext/);
   assert.doesNotMatch(source, /streamChatCompletion|CHAT_DEADLINE_MS|setTimeout/);
-  assert.match(source, /runSubmitRuntimeV2ReadOnly/);
-  assert.match(source, /isRuntimeV2GlobalChatTurn/);
-  assert.match(source, /RUNTIME_V2_CHAT_REJECTS_WORKSPACE_SESSION/);
+  assert.match(source, /runSubmitRuntimeV2ReadOnly\(input, "chat"\)/);
 });

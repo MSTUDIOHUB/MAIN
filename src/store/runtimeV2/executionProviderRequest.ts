@@ -71,6 +71,7 @@ import {
   createRuntimeV2RetryMessageRebuilder,
   createRuntimeV2WireCallbacks,
   retryRuntimeV2ProviderLanguageMismatch,
+  suppressMismatchedToolCommentary,
 } from "./executionProviderLanguageRetry";
 
 export * from "./executionProviderRequestPolicy";
@@ -336,7 +337,9 @@ async function performRuntimeV2ProviderRequest(
   const concludePrompt = buildRuntimeV2ConcludePrompt(
     input.ports.context.phaseLanguage,
   );
-  const concludeInstructions = toolsClosed ? [{ role: "user" as const, content: concludePrompt }] : [];
+  const needsConcludePrompt = toolsClosed && requestMode !== "chat";
+  const directChat = requestMode === "chat" && providerTools.length === 0 && !recoveryPressure;
+  const concludeInstructions = needsConcludePrompt ? [{ role: "user" as const, content: concludePrompt }] : [];
   const initialCoverage = input.live.latestProviderRequestSourceCoverage;
   const inputBudget = budget ? budget.inputBudget ?? computeContextBudgets(budget.contextLimit, maxOutputTokens).inputBudget : null;
   const toolSchemaTokens = estimateTokens(JSON.stringify(input.textEnvelope ? [] : providerTools));
@@ -378,17 +381,17 @@ async function performRuntimeV2ProviderRequest(
     // prefix. Per-decision authority and protocol guidance belong at the
     // current frontier, after the evidence they govern.
     ...boundedConversation,
-    decisionInstruction,
+    ...(directChat ? [] : [decisionInstruction]),
     ...textEnvelopeInstructions,
   ];
   const boundedMessages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
     contextLimit: budget.contextLimit,
-    reservedOutputTokens: maxOutputTokens + (toolsClosed ? 40 : 0),
+    reservedOutputTokens: maxOutputTokens + (needsConcludePrompt ? 40 : 0),
     tools: providerTools,
     preserveUserMessages: unboundedMessages.some(message => "runtimeGuidanceId" in message && !!message.runtimeGuidanceId),
   }) : unboundedMessages;
   const messages = executeRequest?.messages || (
-    toolsClosed && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
+    needsConcludePrompt && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
       ? [...boundedMessages, { role: "user" as const, content: concludePrompt }]
       : boundedMessages);
   input.live.latestProviderRequestSourceCoverage = executeRequest?.coverage || materializedRuntimeV2SourceCoverage(
@@ -553,6 +556,10 @@ async function performRuntimeV2ProviderRequest(
     lane,
     activity,
     logRequestTiming,
+    // Action requests can return convincing prose without settling any effect.
+    // Their public commentary is published only with the admitted tool action.
+    allowPublicText: !input.textEnvelope && (readOnly || requestMode === "conclude"),
+    phaseLanguage: input.ports.context.phaseLanguage,
     appendStreamedText: (token) => {
       streamedText += token;
     },
@@ -702,36 +709,35 @@ async function performRuntimeV2ProviderRequest(
   } finally {
     lane.release();
   }
-  const protocolContent =
-    result.actionableContent || result.content || streamedText;
-  const visibleText =
-    result.semanticContent || streamedText;
+  const protocolContent = result.actionableContent || result.content || streamedText;
+  const visibleText = suppressMismatchedToolCommentary({
+    visibleText: result.semanticContent || streamedText,
+    toolCallCount: result.toolCalls.length,
+    targetLanguage: input.ports.context.phaseLanguage,
+    live: input.live,
+    ports: input.ports,
+    command: input.command,
+    mode: requestMode,
+  });
   input.ports.logStoreEvent("runtime_v2_provider_wire_shape", {
-    turnId: input.command.run.turnId,
-    runId: input.command.run.runId,
-    commandKey: input.command.idempotencyKey,
-    phase: input.command.phase,
-    mode: String(input.command.payload.mode || ""),
-    textEnvelope: input.textEnvelope,
-    finishReason: result.finishReason || null,
-    clientStopReason: result.clientStopReason || null,
+    turnId: input.command.run.turnId, runId: input.command.run.runId,
+    commandKey: input.command.idempotencyKey, phase: input.command.phase,
+    mode: String(input.command.payload.mode || ""), textEnvelope: input.textEnvelope,
+    finishReason: result.finishReason || null, clientStopReason: result.clientStopReason || null,
     rawContentChars: result.content.length,
     actionableContentChars: result.actionableContent?.length || 0,
     semanticContentChars: result.semanticContent?.length || 0,
     reasoningChars: result.reasoningContent?.length || 0,
     mirrorKind: result.streamDiagnostics?.mirrorKind || null,
     nativeToolCalls: result.toolCalls.length,
-    envelopeOpenMarkers:
-      protocolContent.match(/<runtime-v2-tools>/g)?.length || 0,
-    envelopeCloseMarkers:
-      protocolContent.match(/<\/runtime-v2-tools>/g)?.length || 0,
+    envelopeOpenMarkers: protocolContent.match(/<runtime-v2-tools>/g)?.length || 0,
+    envelopeCloseMarkers: protocolContent.match(/<\/runtime-v2-tools>/g)?.length || 0,
     protocolViolation: result.protocolViolation || null,
     reasoningFallbackApplied,
     inputTokens: result.usage?.inputTokens ?? null,
     outputTokens: result.usage?.outputTokens ?? null,
     cachedInputTokens: result.usage?.cachedInputTokens ?? null,
-    uncachedInputTokens: result.usage?.cachedInputTokens === undefined ? null
-      : result.usage.inputTokens - result.usage.cachedInputTokens,
+    uncachedInputTokens: result.usage?.cachedInputTokens === undefined ? null : result.usage.inputTokens - result.usage.cachedInputTokens,
     firstSemanticVisibleElapsedMs: result.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
     firstToolElapsedMs: result.streamDiagnostics?.firstToolElapsedMs ?? null,
   });

@@ -10,6 +10,8 @@ import {
   type HarnessRunOwner,
 } from "../lib/harnessCrashTelemetry";
 import type { MainModeKey } from "../lib/mainModes";
+import { resolveRuntimeV2VisibleRunnerKind } from "../lib/runtimeEngineSelection";
+import { hasExplicitSkillInvocation } from "../lib/agentSkills";
 import type {
   CommandDirective,
   LegacyWorkflowMode,
@@ -164,6 +166,9 @@ export interface StartSubmitAsyncWorkflowRunInput<
   preferredLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   semanticIntent?: import("../lib/runIntent").SemanticTaskIntent;
+  preparedChatAnswer?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+  preparedWorkspaceRead?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+  sourceInvestigationTurnId?: string;
   runtimeRunIntent: ResolvedRunIntent;
 
 
@@ -227,7 +232,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   refreshWorkspaceAdmission?: (
     workspace: string,
     userPrompt?: string,
-    options?: { readonly includeProjectBaseline: boolean },
+    options?: { readonly includeProjectBaseline: boolean; readonly includeMcp?: boolean },
   ) => Promise<{
     instructions: ResolvedInstructionSet | null;
     baseline: ProjectBaselineContext | null;
@@ -1743,6 +1748,41 @@ export async function runSubmitAsyncWorkflowRun<
           clientSubmissionId: admissionTurn?.clientSubmissionId || input.turnId, turnId: input.turnId },
       )
   ));
+  const investigationId = input.sourceInvestigationTurnId;
+  const investigation = !checkpoint && !approvedPlanContinuation && input.runtimeRunIntent === "execute" && investigationId &&
+    investigationId !== input.turnId && checkpointMap && typeof checkpointMap === "object"
+    ? normalizeRuntimeV2Checkpoint((checkpointMap as Record<string, unknown>)[investigationId], {
+      sessionKey: input.runSessionKey, sessionEpoch: runSessionEpoch, turnId: investigationId,
+    }) : null;
+  const sourceInvestigation = investigation?.aggregate.strategy === "analyze" &&
+    investigation.owner.workspaceKey === input.runScopeKey && investigation.aggregate.terminalOutcome?.resultKind === "success"
+    ? admissionState.conversationTurns.find(turn => turn.id === investigation.owner.turnId) : undefined;
+  const investigationFiles = sourceInvestigation ? [...new Set(investigation?.aggregate.evidence
+    .filter(item => item.kind === "source" && item.version)
+    .map(item => item.target))].slice(-8) : [];
+  const restoredStrategy = checkpoint?.aggregate.strategy;
+  const restoredReadOnlyStrategy = restoredStrategy === "chat" || restoredStrategy === "analyze" ? restoredStrategy : undefined;
+  const requiredCapabilities = input.semanticIntent?.requiredCapabilities;
+  const runnerKind = resolveRuntimeV2VisibleRunnerKind({
+    effectiveIntent: input.effectiveRunIntent,
+    runtimeIntent: input.runtimeRunIntent,
+    runWorkspace: input.runWorkspace,
+    hasAttachedFiles: !!(input.mentionSnapshot.length || input.attachedFilesSnapshot.length),
+    requiredCapabilities,
+    checkpointStrategy: restoredReadOnlyStrategy,
+  });
+  const explicitSkill = hasExplicitSkillInvocation(input.text);
+  const prepareWorkspace = runnerKind !== "chat" || explicitSkill;
+  const bareChat = runnerKind === "chat" && requiredCapabilities?.length === 0 && !explicitSkill &&
+    !input.currentImages.length && !input.shouldExecuteOnceFromReplyOption;
+  const scopedCodeRead = runnerKind === "workspace_read" && requiredCapabilities !== undefined;
+  const includeProjectBaseline = runnerKind !== "chat" && !reusePlanContext && !scopedCodeRead;
+  // Typed submissions load external integration only when requested. Legacy
+  // recovery and explicitly approved plans retain their frozen capability path.
+  const includeMcp = runnerKind !== "chat" && !!(approvedPlanContinuation || !requiredCapabilities ||
+    requiredCapabilities.includes("external_interaction") ||
+    (requiredCapabilities.includes("workspace_read") &&
+      /\b(?:unity|tuanjie|editor)\s+(?:editor|console|scene|hierarchy)|(?:Unity|团结)?编辑器.{0,10}(?:控制台|场景|层级)|Unity\s*控制台/i.test(input.text)));
   // A restored Turn's immutable objective wins over a missing or looser
   // resubmission context. Legacy objective fields stay absent, never borrowed.
   const lexicalReadGuards = !checkpoint
@@ -1803,6 +1843,7 @@ export async function runSubmitAsyncWorkflowRun<
     runSessionKey: input.runSessionKey,
     runWorkspace: input.runWorkspace,
     preferredLanguage: input.preferredLanguage,
+    referenceCodeMentionsOnly: requiredCapabilities !== undefined && !!input.runWorkspace,
     markUserContextItemFailed: input.markUserContextItemFailed,
     ingestAttachmentFile: input.ingestAttachmentFile,
     readFile: input.readFile,
@@ -1826,7 +1867,7 @@ export async function runSubmitAsyncWorkflowRun<
       ? input.getLastVisibleTurnAgentSummary(input.turnId, input.sessionGet().taskFlow)
       : "";
 
-  userContent = (phaseRunners.buildPromptContext || buildSubmitPromptContext)({
+  userContent = bareChat ? input.text : (phaseRunners.buildPromptContext || buildSubmitPromptContext)({
     userContent,
     text: input.text,
     preferredLanguage: phaseLanguage,
@@ -1846,6 +1887,14 @@ export async function runSubmitAsyncWorkflowRun<
     selectedChoiceText: input.selectedChoiceText,
     turnInputContextSignals: input.turnInputContextSignals,
   }).userContent;
+  if (sourceInvestigation) {
+    userContent += `\n\n[PREVIOUS INVESTIGATION]\nUse these findings as leads for the requested repair. Begin with the exact relevant files, check their current contents, then apply and verify the smallest supported fix. Earlier findings grant no tool authority.\n${JSON.stringify({
+      request: sourceInvestigation.userPrompt.slice(0, 800),
+      findings: (sourceInvestigation.durableContext?.finalAssistantAnswer || sourceInvestigation.summary || "").slice(0, 2400),
+      files: investigationFiles,
+    })}`;
+    input.logStoreEvent("source_investigation_continued", { turnId: input.turnId, sourceTurnId: sourceInvestigation.id, files: investigationFiles.length });
+  }
 
   input.sessionSet({ contextMentions: [], attachedFiles: [] });
 
@@ -1866,13 +1915,13 @@ export async function runSubmitAsyncWorkflowRun<
     turnId: input.turnId,
     referenceCount: deferredReferences.length,
   });
-  if (input.refreshWorkspaceAdmission) {
+  if (prepareWorkspace && input.refreshWorkspaceAdmission) {
     const admissionRefreshStartedAt = input.nowMs();
     try {
       const admission = await input.refreshWorkspaceAdmission(
         bootstrapWorkspace,
         instructionPrompt,
-        reusePlanContext ? { includeProjectBaseline: false } : undefined,
+        includeProjectBaseline && includeMcp ? undefined : { includeProjectBaseline, ...(!includeMcp ? { includeMcp: false } : {}) },
       );
       resolvedInstructionSnapshot = admission.instructions;
       projectBaselineSnapshot = deferWorkspaceReads ? null : admission.baseline;
@@ -1895,7 +1944,7 @@ export async function runSubmitAsyncWorkflowRun<
         error: error instanceof Error ? error.message : String(error),
       });
     }
-  } else if (input.refreshWorkspaceContext) {
+  } else if (prepareWorkspace && input.refreshWorkspaceContext) {
     const instructionRefreshStartedAt = input.nowMs();
     try {
       resolvedInstructionSnapshot = await input.refreshWorkspaceContext(
@@ -1926,7 +1975,7 @@ export async function runSubmitAsyncWorkflowRun<
     }
   }
 
-  if (!deferWorkspaceReads && !reusePlanContext && !input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
+  if (prepareWorkspace && !deferWorkspaceReads && includeProjectBaseline && !input.refreshWorkspaceAdmission && input.refreshProjectBaseline) {
     const baselineRefreshStartedAt = input.nowMs();
     try {
       projectBaselineSnapshot = await input.refreshProjectBaseline(
@@ -1950,7 +1999,7 @@ export async function runSubmitAsyncWorkflowRun<
   // Runtime v2 consumes the typed baseline. Keep the legacy tree only as a
   // compatibility fallback when baseline construction was unavailable.
   let workspaceTree: string | null = null;
-  if (!deferWorkspaceReads && !reusePlanContext && !projectBaselineSnapshot) {
+  if (prepareWorkspace && !deferWorkspaceReads && includeProjectBaseline && !projectBaselineSnapshot) {
     const workspaceTreeStartedAt = input.nowMs();
     workspaceTree = await input.getWorkspaceTree(input.runWorkspace);
     input.logStoreEvent("workspace_tree_ready", {
@@ -2146,7 +2195,11 @@ export async function runSubmitAsyncWorkflowRun<
     runtimeRunIntent: input.runtimeRunIntent,
     capabilityRestrictions,
     approvalRequiredCapabilities,
-    requiredCapabilities: input.semanticIntent?.requiredCapabilities,
+    requiredCapabilities,
+    restoredReadOnlyStrategy,
+    preparedChatAnswer: input.preparedChatAnswer,
+    preparedWorkspaceRead: checkpoint ? undefined : input.preparedWorkspaceRead,
+    sourceInvestigationTurnId: sourceInvestigation?.id,
     semanticWorkType: input.semanticIntent?.workType,
     intentClarification: input.semanticIntent?.clarification,
 
@@ -2272,6 +2325,7 @@ export async function runSubmitAsyncWorkflowRun<
       acquired: acquiredRunOwner,
     });
   } finally {
+    input.preparedChatAnswer?.dispose?.();
     releasePlanExecutionDispatch(dispatchedPlanExecutionLeaseId);
   }
 }

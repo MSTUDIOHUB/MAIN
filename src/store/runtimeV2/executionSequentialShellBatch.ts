@@ -1,6 +1,8 @@
-import type { RuntimeV2Command, TurnAggregateV1 } from "../../lib/runtime-v2";
+import type { RuntimeV2Command, RuntimeV2NormalizedToolCall, TurnAggregateV1 } from "../../lib/runtime-v2";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { isRuntimeV2ReadOnlyToolCall, RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { isReadOnlyShellInspectionToolCall } from "../../lib/repetitionGuard";
+import { normalizeValidationWorkspaceCwd } from "../../lib/validationContract";
 
 const independentRead = new Set(["knowledge_search", "knowledge_get_excerpt", "load_skill"]);
 
@@ -22,7 +24,8 @@ export function runtimeV2SequentialShellBatchInterruption(
   const callId = String(command.payload.toolCallId || "");
   if (!aggregate || !callId) return null;
   let batchIndex = -1;
-  let predecessors: readonly string[] = [];
+  let predecessors: readonly RuntimeV2NormalizedToolCall[] = [];
+  let sourceReadWithPriorVersion = false;
   for (let index = aggregate.events.length - 1; index >= 0; index -= 1) {
     const event = aggregate.events[index]!;
     if (event.type !== "provider.responded" || event.run.runId !== command.run.runId) continue;
@@ -34,16 +37,26 @@ export function runtimeV2SequentialShellBatchInterruption(
     if (currentIndex === 0 || !sequentialObservation) return null;
     if (calls[currentIndex]!.boundEditorObservation || RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(calls[currentIndex]!.name)) return null;
     batchIndex = index;
-    const currentReadIsIndependent = independentRead.has(calls[currentIndex]!.name);
+    const current = calls[currentIndex]!;
+    const currentReadIsIndependent = independentRead.has(current.name);
+    const workspace = aggregate.turn.workspaceKey;
+    const readPath = current.name === "read_file" &&
+      normalizeValidationWorkspaceCwd(String(current.arguments.path || ""), workspace);
+    sourceReadWithPriorVersion = Boolean(readPath && aggregate.events.slice(0, index).some(event => {
+      const evidence = event.type === "observation.recorded" ? [event.evidence]
+        : event.type === "tool.completed" && event.status === "succeeded" ? event.evidence : [];
+      return evidence.some(item => item.kind === "source" && item.version &&
+        normalizeValidationWorkspaceCwd(item.target, workspace) === readPath);
+    }));
     predecessors = calls.slice(0, currentIndex)
-      .filter(call => !currentReadIsIndependent || call.name !== "run_command")
-      .map(call => call.id);
+      .filter(call => !currentReadIsIndependent || call.name !== "run_command");
     break;
   }
   if (batchIndex < 0) return null;
-  const predecessorIds = new Set(predecessors);
+  const predecessorIds = new Set(predecessors.map(call => call.id));
   const commandCalls = new Map<string, string>();
   const succeeded = new Map<string, boolean>();
+  const shellDeniedBeforeDispatch = new Set<string>();
   for (const event of aggregate.events.slice(batchIndex + 1)) {
     if (!("run" in event) || event.run.runId !== command.run.runId) continue;
     if (event.type === "command.scheduled") {
@@ -51,12 +64,19 @@ export function runtimeV2SequentialShellBatchInterruption(
       if (predecessorIds.has(id)) commandCalls.set(event.command.idempotencyKey, id);
     } else if (event.type === "tool.completed" || event.type === "validation.completed") {
       const id = commandCalls.get(event.idempotencyKey);
-      if (id) succeeded.set(id, event.type === "validation.completed"
-        ? isRuntimeV2ValidationAttempt(event) && event.passed
-        : event.status === "succeeded");
+      if (!id) continue;
+      succeeded.set(id, event.type === "validation.completed"
+        ? isRuntimeV2ValidationAttempt(event) && event.passed : event.status === "succeeded");
+      if (event.type === "tool.completed" && event.status === "blocked" &&
+          event.failureReasonCode === "shell_workspace_path_escape") shellDeniedBeforeDispatch.add(id);
     }
   }
-  for (const id of predecessors) {
+  for (const predecessor of predecessors) {
+    const { id } = predecessor;
+    // A fresh exact read of a previously observed file can stand on its own
+    // after a non-mutating shell probe was denied before dispatch.
+    if (sourceReadWithPriorVersion && shellDeniedBeforeDispatch.has(id) &&
+        isReadOnlyShellInspectionToolCall(predecessor.name, predecessor.arguments)) continue;
     if (succeeded.get(id) !== true) return {
       predecessorToolCallId: id,
       reasonCode: succeeded.has(id)

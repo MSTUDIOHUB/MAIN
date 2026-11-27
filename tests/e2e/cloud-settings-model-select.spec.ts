@@ -30,6 +30,7 @@ test.beforeEach(async ({ page }) => {
       currentWebview: { label: "main" },
     };
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_all_session_snapshots" || cmd === "list_legacy_session_files") return [];
       if (cmd === "get_system_memory") {
         return { total_gb: 32, available_gb: 24 };
       }
@@ -209,11 +210,13 @@ test("cloud settings hides sampling params and keeps advanced compatibility coll
 test("local settings resets endpoint/model and provider-neutral auto protocol on provider switch", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
 
+  const advanced = page.getByTestId("local-advanced-compatibility");
+  const firstResponse = advanced.getByRole("switch", { name: "合并意图识别与首轮回复（实验）" });
   await page.getByTestId("settings-tab-local").click();
   await expect(page.getByTestId("local-model-select")).toBeVisible();
   await expect(page.getByTestId("local-model-select")).not.toHaveValue("");
-  await expect(page.getByTestId("local-advanced-compatibility")).not.toHaveAttribute("open", "");
-  await page.getByTestId("local-advanced-compatibility").locator("summary").click();
+  await expect(advanced).not.toHaveAttribute("open", "");
+  await advanced.locator("summary").click();
   await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("auto");
   await page.getByTestId("local-tool-protocol-select").selectOption("native");
 
@@ -221,6 +224,7 @@ test("local settings resets endpoint/model and provider-neutral auto protocol on
   await expect(page.getByTestId("local-endpoint-input")).toHaveValue("http://127.0.0.1:1234/v1");
   await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("auto");
   await expect(page.getByTestId("local-model-select")).toHaveValue("");
+  await expect(firstResponse).toHaveCount(0);
   await page.getByTestId("local-tool-protocol-select").selectOption("xml");
 
   await page.getByTestId("local-provider-select").selectOption("OMLX");
@@ -228,11 +232,25 @@ test("local settings resets endpoint/model and provider-neutral auto protocol on
   await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("auto");
   await expect(page.getByTestId("local-model-select")).toHaveValue("");
   await page.getByTestId("local-tool-protocol-select").selectOption("native");
+  await expect(firstResponse).toBeVisible();
+  await expect(firstResponse).toHaveAttribute("aria-checked", "false");
+  await advanced.locator("summary").click();
+  await expect(firstResponse).toBeHidden();
+  await advanced.locator("summary").click();
+  await firstResponse.press("Space");
+  await expect(firstResponse).toHaveAttribute("aria-checked", "true");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setModelRuntimeLock?.({ activeProfile: "local", status: "running" }));
+  await expect(firstResponse).toBeDisabled();
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.clearModelRuntimeLock?.());
+  await expect(firstResponse).toBeEnabled();
+  await firstResponse.click();
+  await expect(firstResponse).toHaveAttribute("aria-checked", "false");
 
   await page.getByTestId("local-provider-select").selectOption("Ollama");
   await expect(page.getByTestId("local-endpoint-input")).toHaveValue("http://127.0.0.1:11434/v1");
   await expect(page.getByTestId("local-tool-protocol-select")).toHaveValue("auto");
   await expect(page.getByTestId("local-model-select")).toHaveValue("");
+  await expect(firstResponse).toHaveCount(0);
 });
 
 test("model runtime lock disables current model switching while allowing non-running cloud config edits", async ({ page }) => {

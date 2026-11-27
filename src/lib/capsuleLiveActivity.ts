@@ -22,6 +22,7 @@ export type CapsuleLiveActivity = CapsuleActivityBase & (
       readonly stage: CapsuleModelStage;
       readonly context?: CapsuleModelActivityContext;
       readonly promptProgress?: CapsulePromptProgress;
+      readonly publicCommentary?: string;
     }
   | { readonly kind: "tool"; readonly toolName: string; readonly target: string; readonly validation: boolean }
 );
@@ -89,8 +90,7 @@ function openActivity(owner: CapsuleActivityOwner, activity: CapsuleLiveActivity
 }
 
 /** Presentation only. The active Run owns visibility and each transport
- * dispatch owns its first output signal. No text or provider payload enters
- * the request activity state. */
+ * dispatch owns its first output signal and temporary public prose. */
 export function beginCapsuleModelActivity(run: RuntimeV2RunIdentity, commandKey: string, signal: AbortSignal) {
   const entry = openActivity({ run, commandKey, signal }, {
     kind: "model",
@@ -117,12 +117,20 @@ export function beginCapsuleModelActivity(run: RuntimeV2RunIdentity, commandKey:
           : { ...current, promptProgress }
       );
     },
+    reportPublicCommentary(text: string): void {
+      entry.update((current) =>
+        current.kind !== "model" || (current.stage !== "waiting" && current.stage !== "receiving") ||
+          (current.publicCommentary || "") === text
+          ? current
+          : { ...current, publicCommentary: text }
+      );
+    },
     acquiringLane: () => setStage("acquiring_lane"),
     preparing: () => setStage("preparing"),
     requestDispatched(): () => void {
       const key = newActivityKey();
       entry.update((current) => current.kind === "model"
-        ? { ...current, key, stage: "waiting", startedAt: Date.now(), promptProgress: undefined } : current);
+        ? { ...current, key, stage: "waiting", startedAt: Date.now(), promptProgress: undefined, publicCommentary: undefined } : current);
       let observed = false;
       return () => {
         if (observed) return;

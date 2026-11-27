@@ -166,6 +166,7 @@ function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, b
   if (!block || block.type === "user") return false;
   if (isQuestionnaireAnchorBlock(block)) return false;
   if (isFinalConclusionBlock(block, finalVisibleAgentIndex, blockIndex)) return false;
+  if (block.type === "agent" && block.visibility === "assistant_update") return false;
   if (isPlanGenerationFailureBlock(block)) return false;
   if (isPlanCandidateBlock(block) && !isReviewablePlanBlock(block)) return false;
   if (block.type === "agent" && block.archivedProposal) return false;

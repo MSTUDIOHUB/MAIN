@@ -42,6 +42,7 @@ export function createDefaultAppConfig(): AppConfig {
     instructionsEnabled: true,
     hooksEnabled: true,
     activeProfile: "local",
+    experimentalOmlxFirstResponse: false,
     chatFontSize: 13,
     sessionRecordingEnabled: true,
     debugRecordFullTurnProcess: false,

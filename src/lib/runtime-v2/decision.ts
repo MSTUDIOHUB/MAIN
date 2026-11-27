@@ -2,7 +2,7 @@ import { runtimeV2PendingGuidance } from "./guidance";
 import type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import type { TurnAggregateV1 } from "./aggregate";
-import type { RuntimeV2ProactiveSkipReason } from "./collaborationDecision";
+import { runtimeV2ProactiveSchedulePayload, type RuntimeV2ProactiveCollaboration } from "./collaborationDecision";
 import { deriveUnityCompilation, deriveUnityShaderImport, nextUnityEditorCheck, unresolvedUnityEditorCheck, UNITY_COMPILE_PROJECT_TOOL } from "./unityCompilation";
 import { analyzeValidationCommand } from "../validationContract";
 import { deriveReadOnlyRecoveryWindow } from "./readOnlyProgress";
@@ -13,7 +13,7 @@ import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
-import { resolveRuntimeV2SubagentReferences, runtimeV2SubagentModelHandle, type RuntimeV2SubagentScopeCandidate } from "./subagents";
+import { resolveRuntimeV2SubagentReferences, runtimeV2SubagentModelHandle } from "./subagents";
 import { deriveRuntimeV2PlanExecutionCoverage, resolveRuntimeV2PlanValidationScope, runtimeV2PlanValidationAuthority } from "./planExecution";
 import { deriveRuntimeV2ReviewDispositionLedger } from "./reviewFindings";
 import { isRuntimeV2ValidationToolCall, runtimeV2DirectExecuteReadyForConclusion } from "./phaseTransition";
@@ -39,7 +39,7 @@ export interface RuntimeV2DecisionInput {
   readonly subagentCapacity?: number;
   /** Whether the admitted parent/child provider requests can really overlap. */
   readonly subagentRequestMode?: "parallel" | "serialized";
-  readonly proactiveCollaboration?: { readonly candidate: RuntimeV2SubagentScopeCandidate } | { readonly reason: RuntimeV2ProactiveSkipReason };
+  readonly proactiveCollaboration?: RuntimeV2ProactiveCollaboration;
   readonly settledProactiveJobIds?: readonly string[];
   readonly checkUnityCompilation?: boolean;
   readonly projectValidationRecovery?: { readonly command: string; readonly manifestVersion: string };
@@ -739,19 +739,9 @@ export function decideNextCommands(
     const remainingJoin = finalJoinActiveSubagentsCommand(state);
     if (remainingJoin) return [remainingJoin];
   }
-  if (input.subagentPreference === "preferred" && state.subagentRequirement !== "required" &&
-      input.subagentRequestMode === "parallel" && input.subagentCapacity &&
-      input.proactiveCollaboration && "candidate" in input.proactiveCollaboration) {
-    const candidate = input.proactiveCollaboration.candidate;
-    if (candidate.proactiveKey && candidate.accessMode === "read" && candidate.taskKind !== "implement") {
-      return [boundedCommand(state, "schedule_subagents", {
-        proactiveKey: candidate.proactiveKey,
-        arguments: { task_key: candidate.scopeKey, name: candidate.name, task_kind: candidate.taskKind, access_mode: "read",
-          objective: candidate.objective, success_criteria: candidate.successCriteria, allowed_paths: candidate.allowedPaths.join("\n") },
-        maxActiveSubagents: input.subagentCapacity,
-        collaborationRequestMode: input.subagentRequestMode,
-      })];
-    }
+  if (!(state.strategy === "execute" && executeReadyForConclusion(state))) {
+    const proactiveSchedule = runtimeV2ProactiveSchedulePayload(state, input);
+    if (proactiveSchedule) return [boundedCommand(state, "schedule_subagents", proactiveSchedule)];
   }
 
   switch (state.phase) {

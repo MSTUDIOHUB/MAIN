@@ -55,6 +55,8 @@ const OUTCOMES = {
   resumed: { zh: "已继续", en: "Resumed", tone: "theme-plan-text" },
   partial: { zh: "部分完成", en: "Partial", tone: "text-[var(--surface-text-muted)]" },
   canceled: { zh: "已取消", en: "Canceled", tone: "text-[var(--surface-text-muted)]" },
+  queued: { zh: "等待启动", en: "Queued", tone: "text-[var(--surface-text-muted)]" },
+  running: { zh: "进行中", en: "Running", tone: "theme-plan-text" },
 } satisfies Record<CapsuleActivityHistoryRow["outcome"], { zh: string; en: string; tone: string }>;
 
 export default function CapsuleActivityPopover({ dialogRef, closeRef, onClose, language, current, history }: {
@@ -91,11 +93,13 @@ export default function CapsuleActivityPopover({ dialogRef, closeRef, onClose, l
           {history.map(row => {
             const outcome = OUTCOMES[row.outcome];
             return (
-              <li key={row.key} data-testid="turn-activity-row" data-outcome={row.outcome} className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1 px-1 py-2">
+              <li key={row.key} data-testid="turn-activity-row" data-outcome={row.outcome} className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-baseline gap-x-2 gap-y-1 px-1 py-2">
                 {row.at !== null && <time dateTime={new Date(row.at).toISOString()} className="shrink-0 text-[10px] tabular-nums text-[var(--surface-text-muted)]">{timeFormat.format(row.at)}</time>}
-                <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
-                  {row.title}{row.target && <> <code className="text-[0.92em] text-[var(--surface-text-muted)]">{row.target}</code></>}
-                </span>
+                <div className="col-start-2 min-w-0 [overflow-wrap:anywhere]">
+                  <span>{row.title}{row.target && <> <code className="text-[0.92em] text-[var(--surface-text-muted)]">{row.target}</code></>}</span>
+                  {row.count && <span className="ml-1.5 text-[10px] tabular-nums text-[var(--surface-text-muted)]">×{row.count}</span>}
+                  {row.detail && <p className="mt-0.5 text-[11px] text-[var(--surface-text-muted)]">{row.detail}</p>}
+                </div>
                 <span className={`shrink-0 rounded-md bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] ${outcome.tone}`}>{outcome[language]}</span>
               </li>
             );

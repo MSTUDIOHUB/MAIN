@@ -1618,8 +1618,15 @@ test("local Rust streams keep slow genuine visible output and native tool progre
   };
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
     assert.equal(command, "start_chat_stream");
+    assert.equal(JSON.parse(args.body).return_progress, true);
     const streamId = args.streamId;
     queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: 'data: {"choices":[],"prompt_progress":{"total":32000,"cache":3000,"processed":12000}}\n\n',
+        },
+      });
       listeners.get("chat-stream-chunk")?.({
         payload: {
           stream_id: streamId,
@@ -1646,6 +1653,8 @@ test("local Rust streams keep slow genuine visible output and native tool progre
   }, listenMock);
 
   const tokens = [];
+  const publicText = [];
+  const prefill = [];
   const result = await streamChatCompletion(
     [{ role: "user", content: "继续" }],
     {
@@ -1657,17 +1666,52 @@ test("local Rust streams keep slow genuine visible output and native tool progre
     },
     {
       onToken: (token) => tokens.push(token),
+      onPublicText: (text) => publicText.push(text),
+      onLifecycle: (event) => { if (event.phase === "prompt_progress") prefill.push(event); },
       onDone: () => {},
       onError: (error) => { throw error; },
     },
   );
 
   assert.deepEqual(tokens, ["## 可见进展\n\n正在核对事件参数。"]);
+  assert.deepEqual(publicText, tokens);
+  assert.equal(prefill.length, 1);
+  assert.equal(prefill[0].processedTokens, 12000);
+  assert.equal(prefill[0].totalTokens, 32000);
+  assert.equal(prefill[0].cachedTokens, 3000);
   assert.equal(result.semanticContent, "## 可见进展\n\n正在核对事件参数。");
   assert.equal(result.streamDiagnostics?.semanticVisibleChars > 0, true);
   assert.equal(result.streamDiagnostics?.firstSemanticVisibleElapsedMs != null, true);
   assert.equal(result.streamDiagnostics?.firstToolElapsedMs != null, true);
   assert.equal(result.toolCalls[0]?.name, "read_file");
+});
+
+test("oMLX stream retries with only the rejected progress field removed", async () => {
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    if (requests.length === 1) {
+      const detail = [{ loc: ["body", "return_progress"], type: "extra_forbidden" }];
+      return new Response(JSON.stringify({ detail }), { status: 422 });
+    }
+    return new Response('data: {"choices":[{"delta":{"content":"Public reply."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  };
+  try {
+    const { streamChatCompletion } = await loadStreamingModule(async () => {});
+    const result = await streamChatCompletion(
+      [{ role: "user", content: "Continue" }],
+      { baseUrl: "http://127.0.0.1:8000/v1", apiKey: "", model: "local", provider: "OMLX" },
+      { onToken() {}, onDone() {}, onError() {} },
+    );
+    assert.equal(result.content, "Public reply.");
+    assert.equal(requests.length, 2);
+    const { return_progress, ...withoutProgress } = requests[0];
+    assert.equal(return_progress, true);
+    assert.deepEqual(requests[1], withoutProgress);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("caller-owned Runtime streams survive legal empty keepalives past 120s and mark only model progress", async () => {

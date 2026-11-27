@@ -3,6 +3,9 @@ import { createHash } from "node:crypto";
 
 const scenePath = "Assets/Scenes/SampleScene.unity";
 const privateOutput = "PRIVATE_STREAM_CONTENT_MUST_STAY_OUT_OF_ACTIVITY";
+const privateReasoning = "PRIVATE_REASONING_MUST_STAY_OUT_OF_CHAT";
+const visibleCommentary = "我会先核对场景，再安排验证步骤。";
+const nextFinding = "场景输入来自 `InputController.cs:42`。";
 const sceneContent = `sceneName: SampleScene\ncomment: ${privateOutput}\n`;
 const contentVersion = `sha256-${createHash("sha256").update(sceneContent).digest("hex")}`;
 
@@ -38,6 +41,9 @@ async function mountPlanTransport(page: Page, fromComposer = false) {
       chunk,
       releaseRead: () => releaseRead?.(),
       finishOneShot: (answer: string) => finishOneShot?.(answer),
+      delta: (stream: number, delta: object) => {
+        chunk(stream, `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+      },
       finishText: (stream: number, content: string) => {
         chunk(stream, `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
         emit("chat-stream-done", { stream_id: streams[stream].streamId, status: "ok" });
@@ -165,11 +171,14 @@ test("Plan Capsule follows model and tool boundaries and M shows only recorded a
   await expectStreams(page, 1);
   await expect(capsule).toHaveAttribute("data-activity-kind", "waiting");
   await expect(guidance).toContainText("等待模型响应");
+  await expect(page.getByTestId("chat-area-live-model-progress")).toHaveCount(0);
+  const liveOutput = page.getByTestId("assistant-live-output");
+  await expect(liveOutput).toHaveCount(0);
   await expect(capsule).not.toContainText("整理成可审核的修复计划");
   await trigger.click();
   await expect(activity).toBeVisible();
   await expect(activity.getByTestId("run-status-current-activity")).toContainText("等待模型响应");
-  await expect(activity.getByTestId("turn-activity-empty")).toBeVisible();
+  await expect(rows.filter({ hasNotText: "准备工作区概览" })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(activity).toBeHidden();
   await expect(trigger).toBeFocused();
@@ -183,6 +192,24 @@ test("Plan Capsule follows model and tool boundaries and M shows only recorded a
     await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   });
   await expect(capsule).toHaveAttribute("data-activity-kind", "waiting");
+  await page.evaluate(() => {
+    const fixture = (window as any).__CAPSULE_PLAN_IO__;
+    fixture.chunk(0, 'data: {"prompt_progress":{"total":30000,"cache":10000,"processed":20000,"time_ms":900},"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n');
+  });
+  await expect(guidance).toContainText("正在处理上下文");
+  await expect(guidance).toContainText("20k / 30k tok");
+  await expect(liveOutput).toHaveCount(0);
+  await page.evaluate((reasoning) => {
+    (window as any).__CAPSULE_PLAN_IO__.delta(0, { reasoning_content: reasoning });
+  }, privateReasoning);
+  await expect(capsule).toHaveAttribute("data-activity-kind", "receiving");
+  await expect(liveOutput).toHaveCount(0);
+  await page.evaluate((content) => {
+    (window as any).__CAPSULE_PLAN_IO__.delta(0, { content });
+  }, visibleCommentary);
+  await expect(liveOutput).toContainText(visibleCommentary);
+  await expect(liveOutput).not.toContainText(privateReasoning);
+  await expect(capsule).not.toContainText(visibleCommentary);
   await page.evaluate((path) => {
     (window as any).__CAPSULE_PLAN_IO__.tool(0, "read_file", { path });
   }, scenePath);
@@ -197,11 +224,29 @@ test("Plan Capsule follows model and tool boundaries and M shows only recorded a
   await page.evaluate(() => (window as any).__CAPSULE_PLAN_IO__.releaseRead());
   await expectStreams(page, 2);
   await expect(capsule).toHaveAttribute("data-activity-kind", "waiting");
+  await expect(liveOutput).toHaveCount(0);
+  await expect(page.getByTestId("assistant-update").filter({ hasText: visibleCommentary })).toHaveCount(1);
+  const openingSplit = 8;
+  await page.evaluate((content) => {
+    (window as any).__CAPSULE_PLAN_IO__.delta(1, { content });
+  }, visibleCommentary.slice(0, openingSplit));
+  await expect(capsule).toHaveAttribute("data-activity-kind", "receiving");
+  await expect(liveOutput).toHaveCount(0);
+  await page.evaluate((content) => {
+    (window as any).__CAPSULE_PLAN_IO__.delta(1, { content });
+  }, visibleCommentary.slice(openingSplit));
+  await expect(liveOutput).toHaveCount(0);
+  await page.evaluate((content) => {
+    (window as any).__CAPSULE_PLAN_IO__.delta(1, { content });
+  }, nextFinding);
+  await expect(liveOutput).toContainText("InputController.cs:42");
+  await expect(liveOutput).not.toContainText(visibleCommentary);
   await trigger.click();
   await expect(activity.getByRole("heading", { name: "本轮活动", exact: true })).toBeVisible();
   await expect(rows.filter({ hasText: "SampleScene.unity" })).toHaveCount(1);
   await expect(rows.filter({ hasText: "SampleScene.unity" })).toHaveAttribute("data-outcome", "succeeded");
   await expect(activity).not.toContainText(privateOutput);
+  await expect(activity).not.toContainText(visibleCommentary);
   await expect(activity).not.toContainText("正在形成计划");
   await expect(activity).not.toContainText("最近里程碑");
 
@@ -235,6 +280,8 @@ test("Plan Capsule follows model and tool boundaries and M shows only recorded a
     fixture.finish(1);
   });
   await expect(capsule.getByTestId("structured-user-questionnaire")).toBeVisible();
+  await expect(page.getByTestId("assistant-update").filter({ hasText: visibleCommentary })).toHaveCount(1);
+  await expect(page.getByTestId("assistant-update").filter({ hasText: "InputController.cs:42" })).toHaveCount(1);
   await expect(capsule).toHaveAttribute("data-activity-kind", "action");
   await expect(capsule).not.toContainText(privateOutput);
   await trigger.click();
@@ -245,9 +292,6 @@ test("Plan Capsule follows model and tool boundaries and M shows only recorded a
   await page.keyboard.press("Escape");
   const form = capsule.getByTestId("structured-user-questionnaire");
   await form.getByRole("radio", { name: "键盘", exact: true }).check();
-  await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
-  await form.getByRole("button", { name: "下一题 →", exact: true }).click();
-  await form.getByRole("radio", { name: "形成并保存计划文档", exact: true }).check();
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
   await expect(page.getByText("确认场景测试方式\n\n确认场景测试方式")).toHaveCount(0);
   await expectStreams(page, 3);
@@ -278,9 +322,6 @@ test("Plan from the composer reuses a confirmed answer and reaches a single revi
   await expect(form).toBeVisible();
   const runId = await capsule.getAttribute("data-run-id");
   await form.getByRole("radio", { name: "键盘", exact: true }).check();
-  await expect(form.getByRole("button", { name: "确认并继续", exact: true })).toHaveCount(0);
-  await form.getByRole("button", { name: "下一题 →", exact: true }).click();
-  await form.getByRole("radio", { name: /形成可审核的实施计划/ }).check();
   await form.getByRole("button", { name: "确认并继续", exact: true }).click();
   await expectStreams(page, 2);
 

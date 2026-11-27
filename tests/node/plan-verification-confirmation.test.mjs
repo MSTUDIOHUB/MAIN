@@ -112,6 +112,7 @@ function createPlanHarness({ responses = [] } = {}) {
     ["../../lib/toolExecutor", { executeTool: async () => "[]" }],
     ["./checkpointPort", {
       getRuntimeV2Checkpoint: (_state, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      getRuntimeV2EmergencyTerminalEnvelope: (_state, owner) => state.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null,
       createRuntimeV2CheckpointPort: () => ({
         append: async input => {
           const result = runtime.appendRuntimeV2Checkpoint({

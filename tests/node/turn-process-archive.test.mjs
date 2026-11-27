@@ -63,6 +63,17 @@ const {
   buildCodexActivityGroups,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnProcessArchive.ts"));
 
+test("public assistant updates stay in the conversation instead of the process archive", () => {
+  const blocks = [
+    { id: 1, type: "user", content: "Check the save flow" },
+    { id: 2, type: "agent", visibility: "assistant_update", content: "I found the save entry point." },
+    { id: 3, type: "tool", toolName: "read_file", target: "SaveManager.cs", toolStatus: "executed" },
+    { id: 4, type: "agent", visibility: "assistant_final", content: "Here are the findings." },
+  ];
+  const archive = buildTurnProcessArchiveModel({ blocks, finalVisibleAgentIndex: 3, language: "en" });
+  assert.deepEqual(archive.blocks.map(({ id }) => id), [3]);
+});
+
 test("concrete context actions are not overwritten by a generic scope phase", () => {
   const blocks = [{ id: 1, type: "tool", toolName: "get_project_skeleton", target: "/fixture", status: "running", toolStatus: "running", intentSummary: "读取项目概览", turnPhase: { id: "scope", kind: "scope", title: "范围归纳" } }];
   const live = buildLiveTurnProcessTimelineModel({ blocks, language: "zh" });

@@ -13,6 +13,7 @@ import { resolvePlanDocumentFromAggregate } from "../../lib/planDocumentRecords"
 import { SUBMIT_PLAN_DOCUMENT } from "./planDocumentProtocol";
 import { resolvePlanDocumentSaveRecovery } from "./planDocumentSavePort";
 import { settlePlanPause } from "./planQuestionControl";
+import { recoverRuntimeV2PlanCheckpointBoundary, restoreRuntimeV2PlanEmergencyTerminal } from "./planCheckpointRecovery";
 
 /** One durable interview owner, shared by conceptual plans and /规则 drafts. */
 export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput) {
@@ -71,6 +72,9 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
   };
   const ledger = new PlanLedger(identity.turn, createRuntimeV2CheckpointPort({ ...input, scopeKey: input.context.runScopeKey, sessionId: input.context.runSessionId }),
     createRuntimeV2ProjectionPort({ ...input, language: input.context.phaseLanguage, nextTaskId: () => input.get()._nextTaskId() }), existing || null, input.logStoreEvent);
+  const recovery = { runner: input, ledger, run: identity.run };
+  const emergency = await restoreRuntimeV2PlanEmergencyTerminal(recovery);
+  if (emergency) return emergency;
   try {
   if (!existing) {
     const admission = resolveRuntimeV2ObjectiveAdmission(input.context, turn.userPrompt);
@@ -104,10 +108,18 @@ export async function runRuntimeV2PlanInterview(input: RuntimeV2PlanRunnerInput)
   return await runPlanDocumentInterview({ input, ledger, turn: identity.turn, run: identity.run, objective: turn.userPrompt });
   } catch (error) {
     if (!ledger.snapshot()?.run) throw error;
+    const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...recovery, error, canUseReservedTerminal: true });
+    if (settlement) return settlement;
     const canceled = input.context.abortCtrl.signal.aborted;
     const reason = canceled ? "用户停止了计划访谈。" : "计划访谈未能完成；已保留原始目标、问题与已确认答案。";
     input.logStoreEvent("runtime_v2_plan_interview_failed", { turnId: identity.turn.turnId, error: String(error) });
-    await ledger.finishTerminal({ run: identity.run, resultKind: canceled ? "canceled" : "error", reason });
+    try {
+      await ledger.finishTerminal({ run: identity.run, resultKind: canceled ? "canceled" : "error", reason });
+    } catch (error) {
+      const terminal = await recoverRuntimeV2PlanCheckpointBoundary({ ...recovery, error });
+      if (terminal) return terminal;
+      throw error;
+    }
     return createRuntimeV2RunnerSettlement(input.context, canceled ? abortedAgentLoopOutcome(reason) : completedAgentLoopOutcome(reason, "error"));
   }
 }

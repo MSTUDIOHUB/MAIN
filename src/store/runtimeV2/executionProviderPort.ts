@@ -2,6 +2,7 @@ import { runtimeV2ProviderOmittedKnowledgeCanReplay } from "./providerReadReceip
 import { runtimeV2BoundEditorObservation } from "./executionAuthorizationContext";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
+import { normalizePreparedWorkspaceRead } from "./preparedReadOnlyResponse";
 import {
   providerActionEpochExhausted,
   recordProviderTransportAttempt,
@@ -65,6 +66,8 @@ export { runtimeV2ExecutionProviderDeadlineAt };
 export function createRuntimeV2ProviderPort(
   input: RuntimeV2ExecutionPortsInput,
 ): ProviderPort {
+  let preparedChatAnswer = input.context.preparedChatAnswer;
+  let preparedWorkspaceRead = input.context.preparedWorkspaceRead;
   return {
     async request({ command, signal }) {
       input.logStoreEvent("runtime_v2_provider_request_timing", {
@@ -86,6 +89,8 @@ export function createRuntimeV2ProviderPort(
         requiredToolChoice: false,
       };
       const tools = providerToolDefinitionsForCommand(input, command);
+      const preparedAnswer = preparedChatAnswer;
+      preparedChatAnswer = undefined;
       const allowedToolNames = tools.map((tool) => tool.function.name);
       const requestDeadlineAt = runtimeV2ExecutionProviderDeadlineAt(
         Date.now(),
@@ -97,6 +102,11 @@ export function createRuntimeV2ProviderPort(
         requestDeadlineAt,
         transport: null,
       });
+      const workspace = String(input.context.runWorkspace || "").trim();
+      const preparedRead = preparedWorkspaceRead && command.payload.mode === "analyze" && workspace
+        ? normalizePreparedWorkspaceRead(preparedWorkspaceRead, tools, workspace)
+        : null;
+      preparedWorkspaceRead = undefined;
 
       if (tools.length === 0) {
         return requestRuntimeV2ProviderWithEmptySurface({
@@ -104,6 +114,7 @@ export function createRuntimeV2ProviderPort(
           command,
           requestDeadlineAt,
           signal,
+          preparedChatAnswer: command.payload.mode === "chat" ? preparedAnswer : undefined,
         });
       }
 
@@ -125,6 +136,7 @@ export function createRuntimeV2ProviderPort(
         !Number.isFinite(requestDeadlineAt) ||
         Date.now() < Number(requestDeadlineAt)
       ) {
+        const preparedResult = epoch.attempted.length === 0 ? preparedRead : null;
         const attempt = selectNextProviderTransportAttempt(profile, epoch);
         if (!attempt) break;
         epoch = recordProviderTransportAttempt(epoch, attempt);
@@ -135,13 +147,23 @@ export function createRuntimeV2ProviderPort(
         // Therefore the current supported transport is never interrupted by a
         // shorter adapter retry timer.
         try {
-          const { reasoningActionScope, ...providerResult } = await executeRuntimeV2ProviderWithDeadline({
+          const { reasoningActionScope, ...providerResult } = await executeRuntimeV2ProviderWithDeadline<Awaited<ReturnType<typeof requestRuntimeV2ProviderOnce>>>({
             ports: input,
             command,
             requestDeadlineAt,
             transport: attempt.variant,
             signal,
             task: (request) => {
+              if (preparedResult) {
+                request.signal.throwIfAborted();
+                input.logStoreEvent("runtime_v2_prepared_workspace_read_adopted", {
+                  turnId: command.run.turnId,
+                  runId: command.run.runId,
+                  commandKey: command.idempotencyKey,
+                  toolNames: preparedResult.toolCalls.map(call => call.name),
+                });
+                return Promise.resolve(preparedResult);
+              }
               input.logStoreEvent("runtime_v2_provider_request_opened", {
                 turnId: command.run.turnId,
                 runId: command.run.runId,
@@ -180,7 +202,7 @@ export function createRuntimeV2ProviderPort(
               ? { ...call, arguments: { ...call.arguments, provider: readOnlyNetworkPolicy(input).provider } }
               : call),
           };
-          if (result.toolCalls.length > 0) {
+          if (result.toolCalls.length > 0 && !preparedResult) {
             input.live.provenStructuredToolTransports.add(attempt.variant);
           }
           if (

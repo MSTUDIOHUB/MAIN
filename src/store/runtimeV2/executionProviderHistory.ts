@@ -1,5 +1,5 @@
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
-import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
+import { isChatContext, isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { renderKnowledgeContextAnchor } from "../../lib/knowledgeReferences";
 import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 import type {
@@ -461,31 +461,16 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     input.context.runtimeRunIntent === "analyze" ||
     input.context.runtimeRunIntent === "summarize" ||
     input.context.runtimeRunIntent === "report";
-  const workspaceInstructions = String(
-    input.context.workspaceInstructionContext || "",
-  ).trim();
-  const projectBaseline = renderProjectBaselineContext(
-    isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "")
-      ? input.context.projectBaselineContext
-      : null,
-  );
+  const chat = isChatContext(input);
+  const skillContextBudget = skillCatalogContextCharBudget(input.context.runtimeContextBudget?.contextLimit);
   const skillCatalog = renderSkillCatalogContext(
-    input.context.skillCatalog,
-    skillCatalogContextCharBudget(
-      input.context.runtimeContextBudget?.contextLimit,
-    ),
+    chat && !input.context.skillCatalog?.explicitSkillIds.length ? null : input.context.skillCatalog,
+    skillContextBudget,
   );
   const explicitSkills = renderExplicitSkillActivationContext(
     input.context.skillCatalog,
-    { maxChars: skillCatalogContextCharBudget(input.context.runtimeContextBudget?.contextLimit) },
+    { maxChars: skillContextBudget },
   );
-  const collaborationGuidance = buildSubagentDelegationGuidance({
-    preference:
-      input.context.turnInputContextSignals?.subagentPreference ||
-        "unspecified",
-    requirement: input.context.turnInputContextSignals?.subagentRequirement,
-    language: input.context.phaseLanguage,
-  });
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const dayNamesEn = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -510,7 +495,6 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
   const languageDirective = input.context.phaseLanguage === "en"
     ? "Language requirement: Write ALL user-visible stage commentary and the final answer in English. Keep code, file paths, symbol names, and commands unchanged."
     : "语言要求：所有面向用户的阶段说明（commentary）与最终答复必须严格使用简体中文；仅保留代码、文件路径、符号名和命令原样，不要整段切换为英文。";
-  const chat = readOnlyTurn && !input.context.runWorkspace && !input.context.turnInputContextSignals?.attachedFilePaths?.length;
   if (chat) return [
     "[MAIN RUNTIME V2]", `Current Date: ${currentDate}`, `Respond in: ${language}`,
     languageDirective,
@@ -518,8 +502,19 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     "This is Chat. Answer from the supplied conversation and admitted context. Never claim a tool was used unless its receipt is present. No workspace, shell, browser control, validation, MCP or child-agent capabilities are available.",
     networkInstruction,
     renderKnowledgeContextAnchor(input.context.knowledgeContext),
-    "Return a complete, well-structured user-facing Markdown reply matched to the user's question depth. Skill instructions do not grant additional tool permissions.", skillCatalog, explicitSkills,
+    "Follow the user's requested wording, format, and level of detail. Otherwise reply directly and use Markdown where helpful. Skill instructions do not grant additional tool permissions.", skillCatalog, explicitSkills,
   ].join("\n");
+  const workspaceInstructions = String(input.context.workspaceInstructionContext || "").trim();
+  const projectBaseline = renderProjectBaselineContext(
+    isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "")
+      ? input.context.projectBaselineContext
+      : null,
+  );
+  const collaborationGuidance = readOnlyTurn ? "" : buildSubagentDelegationGuidance({
+    preference: input.context.turnInputContextSignals?.subagentPreference || "unspecified",
+    requirement: input.context.turnInputContextSignals?.subagentRequirement,
+    language: input.context.phaseLanguage,
+  });
   return [
     "[MAIN RUNTIME V2]",
     `Current Date: ${currentDate}`,
@@ -528,6 +523,7 @@ function systemInstruction(input: RuntimeV2ExecutionPortsInput): string {
     languageDirective,
     conversationContinuity,
     readOnlyTurn ? networkInstruction : "",
+    "Start from explicitly referenced or attached source and the current investigation's versioned evidence. When the request concerns existing changes and Git tools are available, use the relevant diff to narrow the file reads.",
     "Use structured tools for every read, modification, command, and verification. When calling native tools at meaningful milestones (such as confirming a root cause, finishing analysis, or transitioning between phases), you may include 1-2 clear sentences of public progress in the user's language explaining the finding or current direction; avoid echoing raw tool names, exposing private reasoning, or repeating the same sentence verbatim in the final answer.",
     "Tool calls are proposed actions. MAIN checks permissions and obtains any required human review before executing them. When an operation requires approval, submit its concrete tool call so MAIN can show the review card; a prose approval question cannot create that card or authorize execution.",
     readOnlyTurn
@@ -634,16 +630,19 @@ function baseProviderHistory(
     (candidate: any) => candidate.id === input.context.turnId,
   );
   const turn = turnIndex >= 0 ? turns[turnIndex] : null;
+  const chat = isChatContext(input);
   const continuation = approvedAggregate?.planContinuation && !isReadOnlyContext(input) ? approvedAggregate : null;
   const history: AgentMessage[] = [];
-  const priorTurns = (continuation ? [] : turnIndex >= 0 ? turns.slice(0, turnIndex) : turns)
+  // The current input already has a bounded, owner-verified investigation
+  // reference. Replaying the earlier review and its digest would duplicate it.
+  const priorTurns = (continuation || input.context.sourceInvestigationTurnId ? [] : turnIndex >= 0 ? turns.slice(0, turnIndex) : turns)
     .filter((candidate: any) => candidate?.uiVisibility !== "internal");
   for (const prior of priorTurns) {
     const user = conversationText(prior?.userPrompt);
     const assistant = conversationText(
       prior?.durableContext?.finalAssistantAnswer || prior?.summary,
     );
-    const durableExecution = conversationText(
+    const durableExecution = chat ? "" : conversationText(
       serializeDurableTurnContextForModel(prior?.durableContext),
     );
     const pair: AgentMessage[] = [
@@ -657,7 +656,8 @@ function baseProviderHistory(
     ];
     history.push(...pair);
   }
-  if (isReadOnlyContext(input) && Array.isArray(state.agentMessages)) {
+  const legacyChatHistory = chat && !priorTurns.length && input.context.requiredCapabilities === undefined && !input.context.runWorkspace;
+  if ((!chat || legacyChatHistory) && isReadOnlyContext(input) && Array.isArray(state.agentMessages)) {
     const priorMessages = state.agentMessages as AgentMessage[];
     const reverseIndex = [...priorMessages].reverse().findIndex((message) => message.role === "user");
     const currentIndex = reverseIndex < 0 ? priorMessages.length : priorMessages.length - 1 - reverseIndex;

@@ -46,13 +46,16 @@ const shellCalls = () => ["tool --version", "tool status", "tool inspect", "tool
   id: `shell-${index}`, name: "run_command", arguments: { command },
 }));
 
-function ledger(calls = shellCalls()) {
+function ledger(calls = shellCalls(), sourceEvidence = []) {
   const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch", turnId: "turn", clientSubmissionId: "submission" };
   const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId, runId: "run", parentRunId: null, attemptId: "attempt" };
   let sequence = 0;
   const event = (type, fields) => ({ schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: sequence++, eventId: `event-${sequence}`, at: sequence, type, ...fields });
   let aggregate = runtime.transition(null, event("turn.admitted", { turn, strategy: "execute", objective: "Run the requested command checks", constraints: [], acceptanceCriteria: [] }));
   aggregate = runtime.transition(aggregate, event("run.started", { run, phase: "observing" }));
+  for (const evidence of sourceEvidence) {
+    aggregate = runtime.transition(aggregate, event("observation.recorded", { run, evidence }));
+  }
   const provider = { kind: "request_model", phase: "observing", run, idempotencyKey: "provider", payload: { mode: "execute" } };
   aggregate = runtime.transition(aggregate, event("command.scheduled", { run, command: provider }));
   aggregate = runtime.transition(aggregate, event("provider.responded", { run, idempotencyKey: provider.idempotencyKey, result: { visibleText: "", toolCalls: calls, diagnostics: [] } }));
@@ -372,6 +375,26 @@ test("blocked shell does not suppress independently bound Editor observations", 
     f.apply("tool.completed", { run: f.run, idempotencyKey: command.idempotencyKey, evidence: [],
       status: index === 0 || blocked ? "blocked" : "succeeded" });
   }
+});
+
+test("a rejected read-only shell probe does not skip rereading a previously versioned file", () => {
+  const { runtimeV2SequentialShellBatchInterruption: interruption } = loadTs("src/store/runtimeV2/executionSequentialShellBatch.ts");
+  const calls = [
+    { id: "shell", name: "run_command", arguments: { command: "ls /Applications" } },
+    { id: "source", name: "read_file", arguments: { path: "src/current.ts" } },
+    { id: "dependent", name: "read_file", arguments: { path: "src/generated.ts" } },
+  ];
+  const f = ledger(calls, [{ id: "previous-read", kind: "source", target: "src/current.ts", version: "source-v1" }]);
+  const [shell] = runtime.decideNextCommands(f.aggregate);
+  f.apply("command.scheduled", { run: f.run, command: shell });
+  f.apply("tool.completed", { run: f.run, idempotencyKey: shell.idempotencyKey, evidence: [],
+    status: "blocked", failureReasonCode: "shell_workspace_path_escape" });
+  const [source] = runtime.decideNextCommands(f.aggregate);
+  assert.equal(interruption(f.aggregate, source), null);
+  f.apply("command.scheduled", { run: f.run, command: source });
+  f.apply("tool.completed", { run: f.run, idempotencyKey: source.idempotencyKey, evidence: [], status: "succeeded" });
+  const [dependent] = runtime.decideNextCommands(f.aggregate);
+  assert.equal(interruption(f.aggregate, dependent)?.reasonCode, "provider_batch_predecessor_failed");
 });
 
 test("mixed observation sequencing accepts only actual predecessor tool receipts", () => {

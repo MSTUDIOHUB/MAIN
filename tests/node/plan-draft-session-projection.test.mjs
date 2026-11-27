@@ -84,3 +84,35 @@ test("the Plan panel finds the latest owned versioned document instead of a stal
   assert.equal(records.resolveSessionPlanDocument([first, stale], owner), first);
   assert.equal(records.resolveSessionPlanDocument([stale], owner), null);
 });
+
+test("cold Session restore projects an exact Plan emergency once and retains its saved draft", async () => {
+  const f = await savedDraftFixture();
+  const events = f.checkpoint.events.slice(0, f.checkpoint.events.findIndex(event =>
+    event.type === "command.scheduled" && event.command.kind === "finalize_turn"));
+  const aggregate = events.reduce((state, event) => runtime.transition(state, event), null);
+  const checkpoint = runtime.createRuntimeV2Checkpoint({ revision: events.length, aggregate, updatedAt: aggregate.updatedAt });
+  const envelope = runtime.createRuntimeV2EmergencyTerminalEnvelope({ owner: f.owner, run: aggregate.run.identity,
+    resultKind: "partial", reasonCode: "checkpoint_persist_failed", language: "en", strategy: "plan", hasMutation: false,
+    at: Date.now(), lastRevision: checkpoint.revision });
+  const raw = JSON.parse(JSON.stringify({
+    conversationTurns: [{ id: f.owner.turnId, userPrompt: "Create a collector", title: "Collector", status: "running",
+      mode: "plan", blockIds: [], createdAt: Date.now() }],
+    runtimeV2Checkpoints: runtime.serializeRuntimeV2CheckpointMap({ [f.owner.turnId]: checkpoint }),
+    runtimeV2EmergencyTerminalEnvelopes: { [f.owner.turnId]: envelope },
+  }));
+  const options = { workspacePath: f.owner.workspaceKey, expectedSessionKey: f.owner.sessionKey, expectedSessionEpoch: f.owner.sessionEpoch, coldRestore: true };
+  const restored = normalizeSessionRuntimeSnapshot(raw, options);
+  const restoredAgain = normalizeSessionRuntimeSnapshot(restored, options);
+  for (const snapshot of [restored, restoredAgain]) {
+    assert.deepEqual(snapshot.conversationTurns[0].planDraft, f.record);
+    assert.equal(snapshot.conversationTurns[0].runtimeOutcome.resultKind, "partial");
+    assert.equal(snapshot.runtimeEvents.filter(event => event.type === "run.completed" && event.turnId === f.owner.turnId).length, 1);
+    assert.equal(snapshot.runtimeEvents.filter(event => event.type === "turn.completed" && event.turnId === f.owner.turnId).length, 1);
+    const finals = snapshot.taskFlow.filter(block => block.turnId === f.owner.turnId && block.visibility === "assistant_final");
+    assert.equal(finals.length, 1);
+    assert.ok(finals[0].content.includes(envelope.reason));
+  }
+  const replaced = normalizeSessionRuntimeSnapshot(raw, { ...options, expectedSessionEpoch: "another-epoch" });
+  assert.deepEqual(replaced.runtimeV2EmergencyTerminalEnvelopes, {});
+  assert.equal(replaced.runtimeEvents.some(event => event.type === "run.completed" && event.turnId === f.owner.turnId), false);
+});

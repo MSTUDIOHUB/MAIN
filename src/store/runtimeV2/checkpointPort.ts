@@ -16,6 +16,7 @@ import { createAsyncRuntimeV2CheckpointAppender } from "../../lib/runtime-v2/che
 import { persistSubmitRuntimeProjection } from "../persistSubmitRuntimeProjection";
 import type { ProjectSessionSaveOptions } from "../../lib/projectSessionMutationCoordinator";
 import { createKeyedAsyncQueue } from "../../lib/keyedAsyncQueue";
+import { RUNTIME_V2_SLOW_CHECKPOINT_MS } from "../../lib/storeLogLevel";
 
 type StoreGet = () => any;
 type StoreSet = (patchOrUpdater: any) => void;
@@ -75,7 +76,7 @@ function checkpointForOwner(state: any, owner: RuntimeV2TurnIdentity): RuntimeV2
 }
 
 function runIdForEvent(event: RuntimeV2Event): string | null {
-  return "run" in event ? event.run.runId : null;
+  return "run" in event ? event.run.runId : event.type === "turn.completed" ? event.runId : null;
 }
 
 const CHECKPOINT_PROJECTION_ATTEMPTS = 3;
@@ -264,21 +265,33 @@ export function createRuntimeV2CheckpointPort(
           }
           return { disposition: "conflict" as const, checkpoint: null };
         }
-        // This is deliberately emitted only after the durable snapshot and
-        // owner-scoped publication both succeed. It lets a debug trace prove
-        // that a side-effect fence existed without serializing model prose or
-        // tool output into the log.
+        const elapsedMs = Date.now() - startedAt;
+        // Fast routine projections have no lifecycle or tool effects. Keep
+        // slow commits and final receipts after durable publication, regardless
+        // of what the presentation port records separately for display.
+        if (event.type === "projection.published" && event.audience !== "final" && elapsedMs < RUNTIME_V2_SLOW_CHECKPOINT_MS) {
+          return { disposition: "committed" as const, checkpoint: appended.checkpoint };
+        }
         input.logStoreEvent("runtime_v2_ledger_committed", {
           turnId: owner.turnId,
           runId: runIdForEvent(event),
           eventType: event.type,
           sequence: event.sequence,
           revision: appended.checkpoint.revision,
-          elapsedMs: Date.now() - startedAt,
+          elapsedMs,
           preparationElapsedMs,
           commandKey: event.type === "command.scheduled" ? event.command.idempotencyKey
             : "idempotencyKey" in event ? event.idempotencyKey : undefined,
           sideEffectFence: event.type === "command.scheduled",
+          ...(event.type === "command.scheduled"
+            ? { commandKind: event.command.kind }
+            : {}),
+          ...(event.type === "projection.published"
+            ? { audience: event.audience, projectionId: event.projectionId }
+            : {}),
+          ...(event.type === "run.completed" || event.type === "turn.completed"
+            ? { resultKind: event.outcome.resultKind }
+            : {}),
           ...(event.type === "soft_signal.observed"
             ? { signal: event.signal }
             : {}),

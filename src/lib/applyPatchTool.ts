@@ -34,6 +34,8 @@ export interface ApplyPatchPreview {
   /** Stable recovery semantics for callers. Callers must not infer control
    * flow from the human-readable error string. */
   failureKind?: "target_unavailable" | "source_mismatch" | "invalid_patch";
+  /** Exact failed anchor, for locating a fresh read without showing the patch. */
+  sourceMismatch?: { target: string; oldText: string; currentContent: string };
 }
 
 export interface ApplyPatchIo {
@@ -397,6 +399,7 @@ export async function previewApplyPatch(
           changes: [],
           error: `Patch context was not found in ${operation.path}.`,
           failureKind: "source_mismatch",
+          sourceMismatch: { target: operation.path, oldText: hunk.oldText, currentContent: current.content },
         };
       }
       next = updated;

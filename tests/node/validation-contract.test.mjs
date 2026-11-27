@@ -48,6 +48,19 @@ const {
   validationPrimitiveClass,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/validationContract.ts"));
 
+test("validation command and receipt identity preserve quoted source bytes", () => {
+  const command = "python3 -c 'if True:\n    assert \"a  b\" == \"a  b\"'";
+  const spec = createValidationCommandSpec(command);
+  assert.equal(spec?.command, command);
+  assert.equal(analyzeValidationCommand(command).segments[0]?.command, command);
+  assert.equal(evaluateValidationSpec(spec, [{ kind: "finite_command_result", command, completed: true, exitCode: 0 }]).acceptanceSatisfied, true);
+  assert.equal(evaluateValidationSpec(spec, [{ kind: "finite_command_result", command: command.replace("    assert", " assert"), completed: true, exitCode: 0 }]).acceptanceSatisfied, false);
+  assert.equal(analyzeValidationCommand("npm test\nnpm run build").rejectionReason, "non_fail_fast_connector");
+  assert.equal(analyzeValidationCommand("echo 'npm test'").spec, null);
+  assert.equal(analyzeValidationCommand("printf '%s' 'cargo build'").spec, null);
+  assert.equal(analyzeValidationCommand('echo \'python3 -c "assert True"\'').spec, null);
+});
+
 test("finite command analysis proves every fail-fast shell segment", () => {
   const analysis = analyzeValidationCommand("cd frontend && CI=1 npm test && npm run build");
   assert.equal(analysis.rejectionReason, null);

@@ -3614,6 +3614,16 @@ export default function SettingsModal({
                     </span>
                   </summary>
                   <div className="mt-4 space-y-4">
+                    {config.local.provider === "OMLX" && (
+                      <label className="flex items-center justify-between gap-3 text-[13px] theme-text">
+                        {config.language === "en" ? "Combine intent and first response (experimental)" : "合并意图识别与首轮回复（实验）"}
+                        <ToggleSwitch
+                          checked={config.experimentalOmlxFirstResponse === true}
+                          disabled={!canChangeCurrentModel}
+                          onCheckedChange={(checked) => setConfig({ ...config, experimentalOmlxFirstResponse: checked })}
+                        />
+                      </label>
+                    )}
                     <div>
                       <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.toolProtocol}</label>
                       <p className="mb-2 text-[11.5px] text-[#71717a]">

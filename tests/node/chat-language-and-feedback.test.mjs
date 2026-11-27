@@ -329,6 +329,34 @@ test("buildRuntimeV2MilestoneProjection preserves medium-length stage commentary
   assert.equal(protocolOnly, null);
 });
 
+test("Plan commentary keeps changed words and verified sites without replaying the 13:04 opening", () => {
+  const run = { sessionKey: "/tmp/ws:1", sessionEpoch: "e1", turnId: "t1", runId: "r1", parentRunId: null, attemptId: "a1" };
+  const aggregate = { turn: { turnId: run.turnId }, events: [] };
+  const first = "我来评估这个整改方案的可执行性。方案本身对问题的诊断是合理的，但作为可执行的整改计划，它缺少几个关键事实，我需要先验证再提交。\n让我先确认几个关键事实：项目是否有 Unity 版本信息、是否已安装 unity-pipeline skill、以及方案中提到的阻塞加载代码的实际位置。";
+  const second = first.replace("验证再提交", "确认再提交");
+  const changedSentence = "方案本身对问题的诊断是合理的，但作为可执行的整改计划，它缺少几个关键事实，我需要先确认再提交。";
+  const finding = "已确认三处阻塞加载位于 `DataConfigManager.cs:39`、`AddressableLoader.cs:73`、`SceneManager.cs:127`。";
+
+  const settle = (idempotencyKey, commentary, owner = run) => {
+    const event = { type: "provider.responded", run: owner, idempotencyKey, result: {
+      commentary, visibleText: commentary, toolCalls: [{ id: `tool-${idempotencyKey}`, name: "read_file", arguments: {} }],
+    } };
+    aggregate.events.push(event);
+    const projection = buildRuntimeV2MilestoneProjection(aggregate, event, `p-${idempotencyKey}`);
+    if (projection) aggregate.events.push({ type: "projection.published", run: owner, audience: "chat_milestone", projection });
+    assert.equal(event.result.visibleText, commentary);
+    return projection?.markdown;
+  };
+
+  assert.equal(settle("initial", first), first.replace("\n", " "));
+  assert.equal(settle("reworded", second), changedSentence);
+  assert.equal(settle("exact", second.replace("\n", "\n\n")), undefined);
+  assert.equal(settle("with-evidence", `${second}\n${finding}`), finding);
+  assert.equal(settle("changed-location", `${second}\n${finding.replace(":39", ":40")}`), finding.replace(":39", ":40"));
+  assert.equal(settle("changed-decision", first.replace("它缺少", "它不缺少")), changedSentence.replace("确认再提交", "验证再提交").replace("它缺少", "它不缺少"));
+  assert.equal(settle("new-attempt", first, { ...run, attemptId: "a2" }), first.replace("\n", " "));
+});
+
 test("runtimeV2ClarificationMessage avoids injecting English prose prefix", () => {
   const message = runtimeV2ClarificationMessage({
     type: "run.decision_recorded",

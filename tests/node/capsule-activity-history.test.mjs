@@ -171,3 +171,33 @@ test("live and historic labels expose only approved display fields", () => {
   assert.equal(describe("grep_search", "private input").target, undefined);
   assert.deepEqual(describe("__proto__", "raw tool payload", { language: "en" }), { title: "Run tool" });
 });
+
+test("repeated successful tool catalog lookups leave room for source evidence and child results", () => {
+  const events = [];
+  const tool = (idempotencyKey, toolName, at, receipt = {}) => {
+    events.push({ type: "command.scheduled", run, command: {
+      run, idempotencyKey, kind: "execute_tool", payload: { toolName },
+    } });
+    events.push({ type: "tool.completed", run, idempotencyKey, at, status: "succeeded", evidence: [], ...receipt });
+  };
+  tool("failed-read", "read_file", 2, {
+    status: "failed", failureReasonCode: "target_not_found",
+    presentation: { toolName: "read_file", target: "missing.cs", message: "do not expose raw error" },
+  });
+  const child = { id: "saving", parentRunId: run.runId, status: "degraded", taskKind: "explore", name: "存档链路" };
+  events.push({ type: "subagents.scheduled", run, jobs: [child], at: 3 });
+  events.push({ type: "subagent.completed", run, jobId: child.id, status: "degraded", at: 4,
+    evidence: [{ id: "child:save", kind: "source", target: "SaveManager.cs", version: "v1" }], summary: "private raw child report" });
+  for (let i = 0; i < 7; i++) tool(`lookup-${i}`, "tool_search", 10 + i);
+
+  const rows = buildCapsuleActivityHistory({ ...owner, aggregate: { turn, run: { identity: run }, subagents: [child], events } });
+  assert.deepEqual(rows.map(({ key, title, outcome }) => [key, title, outcome]), [
+    ["tool:lookup-6", "查找可用工具", "succeeded"],
+    ["child:saving", "子任务调查", "partial"],
+    ["tool:failed-read", "读取文件", "failed"],
+  ]);
+  assert.equal(rows[0].count, 7);
+  assert.equal(rows[1].detail, "产出 1 项证据");
+  assert.match(rows[2].detail, /找不到|不存在/);
+  assert.doesNotMatch(JSON.stringify(rows), /raw error|raw child report/);
+});

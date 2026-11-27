@@ -5,16 +5,20 @@ import type { RuntimeV2Event } from "./runtime-v2/events";
 import { isRuntimeV2UnexecutedToolReceipt } from "./runtime-v2/toolReceipt";
 import type { TaskBlock } from "./taskTypes";
 import type { MainThreadEvent, TerminalResultKind } from "./turnEvents";
+import { describeWorkspaceToolFailure } from "./workspaceToolFailure";
 
 export type CapsuleActivityOutcome =
   | "succeeded" | "failed" | "blocked" | "not_executed"
-  | "waiting" | "resumed" | "partial" | "canceled";
+  | "waiting" | "resumed" | "partial" | "canceled" | "queued" | "running";
 
 export interface CapsuleActivityHistoryRow {
   readonly key: string;
   readonly at: number | null;
   readonly title: string;
   readonly target?: string;
+  readonly detail?: string;
+  readonly category?: "catalog";
+  readonly count?: number;
   readonly outcome: CapsuleActivityOutcome;
 }
 
@@ -96,7 +100,16 @@ function collectCanonicalRows(
     (input.parentRunId !== undefined && run.parentRunId !== input.parentRunId)) return;
 
   const commands = new Map<string, RuntimeV2Command>();
+  const children = new Map(aggregate.subagents?.filter((job) => job.parentRunId === run.runId).map((job) => [job.id, job]));
   const zh = input.language === "zh";
+  const childTitle = (jobId: string): string => {
+    switch (children.get(jobId)?.taskKind) {
+      case "review": return zh ? "子任务审查" : "Review subtask";
+      case "validate": return zh ? "子任务验证" : "Validation subtask";
+      case "implement": return zh ? "子任务实施" : "Implementation subtask";
+      default: return zh ? "子任务调查" : "Investigation subtask";
+    }
+  };
   for (const [index, event] of aggregate.events.entries()) {
     if (!("run" in event) || !sameRun(event.run, run)) continue;
     const add = (key: string, title: string, outcome: CapsuleActivityOutcome) => {
@@ -129,10 +142,12 @@ function collectCanonicalRows(
           (typeof command.payload.toolName === "string" ? command.payload.toolName : "");
         if (INTERNAL_TOOL_NAMES.has(toolName)) break;
         const key = `tool:${event.idempotencyKey}`;
+        const outcome = completionOutcome(event);
+        const detail = describeWorkspaceToolFailure(event.failureReasonCode, input.language)?.cardMessage;
         rows.set(key, {
           key,
           at: event.at,
-          outcome: completionOutcome(event),
+          outcome,
           ...describeCapsuleToolActivity({
             toolName,
             target: event.presentation?.target || event.evidence[0]?.target || commandTarget(command, toolName),
@@ -140,6 +155,29 @@ function collectCanonicalRows(
             workspaceKey: input.workspaceKey ?? aggregate.turn.workspaceKey,
             language: input.language,
           }),
+          ...(toolName === "tool_search" && outcome === "succeeded" ? { category: "catalog" } : {}),
+          ...(detail ? { detail } : {}),
+        });
+        break;
+      }
+      case "subagents.scheduled":
+        for (const { id } of event.jobs) {
+          const job = children.get(id);
+          if (job?.status !== "queued" && job?.status !== "running") continue;
+          const key = `child:${id}`;
+          rows.set(key, { key, at: event.at, title: childTitle(id), outcome: job.status,
+            ...(job.name ? { target: job.name.slice(0, 80) } : {}) });
+        }
+        break;
+      case "subagent.completed": {
+        const job = children.get(event.jobId);
+        if (!job) break;
+        const outcome = event.status === "completed" ? "succeeded" : event.status === "degraded" ? "partial" : event.status;
+        const count = event.evidence.length;
+        const key = `child:${job.id}`;
+        rows.set(key, { key, at: event.at, title: childTitle(job.id), outcome,
+          ...(job.name ? { target: job.name.slice(0, 80) } : {}),
+          ...(count ? { detail: zh ? `产出 ${count} 项证据` : `${count} evidence ${count === 1 ? "item" : "items"}` } : {}),
         });
         break;
       }
@@ -250,7 +288,12 @@ export function buildCapsuleActivityHistory(input: CapsuleActivityHistoryInput):
   } else {
     collectLegacyRows(input, rows);
   }
-  return [...rows.values()].reverse()
-    .sort((left, right) => (right.at ?? -Infinity) - (left.at ?? -Infinity))
-    .slice(0, MAX_HISTORY_ROWS);
+  const ordered = [...rows.values()].reverse()
+    .sort((left, right) => (right.at ?? -Infinity) - (left.at ?? -Infinity));
+  const catalogRows = ordered.filter((row) => row.category === "catalog");
+  if (catalogRows.length <= 1) return ordered.slice(0, MAX_HISTORY_ROWS);
+  const mostRecentCatalog = catalogRows[0];
+  return ordered.filter((row) => row.category !== "catalog" || row === mostRecentCatalog)
+    .slice(0, MAX_HISTORY_ROWS)
+    .map((row) => row === mostRecentCatalog ? { ...row, count: catalogRows.length } : row);
 }

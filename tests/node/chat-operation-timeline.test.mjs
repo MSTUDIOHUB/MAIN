@@ -60,6 +60,21 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolUiGrouping.ts"));
 const { dedupeModelFeedbackText, createModelFeedbackDedupeState } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelFeedbackDedupe.ts"));
 
+test("published assistant updates stay visible between workspace reads", () => {
+  const blocks = [
+    { id: 1, type: "agent", visibility: "assistant_update", content: "我先了解框架结构，再做定向评估。" },
+    { id: 2, type: "tool", toolName: "read_file", toolStatus: "executed", target: "Core.cs" },
+    { id: 3, type: "agent", visibility: "assistant_update", content: "已读完核心层。继续读取剩余模块。" },
+    { id: 4, type: "tool", toolName: "read_file", toolStatus: "executed", target: "Audio.cs" },
+    { id: 5, type: "agent", visibility: "assistant_update", content: "我先查找 MonoGameObject 的定义，确认这项依赖。" },
+    { id: 6, type: "tool", toolName: "grep_search", toolStatus: "executed", target: "MonoGameObject" },
+  ];
+  for (const items of [blocks, blocks.filter(block => block.id !== 2)]) {
+    const segments = buildChatRenderSegments({ blocks: items, language: "zh" });
+    assert.deepEqual(segments.filter(item => item.kind === "block").map(item => item.block.id), [1, 3, 5]);
+  }
+});
+
 test("model feedback plus three reads renders as one collapsed operation cluster", () => {
   const segments = buildChatRenderSegments({
     language: "zh",

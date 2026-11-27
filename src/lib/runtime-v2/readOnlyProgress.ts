@@ -1,4 +1,5 @@
 import { extractReadFileWindowMetadata } from "../readFileWindow";
+import { TOOL_SEARCH_TOOL_NAME } from "../toolSearch";
 import type { TurnAggregateV1 } from "./aggregate";
 import type { RuntimeV2Event } from "./events";
 import type { RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
@@ -139,6 +140,7 @@ export function deriveReadOnlyRecoveryWindow(state: TurnAggregateV1, policy: {
       const receipt = completions.get(call.id)?.find((item) => item.sequence > event.sequence && item.sequence < nextResponseSequence.get(event.sequence)!);
       if (!receipt) continue;
       settledAt = Math.max(settledAt, receipt.at);
+      if (state.strategy === "plan" && call.name === TOOL_SEARCH_TOOL_NAME) continue;
       if (receipt.status !== "succeeded" || receipt.receiptOrigin === "replayed" || !receipt.evidence.length) continue;
       const web = webEvidenceVersions(call.name, receipt.modelContent);
       if (call.name === "web_search" && web?.length) searchCandidates = true;
