@@ -27,6 +27,8 @@ import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuf
 import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
 import { safeConfirmAsync } from "../lib/safeConfirm";
 import SubagentsPanel from "./SubagentsPanel";
+import { useActiveThemePalette, useEffectiveThemeMode } from "./useThemePalette";
+import type { DerivedTerminalTheme } from "../lib/themePresets";
 import { projectSubagentRuns, resolveSubagentCapacityPolicy } from "../lib/subagents";
 import { buildTypedPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import {
@@ -176,11 +178,11 @@ function turnHasPlanPreview(blocks: any[]) {
 
 /** Integrated Terminal sub-component with xterm.js */
 function IntegratedTerminal({
-  themeMode,
+  terminalTheme,
   workspace,
   sessionKey,
 }: {
-  themeMode: "light" | "dark" | "black";
+  terminalTheme: DerivedTerminalTheme;
   workspace: string;
   sessionKey?: string;
 }) {
@@ -188,6 +190,14 @@ function IntegratedTerminal({
   const xtermRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const ptyReadyRef = useRef<Promise<void> | null>(null);
+  const terminalThemeRef = useRef(terminalTheme);
+  terminalThemeRef.current = terminalTheme;
+
+  useEffect(() => {
+    if (xtermRef.current) {
+      xtermRef.current.options.theme = terminalTheme;
+    }
+  }, [terminalTheme]);
 
   useEffect(() => {
     if (!termRef.current) return;
@@ -200,77 +210,7 @@ function IntegratedTerminal({
       lineHeight: 1.25,
       letterSpacing: 0,
       scrollback: 5000,
-      theme: themeMode === "light"
-        ? {
-            background: "#ffffff",
-            foreground: "#18181b",
-            cursor: "#18181b",
-            cursorAccent: "#ffffff",
-            selectionBackground: "#d4d4d8",
-            black: "#18181b",
-            red: "#dc2626",
-            green: "#059669",
-            yellow: "#ca8a04",
-            blue: "#2563eb",
-            magenta: "#9333ea",
-            cyan: "#0891b2",
-            white: "#52525b",
-            brightBlack: "#71717a",
-            brightRed: "#ef4444",
-            brightGreen: "#10b981",
-            brightYellow: "#eab308",
-            brightBlue: "#3b82f6",
-            brightMagenta: "#a855f7",
-            brightCyan: "#06b6d4",
-            brightWhite: "#09090b",
-          }
-        : themeMode === "black"
-        ? {
-            background: "#000000",
-            foreground: "#dedee3",
-            cursor: "#dedee3",
-            cursorAccent: "#000000",
-            selectionBackground: "#202026",
-            black: "#050506",
-            red: "#f48771",
-            green: "#86d9a3",
-            yellow: "#fbbf24",
-            blue: "#6cb6ff",
-            magenta: "#d2a8ff",
-            cyan: "#56d4dd",
-            white: "#dedee3",
-            brightBlack: "#74747e",
-            brightRed: "#f48771",
-            brightGreen: "#86d9a3",
-            brightYellow: "#fbbf24",
-            brightBlue: "#6cb6ff",
-            brightMagenta: "#d2a8ff",
-            brightCyan: "#56d4dd",
-            brightWhite: "#ffffff",
-          }
-        : {
-            background: "#111112",
-            foreground: "#d4d4d8",
-            cursor: "#d4d4d8",
-            cursorAccent: "#111112",
-            selectionBackground: "#2b2b32",
-            black: "#151518",
-            red: "#f48771",
-            green: "#86d9a3",
-            yellow: "#fbbf24",
-            blue: "#6cb6ff",
-            magenta: "#d2a8ff",
-            cyan: "#56d4dd",
-            white: "#d4d4d8",
-            brightBlack: "#8c8c97",
-            brightRed: "#f48771",
-            brightGreen: "#86d9a3",
-            brightYellow: "#fbbf24",
-            brightBlue: "#6cb6ff",
-            brightMagenta: "#d2a8ff",
-            brightCyan: "#56d4dd",
-            brightWhite: "#f4f4f5",
-          },
+      theme: terminalThemeRef.current,
       allowProposedApi: true,
     });
 
@@ -431,7 +371,7 @@ function IntegratedTerminal({
       fitAddonRef.current = null;
       ptyReadyRef.current = null;
     };
-  }, [sessionKey, themeMode, workspace]);
+  }, [sessionKey, workspace]);
 
   const focusTerminal = () => {
     xtermRef.current?.focus();
@@ -1441,9 +1381,11 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
   }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, runtimeV2PlanReview, subagentRuns.length, versionedPlanRef?.title, viewedDiffTask?.target]);
 
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
-  const isBlackTheme = config.themeMode === "black";
+  const effectiveThemeMode = useEffectiveThemeMode();
+  const themePalette = useActiveThemePalette();
+  const isBlackTheme = effectiveThemeMode === "black";
 
-  const isLightTheme = config.themeMode === "light";
+  const isLightTheme = effectiveThemeMode === "light";
   const storePanelVisible =
     (showPlanPanel && hasPlanPanelContent) ||
     showDiff ||
@@ -1656,16 +1598,16 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               gitDiffEntries={gitDiffPreview?.entries || []}
               gitDiffSourceLabel={gitDiffPreview?.sourceLabel}
               language={language}
-              themeMode={config.themeMode}
+              themeMode={effectiveThemeMode}
             />
           )}
 
           {rightPanelTab === "terminal" && (
             <div className="flex h-full flex-col bg-[#050505]">
               <div className="border-b border-[#18181b] px-4 py-3 text-[12px] text-[#a1a1aa]">{language === "zh" ? "终端输出" : "Terminal Output"}</div>
-              <div className="flex-1 overflow-hidden bg-[#000000] p-1">
+              <div className="flex-1 overflow-hidden bg-[#000000] p-1" style={{ backgroundColor: themePalette.terminalTheme.background }}>
                 <IntegratedTerminal
-                  themeMode={config.themeMode}
+                  terminalTheme={themePalette.terminalTheme}
                   workspace={currentWorkspace}
                   sessionKey={terminalSessionKey}
                 />
@@ -1680,7 +1622,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               capacityPolicy={subagentCapacityPolicy}
               proactiveSkipReason={proactiveSkipReason}
               language={language}
-              themeMode={config.themeMode}
+              themeMode={effectiveThemeMode}
               onSelect={selectSubagent}
               onStop={(id) => { stopSubagent(id); }}
               onStopAll={() => { stopAllSubagents(); }}

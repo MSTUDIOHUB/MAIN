@@ -74,6 +74,8 @@ import {
 } from "../lib/localConcurrencyEstimate";
 import ToggleSwitch from "./ToggleSwitch";
 import ManagedProjectRulesSettings from "./ManagedProjectRulesSettings";
+import AppearanceThemeSettings from "./AppearanceThemeSettings";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
@@ -1963,6 +1965,7 @@ export default function SettingsModal({
   const [isFetchingCloudModels, setIsFetchingCloudModels] = useState(false);
   const [isTestingCloudConnection, setIsTestingCloudConnection] = useState(false);
   const [cloudModelInputMode, setCloudModelInputMode] = useState<"select" | "manual">("manual");
+  const effectiveThemeMode = useEffectiveThemeMode();
   const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [cloudConnectionStatus, setCloudConnectionStatus] = useState<{
@@ -3562,7 +3565,7 @@ export default function SettingsModal({
             {settingsTab === 'general' && (
               <div className="space-y-5">
                 <div className="flex items-center justify-between"><h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.general}</h3></div>
-                <ManagedProjectRulesSettings language={language} themeMode={config.themeMode || "dark"} busy={isModelRuntimeLocked} />
+                <ManagedProjectRulesSettings language={language} themeMode={effectiveThemeMode} busy={isModelRuntimeLocked} />
                 <div className={settingsSectionRowClass}>
                   <div>
                     <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.displayLanguage}</label>
@@ -3609,88 +3612,13 @@ export default function SettingsModal({
                   </div>
                 </div>
 
-                {/* THEME COLOR PICKER */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.themeColor}</label>
-                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.themeDesc}</p>
-                  </div>
-                  <div className={`${settingsControlColumnClass} flex flex-wrap gap-3 lg:justify-end`}>
-                    {Object.entries(THEMES).map(([key, theme]) => (
-                      <button
-                        key={key}
-                        onClick={() => setConfig({ ...config, theme: key })}
-                        aria-label={theme.name}
-                        title={theme.name}
-                        className={`h-7 w-12 rounded-full cursor-pointer ${
-                          config.theme === key
-                            ? 'scale-105 ring-2 ring-[#f4f4f5] ring-offset-2 ring-offset-[#09090b] shadow-lg'
-                            : ''
-                        }`}
-                        style={{ backgroundColor: theme.accent }}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                {/* THEME MODE TOGGLE */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.themeMode}</label>
-                  </div>
-                  <div className={`${settingsControlColumnClass} flex flex-wrap items-center gap-2 lg:justify-end`}>
-                    <button
-                      onClick={() => setConfig({ ...config, themeMode: "dark" })}
-                      aria-pressed={config.themeMode === "dark"}
-                      className={settingsOptionButtonClass(config.themeMode === "dark", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
-                    >
-                      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
-                      {t.themeModeDark}
-                    </button>
-                    <button
-                      onClick={() => setConfig({ ...config, themeMode: "black" })}
-                      aria-pressed={config.themeMode === "black"}
-                      className={settingsOptionButtonClass(config.themeMode === "black", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
-                    >
-                      <span className="h-3.5 w-3.5 rounded-full border border-current bg-black shadow-[inset_0_0_0_2px_rgba(255,255,255,0.08)]" />
-                      {t.themeModeBlack}
-                    </button>
-                    <button
-                      onClick={() => setConfig({ ...config, themeMode: "light" })}
-                      aria-pressed={config.themeMode === "light"}
-                      className={settingsOptionButtonClass(config.themeMode === "light", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
-                    >
-                      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
-                      {t.themeModeLight}
-                    </button>
-                  </div>
-                </div>
-
-                {/* CHAT FONT SIZE */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.chatFontSize}</label>
-                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.chatFontSizeDesc}</p>
-                  </div>
-                  <div className={settingsControlColumnClass}>
-                    <div className="mb-3 flex items-center justify-end">
-                      <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{config.chatFontSize ?? 13} px</span>
-                    </div>
-                    <input
-                      data-testid="chat-font-size-slider"
-                      type="range" min={10} max={20} step={1}
-                      value={config.chatFontSize ?? 13}
-                      onChange={(e) => setConfig({ ...config, chatFontSize: parseInt(e.target.value) })}
-                      className="w-full theme-slider cursor-pointer"
-                    />
-                    <div className="relative mt-1 h-4 text-[11px] text-[#3f3f46] font-mono">
-                      <span className="absolute left-0">10</span>
-                      <span className="absolute -translate-x-1/2" style={{ left: "30%" }}>13</span>
-                      <span className="absolute -translate-x-1/2" style={{ left: "60%" }}>16</span>
-                      <span className="absolute right-0">20</span>
-                    </div>
-                  </div>
-                </div>
+                {/* APPEARANCE & THEME PRESETS */}
+                <AppearanceThemeSettings
+                  config={config}
+                  setConfig={setConfig}
+                  language={language === "en" ? "en" : "zh"}
+                  t={t}
+                />
 
                 {/* SESSION RECORDING */}
                 <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>

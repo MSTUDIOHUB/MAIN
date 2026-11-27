@@ -18,6 +18,7 @@ import MarkdownRenderer from "./MarkdownRenderer";
 import WorkspaceTreePanel from "./WorkspaceTreePanel";
 import ToggleSwitch from "./ToggleSwitch";
 import { useAppStore } from "../store/useAppStore";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import { getFileMetadata } from "../lib/ipc";
 import { useExternalFileOpen } from "../lib/useExternalFileOpen";
@@ -932,6 +933,7 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
 
   const language = config.language === "en" ? "en" : "zh";
+  const effectiveThemeMode = useEffectiveThemeMode();
   const workspaceName = useMemo(() => {
     if (!currentWorkspace) return "";
     return currentWorkspace.split("/").filter(Boolean).pop() || currentWorkspace;
@@ -1019,7 +1021,7 @@ export default function FilePanel({ width, onStartResizing }: FilePanelProps) {
               fileCategory={effectiveCategory}
               fileLang={fileLang}
               fileName={fileName}
-              themeMode={config.themeMode}
+              themeMode={effectiveThemeMode}
               uiLanguage={language}
               onClose={clearFileViewer}
               onLoadNextWindow={loadNextFileViewerWindow}

@@ -28,6 +28,7 @@ import {
 } from "../lib/thoughtDisplay";
 import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
 import { isRuntimeV2ValidationAttempt, normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
 import { buildInterimCommentaryHistory, trimRepeatedInterimCommentary } from "../lib/runtime-v2/interimCommentary";
@@ -499,7 +500,7 @@ function TurnSummaryCard({
 
 function ContextCompressionNotice({ block, language }: { block: any; language: "zh" | "en" }) {
   const [isExpanded, setIsExpanded] = useState(false);
-  const themeMode = useAppStore((s) => s.config.themeMode);
+  const themeMode = useEffectiveThemeMode();
   const isLightTheme = themeMode === "light";
   const isBlackTheme = themeMode === "black";
   const stats = block.contextCompression || {};
@@ -2565,8 +2566,9 @@ export default function ChatArea({
   onQuickReply,
 }) {
   const language = config.language === "en" ? "en" : "zh";
-  const isLightThemeMode = config.themeMode === "light";
-  const isBlackThemeMode = config.themeMode === "black";
+  const effectiveThemeMode = useEffectiveThemeMode();
+  const isLightThemeMode = effectiveThemeMode === "light";
+  const isBlackThemeMode = effectiveThemeMode === "black";
   const resolvedChatFontSize = Math.min(20, Math.max(10, Number(config.chatFontSize) || 13));
   const resolvedTurnProcessFontSize = resolveTurnProcessFontSize(resolvedChatFontSize);
   const copy = useMemo(() => ({
@@ -4160,7 +4162,7 @@ export default function ChatArea({
     const proposalCheckpointBlock = hasProposalCheckpoint ? blocks[proposalBlockIndex] : null;
     const proposalApprovalBlock = approvalBlockIndex >= 0 ? blocks[approvalBlockIndex] : null;
     const displayTurnTitle = turnPresentation.title;
-    const isLightThemeMode = config.themeMode === "light";
+    const isLightThemeMode = effectiveThemeMode === "light";
     const processItemCount = Math.max(0, collapsedProcessCount);
     const canToggleProcess = processItemCount > 0;
     const turnHeaderClass = "turn-state-anchor flex w-full items-center justify-between gap-4 rounded-xl border px-3 py-2 text-left transition-colors";
@@ -4484,7 +4486,7 @@ export default function ChatArea({
                 status={turnPresentation.statusLabel}
                 statusToneClass={getTurnStatusTone(turnPresentation.status)}
                 language={language}
-                themeMode={config.themeMode}
+                themeMode={effectiveThemeMode}
                 chatFontSize={resolvedChatFontSize}
                 planTasks={[]}
                 planStage="idle"
@@ -4713,7 +4715,7 @@ export default function ChatArea({
     <PlanReviewCapsule
       request={planReviewActionRequest}
       language={language}
-      themeMode={config.themeMode}
+      themeMode={effectiveThemeMode}
       onOpenPlan={() => openRightPanelTab("plan")}
       opensApprovalDialog={Boolean(openApprovalDialog)}
       onApprove={openApprovalDialog || (() => approvePlan(undefined, planReviewActionRequest))}
@@ -4742,7 +4744,7 @@ export default function ChatArea({
       status={copy.turnStatusLabels.awaiting_input || (language === "zh" ? "待选择" : "Awaiting choice")}
       statusToneClass={getTurnStatusTone("awaiting_input")}
       language={language}
-      themeMode={config.themeMode}
+      themeMode={effectiveThemeMode}
       chatFontSize={resolvedChatFontSize}
       planTasks={[]}
       planStage="idle"
@@ -4786,7 +4788,7 @@ export default function ChatArea({
       status={capsuleStatusLabel}
       statusToneClass={getTurnStatusTone(capsuleControlTurnStatusKey || "awaiting_input")}
       language={language}
-      themeMode={config.themeMode}
+      themeMode={effectiveThemeMode}
       chatFontSize={resolvedChatFontSize}
       planTasks={shouldShowPinnedPlanTasks ? planTasks : []}
       planExecutionEvidenceLedger={shouldShowPinnedPlanTasks ? planExecutionEvidenceLedger : []}
@@ -4822,7 +4824,7 @@ export default function ChatArea({
         status={language === "zh" ? "待选择" : "Awaiting choice"}
         statusToneClass={getTurnStatusTone("awaiting_input")}
         language={language}
-        themeMode={config.themeMode}
+        themeMode={effectiveThemeMode}
         chatFontSize={resolvedChatFontSize}
         planTasks={[]}
         planStage="idle"

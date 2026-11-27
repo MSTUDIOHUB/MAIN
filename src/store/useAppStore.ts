@@ -449,6 +449,12 @@ import {
   normalizeToolPermissionPolicy,
   isRiskAutoExecutable,
 } from "../lib/toolCapabilities";
+import {
+  CLASSIC_ACCENT_SWATCHES,
+  deriveThemePalette,
+  normalizeThemeConfigFields,
+  resolveEffectiveThemeMode,
+} from "../lib/themePresets";
 import type {
   AppConfig,
   Lang,
@@ -693,9 +699,21 @@ export const translations = {
     chatFontSize: "Chat Font Size",
     chatFontSizeDesc: "Adjust the text size in the chat area (10–20 px).",
     themeMode: "Appearance",
+    themeModeSystem: "System",
     themeModeDark: "Dark",
     themeModeBlack: "Black",
     themeModeLight: "Light",
+    lightThemeCard: "Light Theme",
+    darkThemeCard: "Dark Theme",
+    blackThemeCard: "Black Theme",
+    themePreset: "Preset",
+    themeBackground: "Background",
+    themeForeground: "Foreground",
+    themeAccent: "Accent",
+    themeCodePreview: "Code Preview",
+    themeCustomPreset: "Custom",
+    themeActiveBadge: "Active",
+    themeResetPreset: "Reset",
     switchPersona: "Switch Persona",
     runMode: "Run Mode",
     main_mode: "MAIN",
@@ -795,9 +813,21 @@ export const translations = {
     chatFontSize: "聊天区域文字大小",
     chatFontSizeDesc: "调整聊天区域的文字显示大小（10–20 px）。",
     themeMode: "外观模式",
+    themeModeSystem: "跟随系统",
     themeModeDark: "深色",
     themeModeBlack: "黑色",
     themeModeLight: "浅色",
+    lightThemeCard: "浅色主题",
+    darkThemeCard: "深色主题",
+    blackThemeCard: "黑色主题",
+    themePreset: "预设配色",
+    themeBackground: "背景色",
+    themeForeground: "前景色",
+    themeAccent: "强调色",
+    themeCodePreview: "代码预览",
+    themeCustomPreset: "自定义",
+    themeActiveBadge: "当前生效",
+    themeResetPreset: "重置",
     switchPersona: "切换执行角色",
     runMode: "工作方式",
     main_mode: "MAIN",
@@ -884,20 +914,14 @@ export const translations = {
 export type TranslationKey = keyof typeof translations.en;
 
 export function normalizeThemeMode(value: unknown): ThemeMode {
-  return value === "light" || value === "dark" || value === "black" ? value : "dark";
+  return value === "system" || value === "light" || value === "dark" || value === "black"
+    ? value
+    : "dark";
 }
 
 // ── Themes ───────────────────────────────────────────────────────────
 
-export const THEMES = {
-  blue:   { accent: '#007acc', hover: '#005f9e', light: '#3b82f6', subtle: 'rgba(0,122,204,0.15)',   subtleBorder: 'rgba(0,122,204,0.3)',   contrast: '#ffffff', name: 'VS Code Blue' },
-  purple: { accent: '#9333ea', hover: '#7e22ce', light: '#a855f7', subtle: 'rgba(147,51,234,0.15)',  subtleBorder: 'rgba(147,51,234,0.3)',  contrast: '#ffffff', name: 'Amethyst' },
-  green:  { accent: '#059669', hover: '#047857', light: '#10b981', subtle: 'rgba(5,150,105,0.15)',   subtleBorder: 'rgba(5,150,105,0.3)',   contrast: '#ffffff', name: 'Matrix Green' },
-  yellow: { accent: '#ca8a04', hover: '#a16207', light: '#eab308', subtle: 'rgba(202,138,4,0.15)',   subtleBorder: 'rgba(202,138,4,0.3)',   contrast: '#111827', name: 'Sublime Gold' },
-  rose:   { accent: '#e11d48', hover: '#be123c', light: '#fb7185', subtle: 'rgba(225,29,72,0.15)',   subtleBorder: 'rgba(225,29,72,0.3)',   contrast: '#ffffff', name: 'Ruby Red' },
-  hermesOrange: { accent: '#F37021', hover: '#D85F16', light: '#FB923C', subtle: 'rgba(243,112,33,0.15)', subtleBorder: 'rgba(243,112,33,0.32)', contrast: '#111827', name: 'Hermes Orange' },
-  tiffanyBlue: { accent: '#81D8D0', hover: '#5EC7BD', light: '#A8EEE8', subtle: 'rgba(129,216,208,0.16)', subtleBorder: 'rgba(129,216,208,0.34)', contrast: '#063433', name: 'Tiffany Blue' },
-} as const;
+export const THEMES = CLASSIC_ACCENT_SWATCHES;
 
 // ── Domain Types ─────────────────────────────────────────────────────
 
@@ -16852,6 +16876,10 @@ export const useAppStore = create<AppState>()(
               ? (persistedConfig as any).promptLanguageStrategy
               : current.config.promptLanguageStrategy,
           themeMode: normalizeThemeMode((persistedConfig as any).themeMode),
+          ...normalizeThemeConfigFields(
+            persistedConfig as Record<string, unknown>,
+            (persistedConfig as any).theme,
+          ),
           appIconVariant: normalizeAppIconVariant((persistedConfig as any).appIconVariant),
           toolPermissionPolicy: normalizeToolPermissionPolicy((persistedConfig as any).toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
@@ -17201,8 +17229,22 @@ export const useT = () => {
 };
 
 export const useTheme = () => {
+  const themeMode = useAppStore((s) => s.config.themeMode);
+  const lightTheme = useAppStore((s) => s.config.lightTheme);
+  const darkTheme = useAppStore((s) => s.config.darkTheme);
+  const blackTheme = useAppStore((s) => s.config.blackTheme);
   const themeKey = useAppStore((s) => s.config.theme);
-  return THEMES[themeKey] ?? THEMES.purple;
+  const systemPrefersLight =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-color-scheme: light)").matches;
+  return deriveThemePalette({
+    effectiveMode: resolveEffectiveThemeMode(themeMode, systemPrefersLight),
+    lightTheme,
+    darkTheme,
+    blackTheme,
+    legacyThemeKey: themeKey,
+  }).accentTokens;
 };
 
 export {

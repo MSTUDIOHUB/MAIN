@@ -4,6 +4,12 @@ import {
   sanitizeTaskBlocksForPersist,
   useAppStore,
 } from "../store/useAppStore";
+import {
+  CLASSIC_ACCENT_SWATCHES,
+  normalizeThemeConfigFields,
+  resolveMatchingPresetId,
+  type ClassicAccentKey,
+} from "./themePresets";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import {
   extractPlanTasks,
@@ -512,6 +518,14 @@ function bindBridgeSnapshot(scenario: string) {
         .map((block) => block.selectedOption)
         .filter(Boolean),
       themeMode: state.config.themeMode,
+      effectiveThemeMode:
+        state.config.themeMode === "system"
+          ? (typeof window !== "undefined" &&
+              typeof window.matchMedia === "function" &&
+              window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark")
+          : state.config.themeMode,
 
 
       activeActionRequestKind: state.activeActionRequest?.kind ?? null,
@@ -523,17 +537,49 @@ function bindBridgeSnapshot(scenario: string) {
       seedCount: readSeedCount(scenario),
     };
   };
-  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
+  bridge.setThemeMode = (mode: "system" | "light" | "dark" | "black") => {
     useAppStore.getState().setConfig((prev) => ({
       ...prev,
       themeMode: mode,
     }));
   };
   bridge.setTheme = (theme: string) => {
-    useAppStore.getState().setConfig((prev) => ({
-      ...prev,
-      theme: theme as any,
-    }));
+    useAppStore.getState().setConfig((prev) => {
+      const swatch =
+        theme in CLASSIC_ACCENT_SWATCHES
+          ? CLASSIC_ACCENT_SWATCHES[theme as ClassicAccentKey]
+          : null;
+      if (!swatch) {
+        return {
+          ...prev,
+          theme: theme as any,
+        };
+      }
+      const normalized = normalizeThemeConfigFields(prev as any, theme);
+      const nextLight = {
+        ...normalized.lightTheme,
+        accent: swatch.accent,
+      };
+      const nextDark = {
+        ...normalized.darkTheme,
+        accent: swatch.accent,
+      };
+      return {
+        ...prev,
+        theme: theme as any,
+        lightTheme: {
+          ...nextLight,
+          preset: resolveMatchingPresetId("light", nextLight),
+        },
+        darkTheme: {
+          ...nextDark,
+          preset: resolveMatchingPresetId("dark", nextDark),
+        },
+        blackTheme: {
+          accent: swatch.accent,
+        },
+      };
+    });
   };
   bindCloudServerBridgeControls();
 }
@@ -7944,7 +7990,7 @@ function seedComposerMainShortcutsScenario() {
     });
   };
 
-  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
+  bridge.setThemeMode = (mode: "system" | "light" | "dark" | "black") => {
     useAppStore.setState((state) => ({
       config: { ...state.config, themeMode: mode },
     }));
@@ -8761,7 +8807,7 @@ function seedRealOmlxPlanFlowScenario() {
   bridge.rejectPendingTool = () => useAppStore.getState().resolveReview("reject");
   bridge.structuredChoiceSnapshot = () => JSON.parse(JSON.stringify(useAppStore.getState().activeActionRequest || null));
   bridge.sendRealMessage = (text: string, options: any = {}) => useAppStore.getState().sendMessage(text, undefined, options);
-  bridge.setThemeMode = (mode: "light" | "dark" | "black") =>
+  bridge.setThemeMode = (mode: "system" | "light" | "dark" | "black") =>
     useAppStore.getState().setConfig({ themeMode: mode });
   bridge.prepareReadOnlyChat = (web: boolean, provider: "duckduckgo" | "bing" | "baidu" = "bing") => {
     applyRealOmlxWorkspaceFixture();
@@ -9908,7 +9954,7 @@ function seedCloudToolProtocolScenario(scenario: string) {
     selectedDiffTaskId: null,
   }));
 
-  bridge.setThemeMode = (mode: "light" | "dark" | "black") => {
+  bridge.setThemeMode = (mode: "system" | "light" | "dark" | "black") => {
     useAppStore.setState((state) => ({
       config: { ...state.config, themeMode: mode },
     }));

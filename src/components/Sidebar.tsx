@@ -17,6 +17,7 @@ import {
 } from "./Icons";
 import { createPortal } from "react-dom";
 import { GLOBAL_CHAT_KEY, resolveSessionWorkspaceKey, useAppStore, type WorkspaceEntry } from "../store/useAppStore";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import { looksLikeReasoningLeakTitle, normalizeConversationDisplayTitle } from "../lib/workflowModels";
 import { getGitStatus, getGitDiff, gitCommitAll, gitCreateBranch, gitPushCurrentBranch, type GitStatus } from "../lib/ipc";
 import { generateGitCommitMessage } from "../lib/gitCommitMessage";
@@ -787,8 +788,9 @@ export default function Sidebar({
   };
 
   const sortedGlobalSessions = sortSessions(globalSessions);
-  const isBlackTheme = config.themeMode === "black";
-  const isLightTheme = config.themeMode === "light";
+  const effectiveThemeMode = useEffectiveThemeMode();
+  const isBlackTheme = effectiveThemeMode === "black";
+  const isLightTheme = effectiveThemeMode === "light";
 
   const gitMenuThemeClasses: GitMenuThemeClasses = useMemo(() => {
     if (isBlackTheme) {
@@ -813,16 +815,16 @@ export default function Sidebar({
     }
     if (isLightTheme) {
       return {
-        bg: "bg-white",
-        border: "border-[#d4d4d9]",
-        text: "text-[#18181b]",
-        hover: "hover:bg-[#f4f4f5]",
-        subtleText: "text-[#71717a]",
-        mutedText: "text-[#52525b]",
-        inputBg: "bg-[#fafafa]",
-        divider: "border-[#e4e4e7]",
-        strongText: "text-[#111827]",
-        lineText: "text-[#27272a]",
+        bg: "bg-[var(--surface-2)]",
+        border: "border-[var(--surface-border)]",
+        text: "text-[var(--surface-text)]",
+        hover: "hover:bg-[var(--surface-3)]",
+        subtleText: "text-[var(--surface-text-subtle)]",
+        mutedText: "text-[var(--surface-text-muted)]",
+        inputBg: "bg-[var(--surface-1)]",
+        divider: "border-[var(--surface-border-soft)]",
+        strongText: "text-[var(--surface-text-strong)]",
+        lineText: "text-[var(--surface-text)]",
         dangerText: "text-[#b91c1c]",
         successText: "text-[#047857]",
         warningText: "text-[#a16207]",
@@ -833,16 +835,16 @@ export default function Sidebar({
     }
     // dark (default)
     return {
-      bg: "bg-[#202022]",
-      border: "border-[#3f3f46]",
-      text: "text-[#e4e4e7]",
-      hover: "hover:bg-[#27272a]",
-      subtleText: "text-[#71717a]",
-      mutedText: "text-[#a1a1aa]",
-      inputBg: "bg-[#111113]",
-      divider: "border-[#3f3f46]",
-      strongText: "text-[#f4f4f5]",
-      lineText: "text-[#d4d4d8]",
+      bg: "bg-[var(--surface-2)]",
+      border: "border-[var(--surface-border)]",
+      text: "text-[var(--surface-text)]",
+      hover: "hover:bg-[var(--surface-3)]",
+      subtleText: "text-[var(--surface-text-subtle)]",
+      mutedText: "text-[var(--surface-text-muted)]",
+      inputBg: "bg-[var(--surface-1)]",
+      divider: "border-[var(--surface-border-soft)]",
+      strongText: "text-[var(--surface-text-strong)]",
+      lineText: "text-[var(--surface-text)]",
       dangerText: "text-[#fca5a5]",
       successText: "text-[#86d9a3]",
       warningText: "text-[#facc15]",

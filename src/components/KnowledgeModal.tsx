@@ -21,6 +21,7 @@ import {
 } from "../lib/ipc";
 import { normalizeWebSearchProvider } from "../lib/networkRead";
 import { useAppStore } from "../store/useAppStore";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import ToggleSwitch from "./ToggleSwitch";
 import KnowledgeEvidence from "./KnowledgeEvidence";
 import {
@@ -115,7 +116,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
   currentWorkspace?: string;
 }) {
   const language = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
-  const themeMode = useAppStore((s) => s.config.themeMode) || "dark";
+  const themeMode = useEffectiveThemeMode();
   const isLight = themeMode === "light";
   const isBlack = themeMode === "black";
   const copy = COPY[language];

@@ -16,6 +16,7 @@ import {
   createDefaultToolPermissionPolicy,
 } from "./toolCapabilities";
 import { createDefaultImAdaptersConfig } from "./imAdapters";
+import { getDefaultBlackThemeConfig, getDefaultThemeVariantConfig } from "./themePresets";
 
 export const CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE = false;
 
@@ -34,6 +35,9 @@ export function createDefaultAppConfig(): AppConfig {
     responseLanguagePolicy: "follow_input_language",
     theme: "purple",
     themeMode: "dark",
+    lightTheme: getDefaultThemeVariantConfig("light"),
+    darkTheme: getDefaultThemeVariantConfig("dark"),
+    blackTheme: getDefaultBlackThemeConfig(),
     appIconVariant: "dark",
     workflowMode: "chat",
     promptLanguageStrategy: "english_core_localized_output",

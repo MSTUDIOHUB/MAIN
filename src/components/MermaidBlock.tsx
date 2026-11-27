@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store/useAppStore";
+import { useActiveThemePalette } from "./useThemePalette";
 
 let mermaidModulePromise: Promise<typeof import("mermaid")["default"]> | null = null;
 let mermaidRenderId = 0;
@@ -12,88 +13,14 @@ function loadMermaid() {
   return mermaidModulePromise;
 }
 
-function getMermaidTheme(themeMode: "light" | "dark" | "black") {
-  const isLight = themeMode === "light";
-  const isBlack = themeMode === "black";
-
-  return {
-    startOnLoad: false,
-    securityLevel: "loose" as const,
-    theme: "base" as const,
-    fontFamily: "ui-sans-serif, system-ui, sans-serif",
-    themeVariables: isLight
-      ? {
-          darkMode: false,
-          background: "#ffffff",
-          primaryColor: "#f8fafc",
-          primaryBorderColor: "#94a3b8",
-          primaryTextColor: "#0f172a",
-          secondaryColor: "#eef2ff",
-          secondaryBorderColor: "#6366f1",
-          secondaryTextColor: "#312e81",
-          tertiaryColor: "#f5f3ff",
-          tertiaryBorderColor: "#8b5cf6",
-          tertiaryTextColor: "#4c1d95",
-          clusterBkg: "#f8fafc",
-          clusterBorder: "#cbd5e1",
-          lineColor: "#64748b",
-          edgeLabelBackground: "#ffffff",
-          mainBkg: "#ffffff",
-          nodeBorder: "#94a3b8",
-          fontFamily: "ui-sans-serif, system-ui, sans-serif",
-        }
-      : isBlack
-      ? {
-          darkMode: true,
-          background: "#000000",
-          primaryColor: "#070708",
-          primaryBorderColor: "#303038",
-          primaryTextColor: "#ffffff",
-          secondaryColor: "#08111f",
-          secondaryBorderColor: "#60a5fa",
-          secondaryTextColor: "#dbeafe",
-          tertiaryColor: "#15101f",
-          tertiaryBorderColor: "#a78bfa",
-          tertiaryTextColor: "#ede9fe",
-          clusterBkg: "#030304",
-          clusterBorder: "#202026",
-          lineColor: "#a5a5ae",
-          edgeLabelBackground: "#000000",
-          mainBkg: "#000000",
-          nodeBorder: "#303038",
-          fontFamily: "ui-sans-serif, system-ui, sans-serif",
-        }
-      : {
-          darkMode: true,
-          background: "#19191d",
-          primaryColor: "#202025",
-          primaryBorderColor: "#4a4a54",
-          primaryTextColor: "#f5f5f5",
-          secondaryColor: "#233041",
-          secondaryBorderColor: "#60a5fa",
-          secondaryTextColor: "#dbeafe",
-          tertiaryColor: "#31253c",
-          tertiaryBorderColor: "#a78bfa",
-          tertiaryTextColor: "#ede9fe",
-          clusterBkg: "#1d1d20",
-          clusterBorder: "#4a4a54",
-          lineColor: "#a1a1aa",
-          edgeLabelBackground: "#181818",
-          mainBkg: "#232327",
-          nodeBorder: "#5a5a66",
-          fontFamily: "ui-sans-serif, system-ui, sans-serif",
-        },
-  };
-}
-
 export default function MermaidBlock({ code, expanded = false }: { code: string; expanded?: boolean }) {
-  const themeMode = useAppStore((s) => s.config.themeMode);
+  const themePalette = useActiveThemePalette();
   const language = useAppStore((s) => s.config.language);
   const containerRef = useRef<HTMLDivElement>(null);
   const bindFunctionsRef = useRef<((element: Element) => void) | undefined>(undefined);
   const requestIdRef = useRef(0);
   const source = useMemo(() => code.trim(), [code]);
-  const cacheKey = `${themeMode}::${source}`;
+  const cacheKey = `${themePalette.signature}::${source}`;
   const [svg, setSvg] = useState(() => mermaidSvgCache.get(cacheKey)?.svg || "");
   const [isRendering, setIsRendering] = useState(() => Boolean(source) && !mermaidSvgCache.has(cacheKey));
   const [error, setError] = useState("");
@@ -125,7 +52,13 @@ export default function MermaidBlock({ code, expanded = false }: { code: string;
     const render = async () => {
       try {
         const mermaid = await loadMermaid();
-        mermaid.initialize(getMermaidTheme(themeMode));
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: "loose",
+          theme: "base",
+          fontFamily: "ui-sans-serif, system-ui, sans-serif",
+          themeVariables: themePalette.mermaidThemeVariables,
+        });
 
         const { svg: renderedSvg, bindFunctions } = await mermaid.render(
           `mermaid-diagram-${++mermaidRenderId}`,
@@ -153,7 +86,7 @@ export default function MermaidBlock({ code, expanded = false }: { code: string;
       disposed = true;
       window.clearTimeout(timerId);
     };
-  }, [cacheKey, source, themeMode]);
+  }, [cacheKey, source, themePalette.mermaidThemeVariables]);
 
   useEffect(() => {
     if (!svg || !containerRef.current) return;
