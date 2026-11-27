@@ -16,6 +16,7 @@ export interface ToolUiGroupBlock {
   intentSummary?: string;
   why?: string;
   content?: string;
+  visibility?: string;
   streaming?: boolean;
   hiddenProcess?: boolean;
   evidence?: string;
@@ -524,7 +525,7 @@ function isOperationCandidate(
 }
 
 function isTransparentOperationNarration(block: ToolUiGroupBlock): boolean {
-  if (block.type !== "agent" || block.streaming || block.hiddenProcess) return false;
+  if (block.type !== "agent" || block.streaming || block.hiddenProcess || block.visibility === "assistant_update") return false;
   return isThinModelToolNarration(String(block.content || ""));
 }
 
@@ -760,11 +761,15 @@ export function buildChatRenderSegments(input: BuildChatRenderSegmentsInput): Ch
     }
 
     if (block?.type === "agent" && !block.streaming && !block.hiddenProcess) {
-      const decision = dedupeModelFeedbackText(String(block.content || ""), feedbackState);
-      const nextIsOperation = index + 1 < blocks.length && isOperationCandidate(blocks[index + 1], input.completedToolGrouping);
-      if (decision.shouldSuppress || (decision.thinToolNarration && nextIsOperation && visibleNarrativeCount > 0)) {
-        index += 1;
-        continue;
+      // Runtime already admitted and deduplicated public progress. These
+      // updates are visible messages and delimit adjacent tool groups.
+      if (block.visibility !== "assistant_update") {
+        const decision = dedupeModelFeedbackText(String(block.content || ""), feedbackState);
+        const nextIsOperation = index + 1 < blocks.length && isOperationCandidate(blocks[index + 1], input.completedToolGrouping);
+        if (decision.shouldSuppress || (decision.thinToolNarration && nextIsOperation && visibleNarrativeCount > 0)) {
+          index += 1;
+          continue;
+        }
       }
       visibleNarrativeCount += 1;
     }

@@ -109,7 +109,7 @@ export function isValidRuntimeV2SubagentJob(
     !!job.scopeKey &&
     !!job.objective &&
     job.allowedPaths.length > 0 &&
-    (!job.proactiveKey || (!job.sourceToolCallId && job.accessMode === "read" && job.taskKind !== "implement")) &&
+    (!job.proactiveKey || (job.accessMode === "read" && job.taskKind !== "implement")) &&
     (
       job.taskKind === "implement"
         ? job.accessMode === "write" &&

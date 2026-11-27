@@ -1,6 +1,7 @@
 import { summarizeApplyPatchTarget } from "./applyPatchTool";
 import { formatPtyInputTarget } from "./ptyCommandRuntime";
 import { resolveWorkspaceMutationTargets } from "./workspaceMutationTools";
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL } from "./runtime-v2/workspaceReadPolicy";
 
 /** Derive a short display target from tool arguments. */
 export function getToolTarget(name: string, args: Record<string, unknown>): string {
@@ -50,6 +51,7 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "run_command": return (args.command as string) || "";
     case "browser_evaluate": return (args.url as string) || "";
     case "computer_use": return (args.app_name as string) || (args.appName as string) || (args.app as string) || "desktop app";
+    case ENABLE_UNITY_OFFICIAL_MCP_TOOL: return "Unity Official MCP";
     case "read_pty_buffer": return "terminal";
     case "read_pty_tail": return "terminal tail";
     case "read_pty_since": return `terminal @ ${args.offset ?? 0}`;

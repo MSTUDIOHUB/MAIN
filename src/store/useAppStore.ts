@@ -11,6 +11,7 @@ import type { ApprovedWorkPlanContinuationReference } from "../lib/runtime-v2/co
 import type { RuntimeV2PlanAuthority } from "../lib/runtime-v2/workPlan";
 import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
 import { retireRemovedFeatures } from "../lib/retiredFeatureMigration";
+import { createTerminalCredentialProjection } from "../lib/terminalCredentialHistory";
 import { resolveSessionModeAffinity, normalizeSessionModeAffinity, buildStandardSessionDefaultTitle, type SessionModeAffinity, type SessionModeAffinityLike } from "../lib/mainModes";
 import { captureNetworkRead, DEFAULT_WEB_SEARCH_PROVIDER, normalizeWebSearchProvider, type WebSearchProvider } from "../lib/networkRead";
 import { createRuntimeV2ExecutionBlockerView, resolveRuntimeV2ExecutionBlocker, resolveRuntimeV2StructuredUserChoice } from "./runtimeV2/executionBlocker";
@@ -62,6 +63,7 @@ import {
   closeHarnessRunMarkerForSessionDeletion,
   getHarnessActionRunId,
   getCurrentHarnessInstanceId,
+  matchesHarnessTerminalNotice,
   normalizeHarnessRunMarker,
   persistHarnessRunMarkerIfOwned,
   readHarnessRunMarker,
@@ -74,7 +76,7 @@ import { inspectGlobalSkillPackage, promoteLegacySkillPackage } from "../lib/ipc
 import { globalSkillPackageId, migrateLegacySkillRegistrations, upsertGlobalSkillRegistration } from "../lib/globalSkillPackages";
 import { applyGithubSkillPackageCandidate, type GithubSkillUpdateCandidate, type GithubSkillUpdateResult } from "../lib/githubSkillUpdates";
 import { normalizeGithubSkillSource } from "../lib/githubSkillSource";
-import { bindWorkspaceUnityMcpView, resolveWorkspaceMcpView } from "../lib/workspaceMcp";
+import { bindWorkspaceUnityCliConsole, bindWorkspaceUnityMcpView, bindWorkspaceUnityOfficialMcp, resolveWorkspaceMcpView } from "../lib/workspaceMcp";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
@@ -417,6 +419,8 @@ import {
   normalizeApprovedPlanTaskStatuses,
 } from "./submitApprovedPlanExecution";
 import { runIntentPreflight } from "../lib/intentPreflight";
+import { runIntentFirstResponse, supportsOmlxFirstResponse } from "../lib/intentFirstResponse";
+import { hasExplicitSkillInvocation } from "../lib/agentSkills";
 import { scheduleRuntimeTask } from "../lib/runtimeScheduling";
 import {
   cancelSubagentRun,
@@ -445,6 +449,12 @@ import {
   normalizeToolPermissionPolicy,
   isRiskAutoExecutable,
 } from "../lib/toolCapabilities";
+import {
+  CLASSIC_ACCENT_SWATCHES,
+  deriveThemePalette,
+  normalizeThemeConfigFields,
+  resolveEffectiveThemeMode,
+} from "../lib/themePresets";
 import type {
   AppConfig,
   Lang,
@@ -689,9 +699,21 @@ export const translations = {
     chatFontSize: "Chat Font Size",
     chatFontSizeDesc: "Adjust the text size in the chat area (10–20 px).",
     themeMode: "Appearance",
+    themeModeSystem: "System",
     themeModeDark: "Dark",
     themeModeBlack: "Black",
     themeModeLight: "Light",
+    lightThemeCard: "Light Theme",
+    darkThemeCard: "Dark Theme",
+    blackThemeCard: "Black Theme",
+    themePreset: "Preset",
+    themeBackground: "Background",
+    themeForeground: "Foreground",
+    themeAccent: "Accent",
+    themeCodePreview: "Code Preview",
+    themeCustomPreset: "Custom",
+    themeActiveBadge: "Active",
+    themeResetPreset: "Reset",
     switchPersona: "Switch Persona",
     runMode: "Run Mode",
     main_mode: "MAIN",
@@ -702,19 +724,17 @@ export const translations = {
     mcpServers: "MCP Servers",
     mcpScanTools: "Scan Tools",
     mcpScanning: "Scanning...",
-    mcpDescription: "Configure MCP (Model Context Protocol) servers so MAIN can connect to external tools or engines. HTTP transport is supported.",
-    mcpNoServersConfigured: "No MCP servers configured",
-    mcpNoServersHint: "Use Add Server below to connect an external engine",
+    mcpNoServersConfigured: "No HTTP MCP servers",
+    mcpNoServersHint: "Use the plus button to add a server",
     mcpRemoveServer: "Remove",
-    mcpAddServer: "Add Server",
+    mcpAddServer: "Add HTTP MCP Server",
     mcpServerNamePlaceholder: "Name (for example unityMCP)",
     mcpAdd: "Add",
     mcpDiscoveredTools: "Discovered Tools",
-    mcpDiscoveredMessage: "Discovered {toolCount} tool(s) from {serverCount} server(s)",
-    mcpNoServers: "No MCP servers configured",
-    mcpNoTools: "No tools found. Check whether the servers are online.",
-    mcpDiscoveryFailedMessage: "Discovery failed: {message}",
-    mcpTip: "Start the MCP server and make sure it is listening on the configured port, then click Scan Tools. Discovered tools become available to the AI automatically. Unity MCP defaults to",
+    mcpDiscoveredMessage: "Discovered {toolCount} tool(s) from {serverCount} HTTP MCP server(s)",
+    mcpNoServers: "Enable an MCP service before scanning.",
+    mcpNoTools: "No HTTP MCP tools found. Check whether the enabled servers are online.",
+    mcpDiscoveryFailedMessage: "HTTP MCP scan failed ({message})",
     instructionsHooks: "Instructions & Hooks",
     about: "About",
     currentVersion: "Current Version",
@@ -793,9 +813,21 @@ export const translations = {
     chatFontSize: "聊天区域文字大小",
     chatFontSizeDesc: "调整聊天区域的文字显示大小（10–20 px）。",
     themeMode: "外观模式",
+    themeModeSystem: "跟随系统",
     themeModeDark: "深色",
     themeModeBlack: "黑色",
     themeModeLight: "浅色",
+    lightThemeCard: "浅色主题",
+    darkThemeCard: "深色主题",
+    blackThemeCard: "黑色主题",
+    themePreset: "预设配色",
+    themeBackground: "背景色",
+    themeForeground: "前景色",
+    themeAccent: "强调色",
+    themeCodePreview: "代码预览",
+    themeCustomPreset: "自定义",
+    themeActiveBadge: "当前生效",
+    themeResetPreset: "重置",
     switchPersona: "切换执行角色",
     runMode: "工作方式",
     main_mode: "MAIN",
@@ -806,19 +838,17 @@ export const translations = {
     mcpServers: "MCP 服务器",
     mcpScanTools: "扫描工具",
     mcpScanning: "扫描中...",
-    mcpDescription: "配置 MCP (Model Context Protocol) 服务器，让 MAIN 可以连接外部工具或引擎。支持 HTTP 传输协议。",
-    mcpNoServersConfigured: "暂无 MCP 服务器配置",
-    mcpNoServersHint: "点击下方「添加服务器」连接外部引擎",
+    mcpNoServersConfigured: "暂无 HTTP MCP 服务器",
+    mcpNoServersHint: "点击右上角的＋添加服务器",
     mcpRemoveServer: "移除",
-    mcpAddServer: "添加服务器",
+    mcpAddServer: "添加 HTTP MCP 服务器",
     mcpServerNamePlaceholder: "名称 (如 unityMCP)",
     mcpAdd: "添加",
     mcpDiscoveredTools: "已发现的工具",
-    mcpDiscoveredMessage: "已发现 {toolCount} 个工具（来自 {serverCount} 个服务器）",
-    mcpNoServers: "尚未配置 MCP 服务器",
-    mcpNoTools: "未发现任何工具，请检查服务器是否在线",
-    mcpDiscoveryFailedMessage: "发现失败：{message}",
-    mcpTip: "MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为",
+    mcpDiscoveredMessage: "从 {serverCount} 个 HTTP MCP 服务器发现 {toolCount} 个工具",
+    mcpNoServers: "请先启用要扫描的 MCP 服务。",
+    mcpNoTools: "HTTP MCP 未发现工具。请检查已启用的服务器是否在线。",
+    mcpDiscoveryFailedMessage: "HTTP MCP 扫描失败（{message}）",
     instructionsHooks: "指令与 Hooks",
     about: "关于",
     currentVersion: "当前版本",
@@ -884,20 +914,14 @@ export const translations = {
 export type TranslationKey = keyof typeof translations.en;
 
 export function normalizeThemeMode(value: unknown): ThemeMode {
-  return value === "light" || value === "dark" || value === "black" ? value : "dark";
+  return value === "system" || value === "light" || value === "dark" || value === "black"
+    ? value
+    : "dark";
 }
 
 // ── Themes ───────────────────────────────────────────────────────────
 
-export const THEMES = {
-  blue:   { accent: '#007acc', hover: '#005f9e', light: '#3b82f6', subtle: 'rgba(0,122,204,0.15)',   subtleBorder: 'rgba(0,122,204,0.3)',   contrast: '#ffffff', name: 'VS Code Blue' },
-  purple: { accent: '#9333ea', hover: '#7e22ce', light: '#a855f7', subtle: 'rgba(147,51,234,0.15)',  subtleBorder: 'rgba(147,51,234,0.3)',  contrast: '#ffffff', name: 'Amethyst' },
-  green:  { accent: '#059669', hover: '#047857', light: '#10b981', subtle: 'rgba(5,150,105,0.15)',   subtleBorder: 'rgba(5,150,105,0.3)',   contrast: '#ffffff', name: 'Matrix Green' },
-  yellow: { accent: '#ca8a04', hover: '#a16207', light: '#eab308', subtle: 'rgba(202,138,4,0.15)',   subtleBorder: 'rgba(202,138,4,0.3)',   contrast: '#111827', name: 'Sublime Gold' },
-  rose:   { accent: '#e11d48', hover: '#be123c', light: '#fb7185', subtle: 'rgba(225,29,72,0.15)',   subtleBorder: 'rgba(225,29,72,0.3)',   contrast: '#ffffff', name: 'Ruby Red' },
-  hermesOrange: { accent: '#F37021', hover: '#D85F16', light: '#FB923C', subtle: 'rgba(243,112,33,0.15)', subtleBorder: 'rgba(243,112,33,0.32)', contrast: '#111827', name: 'Hermes Orange' },
-  tiffanyBlue: { accent: '#81D8D0', hover: '#5EC7BD', light: '#A8EEE8', subtle: 'rgba(129,216,208,0.16)', subtleBorder: 'rgba(129,216,208,0.34)', contrast: '#063433', name: 'Tiffany Blue' },
-} as const;
+export const THEMES = CLASSIC_ACCENT_SWATCHES;
 
 // ── Domain Types ─────────────────────────────────────────────────────
 
@@ -1090,6 +1114,8 @@ export interface Session {
   runtimeSnapshot?: SessionRuntimeSnapshot;
   /** SQLite-owned CAS revision returned by Project Session persistence. */
   storageRevision?: number;
+  /** Retains legacy browser details until their exact native import commits. */
+  _retirementMigrationPending?: boolean;
   storageStatus?: "ok" | "missing" | "temporary";
   transcriptPartial?: boolean;
   transcriptLoadedTurns?: number;
@@ -1594,6 +1620,9 @@ export interface AppState {
       resolvedIntent?: ResolvedUserIntent;
       explicitIntent?: ResolvedUserIntent;
       semanticIntent?: SemanticTaskIntent;
+      preparedChatAnswer?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+      preparedWorkspaceRead?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+      sourceInvestigationTurnId?: string;
       runtimeIntentOverride?: ResolvedUserIntent;
       forceExecuteRecoveryMode?: ExecuteRecoveryMode;
       forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -3609,6 +3638,7 @@ export function normalizeSessionRuntimeSnapshot(
     workspacePath?: string | null;
     expectedSessionKey?: string | null;
     expectedSessionEpoch?: string | null;
+    language?: "zh" | "en";
     /** True only while hydrating a persisted snapshot after process loss. */
     coldRestore?: boolean;
   },
@@ -3872,7 +3902,7 @@ export function normalizeSessionRuntimeSnapshot(
       executionCheckpoint.owner.sessionKey === restoredLifecycleSessionKey &&
       executionCheckpoint.aggregate.run?.identity.runId === restoredHarnessRunMarker?.runId &&
       !executionCheckpoint.aggregate.run?.blocker?.decision
-    ? createRuntimeV2ExecutionBlockerView(executionCheckpoint.aggregate, "zh", Math.max(0, ...rawTaskFlow.map(block => block.id)) + 1)
+    ? createRuntimeV2ExecutionBlockerView(executionCheckpoint.aggregate, options?.language ?? "zh", Math.max(0, ...rawTaskFlow.map(block => block.id)) + 1)
     : null;
   if (executionChoice) {
     const { request } = executionChoice;
@@ -3888,7 +3918,7 @@ export function normalizeSessionRuntimeSnapshot(
       (block.choiceRequest.parentRunId ?? null) === (request.parentRunId ?? null));
     if (persistedIndex >= 0) {
       rawTaskFlow = rawTaskFlow.map((block, index) => index === persistedIndex && block.type === "agent"
-        ? { ...block, options: executionChoice.block.options, choiceRequest: request }
+        ? { ...block, content: executionChoice.block.content, options: executionChoice.block.options, choiceRequest: request }
         : block);
     } else {
       rawTaskFlow = [...rawTaskFlow, executionChoice.block];
@@ -5770,10 +5800,7 @@ function settleCanceledTurnHarnessProjection(
   if (
     latestMarker.status !== "running" &&
     latestMarker.status !== "paused" &&
-    (
-      latestMarker.status !== projectedMarker.status ||
-      latestMarker.closeReason !== projectedMarker.closeReason
-    )
+    !matchesHarnessTerminalNotice(latestMarker, projectedMarker)
   ) {
     logStoreEvent("canceled_turn_harness_terminal_conflict", {
       expected: exactOwner,
@@ -6224,10 +6251,13 @@ function getClosedSessionPanelPatch(): Partial<AppState> {
 function getSessionRuntimeUiPatch(
   runtime: SessionRuntimeState,
   options: { resetPanels?: boolean; requireTranscript?: boolean } = {},
+  projectHistory = createTerminalCredentialProjection(runtime),
 ): Partial<AppState> {
   const normalizedRuntime = {
     ...runtime,
-    taskFlow: archiveConsumedReplyOptionsFromTaskFlow(runtime.taskFlow || []),
+    taskFlow: projectHistory(archiveConsumedReplyOptionsFromTaskFlow(runtime.taskFlow || [])),
+    conversationTurns: projectHistory(runtime.conversationTurns),
+    agentMessages: projectHistory(runtime.agentMessages),
   };
   return options.resetPanels
     ? { ...normalizedRuntime, ...getClosedSessionPanelPatch() }
@@ -6259,6 +6289,7 @@ export function buildRestoredSessionRuntimePatch(input: {
     workspacePath: input.workspacePath ?? input.fallbackState.currentWorkspace,
     expectedSessionKey: input.expectedSessionKey,
     expectedSessionEpoch: input.expectedSessionEpoch,
+    language: input.fallbackState.config?.language === "en" ? "en" : "zh",
   });
   if (!normalized) return {};
   let taskFlow = normalized.taskFlow || [];
@@ -6320,7 +6351,7 @@ export function buildRestoredSessionRuntimePatch(input: {
   });
   return getSessionRuntimeUiPatch(runtime, {
     resetPanels: input.resetPanels === true,
-  });
+  }, createTerminalCredentialProjection(mergedSnapshot));
 }
 
 function hasSessionRuntimeTranscript(runtime: Partial<SessionRuntimeState> | null | undefined): boolean {
@@ -7996,11 +8027,13 @@ async function hydrateExistingPlanArtifactsForWorkspace(
       const fileName = path.split("/").pop()?.toLowerCase() || "";
       return fileNames.has(fileName);
     });
-    if (availablePaths.length === 0) {
+  } catch {
+    try {
+      await listDirectory("", workspace || undefined);
+      availablePaths = [];
+    } catch {
       availablePaths = [...PLAN_ARTIFACT_PATHS];
     }
-  } catch {
-    availablePaths = [...PLAN_ARTIFACT_PATHS];
   }
 
   return hydratePlanArtifactsFromReader(
@@ -9732,7 +9765,6 @@ export const useAppStore = create<AppState>()(
           },
         }));
         invalidateWorkspaceTreeCache();
-        void get().refreshMcpDiscovery();
         return get().refreshManagedProjectRules(stablePath)
           .then(() => get().refreshInstructionAndHookState())
           .finally(() => {
@@ -15035,6 +15067,9 @@ export const useAppStore = create<AppState>()(
     resolvedIntent?: ResolvedRunIntent;
     explicitIntent?: ResolvedUserIntent;
     semanticIntent?: SemanticTaskIntent;
+    preparedChatAnswer?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+    preparedWorkspaceRead?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+    sourceInvestigationTurnId?: string;
     runtimeIntentOverride?: ResolvedRunIntent;
     forceExecuteRecoveryMode?: ExecuteRecoveryMode;
     forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
@@ -15917,14 +15952,44 @@ export const useAppStore = create<AppState>()(
       startBlockingPreflight: (blockingPreflightEffect) => {
         void startSubmitBlockingPreflightEffect({
           effect: blockingPreflightEffect,
-          runIntentPreflight: (request) => runIntentPreflight({
-            ...request,
-            onDiagnostic: (diagnostic) => logStoreEvent("intent_preflight_rejected", {
+          runIntentPreflight: async (request) => {
+            const turnId = blockingPreflightEffect.originalOptions?.workspaceInstructionClaim?.turnId ?? null;
+            const onDiagnostic: NonNullable<Parameters<typeof runIntentPreflight>[0]["onDiagnostic"]> = (diagnostic) => logStoreEvent("intent_preflight_rejected", {
               sessionKey: blockingPreflightEffect.sendOriginSessionKey,
-              turnId: blockingPreflightEffect.originalOptions?.workspaceInstructionClaim?.turnId ?? null,
+              turnId,
               ...diagnostic,
-            }),
-          }),
+            });
+            const turnNetworkRead = state.conversationTurns.find((turn) => turn.id === turnId)?.networkRead;
+            const preceding = state.conversationTurns.slice().reverse().find((turn) => turn.id !== turnId && turn.uiVisibility !== "internal");
+            const findings = preceding?.durableContext?.finalAssistantAnswer || preceding?.summary;
+            const previousInvestigation = preceding && findings && ["success", "done"].includes(preceding.status) &&
+              resolveConversationTurnIntent(preceding) === "analyze"
+              ? { turnId: preceding.id, request: preceding.userPrompt, findings } : undefined;
+            if (supportsOmlxFirstResponse(request.config) && !request.explicitIntent && !remoteFeishu &&
+                !images?.length && !attachedFilesSnapshot.length &&
+                !options?.knowledgeReferencesSnapshot?.length &&
+                !hasExplicitSkillInvocation(request.input) &&
+                !(turnNetworkRead?.enabled ?? state.webSearchEnabled)) {
+              const recentConversation = state.conversationTurns.filter((turn) =>
+                turn.id !== turnId && turn.uiVisibility !== "internal" &&
+                (turn.durableContext?.finalAssistantAnswer || ["success", "done", "completed_with_changes"].includes(turn.status))
+              ).slice(-2).flatMap((turn) => [
+                { role: "user" as const, content: turn.userPrompt.slice(0, 1500) },
+                { role: "assistant" as const, content: (turn.durableContext?.finalAssistantAnswer || turn.summary || "").slice(0, 1500) },
+              ].filter(({ content }) => !!content.trim()));
+              const first = await runIntentFirstResponse({
+                ...request,
+                previousInvestigation,
+                recentConversation,
+                mentionedPaths: mentionSnapshot,
+                offerWorkspaceReads: !!mentionSnapshot.length || blockingPreflightEffect.resolution.intent === "analyze",
+                replyLanguage: preferredLanguage,
+                onOutcome: (outcome) => logStoreEvent("intent_first_response", { turnId, outcome }),
+              });
+              if (first || request.signal?.aborted) return first;
+            }
+            return runIntentPreflight({ ...request, previousInvestigation, onDiagnostic });
+          },
           getState: get,
           setState: set,
           isSessionRuntimeActive,
@@ -16400,6 +16465,9 @@ export const useAppStore = create<AppState>()(
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       effectiveRunIntent,
       semanticIntent: options?.semanticIntent,
+      preparedChatAnswer: options?.preparedChatAnswer,
+      preparedWorkspaceRead: options?.preparedWorkspaceRead,
+      sourceInvestigationTurnId: options?.sourceInvestigationTurnId,
       runtimeRunIntent,
 
 
@@ -16447,7 +16515,7 @@ export const useAppStore = create<AppState>()(
       getWorkspaceTree,
       refreshWorkspaceAdmission: async (workspace, userPrompt, options) => {
         if (workspace) await get().refreshManagedProjectRules(workspace);
-        const discovery = get().refreshMcpDiscovery();
+        const discovery = options?.includeMcp !== false ? get().refreshMcpDiscovery() : null;
         const admissionState = get();
         const freezeMcp = () => resolveWorkspaceMcpView({
           workspace,
@@ -16468,7 +16536,7 @@ export const useAppStore = create<AppState>()(
               { workspace, projectToUi: false, userPrompt },
             ),
             baseline: null,
-            mcpSnapshot: await bindWorkspaceUnityMcpView(freezeMcp(), undefined),
+            mcpSnapshot: discovery ? await bindWorkspaceUnityMcpView(freezeMcp(), undefined) : null,
             warnings: [],
           };
         }
@@ -16482,6 +16550,12 @@ export const useAppStore = create<AppState>()(
           includeProjectBaseline: options?.includeProjectBaseline,
           io: workspaceAdmissionIpcIo,
         });
+        if (!discovery) return {
+          instructions: snapshot.instructions,
+          baseline: snapshot.baseline,
+          mcpSnapshot: { workspace, mcpServers: [], mcpDiscoveredTools: [], mcpToolServerMap: {} },
+          warnings: snapshot.warnings.map((warning) => `${warning.code}: ${warning.message}`),
+        };
         await Promise.race([discovery, new Promise<void>(resolve => setTimeout(resolve, 800))]);
         const refreshedMetadata = options?.includeProjectBaseline === false
           ? await buildProjectBaselineContext({ workspace, io: projectBaselineIpcIo, metadataOnly: true }).catch(() => null)
@@ -16489,16 +16563,36 @@ export const useAppStore = create<AppState>()(
         const baseline = snapshot.baseline || (refreshedMetadata?.anchors.length ? refreshedMetadata : null);
         const editorVersion = baseline?.facts.runtimes.find(fact => fact.name === "unity")?.version;
         const mcpView = freezeMcp();
-        const mcpSnapshot = await Promise.race([
+        const boundMcp = await Promise.race([
           bindWorkspaceUnityMcpView(mcpView, editorVersion),
           new Promise<null>(resolve => setTimeout(() => resolve(null), 800)),
         ]) || await bindWorkspaceUnityMcpView(mcpView, undefined);
+        const officialVersion = editorVersion?.startsWith("6000.") &&
+          !baseline?.facts.runtimes.some(fact => fact.name === "tuanjie") ? editorVersion : undefined;
+        let officialMcpView = boundMcp;
+        if (officialVersion) {
+          if (get().config.unityOfficialMcpEnabled) {
+            try {
+              const official = await bindWorkspaceUnityOfficialMcp(boundMcp, officialVersion, AbortSignal.timeout(10_000));
+              if (get().config.unityOfficialMcpEnabled) officialMcpView = official;
+            } catch (error) {
+              logStoreEvent("workspace_unity_official_mcp_unavailable", { workspace, reason: String(error) });
+            }
+          } else {
+            officialMcpView = Object.freeze({ ...boundMcp, unityOfficialMcpOfferVersion: officialVersion });
+          }
+        }
+        const mcpSnapshot = await bindWorkspaceUnityCliConsole(officialVersion
+          ? Object.freeze({ ...officialMcpView, unityGameViewSupported: true })
+          : officialMcpView, editorVersion);
         logStoreEvent("workspace_mcp_admitted", {
           workspace,
           configured: mcpView.mcpServers.length,
           discovered: mcpView.mcpDiscoveredTools.length,
           admitted: mcpSnapshot.mcpDiscoveredTools.length,
           boundEditors: Object.keys(mcpSnapshot.unityBindings || {}).length,
+          unityOfficialMcp: !!mcpSnapshot.unityOfficialMcp,
+          unityCliConsole: !!mcpSnapshot.unityCliConsole,
         });
         return {
           instructions: snapshot.instructions,
@@ -16782,11 +16876,17 @@ export const useAppStore = create<AppState>()(
               ? (persistedConfig as any).promptLanguageStrategy
               : current.config.promptLanguageStrategy,
           themeMode: normalizeThemeMode((persistedConfig as any).themeMode),
+          ...normalizeThemeConfigFields(
+            persistedConfig as Record<string, unknown>,
+            (persistedConfig as any).theme,
+          ),
           appIconVariant: normalizeAppIconVariant((persistedConfig as any).appIconVariant),
           toolPermissionPolicy: normalizeToolPermissionPolicy((persistedConfig as any).toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
+          unityOfficialMcpEnabled: persistedConfig.unityOfficialMcpEnabled === true,
           sessionRecordingEnabled: (persistedConfig as any).sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           debugRecordFullTurnProcess: (persistedConfig as any).debugRecordFullTurnProcess === true,
+          experimentalOmlxFirstResponse: persistedConfig.experimentalOmlxFirstResponse === true,
           eventStreamMode: normalizeEventStreamMode(
             (persistedConfig as any).eventStreamMode,
             current.config.eventStreamMode,
@@ -17129,8 +17229,22 @@ export const useT = () => {
 };
 
 export const useTheme = () => {
+  const themeMode = useAppStore((s) => s.config.themeMode);
+  const lightTheme = useAppStore((s) => s.config.lightTheme);
+  const darkTheme = useAppStore((s) => s.config.darkTheme);
+  const blackTheme = useAppStore((s) => s.config.blackTheme);
   const themeKey = useAppStore((s) => s.config.theme);
-  return THEMES[themeKey] ?? THEMES.purple;
+  const systemPrefersLight =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-color-scheme: light)").matches;
+  return deriveThemePalette({
+    effectiveMode: resolveEffectiveThemeMode(themeMode, systemPrefersLight),
+    lightTheme,
+    darkTheme,
+    blackTheme,
+    legacyThemeKey: themeKey,
+  }).accentTokens;
 };
 
 export {

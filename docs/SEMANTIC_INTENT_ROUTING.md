@@ -1,10 +1,12 @@
 # Semantic task routing
 
-Natural-language requests use one tool-free semantic preflight before the existing submission handoff. A lexical `RunIntentResolution` is diagnostic context only. Its confidence, continuation phrases, operation metadata, and answer-format words cannot choose the final mode, approve a Plan, or resume execution.
+Natural-language requests normally use a tool-free semantic preflight before the existing submission handoff. A lexical `RunIntentResolution` is diagnostic context only. Its confidence, continuation phrases, operation metadata, and answer-format words cannot choose the final mode, approve a Plan, or resume execution.
 
 The semantic result separates the objective, work type, answer format, required capabilities, and current forbidden capabilities. It describes the task; it does not grant approval, paths, source leases, or completion evidence. The original current request remains the Turn's user input and runtime objective. The preceding request is supplied as reference context so semantic interpretation can recognize a follow-up without a lexical continuation gate. It applies only to an actual continuation; historical restrictions and routes do not automatically become current restrictions or authority.
 
 The `operate` label alone neither requires an effect nor conflicts with a read-only ceiling. Declared `workspace_write`, `command`, or `external_interaction` requirements select Execute; `workspace_read` without those requirements selects Analyze, and a capability-free `operate` result selects Respond. The existing `implement` mapping and explicit Plan/resume boundaries remain unchanged. All forbidden capabilities and individual approval requirements still apply.
+
+Natural-language Plan admission requires an explicit request for a plan or revision, grounded by `planRequestExcerpt` in the current request. Complex implementation stays in Execute. A request to implement the latest investigation can select its exact Turn as reference context. The runtime rechecks Session identity, workspace and source versions before it carries over any evidence.
 
 Explicit Composer modes and slash modes remain capability ceilings. Their natural-language body still receives semantic interpretation, including current restrictions. An Execute ceiling permits an answer-only request to remain an answer. A narrower explicit mode cannot be elevated by a model's capability suggestion. Debug commands, exact user-choice actions, and trusted internal resumptions retain their existing typed control paths.
 
@@ -26,4 +28,6 @@ Automatic workspace preparation is deferred when workspace reads require individ
 
 This follows the published [application-owned tool execution flow](https://developers.openai.com/api/docs/guides/function-calling#the-tool-calling-flow) and the independently enforced runtime boundaries described in the [Codex security cookbook](https://learn.chatgpt.com/docs/enterprise/security-cookbook). It makes no claim about Codex's private intent router.
 
-The first-response fusion phase is a separate compatibility evaluation. It must preserve the same semantic and permission contracts while allowing an ordinary direct answer or ordinary tool calls; it must not introduce a mandatory routing-tool ceremony.
+OMLX's experimental first-response switch is under the local provider's advanced compatibility settings and defaults off. It tries a single streamed request with one private `MAIN_INTENT` JSON record, followed by ordinary Chat text when applicable. The record can carry a bounded set of scoped read proposals for an investigation. Text and proposals enter the ordinary read-only provider port only after semantic validation and exact-owner admission. Read proposals pass the current schema, path, restrictions, review and executor checks. An invalid or ambiguous opening returns to semantic preflight on the same Turn. If already admitted Chat loses its stream, the ordinary empty-surface provider path completes the same Turn.
+
+Workspace Session identity carries no automatic read authority. A capability-free reply can remain in that Session with bounded visible history and no workspace preparation. Source snapshots and optional integration are resolved only when the admitted task uses them.

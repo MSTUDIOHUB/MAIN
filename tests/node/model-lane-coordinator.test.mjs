@@ -360,15 +360,14 @@ test("critical admission pressure queues the waiter safely without killing it an
   child.release();
 });
 
-test("optional streams wait below reserve while the parent progresses, then overlap at recovered capacity", { timeout: 8_000 }, async () => {
+test("optional streams skip memory pressure and two independent results can overlap their parent", { timeout: 8_000 }, async () => {
   lanes.resetModelLaneCoordinatorForTests();
   lanes.setModelLaneStaggerMsForTests(0);
   const config = localConfig();
   const gib = 1024 ** 3;
   let availableGb = 8.1;
-  let childAdmitted = false;
-  const wait = new AbortController();
   const logs = [];
+  const parentRunId = "repair-run";
   lanes.setModelLaneMemoryReaderForTests(async () => ({ total_bytes: 68.7 * gib, available_bytes: availableGb * gib }));
   const childPromise = lanes.acquireModelLane({
     config,
@@ -376,27 +375,30 @@ test("optional streams wait below reserve while the parent progresses, then over
     requestTokenBudget: 262_144,
     agentKind: "subagent",
     optionalOverlap: true,
-    signal: wait.signal,
+    parentRunId,
+    subagentId: "optional-skip",
     onDebugEvent: (event, data) => logs.push({ event, ...data }),
-  }).then(lease => { childAdmitted = true; return lease; });
+  });
+  const skipped = assert.rejects(childPromise, /memory_reserve/);
   const parent = await lanes.acquireModelLane({
     config,
     contextLimit: 262_144,
     requestTokenBudget: 262_144,
     agentKind: "parent",
+    parentRunId,
   });
   let child;
   let sibling;
   try {
     parent.markFirstToken();
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(childAdmitted, false);
-    assert.ok(logs.some(item => item.queueReason === "memory_reserve"));
-    availableGb = 10.2; // < reserve (6.87 + 4.0 = 10.87 GiB), but enough headroom (3.33 GiB >= 3.0 GiB) for 1 overlap probe
-    await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 262_144);
-    assert.equal(lanes.getModelLaneCapacityObservation(config).maxActiveSubagents, 1);
+    await skipped;
+    assert.ok(logs.some(item => item.decision === "skipped" && item.queueReason === "memory_reserve" && Number.isFinite(item.waitMs)));
     availableGb = 30;
-    child = await childPromise;
+    child = await lanes.acquireModelLane({
+      config, contextLimit: 262_144, requestTokenBudget: 262_144,
+      agentKind: "subagent", optionalOverlap: true, parentRunId, subagentId: "shader-one",
+      onDebugEvent: (event, data) => logs.push({ event, ...data }),
+    });
     child.markFirstToken();
     sibling = await lanes.acquireModelLane({
       config,
@@ -404,18 +406,33 @@ test("optional streams wait below reserve while the parent progresses, then over
       requestTokenBudget: 262_144,
       agentKind: "subagent",
       optionalOverlap: true,
+      parentRunId,
+      subagentId: "shader-two",
+      onDebugEvent: (event, data) => logs.push({ event, ...data }),
     });
     sibling.markFirstToken();
     const observed = lanes.getModelLaneCapacityObservation(config);
     assert.equal(observed.maxConfirmedOverlappingChildren, 2);
     assert.equal(observed.maxActiveSubagents, 7);
+    assert.deepEqual(logs.filter(item => item.decision === "admitted" && item.overlapsParent).map(item => item.subagentId),
+      ["shader-one", "shader-two"]);
   } finally {
-    wait.abort();
-    await childPromise.catch(() => {});
     sibling?.release();
     child?.release();
     parent.release();
   }
+});
+
+test("an explicit dependency can finish its model request after the parent releases its lane", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const config = localConfig(2);
+  const parentRunId = "r";
+  const selected = lanes.acquireModelLane({ config, agentKind: "subagent", parentRunId, subagentId: "s", optionalOverlap: true });
+  await new Promise(resolve => setImmediate(resolve));
+  lanes.promoteModelLaneSubagentDependency("another-run", "s");
+  lanes.promoteModelLaneSubagentDependency(parentRunId, "s");
+  const child = await selected;
+  child.release();
 });
 
 for (const failureMessage of ["OOM", "429 rate limited", "concurrency limit reached"]) {

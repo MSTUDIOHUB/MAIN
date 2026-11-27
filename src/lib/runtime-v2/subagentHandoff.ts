@@ -214,12 +214,16 @@ export function isValidRuntimeV2SubagentHandoffDelivery(input: {
   const completionEvidenceIds = completion?.type === "subagent.completed"
     ? completion.evidence.map((evidence) => evidence.id)
     : [];
+  const citedEvidenceIds = completion?.type === "subagent.completed" && completion.status === "completed"
+    ? completion.report?.findings.flatMap(finding => finding.evidenceIds) || [] : [];
   return Boolean(
     job &&
     completion &&
     evidenceIds &&
     event.contextEntryId === `child:${event.jobId}` &&
-    sameEvidenceIdSet(evidenceIds, completionEvidenceIds) &&
+    (job.proactiveKey && job.sourceToolCallId
+      ? evidenceIds.length > 0 && evidenceIds.every(id => completionEvidenceIds.includes(id) && citedEvidenceIds.includes(id))
+      : sameEvidenceIdSet(evidenceIds, completionEvidenceIds)) &&
     !state.events.some((candidate) =>
       candidate.type === "subagent.handoff_delivered" &&
       candidate.jobId === event.jobId

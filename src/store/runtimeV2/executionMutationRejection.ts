@@ -1,4 +1,21 @@
 import type { RuntimeV2MutationRecoveryExcerpt } from "./correctiveMutationPolicy";
+import type { RecoveryReadLease } from "../../lib/executeRecoveryTools";
+
+export const MUTATION_SOURCE_CHANGED_REASON = "mutation_source_changed";
+
+export function runtimeV2MutationSourceRefreshInstruction(input: {
+  target: string;
+  requestedRange?: RecoveryReadLease["requestedRange"];
+}): string {
+  const start = input.requestedRange?.startLine;
+  const end = input.requestedRange?.endLine;
+  const bounded = start && end && end >= start
+    ? { path: input.target, start_line: start, end_line: Math.min(end, start + 79) }
+    : null;
+  return bounded
+    ? `Refresh the exact source with read_file(${JSON.stringify(bounded)}). Use its current version and bytes to propose a smaller edit.`
+    : `Locate the relevant symbol in ${JSON.stringify(input.target)} and use read_file on the smallest relevant line range. Use its current version and bytes before proposing a new edit.`;
+}
 
 export function runtimeV2MutationLeaseRejectionReason(input: {
   readonly toolName: string;

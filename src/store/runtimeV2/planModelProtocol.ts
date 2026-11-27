@@ -1,4 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { buildRuntimeLanguageDirective } from "../../lib/languageContract";
 import { PLAN_CLARIFICATION_GUIDANCE, PLAN_QUESTION_TOOL } from "./planQuestionTool";
 import type { StreamResult } from "../../lib/streaming";
 import {
@@ -16,15 +17,16 @@ import {
 } from "../../lib/turnIntake";
 import { buildLoadSkillToolDefinition } from "../../lib/agentSkills";
 import { filterToCoreAndUnlockedTools } from "../../lib/toolSearch";
-import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES, RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { normalizeKnowledgeReferences, renderKnowledgeContextAnchor } from "../../lib/knowledgeReferences";
 import { containsProviderTextEnvelopePrompt } from "./executionProviderContext";
 import { buildRuntimeV2TextEnvelopeCatalog } from "./executionProviderTools";
 import { renderPlanSkillContext } from "./planSkillContext";
-import { unityMcpObservationTools, UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
+import { workspaceEditorObservationTools } from "../../lib/workspaceMcp";
+import { SUBMIT_WORK_PLAN_TOOL, SUBMIT_WORK_PLAN_TOOL_NAME } from "./planSubmissionToolSchema";
 
-export const SUBMIT_WORK_PLAN_TOOL_NAME = "submit_runtime_v2_work_plan";
+export { SUBMIT_WORK_PLAN_TOOL, SUBMIT_WORK_PLAN_TOOL_NAME };
 export const PLAN_MODEL_REQUEST_TIMEOUT_MS = 90_000;
 export const PLAN_SYNTHESIS_REQUEST_TIMEOUT_MS = 3 * 60_000;
 export const PLAN_CONTEXT_RESULT_CHARS = 10_000;
@@ -48,113 +50,12 @@ export const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "tool_search",
   "knowledge_search",
   "knowledge_get_excerpt",
-  ...UNITY_MCP_OBSERVATION_NAMES,
+  ...RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
 ]);
 
-export const SUBMIT_WORK_PLAN_TOOL: ToolDefinition = {
-  type: "function",
-  function: {
-    name: SUBMIT_WORK_PLAN_TOOL_NAME,
-    description:
-      "提交可审阅的实现计划。必须提供 Markdown 方案说明（planMarkdown）、文件变更步骤（changes）及验证方式（validations）。主动核实可用的构建、测试或交互检查，将能判定通过或失败的检查写入 validations。请为每个步骤在 dependsOn 中显式声明前置依赖（省略 dependsOn 表示 [] 无依赖，运行时不会自动推断；共享接口/基类、消费模块与服务组装入口之间的依赖关系必须明确列出）。仅准则映射在省略时由运行时补充；不要编造命令。",
-    parameters: {
-      type: "object",
-      properties: {
-        planMarkdown: {
-          type: "string",
-          description:
-            "清晰的 Markdown 计划正文（包含问题诊断、设计思路与关键注意事项）。",
-        },
-        changes: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: {
-              title: { type: "string", description: "步骤简短标题" },
-              operation: {
-                type: "string",
-                enum: ["modify", "create", "delete", "preserve"],
-                description: "操作类型，默认为 modify",
-              },
-              targets: {
-                type: "array",
-                minItems: 1,
-                items: { type: "string" },
-                description: "涉及的工作区相对文件路径列表",
-              },
-              change: {
-                type: "string",
-                description: "具体的代码或行为改动说明",
-              },
-              expectedOutcome: { type: "string", description: "可选，预期结果" },
-              basis: {
-                type: "array",
-                items: { type: "string" },
-                description: "可选，支撑该步骤的证据 ID（如 E1、E2）",
-              },
-              dependsOn: {
-                type: "array",
-                items: { type: "integer" },
-                description: "可选，前置步骤的 0-based 索引列表；省略表示 []（无前置依赖），运行时不会自动推断。当存在共享接口、基类或总装注册入口时，消费模块和总装步必须显式依赖定义它们的前置步骤。",
-              },
-              criterionIds: {
-                type: "array",
-                items: { type: "string" },
-                description: "可选，对应的验收准则 ID，默认自动映射",
-              },
-            },
-            required: ["targets", "change"],
-          },
-        },
-        validations: {
-          type: "array",
-          minItems: 1,
-          description: "必填，说明如何验证计划满足已接纳的验收准则；不要只在 Markdown 中描述验证。",
-          items: {
-            type: "object",
-            properties: {
-              kind: {
-                type: "string",
-                enum: ["finite_command", "browser", "desktop", "assertion", "advisory"],
-                description: "finite_command、browser、desktop 可提供必要验收；assertion、advisory 仅作说明，不提供必要验收覆盖。计划阶段只描述验证，不执行。",
-              },
-              command: {
-                type: "string",
-                description: "可选，用于验证的构建/测试/检查命令（如 npm run build）",
-              },
-              cwd: { type: "string", description: "工作区相对目录，根目录用 ." },
-              expectedTestCases: { type: "integer", description: "为 Unity 测试定义了确定的用例集时填正整数用例数。运行时要求该数量全部通过。" },
-              useProjectEditor: { type: "boolean", description: "Unity 或团结 PlayMode 验收设置为 true。命令用 unity test . --mode PlayMode --filter SuiteName，填写确定的正整数用例数。审批涵盖同一工程版本和测试筛选的在线与批处理方式。" },
-              expectedOutcome: {
-                type: "string",
-                description: "预期的验证通过结果说明",
-              },
-              required: { type: "boolean", description: "可选，finite_command、browser、desktop 默认 true；assertion、advisory 始终为 false，即使填写 true。" },
-              stepIndexes: {
-                type: "array",
-                items: { type: "integer" },
-                description: "该检查覆盖的 changes[] 零基下标。Unity PlayMode 测试覆盖场景时也应引用创建场景和引导脚本的步骤。",
-              },
-              criterionIds: {
-                type: "array",
-                items: { type: "string" },
-                description: "可选，对应的已接纳验收准则 ID；省略时自动映射。",
-              },
-            },
-            required: ["expectedOutcome"],
-          },
-        },
-        questions: {
-          type: "array",
-          items: { type: "string" },
-          description: "可选，仅填写会阻止方案完成、且须用户回答的具体问题；运行时会展示问题并等待回答。工具可用时优先调用 ask_plan_questions。",
-        },
-      },
-      required: ["planMarkdown", "changes", "validations"],
-    },
-  },
-};
+const GLOBAL_PLAN_READ_TOOL_NAMES = new Set([
+  "tool_search", "load_skill", "web_search", "web_fetch", "knowledge_search", "knowledge_get_excerpt",
+]);
 
 export const PLAN_MODEL_TOOLS = [
   ...TOOL_DEFINITIONS.filter((definition) =>
@@ -172,13 +73,14 @@ export function planModelToolCandidates(
   const knowledgeReferences = normalizeKnowledgeReferences(context.knowledgeContext?.references);
   const baseTools = TOOL_DEFINITIONS.filter((definition) => {
     const name = definition.function.name;
+    if (!context.runWorkspace && !GLOBAL_PLAN_READ_TOOL_NAMES.has(name)) return false;
     if ((name === "knowledge_search" || name === "knowledge_get_excerpt") && (!knowledgeReferences?.length || ["stale", "error"].includes(context.knowledgeContext?.state || ""))) return false;
     return PLAN_READ_ONLY_TOOL_NAMES.has(name) ||
       (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
   });
   return [
     ...baseTools,
-    ...(context.workspaceMcpSnapshot?.planObservationsAllowed ? unityMcpObservationTools(context.workspaceMcpSnapshot) : []),
+    ...(context.workspaceMcpSnapshot?.planObservationsAllowed ? workspaceEditorObservationTools(context.workspaceMcpSnapshot) : []),
     ...(loadSkill ? [loadSkill] : []),
   ];
 }
@@ -191,7 +93,7 @@ export function planModelTools(context: RuntimeV2SubmissionContext): ToolDefinit
   );
   return filterToCoreAndUnlockedTools([...planModelToolCandidates(context), ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL] : []), SUBMIT_WORK_PLAN_TOOL], {
     sessionKey: context.runSessionKey,
-    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...UNITY_MCP_OBSERVATION_NAMES,
+    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
       ...(context.knowledgeContext?.references.length ? ["knowledge_search", "knowledge_get_excerpt"] : []),
       ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL.function.name] : [])],
   });
@@ -214,7 +116,7 @@ function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
       description: [
         "Create one bounded read-only planning child for independent investigation, review, or validation design.",
         "Each child accepts at most 6 narrow workspace-relative paths in required_paths and allowed_paths (never '.' or '*'); split larger module reviews across multiple spawn_subagent calls.",
-        "The parent must continue unrelated discovery and later join the child before submitting the WorkPlan.",
+        "Continue unrelated discovery. Wait for an optional child only when a specific plan decision depends on its result. A child explicitly required by the user must be joined before submitting the WorkPlan.",
         "Planning children cannot modify or stage workspace files.",
       ].join(" "),
       parameters: {
@@ -238,10 +140,22 @@ function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
 const PLAN_SPAWN_SUBAGENT_TOOL = planCollaborationTool("spawn_subagent");
 const PLAN_WAIT_SUBAGENTS_TOOL = planCollaborationTool("wait_subagents");
 
+export function planToolSearchCandidates(
+  context: RuntimeV2SubmissionContext,
+  advertisedToolNames: ReadonlySet<string>,
+): ToolDefinition[] {
+  return [
+    ...planModelToolCandidates(context),
+    ...[PLAN_SPAWN_SUBAGENT_TOOL, PLAN_WAIT_SUBAGENTS_TOOL].filter((tool): tool is ToolDefinition =>
+      !!tool && advertisedToolNames.has(tool.function.name)),
+  ];
+}
+
 export function selectPlanModelTools(input: {
   readonly submissionStage: boolean;
   readonly submissionRepairPending?: boolean;
   readonly collaborationAllowed: boolean;
+  readonly spawnAllowed?: boolean;
   readonly collaborationRequired?: boolean;
   readonly collaborationRequirementMet?: boolean;
   readonly remainingSubagentCapacity: number;
@@ -261,6 +175,7 @@ export function selectPlanModelTools(input: {
   const tools = [...(input.baseTools || PLAN_MODEL_TOOLS)];
   if (
     input.collaborationAllowed &&
+    input.spawnAllowed !== false &&
     input.remainingSubagentCapacity > 0 &&
     PLAN_SPAWN_SUBAGENT_TOOL
   ) {
@@ -390,14 +305,15 @@ export function providerPlanMessages(input: {
         "[MAIN RUNTIME V2 PLAN]",
         `Workspace: ${input.context.runWorkspace || "global"}`,
         `Respond in: ${language}`,
+        buildRuntimeLanguageDirective(input.context.phaseLanguage),
         "You are in Plan Mode: inspect relevant files with read-only tools and then submit a clear plan via submit_runtime_v2_work_plan.",
         "Do not invent file paths or modify project files during planning. Never guess unverified filenames from a folder name; list the subdirectory or search first when its files are not yet in workspace overview.",
-        "Keep subagent fan-out compact (typically up to 2 focused subagents on disjoint modules with <= 6 paths each; never re-read files in the parent that a subagent already inspected, and never spawn a subagent for files already read).",
-        "Use prior read receipts as evidence. Inspect the smallest missing fact about a test entry point, fixture, or interaction capability. Use a relevant admitted Skill when it can identify the check. If adding a test is in scope and the project has a suitable runner, plan that test as a change and bind the runnable check to it. Design the check yourself; ask only for a consequential scope, constraint, or acceptance decision that safe inspection cannot resolve.",
+        "When the model lane has spare capacity, delegate independent read-only questions grounded in project evidence. Assign exact scopes and continue useful parent work. Reuse returned source evidence before reading the same files again.",
+        "Reuse prior read receipts. Inspect the smallest missing fact before expanding scope. Ask only for a consequential decision safe inspection cannot resolve.",
         ...(input.context.projectBaselineContext?.facts.runtimes.some(runtime => ["unity", "tuanjie"].includes(runtime.name)) ? [
           "For Unity or Tuanjie tests, check the project's existing test and runtime assembly definitions and references. Include each necessary .asmdef in the reviewed changes, with dependencies. A PlayMode test using yield must return IEnumerator. Bind PlayMode to a named suite with useProjectEditor and expectedTestCases so the same reviewed check can use the exact Editor or batch mode.",
         ] : []),
-        "When ready, call submit_runtime_v2_work_plan with planMarkdown, changes, and validations. Record each runnable check as a structured validation with its working directory where needed and its concrete expected outcome. Keep manual checks as supplemental assertions.",
+        "Submit one concise WorkPlan with scope, key decisions, structured changes and runnable validations. Give each check its working directory where needed and a concrete expected result. Keep manual checks supplemental.",
         "Implementation acceptance normally needs a runnable behavioral test, executable assertion, or supported interaction that observes the user's outcome. Build, lint and typecheck are supplemental unless the admitted criterion explicitly asks for static verification.",
         `[ADMITTED CRITERIA]\n${criteria.map((criterion) => `${criterion.id}: ${criterion.text}`).join("\n")}`,
         collaborationRequired
@@ -462,14 +378,17 @@ export function synthesisPlanTranscript(input: {
   readonly evidenceContents: ReadonlyMap<string, string>;
   readonly submissionRepairPending: boolean;
   readonly compactRecovery: boolean;
+  readonly validationDiscoveryFocus?: boolean;
   readonly transport: PlanProviderTransport;
   readonly canAskPlanQuestions?: boolean;
+  readonly phaseLanguage?: "zh" | "en";
 }): AgentMessage[] {
   return [
     ...input.messages,
     {
       role: "system",
       content: [
+        buildRuntimeLanguageDirective(input.phaseLanguage || "zh"),
         input.submissionRepairPending
           ? input.transport === "structured_response"
             ? "Correct the rejected WorkPlan using the exact feedback and retained source receipts."
@@ -478,6 +397,7 @@ export function synthesisPlanTranscript(input: {
         input.transport === "structured_response"
           ? "Return exactly one JSON object matching the supplied runtime_v2_work_plan_submission schema, without prose or Markdown fences."
           : "Read only a specific missing fact, or call submit_runtime_v2_work_plan with the complete plan.",
+        input.validationDiscoveryFocus && "Capability searches repeated the same result. Use an available read for a concrete missing validation fact, ask about a consequential validation choice if needed, or resubmit with a demonstrably runnable check. Keep the implementation scope and do not invent capabilities.",
         input.canAskPlanQuestions && (input.transport === "structured_response"
           ? "If a consequential new user decision blocks completion, put the specific question in the questions field so MAIN pauses for an answer. Treat explicit requirements in the original request and confirmed answers as resolved decisions."
           : PLAN_CLARIFICATION_GUIDANCE),

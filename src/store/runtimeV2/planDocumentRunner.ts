@@ -5,7 +5,7 @@ import { withProjectInitManagedBlock } from "../../lib/projectInit";
 import { planDocumentDisplayTitle, type PlanDocumentRef } from "../../lib/planDocuments";
 import { resolvePlanDocumentFromAggregate } from "../../lib/planDocumentRecords";
 import type { RuntimeV2RunIdentity, RuntimeV2TurnIdentity, WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
-import { isRuntimeV2ProviderTransportsUnavailableError } from "../../lib/runtime-v2";
+import { isRuntimeV2ProviderTransportsUnavailableError, runtimeV2CheckpointWriteFailureReason } from "../../lib/runtime-v2";
 import { deriveReadOnlyRecoveryWindow } from "../../lib/runtime-v2/readOnlyProgress";
 import { runtimeV2ProviderRecoveryStallExpired } from "../../lib/runtime-v2/lifecycle";
 import { runtimeV2ParallelReadCount } from "./executionText";
@@ -112,13 +112,14 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
       ? narrowedPlanSubmissionTools(baseDocumentTools, { submissionRepairPending: false })
           .filter(tool => tool.function.name !== SUBMIT_PLAN_DOCUMENT || !requiresInterviewConfirmation || hasConfirmedDecision)
       : baseDocumentTools;
-    let response: { visibleText?: string; toolCalls: import("../../lib/runtime-v2").RuntimeV2NormalizedProviderResult["toolCalls"]; rejectedAdmission?: boolean; unexpectedToolNames?: readonly string[] };
+    let response: { visibleText?: string; toolCalls: import("../../lib/runtime-v2").RuntimeV2NormalizedProviderResult["toolCalls"]; rejectedAdmission?: boolean; advertisedToolNames?: readonly string[] };
     try {
       response = recovered ? { visibleText: "", toolCalls: recovered.calls } : await requestPlanModel({ get: input.get, context: input.context, ledger, run, messages, deadlineAt,
         stage: narrowRejectionSynthesis ? "synthesis" : "discovery", compactRecovery: narrowRejectionSynthesis, evidence, evidenceContents, collaboration: collaborationPayload,
         submissionRepairPending: false, customTools: documentCustomTools.length > 0 ? documentCustomTools : baseDocumentTools, logStoreEvent: input.logStoreEvent });
     } catch (error) {
-      if (isRuntimeV2ProviderTransportsUnavailableError(error) || input.context.abortCtrl.signal.aborted) throw error;
+      if (runtimeV2CheckpointWriteFailureReason(error) ||
+        isRuntimeV2ProviderTransportsUnavailableError(error) || input.context.abortCtrl.signal.aborted) throw error;
       await ledger.recordSoftSignal(run, "protocol_drift");
       messages.push({ role: "system", content: "The last provider request failed. Continue the same plan from retained receipts; no save or approval occurred." });
       continue;
@@ -184,6 +185,8 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
         continue;
       }
       await executeReadOnlyPlanTool({ context: input.context, ledger, run, call, messages, evidence, evidenceContents,
+        isUnityOfficialMcpEnabled: () => input.get().config.unityOfficialMcpEnabled === true,
+        advertisedToolNames: response.advertisedToolNames,
         logStoreEvent: input.logStoreEvent, parallelReadCount: runtimeV2ParallelReadCount(response.toolCalls) });
     }
   }

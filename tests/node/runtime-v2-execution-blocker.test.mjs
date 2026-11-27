@@ -5,18 +5,35 @@ import { createTsModuleLoader } from "./tsModuleLoader.mjs";
 const load = createTsModuleLoader();
 const runtime = load("src/lib/runtime-v2/index.ts");
 const { resolveRuntimeV2ExecutionBlocker: resolve,
-  projectRuntimeV2ExecutionBlocker: project } = load("src/store/runtimeV2/executionBlocker.ts");
+  projectRuntimeV2ExecutionBlocker: project, executionRecoveryOptions, finishPendingExecutionVerification } = load("src/store/runtimeV2/executionBlocker.ts");
 const { installRuntimeV2ExecutionDecisionReplay: installReplay } = load("src/store/runtimeV2/executionDecisionReplay.ts");
 const { toUserChoiceResolutionIdentity } = load("src/lib/actionRequest.ts");
 const turn = { workspaceKey: "/fixture", sessionKey: "/fixture:1", sessionEpoch: "epoch", clientSubmissionId: "submit", turnId: "turn" };
 const run = { ...turn, runId: "run", parentRunId: null, attemptId: "attempt" };
-function fixture(decision, clarification) {
+function fixture(decision, clarification, verification = false) {
   const event = (state, type, fields) => ({ schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, type,
     eventId: `${type}:${state?.nextSequence || 0}`, sequence: state?.nextSequence || 0, at: (state?.updatedAt || 0) + 1, ...fields });
   let aggregate = runtime.transition(null, event(null, "turn.admitted", { turn, strategy: "execute", objective: "Fix fixture", constraints: [], acceptanceCriteria: ["Works"] }));
   aggregate = runtime.transition(aggregate, event(aggregate, "run.started", { run, phase: "observing" }));
-  aggregate = runtime.transition(aggregate, event(aggregate, "run.paused", { run, blocker: { requestId: "choice", reasonCode: "recovery_stalled", evidenceSequence: 1,
-    message: "Check prerequisite", options: ["recheck", "stop"], ...(clarification ? { reasonCode: "intent_clarification", clarification } : {}) } }));
+  if (verification) {
+    const append = (type, fields) => { aggregate = runtime.transition(aggregate, event(aggregate, type, { run, ...fields })); };
+    const schedule = () => {
+      const command = runtime.decideNextCommands(aggregate)[0];
+      append("command.scheduled", { command });
+      return command;
+    };
+    const path = "game.ts";
+    const request = schedule();
+    append("provider.responded", { idempotencyKey: request.idempotencyKey,
+      result: { visibleText: "", diagnostics: [], toolCalls: [{ id: "write", name: "write_file", arguments: { path, content: "game()" } }] } });
+    append("phase.changed", { phase: "acting", reason: "pending_mutation_call" });
+    const write = schedule();
+    append("tool.completed", { idempotencyKey: write.idempotencyKey, status: "succeeded", effectKind: "workspace_change",
+      evidence: [{ id: "change", kind: "mutation", target: path, previousVersion: "absent", version: `sha256-${"a".repeat(64)}` }] });
+    append("phase.changed", { phase: "validating", reason: "mutation_committed" });
+  }
+  aggregate = runtime.transition(aggregate, event(aggregate, "run.paused", { run, blocker: { requestId: "choice", reasonCode: "recovery_stalled", evidenceSequence: aggregate.nextSequence - 1,
+    message: "Check prerequisite", ...executionRecoveryOptions(aggregate), ...(clarification ? { reasonCode: "intent_clarification", clarification } : {}) } }));
   if (decision) aggregate = runtime.transition(aggregate, event(aggregate, "run.decision_recorded", { run, requestId: "choice", choice: decision }));
   const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate, revision: aggregate.nextSequence, updatedAt: aggregate.updatedAt });
   let state = { currentTurnId: "turn", currentSessionId: 1, isGenerating: false, taskFlow: [],
@@ -94,6 +111,26 @@ test("failed persistence never authorizes resume and stop has a durable decision
   assert.equal(await resolve(f.input), true);
   assert.equal(f.get().runtimeV2Checkpoints.turn.aggregate.run.blocker.decision, "stop");
   assert.deepEqual(f.counts(), { dispatched: 0, stopped: 1 });
+});
+
+test("finish and retain changes persists its choice and requests a partial terminal outcome after restore", async () => {
+  const f = fixture(undefined, undefined, true);
+  const request = f.get().activeActionRequest;
+  assert.deepEqual(request.optionValues, ["recheck", "continue", "stop"]);
+  assert.match(request.verification.verified, /保存 1 个文件/);
+  assert.match(request.verification.verified, /尚无通过的验证记录/);
+  assert.match(request.verification.next, /保留修改并结束/);
+  f.input.choice = "continue";
+  assert.equal(await resolve(f.input), true);
+  assert.deepEqual(f.counts(), { dispatched: 1, stopped: 0 });
+  const restored = runtime.normalizeRuntimeV2CheckpointMap(runtime.serializeRuntimeV2CheckpointMap(f.get().runtimeV2Checkpoints)).turn.aggregate;
+  assert.equal(restored.run.blocker.decision, "continue");
+  const resumed = runtime.transition(restored, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, type: "run.resumed",
+    eventId: "resume-verification", sequence: restored.nextSequence, at: restored.updatedAt + 1, run, requestId: "choice" });
+  const conclusion = finishPendingExecutionVerification(resumed, "zh");
+  assert.equal(conclusion.resultKind, "partial");
+  assert.match(conclusion.resultReason, /自动验收/);
+  assert.equal(runtime.decideNextCommands(resumed, conclusion)[0].kind, "finalize_turn");
 });
 
 test("cold ledger restore replays an already committed decision exactly once", async () => {

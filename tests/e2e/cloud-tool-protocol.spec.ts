@@ -70,6 +70,8 @@ test.beforeEach(async ({ page }) => {
         };
       }
       if (
+        cmd === "list_all_session_snapshots" ||
+        cmd === "list_legacy_session_files" ||
         cmd === "list_project_sessions" ||
         cmd === "rebuild_project_sessions_index"
       )
@@ -405,13 +407,9 @@ test("global chat without explicit files does not expose workspace tools", async
   page,
 }) => {
   await page.goto("/?e2eScenario=global-chat-tool-scope");
-
-  const sent = await page.evaluate(() =>
-    (window as any).__CODELY_E2E__?.sendCloudMessage?.(
-      "这是全局聊天，请直接回答一个普通问题。",
-    ),
-  );
-  expect(sent).toBe(true);
+  await page.getByTitle("新建聊天", { exact: true }).click();
+  await page.getByTestId("composer-textarea").fill("这是全局聊天，请直接回答一个普通问题。");
+  await page.getByTestId("composer-send-button").click();
 
   await expect(
     page
@@ -453,6 +451,8 @@ test("global chat without explicit files does not expose workspace tools", async
         ];
         return {
           names,
+          providerRequests: requests.length,
+          latestUserContent: [...(parsed.input || [])].reverse().find((item: any) => item.role === "user")?.content,
           leakedWorkspaceTools: names.filter((name: string) =>
             workspaceToolNames.includes(name),
           ),
@@ -465,7 +465,9 @@ test("global chat without explicit files does not expose workspace tools", async
       }),
     )
     .toEqual({
-      names: ["tool_search"],
+      names: [],
+      providerRequests: 1,
+      latestUserContent: "这是全局聊天，请直接回答一个普通问题。",
       leakedWorkspaceTools: [],
       listDirectoryCalls: [],
       getProjectSkeletonCalls: 0,

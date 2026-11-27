@@ -8,7 +8,15 @@ import {
 } from "./mcpClient";
 import type { ToolCatalogEntry } from "./toolCatalog";
 import type { ToolDefinition } from "./toolSchemas";
-import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES, type RuntimeV2EditorReadToolName } from "./runtime-v2/workspaceReadPolicy";
+import { UNITY_CLI_CONSOLE_TOOL, UNITY_MCP_CONSOLE_TOOL, UNITY_OFFICIAL_MCP_CONSOLE_TOOL } from "./runtime-v2/workspaceReadPolicy";
+import { discoverUnityOfficialMcp, UNITY_OFFICIAL_MCP_SERVER, type UnityOfficialMcpBinding } from "./unityOfficialMcp";
+import { runUnityEditorOperation } from "./ipc";
+
+interface UnityCliConsoleBinding {
+  readonly instanceId: string;
+  readonly editorPid: number;
+  readonly editorVersion: string;
+}
 
 export interface WorkspaceMcpSnapshot {
   readonly workspace: string;
@@ -16,6 +24,10 @@ export interface WorkspaceMcpSnapshot {
   readonly mcpDiscoveredTools: MCPTool[];
   readonly mcpToolServerMap: Record<string, string>;
   readonly unityBindings?: Readonly<Record<string, UnityMcpWorkspaceBinding>>;
+  readonly unityCliConsole?: UnityCliConsoleBinding;
+  readonly unityGameViewSupported?: true;
+  readonly unityOfficialMcp?: UnityOfficialMcpBinding;
+  readonly unityOfficialMcpOfferVersion?: string;
   readonly disabledToolKeys?: readonly string[];
   readonly planObservationsAllowed?: boolean;
 }
@@ -46,9 +58,24 @@ export async function bindWorkspaceUnityMcpView(
 
 const EDITOR_OBSERVATIONS = {
   unity_mcp_scene: { remoteName: "manage_scene", action: "get_active", description: "Read the active scene of this workspace's connected Editor." },
-  unity_mcp_console: { remoteName: "read_console", action: "get", description: "Read current Console errors and warnings from this workspace's connected Editor." },
-} as const satisfies Record<RuntimeV2EditorReadToolName, { remoteName: string; action: string; description: string }>;
-export const UNITY_MCP_OBSERVATION_NAMES = RUNTIME_V2_EDITOR_READ_TOOL_NAMES;
+  [UNITY_MCP_CONSOLE_TOOL]: { remoteName: "read_console", action: "get", description: "Read current Console errors and warnings from this workspace's connected Editor." },
+} as const;
+const UNITY_CLI_CONSOLE_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: UNITY_CLI_CONSOLE_TOOL,
+    description: "Read current Unity Console errors and warnings, including compiler file and line diagnostics, from this workspace's connected Editor through Unity CLI.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+};
+const UNITY_OFFICIAL_MCP_CONSOLE_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: UNITY_OFFICIAL_MCP_CONSOLE_TOOL,
+    description: "Read the current Unity Console errors and warnings through the official Unity MCP server for this workspace.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+};
 export const UNITY_MCP_CONSOLE_ARGS = Object.freeze({ action: "get", types: ["error", "warning"], count: 25, format: "json" });
 export const UNITY_MCP_REPAIR_CONSOLE_ARGS = Object.freeze({ action: "get", types: ["error", "warning"], format: "json", page_size: 100, cursor: 0 });
 const UNITY_CONSOLE_READ_ARGUMENTS = new Set(["action", "types", "count", "format", "page_size", "pageSize", "cursor",
@@ -72,12 +99,86 @@ function editorObservationBinding(snapshot: WorkspaceMcpSnapshot | null | undefi
   return null;
 }
 
-export function boundUnityMcpObservation(
+export async function bindWorkspaceUnityCliConsole(
+  snapshot: WorkspaceMcpSnapshot,
+  editorVersion: string | undefined,
+  probe: (workspace: string, editorVersion: string) => Promise<unknown> = probeWorkspaceUnityCliConsole,
+): Promise<WorkspaceMcpSnapshot> {
+  if (!snapshot.workspace || !editorVersion || workspaceUnityOfficialConsoleBinding(snapshot) ||
+      editorObservationBinding(snapshot, UNITY_MCP_CONSOLE_TOOL)) return snapshot;
+  const result = await probe(snapshot.workspace, editorVersion).catch(() => null) as Partial<UnityCliConsoleBinding> | null;
+  const pid = result?.editorPid;
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || result?.editorVersion !== editorVersion) return snapshot;
+  return Object.freeze({ ...snapshot, unityCliConsole: Object.freeze({
+    instanceId: `unity-cli:${pid}`, editorPid: pid, editorVersion,
+  }) });
+}
+
+export function probeWorkspaceUnityCliConsole(workspace: string, editorVersion: string, signal?: AbortSignal) {
+  const timeout = AbortSignal.timeout(6_000);
+  return runUnityEditorOperation(UNITY_CLI_CONSOLE_TOOL, { workspace, editorVersion },
+    signal ? AbortSignal.any([timeout, signal]) : timeout, Date.now() + 6_000);
+}
+
+export async function bindWorkspaceUnityOfficialMcp(
+  snapshot: WorkspaceMcpSnapshot, editorVersion: string, signal: AbortSignal,
+): Promise<WorkspaceMcpSnapshot> {
+  const official = await discoverUnityOfficialMcp(snapshot.workspace, editorVersion, signal);
+  const tools = [...snapshot.mcpDiscoveredTools, ...official.tools];
+  const toolServerMap = { ...snapshot.mcpToolServerMap };
+  for (const tool of official.tools) toolServerMap[tool.name] ??= official.server.url;
+  return Object.freeze({
+    ...snapshot, unityOfficialMcp: official.binding, unityOfficialMcpOfferVersion: undefined,
+    mcpServers: Object.freeze([...snapshot.mcpServers, official.server]) as unknown as MCPServer[],
+    mcpDiscoveredTools: Object.freeze(tools) as unknown as MCPTool[],
+    mcpToolServerMap: Object.freeze(toolServerMap),
+  });
+}
+
+export function withoutWorkspaceUnityOfficialMcp(snapshot: WorkspaceMcpSnapshot): WorkspaceMcpSnapshot {
+  const { url } = UNITY_OFFICIAL_MCP_SERVER;
+  return Object.freeze({
+    ...snapshot,
+    unityOfficialMcp: undefined,
+    mcpServers: snapshot.mcpServers.filter(server => server.url !== url),
+    mcpDiscoveredTools: snapshot.mcpDiscoveredTools.filter(tool => getMcpToolOrigin(tool)?.serverUrl !== url),
+    mcpToolServerMap: Object.fromEntries(Object.entries(snapshot.mcpToolServerMap).filter(([, serverUrl]) => serverUrl !== url)),
+  });
+}
+
+export function workspaceUnityOfficialConsoleBinding(snapshot: WorkspaceMcpSnapshot | null | undefined) {
+  const binding = snapshot?.unityOfficialMcp;
+  if (!snapshot || !binding) return null;
+  const consoleOrigin = snapshot.mcpDiscoveredTools.map(getMcpToolOrigin)
+    .find(origin => origin?.connector === "unity_official" && origin.remoteName === "console");
+  if (!consoleOrigin) return null;
+  const { serverName, serverUrl, remoteName } = consoleOrigin;
+  const keys = [UNITY_OFFICIAL_MCP_CONSOLE_TOOL, remoteName, `${serverName}:${remoteName}`,
+    `${serverName}/${remoteName}`, `${serverUrl}:${remoteName}`, `${serverUrl}#${remoteName}`].map(key => key.toLowerCase());
+  return snapshot.disabledToolKeys?.some(key => keys.includes(key.trim().toLowerCase())) ? null : binding;
+}
+
+export function workspaceUnityCliConsoleBinding(
+  snapshot: WorkspaceMcpSnapshot | null | undefined, workspace: string | undefined, args: Readonly<Record<string, unknown>>,
+): UnityCliConsoleBinding | null {
+  return workspace && snapshot?.workspace === normalizeMcpWorkspace(workspace) && !Object.keys(args).length
+    ? snapshot.unityCliConsole ?? null : null;
+}
+
+export function boundWorkspaceEditorObservation(
   snapshot: WorkspaceMcpSnapshot | null | undefined, workspace: string | undefined,
   entry: ToolCatalogEntry, args: Readonly<Record<string, unknown>>,
-): { binding: UnityMcpWorkspaceBinding; kind: "console" | "scene" | "reflection" } | null {
+): { binding: UnityMcpWorkspaceBinding | UnityCliConsoleBinding | UnityOfficialMcpBinding; kind: "console" | "scene" | "reflection" } | null {
   if (!workspace || snapshot?.workspace !== normalizeMcpWorkspace(workspace)) return null;
   if (entry.source === "built_in") {
+    if (entry.executionName === UNITY_OFFICIAL_MCP_CONSOLE_TOOL) {
+      const binding = workspaceUnityOfficialConsoleBinding(snapshot);
+      return binding && !Object.keys(args).length ? { binding, kind: "console" } : null;
+    }
+    if (entry.executionName === UNITY_CLI_CONSOLE_TOOL) {
+      const binding = workspaceUnityCliConsoleBinding(snapshot, workspace, args);
+      return binding ? { binding, kind: "console" } : null;
+    }
     const match = editorObservationBinding(snapshot, entry.executionName);
     return match && Object.keys(args).length === 0
       ? { binding: match.binding, kind: match.observation.remoteName === "read_console" ? "console" : "scene" } : null;
@@ -93,13 +194,16 @@ export function boundUnityMcpObservation(
   return null;
 }
 
-export function unityMcpObservationTools(snapshot: WorkspaceMcpSnapshot | null | undefined): ToolDefinition[] {
-  return Object.entries(EDITOR_OBSERVATIONS).flatMap(([name, observation]) =>
+export function workspaceEditorObservationTools(snapshot: WorkspaceMcpSnapshot | null | undefined): ToolDefinition[] {
+  const tools: ToolDefinition[] = Object.entries(EDITOR_OBSERVATIONS).flatMap(([name, observation]) =>
     editorObservationBinding(snapshot, name)
       ? [{ type: "function" as const, function: {
           name, description: observation.description, parameters: { type: "object", properties: {}, required: [] },
         } }]
       : []);
+  if (snapshot?.unityCliConsole) tools.push(UNITY_CLI_CONSOLE_DEFINITION);
+  if (workspaceUnityOfficialConsoleBinding(snapshot)) tools.unshift(UNITY_OFFICIAL_MCP_CONSOLE_DEFINITION);
+  return tools;
 }
 
 export async function executeUnityMcpObservation(input: {

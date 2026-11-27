@@ -337,16 +337,15 @@ export function applyRuntimeV2SubagentTelemetry(
   return { ...job, closedAt: telemetry.at };
 }
 
-/** Derive actual request overlap from durable child telemetry, not an intent. */
+/** Count overlap only from worker requests that produced a provider token. */
 export function deriveRuntimeV2SubagentConcurrency(
   jobs: readonly RuntimeV2SubagentJob[],
 ): RuntimeV2SubagentConcurrency {
   const intervals = jobs
-    .filter((job) => job.status !== "queued")
-    .map((job) => ({
-      start: job.requestedAt,
+    .flatMap(job => job.firstTokenAt === null ? [] : [{
+      start: job.firstTokenAt,
       end: job.closedAt ?? Number.POSITIVE_INFINITY,
-    }))
+    }])
     .filter((interval) => Number.isFinite(interval.start) && interval.end >= interval.start);
   const points: Array<{ at: number; delta: number }> = [];
   for (const interval of intervals) {

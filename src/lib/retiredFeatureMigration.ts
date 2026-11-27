@@ -2,6 +2,8 @@
  * Text, attachments, tool history, exported files and ordinary FIFO entries are retained.
  * This codec deliberately accepts opaque legacy snapshots and never grants execution.
  */
+import type { TerminalCredentialCleanupPlan } from "./terminalCredentialHistory";
+
 type RecordValue = Record<string, unknown>;
 /** One startup transaction survives React effect cleanup/resubscription.
  * Subscription cancellation never cancels shared data work. Failed work may
@@ -44,6 +46,30 @@ export function mergeCommittedStartupSessions<T>(
     result[entry.workspace] = next;
   }
   return result;
+}
+
+export async function withSessionMigrationStage<T>(stage: string, work: () => Promise<T>, owner?: string): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${stage}${owner ? ` (${owner})` : ""}: ${message}`);
+  }
+}
+
+/** Storage owns these top-level fields. All remaining content must match. */
+export function matchesCommittedStartupSession(local: RecordValue, native: RecordValue): boolean {
+  const content = (snapshot: RecordValue) => {
+    const {
+      projectId: _projectId, workspaceRoot: _workspaceRoot, storageVersion: _storageVersion,
+      storageRevision: _storageRevision, storageStatus: _storageStatus, updatedAtMs: _updatedAtMs,
+      ...body
+    } = retireRemovedFeatures(snapshot);
+    return JSON.stringify(body, (_key, value) => record(value)
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
+      : value);
+  };
+  return content(local) === content(native);
 }
 
 const RETIRED_FIELDS = new Set([
@@ -160,6 +186,13 @@ export interface RetiredFeatureMigrationPort {
   listLegacyFiles(): Promise<LegacyMigrationFile[]>;
   compareAndSwapLegacyFile(input: Omit<LegacyMigrationFile, "contentHash"> & { expectedHash: string }): Promise<unknown>;
   cleanupOutputs(): Promise<unknown>;
+  planTerminalCredentialCleanup?<T>(value: T, related?: readonly unknown[]): TerminalCredentialCleanupPlan<T>;
+}
+
+export interface SessionMigrationResult {
+  scanned: number;
+  changed: number;
+  deferred?: number;
 }
 export interface LegacyMigrationFile {
   workspace: string;
@@ -207,22 +240,65 @@ export function cleanLegacySessionFiles(files: readonly LegacyMigrationFile[]): 
 /** Output cleanup is unreachable until every enumerated snapshot has committed.
  * A CAS conflict aborts the pass; the next pass re-enumerates current revisions.
  */
-export async function migrateRetiredFeatureSnapshots(port: RetiredFeatureMigrationPort): Promise<{ scanned: number; changed: number }> {
-  const snapshots = await port.list();
+export async function migrateRetiredFeatureSnapshots(port: RetiredFeatureMigrationPort): Promise<SessionMigrationResult> {
+  const snapshots = await withSessionMigrationStage("list_native_snapshots", () => port.list());
+  const legacyFiles = await withSessionMigrationStage("list_legacy_copies", () => port.listLegacyFiles());
+  const ownerKey = (entry: { workspace: string; sessionId: string }) => JSON.stringify([entry.workspace, entry.sessionId]);
+  const fileKey = (file: LegacyMigrationFile) => JSON.stringify([file.workspace, file.sessionId, file.fileName]);
+  const deferredOwners = new Set<string>();
+  const evidenceByOwner = new Map<string, unknown[]>();
+  const addEvidence = (entry: { workspace: string; sessionId: string }, value: unknown) => {
+    const owner = ownerKey(entry);
+    const evidence = evidenceByOwner.get(owner) || [];
+    evidence.push(value);
+    evidenceByOwner.set(owner, evidence);
+  };
+  if (port.planTerminalCredentialCleanup) {
+    for (const entry of snapshots) addEvidence(entry, entry.snapshot);
+    for (const file of legacyFiles) addEvidence(file, file.value);
+  }
+  const plan = <T>(entry: { workspace: string; sessionId: string }, value: T): T => {
+    const owner = ownerKey(entry);
+    if (deferredOwners.has(owner)) return value;
+    const candidate = port.planTerminalCredentialCleanup?.(value, evidenceByOwner.get(owner));
+    if (candidate?.disposition === "deferred") {
+      deferredOwners.add(owner);
+      return value;
+    }
+    return candidate?.snapshot ?? value;
+  };
+  // Determine every deferred owner before writing either its primary record
+  // or any sibling legacy file. An unrelated owner can finish maintenance.
+  const nativeCandidates = snapshots.map(entry => [entry, plan(entry, entry.snapshot)] as const);
+  const legacyCandidates = legacyFiles.map(file => ({ ...file, value: plan(file, file.value) }));
+  const retiredFiles = new Map(cleanLegacySessionFiles(legacyCandidates).map(file => [fileKey(file), file]));
   const committed: Array<{ workspace: string; sessionId: string; revision: number; snapshot: RecordValue }> = [];
   let changed = 0;
-  for (const entry of snapshots) {
-    const snapshot = retireRemovedFeatures(entry.snapshot);
+  for (const [entry, redacted] of nativeCandidates) {
+    if (deferredOwners.has(ownerKey(entry))) continue;
+    const snapshot = retireRemovedFeatures(redacted);
     if (JSON.stringify(snapshot) === JSON.stringify(entry.snapshot)) { committed.push(entry); continue; }
-    const saved = await port.compareAndSwap({ workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, snapshot });
+    const saved = await withSessionMigrationStage("rewrite_native_snapshot", () => port.compareAndSwap({
+      workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, snapshot,
+    }), `${entry.workspace}:${entry.sessionId}@${entry.revision}`);
     committed.push({ ...entry, revision: saved.revision, snapshot: saved.snapshot });
     changed++;
   }
-  for (const file of cleanLegacySessionFiles(await port.listLegacyFiles())) {
+  for (const [index, candidate] of legacyCandidates.entries()) {
+    if (deferredOwners.has(ownerKey(candidate))) continue;
+    const retired = retiredFiles.get(fileKey(candidate));
+    if (!retired && candidate.value === legacyFiles[index].value) continue;
+    const file = retired || candidate;
     const { contentHash, ...payload } = file;
-    await port.compareAndSwapLegacyFile({ ...payload, expectedHash: contentHash });
+    await withSessionMigrationStage("rewrite_legacy_copy", () => port.compareAndSwapLegacyFile({
+      ...payload, expectedHash: contentHash,
+    }), `${file.workspace}:${file.sessionId}/${file.fileName}`);
   }
-  for (const entry of committed) await port.finalizeLegacyCopy({ workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, expectedSnapshot: entry.snapshot });
-  await port.cleanupOutputs();
-  return { scanned: snapshots.length, changed };
+  for (const entry of committed) {
+    await withSessionMigrationStage("finalize_legacy_copy", () => port.finalizeLegacyCopy({
+      workspace: entry.workspace, sessionId: entry.sessionId, expectedRevision: entry.revision, expectedSnapshot: entry.snapshot,
+    }), `${entry.workspace}:${entry.sessionId}@${entry.revision}`);
+  }
+  if (!deferredOwners.size) await withSessionMigrationStage("cleanup_retired_outputs", () => port.cleanupOutputs());
+  return { scanned: snapshots.length, changed, ...(deferredOwners.size ? { deferred: deferredOwners.size } : {}) };
 }

@@ -247,6 +247,17 @@ impl SessionStore {
         })
     }
 
+    /// Reclaim WAL pages after an exact maintenance CAS replaces sensitive
+    /// history. Do not clear or vacuum unrelated snapshots.
+    pub fn truncate_maintenance_wal(&self) -> SessionStoreResult<()> {
+        let connection = self.lock_connection()?;
+        let blocked: i64 = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        if blocked != 0 {
+            return Err(SessionStoreError::new(SessionStoreErrorCode::DatabaseBusy, "Session maintenance WAL checkpoint is busy."));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn open_in_memory_with_options(options: SessionStoreOptions) -> SessionStoreResult<Self> {
         let connection = Connection::open_in_memory().map_err(SessionStoreError::database)?;
@@ -678,7 +689,7 @@ fn configure_connection(
         .map_err(SessionStoreError::database)?;
     connection
         .execute_batch(
-            "PRAGMA foreign_keys = ON;\nPRAGMA journal_mode = WAL;\nPRAGMA synchronous = FULL;",
+            "PRAGMA foreign_keys = ON;\nPRAGMA journal_mode = WAL;\nPRAGMA synchronous = FULL;\nPRAGMA secure_delete = ON;",
         )
         .map_err(SessionStoreError::database)?;
     Ok(())
@@ -934,6 +945,31 @@ mod tests {
             })
             .expect("create snapshot")
             .snapshot
+    }
+
+    #[test]
+    fn terminal_credentials_history_cas_reclaims_old_sqlite_pages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&path).unwrap();
+        let secret = "SYNTHETIC.unity.editor.123456";
+        let affected = key("affected");
+        let other = create_snapshot(&store, key("unaffected"));
+        let save = |expected_revision, snapshot| store.compare_and_swap_session_snapshot(
+            CompareAndSwapSessionSnapshotRequest { key: affected.clone(), expected_revision, snapshot, updated_at_ms: 12345 }
+        );
+        save(0, json!({"receipt": secret.repeat(400)})).unwrap();
+        // Put the old credential in the main database, not just its WAL.
+        store.truncate_maintenance_wal().unwrap();
+        assert!(fs::read(&path).unwrap().windows(secret.len()).any(|bytes| bytes == secret.as_bytes()));
+        let next = save(1, json!({"receipt": "[REDACTED]"})).unwrap().snapshot;
+        assert_eq!(next.revision, 2);
+        assert_eq!(store.get_session_snapshot(&key("unaffected")).unwrap(), Some(other));
+        store.truncate_maintenance_wal().unwrap();
+        for file in [path, dir.path().join("sessions.sqlite3-wal")] {
+            let bytes = fs::read(file).unwrap_or_default();
+            assert!(!bytes.windows(secret.len()).any(|bytes| bytes == secret.as_bytes()));
+        }
     }
 
     #[test]

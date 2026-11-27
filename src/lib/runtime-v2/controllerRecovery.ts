@@ -152,7 +152,8 @@ export function decideRuntimeV2CommandFailureRecovery(input: {
       publish: false,
     };
   }
-  if (input.command.kind === "schedule_subagents" && input.command.payload.proactiveKey) {
+  if (input.command.kind === "schedule_subagents" &&
+      (input.command.payload.proactiveKey || input.command.payload.optionalDelegationRejected)) {
     return { kind: "continue", publish: true };
   }
   if (isRuntimeV2ProviderProtocolError(input.error)) {

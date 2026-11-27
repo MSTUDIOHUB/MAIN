@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use glob::glob;
+use glob::{glob, MatchOptions, Pattern};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
 use regex::Regex;
@@ -56,9 +56,23 @@ pub mod runtime;
 pub mod session_store;
 pub mod skill_packages;
 pub mod task_graph;
+mod terminal_credentials;
 pub mod trusted_execution;
+mod unity_assembly_dependencies;
 mod unity_editor;
+mod unity_cli_update;
+#[doc(hidden)]
+pub use unity_assembly_dependencies::inspect_unity_assembly_dependencies;
+#[doc(hidden)]
+pub use unity_cli_update::{apply_unity_cli_update, check_unity_cli_updates};
+#[doc(hidden)]
+pub use unity_editor::{
+    run_unity_cli_console, run_unity_compile_project, run_unity_official_mcp, run_unity_test_project, UnityConsoleCheckBinding,
+};
+#[doc(hidden)]
+pub use unity_editor::run_unity_game_view_capture;
 pub mod web_search;
+mod workspace_engine;
 
 // region: 全局常量与状态
 
@@ -118,6 +132,7 @@ fn get_workspace_write_lock() -> &'static Mutex<()> {
 const DEBUG_LOG_FILE_NAME: &str = "main-debug.log";
 const DEBUG_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DEBUG_LOG_TRIM_KEEP_BYTES: usize = 3 * 1024 * 1024;
+static DEBUG_LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,12 +166,16 @@ fn now_millis() -> u64 {
 }
 
 fn sanitize_log_part(value: &str) -> String {
-    let mut result = value
+    let mut result = terminal_credentials::redact(value)
         .replace('\r', "\\r")
         .replace('\n', "\\n")
         .replace('\t', "\\t");
     if result.len() > 8_000 {
-        result.truncate(8_000);
+        let mut end = 8_000;
+        while !result.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.truncate(end);
         result.push_str("...<truncated>");
     }
     result
@@ -194,6 +213,7 @@ fn trim_debug_log_file(path: &Path) {
 }
 
 fn append_debug_log_line(app: &AppHandle, payload: &DebugLogPayload) -> Result<(), String> {
+    let _lock = DEBUG_LOG_WRITE_LOCK.lock().map_err(|_| "调试日志锁不可用")?;
     let path = debug_log_path(app)?;
     let line = format!(
         "[{}] [{}] [{}] {}\n",
@@ -216,9 +236,9 @@ fn append_debug_log_line(app: &AppHandle, payload: &DebugLogPayload) -> Result<(
 fn record_debug_log(app: &AppHandle, level: &str, source: &str, message: impl AsRef<str>) {
     let payload = DebugLogPayload {
         timestamp: debug_timestamp(),
-        level: level.to_string(),
-        source: source.to_string(),
-        message: message.as_ref().to_string(),
+        level: terminal_credentials::redact(level).into_owned(),
+        source: terminal_credentials::redact(source).into_owned(),
+        message: terminal_credentials::redact(message.as_ref()).into_owned(),
     };
     let _ = append_debug_log_line(app, &payload);
     let _ = app.emit("main-debug-log", payload);
@@ -242,6 +262,7 @@ fn append_debug_log(
 
 #[tauri::command]
 fn read_debug_log(app: AppHandle, max_bytes: Option<usize>) -> Result<DebugLogSnapshot, String> {
+    let _lock = DEBUG_LOG_WRITE_LOCK.lock().map_err(|_| "调试日志锁不可用")?;
     let path = debug_log_path(&app)?;
     if !path.exists() {
         return Ok(DebugLogSnapshot {
@@ -251,7 +272,10 @@ fn read_debug_log(app: AppHandle, max_bytes: Option<usize>) -> Result<DebugLogSn
         });
     }
 
-    let bytes = fs::read(&path).map_err(|e| format!("读取调试日志失败: {e}"))?;
+    let log = fs::read_to_string(&path).or_else(|_| fs::read(&path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+        .map_err(|e| format!("读取调试日志失败: {e}"))?;
+    let redacted = terminal_credentials::redact_history(&log);
+    let bytes = redacted.as_bytes();
     let max = max_bytes.unwrap_or(256 * 1024).clamp(1_024, 1024 * 1024);
     let truncated = bytes.len() > max;
     let slice = if truncated {
@@ -268,8 +292,44 @@ fn read_debug_log(app: AppHandle, max_bytes: Option<usize>) -> Result<DebugLogSn
 
 #[tauri::command]
 fn clear_debug_log(app: AppHandle) -> Result<(), String> {
+    let _lock = DEBUG_LOG_WRITE_LOCK.lock().map_err(|_| "调试日志锁不可用")?;
     let path = debug_log_path(&app)?;
     fs::write(path, "").map_err(|e| format!("清空调试日志失败: {e}"))
+}
+
+fn redact_debug_log_history_at(path: &Path) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Err("调试日志路径不是普通文件".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("读取调试日志元数据失败: {error}")),
+    };
+    let bytes = fs::read(path).map_err(|error| format!("读取调试日志失败: {error}"))?;
+    let original = String::from_utf8_lossy(&bytes);
+    let redacted = terminal_credentials::redact_history(&original);
+    if redacted == original {
+        return Ok(false);
+    }
+    let parent = path.parent().ok_or("调试日志缺少父目录")?;
+    let mut output = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    output.as_file().set_permissions(metadata.permissions()).map_err(|error| error.to_string())?;
+    output.write_all(redacted.as_bytes()).and_then(|_| output.as_file().sync_all()).map_err(|error| error.to_string())?;
+    output.persist(path).map_err(|error| error.error.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn finalize_terminal_credential_history_cleanup(app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let log_changed = {
+            let _lock = DEBUG_LOG_WRITE_LOCK.lock().map_err(|_| "调试日志锁不可用")?;
+            redact_debug_log_history_at(&debug_log_path(&app)?)?
+        };
+        // The snapshot CAS ran first. Reclaim old WAL pages once the committed
+        // replacement can survive a crash; a busy reader makes this retryable.
+        open_project_session_store(&app)?.truncate_maintenance_wal().map_err(project_session_store_error)?;
+        Ok(log_changed)
+    }).await.map_err(|error| error.to_string())?
 }
 
 // endregion
@@ -309,6 +369,9 @@ struct PtySession {
 struct PtyBuffer {
     bytes: Vec<u8>,
     start_offset: u64,
+    // When eviction cuts an argument/value pair, its remaining line can no
+    // longer be parsed from the retained bytes. Withhold just that fragment.
+    leading_credential_fragment: bool,
 }
 
 #[derive(Serialize)]
@@ -562,12 +625,22 @@ impl PtyBuffer {
         self.bytes.extend_from_slice(data);
         if self.bytes.len() > PTY_BUFFER_LIMIT_BYTES {
             let overflow = self.bytes.len() - PTY_BUFFER_LIMIT_BYTES;
+            let line_start = self.bytes[..overflow].iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+            let line_end = self.bytes[overflow..].iter().position(|byte| *byte == b'\n').map_or(self.bytes.len(), |index| index + overflow);
+            let discarded = overflow - line_start;
+            self.leading_credential_fragment = (self.leading_credential_fragment && line_start == 0)
+                || (discarded > 0 && terminal_credentials::credential_matches(&self.bytes[line_start..line_end]).into_iter()
+                    .any(|matched| matched.argument_start < discarded && matched.value.end >= discarded));
             self.bytes.drain(..overflow);
             self.start_offset += overflow as u64;
         }
     }
 
     fn clear(&mut self) {
+        let line_start = self.bytes.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+        let partial_line = &self.bytes[line_start..];
+        self.leading_credential_fragment = (self.leading_credential_fragment && line_start == 0)
+            || terminal_credentials::credential_matches(partial_line).into_iter().any(|matched| matched.value.end == partial_line.len());
         self.start_offset = self.end_offset();
         self.bytes.clear();
     }
@@ -593,9 +666,22 @@ impl PtyBuffer {
             None => (text, false),
         };
         let effective_start = if truncated_by_chars {
-            buffer_end.saturating_sub(text.as_bytes().len() as u64)
+            buffer_end.saturating_sub(text.len() as u64).max(start_offset)
         } else {
             start_offset
+        };
+
+        let effective_idx = (effective_start - self.start_offset) as usize;
+        let mut ranges = terminal_credentials::credential_ranges(&self.bytes);
+        if self.leading_credential_fragment {
+            let leading_end = self.bytes.iter().position(|byte| *byte == b'\n').unwrap_or(self.bytes.len());
+            ranges.retain(|range| range.start >= leading_end);
+            ranges.insert(0, 0..leading_end);
+        }
+        let text = if ranges.is_empty() {
+            text
+        } else {
+            decode_utf8_lossy_for_display(&terminal_credentials::redact_window(&self.bytes, effective_idx, &ranges))
         };
 
         PtyReadResult {
@@ -1392,7 +1478,20 @@ fn remove_workspace_symlink(path: &Path) -> Result<(), String> {
     }
 }
 
-fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(), String> {
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletedWorkspaceEntry {
+    changed: bool,
+    previous_version: String,
+}
+
+impl DeletedWorkspaceEntry {
+    fn absent() -> Self {
+        Self { changed: false, previous_version: "deleted".into() }
+    }
+}
+
+fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<DeletedWorkspaceEntry, String> {
     if raw_path == workspace {
         return Err("禁止删除工作区根目录".to_string());
     }
@@ -1404,13 +1503,13 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
         .parent()
         .ok_or_else(|| "待删除路径没有有效父目录".to_string())?;
     let Some(canonical_parent) = resolve_workspace_delete_parent(parent, workspace)? else {
-        return Ok(());
+        return Ok(DeletedWorkspaceEntry::absent());
     };
     let delete_path = canonical_parent.join(file_name);
 
     let metadata = match fs::symlink_metadata(&delete_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DeletedWorkspaceEntry::absent()),
         Err(error) => return Err(format!("无法访问待删除路径: {error}")),
     };
 
@@ -1438,11 +1537,12 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
 
     let metadata = match fs::symlink_metadata(&delete_path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DeletedWorkspaceEntry::absent()),
         Err(error) => return Err(format!("删除前无法访问目标路径: {error}")),
     };
     if metadata.file_type().is_symlink() {
-        return remove_workspace_symlink(&delete_path);
+        remove_workspace_symlink(&delete_path)?;
+        return Ok(DeletedWorkspaceEntry { changed: true, previous_version: "present".into() });
     }
 
     let canonical_target = delete_path
@@ -1453,6 +1553,15 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
         return Err("禁止删除工作区根目录".to_string());
     }
 
+    let previous_version = if metadata.is_file() && metadata.len() <= 1024 * 1024 {
+        File::open(&canonical_target).ok().and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() <= 1024 * 1024).then(|| format!("sha256-{:x}", Sha256::digest(&bytes)))
+        }).unwrap_or_else(|| "present".into())
+    } else {
+        "present".into()
+    };
     if metadata.is_dir() {
         // std::fs::remove_dir_all does not follow symlinks encountered while
         // walking. The final entry was also checked with symlink_metadata above.
@@ -1461,7 +1570,7 @@ fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(),
         fs::remove_file(&delete_path).map_err(|error| format!("删除文件失败: {error}"))?;
     }
 
-    Ok(())
+    Ok(DeletedWorkspaceEntry { changed: true, previous_version })
 }
 
 fn resolve_existing_path(input: &str, workspace: &Path) -> Result<PathBuf, String> {
@@ -1537,6 +1646,25 @@ fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
         return Err("glob 模式不允许包含 ..".to_string());
     }
     Ok(())
+}
+
+fn portable_relative_path(path: &Path) -> Option<String> {
+    let components: Option<Vec<_>> = path
+        .components()
+        .map(|component| {
+            let Component::Normal(part) = component else {
+                return None;
+            };
+            let part = part.to_str()?;
+            (!part.contains('\\') && !part.chars().any(char::is_control)).then_some(part)
+        })
+        .collect();
+    let components = components?;
+    Some(if components.is_empty() {
+        ".".into()
+    } else {
+        components.join("/")
+    })
 }
 
 // endregion
@@ -2372,6 +2500,66 @@ mod terminal_utf8_tests {
     }
 
     #[test]
+    fn terminal_credentials_mask_split_pty_tokens_at_the_original_cursor() {
+        let mut buffer = PtyBuffer::default();
+        buffer.append(b"/Unity -access");
+        buffer.append(b"Token synthetic");
+        let resume = buffer.end_offset();
+        assert_eq!(buffer.read_all(None).text, "/Unity -accessToken [REDACTED]");
+        buffer.append(b".credential -projectPath /fixture\n");
+        let suffix = buffer.read_since(resume, None);
+        assert_eq!(suffix.start_offset, resume);
+        assert_eq!(suffix.end_offset, buffer.end_offset());
+        assert_eq!(suffix.text, "[REDACTED] -projectPath /fixture\n");
+        let tail = buffer.read_all(Some(36));
+        assert!(tail.truncated);
+        assert_eq!(tail.text, "[REDACTED] -projectPath /fixture\n");
+    }
+
+    #[test]
+    fn terminal_credentials_mask_a_pty_value_whose_argument_was_evicted() {
+        let mut buffer = PtyBuffer::default();
+        buffer.append(b"-accessToken synthetic.credential\n");
+        let suffix = b"\nReady\n";
+        buffer.append(&vec![b'x'; PTY_BUFFER_LIMIT_BYTES - suffix.len() - 9]);
+        buffer.append(suffix);
+        assert!(buffer.start_offset > 13);
+        assert!(buffer.read_since(0, None).text.starts_with("[REDACTED]\n"));
+        assert!(buffer.read_all(None).text.ends_with("Ready\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_credentials_native_shell_preserves_output_and_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let command = "printf '%s\\n' 'Unity -accessToken SYNTHETIC.unity.123456 -projectPath /fixture' 'Assets/Probe.cs(3,7): error CS1002'";
+        let approval = harness::permissions::ShellPermissionApproval {
+            command: command.to_string(),
+            approved_at_ms: Some(1),
+            scope: Some("once".to_string()),
+            rules: Vec::new(),
+            risk_level: None,
+        };
+        let result = run_workspace_shell_command(&workspace, &workspace, command.into(), None, Duration::from_secs(2), Some(approval)).unwrap();
+        assert!(result.success);
+        assert_eq!(result.exit_code, 0);
+        assert!(!result.command.contains("SYNTHETIC.unity.123456"));
+        assert_eq!(result.stdout, "Unity -accessToken [REDACTED] -projectPath /fixture\nAssets/Probe.cs(3,7): error CS1002\n");
+    }
+
+    #[test]
+    fn terminal_credentials_rewrite_only_affected_debug_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join(DEBUG_LOG_FILE_NAME);
+        let original = "[1] process -accessToken SYNTHETIC.only.123456 -keep\n[2] echo SYNTHETIC.only.123456\n[3] ordinary\n";
+        fs::write(&log, original).unwrap();
+        assert!(redact_debug_log_history_at(&log).unwrap());
+        assert_eq!(fs::read_to_string(&log).unwrap(), "[1] process -accessToken [REDACTED] -keep\n[2] echo [REDACTED]\n[3] ordinary\n");
+        assert!(!redact_debug_log_history_at(&log).unwrap());
+    }
+
+    #[test]
     fn login_shell_env_parser_skips_noise_and_invalid_keys() {
         let parsed = parse_login_shell_env_output(
             "startup banner\nPATH=/opt/homebrew/bin:/usr/bin\0BAD-KEY=value\0HOME=/Users/test\0",
@@ -2548,23 +2736,32 @@ pub fn run_workspace_shell_command(
     }
     harness::permissions::PermissionGuard::from_workspace(workspace)
         .and_then(|guard| guard.validate_with_approval(trimmed, permission_approval.as_ref()))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| terminal_credentials::redact(&error.to_string()).into_owned())?;
     let prepared =
         trusted_execution::prepare_trusted_shell_execution(workspace, working_directory, trimmed)
-            .map_err(|error| format!("TRUSTED_EXECUTION_REJECTED: {error}"))?;
+            .map_err(|error| terminal_credentials::redact(&format!("TRUSTED_EXECUTION_REJECTED: {error}")).into_owned())?;
 
     let mut process = build_workspace_shell_command(trimmed);
     process.current_dir(prepared.working_directory());
     if let Some(filter) = unity_editor::live_playmode_filter(prepared.inspection()) {
-        return unity_editor::run_live_playmode(workspace, prepared.working_directory(), filter, timeout, None,
-            |remaining| capture_command_output(process, trimmed, input, remaining));
+        return unity_editor::run_live_playmode(workspace, prepared.working_directory(), filter, timeout, None, None,
+            |remaining| capture_command_output(process, trimmed, input, remaining))
+            .map(redact_terminal_command_output)
+            .map_err(|error| terminal_credentials::redact(&error).into_owned());
     }
     let report_checks = unity_editor::batch_report_expectations(workspace, prepared.working_directory(), prepared.inspection());
     let mut output = capture_command_output(process, trimmed, input, timeout)?;
     if output.success {
         output.unity_test_reports = unity_editor::verify_batch_reports(workspace, report_checks);
     }
-    Ok(output)
+    Ok(redact_terminal_command_output(output))
+}
+
+fn redact_terminal_command_output(mut output: TerminalCommandOutput) -> TerminalCommandOutput {
+    output.command = terminal_credentials::redact(&output.command).into_owned();
+    output.stdout = terminal_credentials::redact(&output.stdout).into_owned();
+    output.stderr = terminal_credentials::redact(&output.stderr).into_owned();
+    output
 }
 
 fn capture_command_output(
@@ -2577,11 +2774,22 @@ fn capture_command_output(
 }
 
 fn capture_command_output_with_cancel(
+    process: ProcessCommand,
+    command: &str,
+    input: Option<String>,
+    timeout: Duration,
+    canceled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<TerminalCommandOutput, String> {
+    capture_command_output_with_limit(process, command, input, timeout, canceled, COMMAND_OUTPUT_LIMIT_BYTES)
+}
+
+fn capture_command_output_with_limit(
     mut process: ProcessCommand,
     command: &str,
     input: Option<String>,
     timeout: Duration,
     canceled: Option<&std::sync::atomic::AtomicBool>,
+    stdout_limit: usize,
 ) -> Result<TerminalCommandOutput, String> {
     let is_canceled = || canceled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
     if is_canceled() {
@@ -2597,7 +2805,7 @@ fn capture_command_output_with_cancel(
     let stdout_handle = child
         .stdout
         .take()
-        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, COMMAND_OUTPUT_LIMIT_BYTES)));
+        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, stdout_limit)));
     let stderr_handle = child
         .stderr
         .take()
@@ -2671,7 +2879,7 @@ fn validate_pty_input(
                         .and_then(|guard| {
                             guard.validate_with_approval(command, permission_approval)
                         })
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| terminal_credentials::redact(&error.to_string()).into_owned())?;
                 }
                 next_pending.clear();
             }
@@ -3717,6 +3925,22 @@ fn canonicalize_workspace_path(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn inspect_workspace_engine_profile(
+    workspace: String,
+    context_paths: Vec<String>,
+    project_root_hint: Option<String>,
+) -> Result<Option<workspace_engine::EngineProfile>, String> {
+    run_file_read_io(move || {
+        Ok(workspace_engine::inspect(
+            Path::new(workspace.trim()),
+            &context_paths,
+            project_root_hint.as_deref(),
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn read_file(
     app: AppHandle,
     state: State<'_, WorkspaceState>,
@@ -4021,6 +4245,26 @@ fn get_file_metadata(
         size_bytes: metadata.len(),
         modified_ms,
     })
+}
+
+fn observe_missing_workspace_paths(workspace: &Path, paths: &[String]) -> Vec<String> {
+    paths.iter().take(32).filter_map(|path| {
+        let trusted = trusted_execution::resolve_workspace_path(
+            workspace, path, trusted_execution::WorkspacePathMode::AllowMissing,
+        ).ok()?;
+        match fs::symlink_metadata(trusted.path()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(path.clone()),
+            _ => None,
+        }
+    }).collect()
+}
+
+#[tauri::command]
+async fn observe_worktree_absence(workspace: String, paths: Vec<String>) -> Result<Vec<String>, String> {
+    run_file_read_io(move || {
+        let workspace = canonicalize_workspace_dir(&workspace)?;
+        Ok(observe_missing_workspace_paths(&workspace, &paths))
+    }).await
 }
 
 const PROJECT_INIT_TARGET_NAME: &str = "AGENTS.md";
@@ -5784,10 +6028,21 @@ const SKELETON_IGNORED_DIRS: &[&str] = &[
     "PackageCache",
     ".protocols",
 ];
+const ENGINE_GENERATED_SEARCH_DIRS: &[&str] = &[
+    ".godot",
+    "Binaries",
+    "DerivedDataCache",
+    "Intermediate",
+    "Saved",
+];
 const CS_COLLAPSE_THRESHOLD: usize = 12;
 
 fn should_skip_recursive_search_dir(name: &str) -> bool {
     SKELETON_IGNORED_DIRS.contains(&name) || LIST_DIRECTORY_IGNORED_DIRS.contains(&name)
+}
+
+fn should_skip_source_search_dir(name: &str) -> bool {
+    should_skip_recursive_search_dir(name) || ENGINE_GENERATED_SEARCH_DIRS.contains(&name)
 }
 
 fn ext_in_list(name: &str, list: &[&str]) -> bool {
@@ -6101,13 +6356,21 @@ fn get_project_skeleton(
 }
 
 #[tauri::command]
-fn glob_search(
-    state: State<WorkspaceState>,
+async fn glob_search(
+    state: State<'_, WorkspaceState>,
     pattern: String,
     workspace: Option<String>,
+    source_search: Option<bool>,
 ) -> Result<Vec<String>, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
-    glob_search_in_workspace(&workspace, &pattern)
+    run_file_read_io(move || {
+        if source_search == Some(true) {
+            source_glob_search(&workspace, &pattern)
+        } else {
+            glob_search_in_workspace(&workspace, &pattern)
+        }
+    })
+    .await
 }
 
 fn glob_search_in_workspace(workspace: &Path, pattern: &str) -> Result<Vec<String>, String> {
@@ -6139,22 +6402,91 @@ fn glob_search_in_workspace(workspace: &Path, pattern: &str) -> Result<Vec<Strin
     Ok(hits)
 }
 
+fn source_glob_search(workspace: &Path, pattern: &str) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    let windows_pattern = pattern.replace('\\', "/");
+    #[cfg(windows)]
+    let pattern = windows_pattern.as_str();
+    let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+    validate_glob_pattern(pattern)?;
+    let components: Vec<_> = pattern
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let compiled =
+        Pattern::new(&components.join("/")).map_err(|error| format!("glob 模式错误: {error}"))?;
+    let literal_count = components
+        .iter()
+        .take_while(|part| !part.contains(['*', '?', '[']))
+        .count();
+    let literal = components[..literal_count].join("/");
+    let start = if literal.is_empty() { "." } else { &literal };
+    let Ok(start_path) = resolve_existing_path(start, workspace) else {
+        return Ok(Vec::new());
+    };
+    if literal_count == components.len() {
+        return Ok(portable_relative_path(Path::new(&literal))
+            .into_iter()
+            .collect());
+    }
+    let depth = if components[literal_count..].contains(&"**") {
+        usize::MAX
+    } else {
+        components.len() - literal_count
+    };
+    let options = MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    let mut hits = Vec::new();
+    for entry in WalkDir::new(&start_path)
+        .min_depth(1)
+        .max_depth(depth)
+        .into_iter()
+        .filter_entry(|entry| {
+            !entry.file_type().is_dir()
+                || !should_skip_source_search_dir(&entry.file_name().to_string_lossy())
+        })
+        .filter_map(Result::ok)
+    {
+        let Ok(suffix) = entry.path().strip_prefix(&start_path) else {
+            continue;
+        };
+        let Some(relative) = portable_relative_path(&Path::new(&literal).join(suffix)) else {
+            continue;
+        };
+        if compiled.matches_with(&relative, options)
+            && (!entry.file_type().is_symlink()
+                || resolve_existing_path(&relative, workspace).is_ok())
+        {
+            hits.push(relative);
+        }
+    }
+    hits.sort();
+    Ok(hits)
+}
+
 #[tauri::command]
-fn grep_search(
-    state: State<WorkspaceState>,
+async fn grep_search(
+    state: State<'_, WorkspaceState>,
     query: String,
     path: String,
     workspace: Option<String>,
 ) -> Result<String, String> {
-    let regex = Regex::new(&query).map_err(|e| format!("无效正则表达式: {e}"))?;
     let workspace = resolve_workspace_root(&state, workspace)?;
-    let target = resolve_existing_path(&path, &workspace)?;
+    run_file_read_io(move || grep_search_in_workspace(&workspace, &query, &path)).await
+}
+
+fn grep_search_in_workspace(workspace: &Path, query: &str, path: &str) -> Result<String, String> {
+    let regex = Regex::new(query).map_err(|e| format!("无效正则表达式: {e}"))?;
+    let target = resolve_existing_path(path, workspace)?;
 
     let mut output = String::new();
     let mut matched = 0_usize;
 
     if target.is_file() {
-        grep_file(&workspace, &target, &regex, &mut output, &mut matched)?;
+        grep_file(workspace, &target, &regex, &mut output, &mut matched)?;
     } else if target.is_dir() {
         for entry in WalkDir::new(&target)
             .follow_links(false)
@@ -6164,7 +6496,7 @@ fn grep_search(
                     return true;
                 }
                 let name = entry.file_name().to_string_lossy();
-                !should_skip_recursive_search_dir(name.as_ref())
+                !should_skip_source_search_dir(name.as_ref())
             })
         {
             let entry = match entry {
@@ -6180,7 +6512,7 @@ fn grep_search(
                 continue;
             }
 
-            let _ = grep_file(&workspace, file_path, &regex, &mut output, &mut matched);
+            let _ = grep_file(workspace, file_path, &regex, &mut output, &mut matched);
             if matched >= GREP_MATCH_LIMIT || output.len() >= GREP_OUTPUT_LIMIT_BYTES {
                 break;
             }
@@ -12880,7 +13212,7 @@ fn delete_protocol_package_at(workspace: &Path, local_path: &str) -> Result<(), 
     let canonical_workspace = workspace
         .canonicalize()
         .map_err(|error| format!("无法解析协议包工作区: {error}"))?;
-    delete_path_within_workspace(&canonical_workspace.join(relative), &canonical_workspace)
+    delete_path_within_workspace(&canonical_workspace.join(relative), &canonical_workspace).map(|_| ())
 }
 
 #[tauri::command]
@@ -12899,7 +13231,7 @@ fn delete_workspace_path(
     state: State<WorkspaceState>,
     path: String,
     workspace: Option<String>,
-) -> Result<(), String> {
+) -> Result<DeletedWorkspaceEntry, String> {
     let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let raw_path = if Path::new(&path).is_absolute() {
@@ -13710,12 +14042,14 @@ pub fn run() {
             get_workspace_root,
             set_workspace_root,
             canonicalize_workspace_path,
+            inspect_workspace_engine_profile,
             list_directory,
             get_project_skeleton,
             get_file_outline,
             read_file,
             read_file_window,
             get_file_metadata,
+            observe_worktree_absence,
             inspect_project_init_target,
             commit_project_init,
             open_file_external,
@@ -13739,7 +14073,13 @@ pub fn run() {
             run_command,
             unity_editor::unity_create_scene,
             unity_editor::unity_compile_project,
+            unity_assembly_dependencies::unity_inspect_assemblies,
             unity_editor::unity_probe_editor,
+            unity_editor::unity_cli_console,
+            unity_editor::capture_unity_game_view,
+            unity_editor::unity_official_mcp,
+            unity_cli_update::unity_cli_check_update,
+            unity_cli_update::unity_cli_apply_update,
             unity_editor::unity_test_project,
             unity_editor::cancel_unity_editor_operation,
             browser_evaluate,
@@ -13769,6 +14109,7 @@ pub fn run() {
             append_debug_log,
             read_debug_log,
             clear_debug_log,
+            finalize_terminal_credential_history_cleanup,
             cloud_auth_begin,
             cloud_auth_finish,
             cloud_auth_status,
@@ -15861,6 +16202,65 @@ fn legacy_snapshot_enumeration_discovers_unlisted_owners_and_fails_closed_on_unk
         assert!(should_skip_recursive_search_dir(".protocols"));
         assert!(!should_skip_recursive_search_dir(".MAIN"));
         assert!(!should_skip_recursive_search_dir("Scripts"));
+    }
+
+    #[test]
+    fn source_search_skips_generated_subtrees_unless_scoped_explicitly() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().canonicalize().unwrap();
+        for path in [
+            "Script.gd",
+            "Game/Source/Player.gd",
+            "Game/.godot/Noise.gd",
+            "Game/Intermediate/Build.gd",
+            "Game/Library/Cache.gd",
+        ] {
+            let path = workspace.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "engine_fixture_symbol\n").unwrap();
+        }
+        assert_eq!(
+            super::source_glob_search(&workspace, "**/*.gd").unwrap(),
+            vec!["Game/Source/Player.gd", "Script.gd"]
+        );
+        assert_eq!(
+            super::source_glob_search(&workspace, "*.gd").unwrap(),
+            vec!["Script.gd"]
+        );
+        assert_eq!(
+            super::source_glob_search(&workspace, "Game/Intermediate/*.gd").unwrap(),
+            vec!["Game/Intermediate/Build.gd"]
+        );
+        assert_eq!(
+            super::source_glob_search(&workspace, "Game/.godot/Noise.gd").unwrap(),
+            vec!["Game/.godot/Noise.gd"]
+        );
+        assert!(super::source_glob_search(&workspace, "../*.gd").is_err());
+        let ordinary =
+            super::grep_search_in_workspace(&workspace, "engine_fixture_symbol", ".").unwrap();
+        assert!(ordinary.contains("Game/Source/Player.gd"));
+        assert!(!ordinary.contains("Game/Intermediate/Build.gd"));
+        assert!(super::grep_search_in_workspace(
+            &workspace,
+            "engine_fixture_symbol",
+            "Game/Intermediate"
+        )
+        .unwrap()
+        .contains("Game/Intermediate/Build.gd"));
+    }
+
+    #[test]
+    fn worktree_absence_observes_only_contained_paths_and_retains_existing_entries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        fs::create_dir(root.join("Assets")).unwrap();
+        fs::write(root.join("Assets/Existing.cs"), "class Existing {}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("missing-target"), root.join("Assets/BrokenLink.cs")).unwrap();
+        let mut paths = vec!["Assets/Removed.cs".into(), "Assets/Existing.cs".into(), "../outside.cs".into()];
+        #[cfg(unix)]
+        paths.push("Assets/BrokenLink.cs".into());
+        assert_eq!(super::observe_missing_workspace_paths(&root, &paths), ["Assets/Removed.cs"]);
     }
 
     #[test]

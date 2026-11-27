@@ -146,6 +146,7 @@ export type TaskBlock =
       streaming?: boolean;
       hiddenProcess?: boolean;
       visibility?: AssistantTextVisibility;
+      runtimeProjectionKey?: string;
       /** Explicit provenance for safe Capsule public-progress projection. */
       publicProgress?: PublicAssistantProgressIdentity;
       archivedAfterChoice?: boolean;

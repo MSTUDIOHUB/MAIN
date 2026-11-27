@@ -17,6 +17,7 @@ export function runtimeV2StructuredToolOutcome(toolName: string, output: unknown
   const result = output && typeof output === "object" && !Array.isArray(output)
     ? output as Record<string, unknown> : null;
   let reason: string | undefined;
+  if (toolName === "capture_unity_game_view" && result?.status !== "captured") reason = "unity_game_view_unavailable";
   if (toolName === "run_command") {
     if (!result) reason = "command_result_unverified";
     else if (result.timedOut === true) reason = "command_timed_out";
@@ -26,10 +27,10 @@ export function runtimeV2StructuredToolOutcome(toolName: string, output: unknown
     else {
       const command = String(args.command || "");
       const unity = unityValidationInvocations(command);
-      const review = authority as { expectedTestCases?: number; useProjectEditor?: true } | undefined;
+      const review = authority as { expectedTestCases?: number; expectedTestCaseNames?: readonly string[]; useProjectEditor?: true } | undefined;
       if (review?.useProjectEditor) {
         const filter = projectEditorPlayModeFilter(command);
-        if (!filter || !verifiedProjectEditorPlayModeResult(filter, result, review.expectedTestCases)) reason = "unity_validation_verdict_unverified";
+        if (!filter || !verifiedProjectEditorPlayModeResult(filter, result, review.expectedTestCases, review.expectedTestCaseNames)) reason = "unity_validation_verdict_unverified";
       } else if (unity.length > 0 && !verifiedUnityValidationResult(unity, result, review?.expectedTestCases)) {
         reason = "unity_validation_verdict_unverified";
       } else if (unity.length === 0 && isUnmanagedUnityVerification(command)) {

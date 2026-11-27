@@ -430,6 +430,11 @@ function explicitSkillReferences(prompt: string): Set<string> {
   return references;
 }
 
+/** A possible explicit invocation requests catalog lookup, but grants no Skill. */
+export function hasExplicitSkillInvocation(prompt: string): boolean {
+  return explicitSkillReferences(prompt).size > 0 || /(?:^|\s)[$@]\p{L}[\p{L}\p{N}_-]*(?=$|[\s.,;:!?，。；：！？])/u.test(prompt);
+}
+
 async function supportingFilesFor(basePath: string, entryPath: string, workspace: string): Promise<string[]> {
   if (!basePath || !workspace) return [];
   const candidates = await globSearch(`${basePath}/**/*`, workspace).catch(() => []);

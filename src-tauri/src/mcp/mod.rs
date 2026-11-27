@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod filesystem;
 pub mod git;
+pub(crate) mod stdio;
 pub mod terminal;
 pub mod unity;
 

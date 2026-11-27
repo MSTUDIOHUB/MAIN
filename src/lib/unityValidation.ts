@@ -13,7 +13,7 @@ export function unityCommandArguments(command: string): string[] | null {
 /** An explicitly reviewed, engine-neutral PlayMode route with no shell
  * composition or additional process arguments. */
 export function projectEditorPlayModeFilter(command: string): string | null {
-  return /^unity[ \t]+test[ \t]+\.[ \t]+--mode[ \t]+(?:PlayMode|playmode)[ \t]+--filter[ \t]+([A-Za-z_][A-Za-z0-9_.]{0,199})$/.exec(command.trim())?.[1] ?? null;
+  return /^unity[ \t]+test[ \t]+\.[ \t]+--mode[ \t]+(?:PlayMode|playmode)[ \t]+--filter[ \t]+([A-Za-z_][A-Za-z0-9_.+]{0,199})$/.exec(command.trim())?.[1] ?? null;
 }
 
 export function isUnmanagedUnityVerification(command: string): boolean {
@@ -85,6 +85,7 @@ export function verifiedUnityValidationResult(
   invocations: readonly UnityValidationInvocation[],
   output: unknown,
   expectedTestCases?: number,
+  expectedTestCaseNames?: readonly string[],
 ): boolean {
   const result = record(output);
   if (!result || result.timedOut === true || result.exitCode !== 0 || result.success === false) return false;
@@ -107,11 +108,17 @@ export function verifiedUnityValidationResult(
   const summary = record(verdict.summary ?? verdict.Summary);
   const total = summary?.total ?? summary?.Total;
   const outcomes = verdict.results ?? verdict.Results;
+  const observedNames = Array.isArray(outcomes) ? new Set(outcomes.map(outcome => {
+    const result = record(outcome);
+    return result?.fullName ?? result?.FullName;
+  })) : undefined;
   return (verdict.success ?? verdict.Success) === true &&
     String(verdict.mode ?? verdict.Mode).toLowerCase() === "playmode" &&
     String(verdict.filterApplied ?? verdict.FilterApplied).replace(/^testname: /i, "") === first.filter &&
     typeof total === "number" && Number.isSafeInteger(total) && total > 0 &&
     (expectedTestCases === undefined || total === expectedTestCases) &&
+    (!expectedTestCaseNames || expectedTestCaseNames.length === total && observedNames?.size === total &&
+      expectedTestCaseNames.every(name => observedNames.has(name))) &&
     (summary?.passed ?? summary?.Passed) === total && (summary?.failed ?? summary?.Failed) === 0 &&
     (summary?.skipped ?? summary?.Skipped) === 0 && (summary?.inconclusive ?? summary?.Inconclusive) === 0 &&
     Array.isArray(outcomes) && outcomes.length === total && outcomes.every(outcome => {
@@ -122,8 +129,9 @@ export function verifiedUnityValidationResult(
     });
 }
 
-export function verifiedProjectEditorPlayModeResult(filter: string, output: unknown, expectedTestCases: number | undefined): boolean {
+export function verifiedProjectEditorPlayModeResult(filter: string, output: unknown, expectedTestCases: number | undefined,
+  expectedTestCaseNames?: readonly string[]): boolean {
   if (!expectedTestCases || expectedTestCases < 1) return false;
-  return verifiedUnityValidationResult([{ kind: "batch" }], output, expectedTestCases) ||
-    verifiedUnityValidationResult([{ kind: "live_playmode", filter, timeoutSeconds: 90 }], output, expectedTestCases);
+  return (!expectedTestCaseNames && verifiedUnityValidationResult([{ kind: "batch" }], output, expectedTestCases)) ||
+    verifiedUnityValidationResult([{ kind: "live_playmode", filter, timeoutSeconds: 90 }], output, expectedTestCases, expectedTestCaseNames);
 }

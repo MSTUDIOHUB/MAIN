@@ -15,6 +15,7 @@ import { compressImage, getImageFilesFromClipboard, processImageFile } from "../
 import { estimateTokens } from "../lib/contextTrim";
 import { ingestAttachmentBytes } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import type { AgentMessage, ContentPart } from "../lib/agentMessages";
 import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
 import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcutForMode, resolveComposerIntentSuggestion } from "../lib/runIntent";
@@ -292,7 +293,7 @@ export default function Composer({
   // ── Context usage estimation ──
   const agentMessages = useAppStore((s) => s.agentMessages);
   const activeProfile = useAppStore((s) => s.config.activeProfile);
-  const themeMode = useAppStore((s) => s.config.themeMode);
+  const themeMode = useEffectiveThemeMode();
   const contextLimit = useAppStore((s) => s.config.local.contextLimit);
   const language = useAppStore((s) => s.config.language);
   const storeInput = useAppStore((s) => s.input);

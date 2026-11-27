@@ -228,6 +228,7 @@ export function normalizeRuntimeV2ProviderToolCalls(
       call.name,
       call.arguments,
       workspace,
+      schema,
     );
     const normalizedArguments = Object.fromEntries(
       Object.entries(canonicalArguments).flatMap(([key, value]) => {

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { collectTerminalCredentialValues, createKnownTerminalCredentialRedactor, redactTerminalCredentials } from "./terminalCredentials";
 
 export type DebugLogLevel = "debug" | "info" | "warn" | "error";
 
@@ -83,10 +84,16 @@ function isSecretDebugKey(key: string): boolean {
 }
 
 function redactSecrets(text: string): string {
-  return text
+  return redactTerminalCredentials(text)
     .replace(/Bearer\s+[\w.+/=-]+/gi, "Bearer [REDACTED]")
     .replace(/("(?:authorization|api[-_]?key|x-api-key|token|password|secret)"\s*:\s*)"[^"]*"/gi, "$1\"[REDACTED]\"")
     .replace(/((?:authorization|api[-_]?key|x-api-key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+}
+
+function redactStoredEntry(entry: DebugLogEntry, redactKnown: (text: string) => string): DebugLogEntry {
+  const message = redactKnown(redactSecrets(String(entry?.message ?? "")));
+  const source = redactKnown(redactSecrets(String(entry?.source ?? "")));
+  return message === entry?.message && source === entry?.source ? entry : { ...entry, message, source };
 }
 
 function stableDebugHash(value: string): string {
@@ -363,11 +370,14 @@ function readLocalEntries(): DebugLogEntry[] {
       return localEntriesCache;
     }
     const parsed = JSON.parse(raw);
-    localEntriesCache = Array.isArray(parsed)
-      ? parsed.slice(-MAX_LOCAL_ENTRIES)
-      : [];
+    const entries: DebugLogEntry[] = Array.isArray(parsed) ? parsed.slice(-MAX_LOCAL_ENTRIES) : [];
+    const credentials = new Set<string>();
+    for (const entry of entries) collectTerminalCredentialValues(String(entry?.message ?? ""), credentials);
+    const redactKnown = createKnownTerminalCredentialRedactor(credentials);
+    localEntriesCache = entries.map(entry => redactStoredEntry(entry, redactKnown));
     localEntriesSerialized = raw;
-    localEntriesDirty = false;
+    localEntriesDirty = localEntriesCache.some((entry, index) => entry !== entries[index]);
+    if (localEntriesDirty) flushLocalEntries();
     return localEntriesCache;
   } catch {
     return localEntriesCache || [];
@@ -659,7 +669,7 @@ export function appendDebugLog(
   const entry: DebugLogEntry = {
     timestamp: toIsoTimestamp(),
     level,
-    source,
+    source: redactSecrets(source),
     message: normalizeMessage(message),
   };
 
@@ -676,13 +686,15 @@ export function appendDebugLog(
 }
 
 export function getLocalDebugLogText() {
+  const entries = readLocalEntries();
   flushLocalEntries();
-  return readLocalEntries().map(formatEntry).join("\n");
+  return entries.map(formatEntry).join("\n");
 }
 
 export async function readDebugLogSnapshot(maxBytes = 256 * 1024): Promise<DebugLogSnapshot> {
   try {
-    return await invoke<DebugLogSnapshot>("read_debug_log", { maxBytes });
+    const snapshot = await invoke<DebugLogSnapshot>("read_debug_log", { maxBytes });
+    return { ...snapshot, content: redactSecrets(snapshot.content) };
   } catch {
     return {
       path: "localStorage:main.debugLog.v1",
@@ -698,13 +710,14 @@ export async function clearDebugLog() {
 }
 
 export async function copyDebugLogToClipboard(text: string) {
+  const redacted = redactSecrets(text);
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
+    await navigator.clipboard.writeText(redacted);
     return;
   }
 
   const textArea = document.createElement("textarea");
-  textArea.value = text;
+  textArea.value = redacted;
   textArea.style.position = "fixed";
   textArea.style.left = "-9999px";
   document.body.appendChild(textArea);
@@ -724,13 +737,19 @@ export function installDebugLogCapture() {
 
   const wrapConsole = (level: DebugLogLevel, original: (...args: unknown[]) => void) => {
     return (...args: unknown[]) => {
-      if (shouldSkipConsoleLog(level, args)) {
-        original(...args);
+      const safeArgs = args.map((arg) => {
+        if (typeof arg !== "string" && !(arg instanceof Error)) return arg;
+        const text = stringifyArg(arg);
+        const redacted = redactTerminalCredentials(text);
+        return redacted === text ? arg : redacted;
+      });
+      if (shouldSkipConsoleLog(level, safeArgs)) {
+        original(...safeArgs);
         return;
       }
-      const classified = classifyConsoleLog(args);
+      const classified = classifyConsoleLog(safeArgs);
       if (!classified.suppressNativeConsole) {
-        original(...args);
+        original(...safeArgs);
       }
       appendDebugLog(level, classified.source, classified.messageArgs);
     };
@@ -760,7 +779,7 @@ export function installDebugLogCapture() {
     const entry = {
       timestamp: String(event.payload.timestamp || toIsoTimestamp()),
       level: (event.payload.level as DebugLogLevel) || "info",
-      source: event.payload.source || "rust",
+      source: redactSecrets(event.payload.source || "rust"),
       message: normalizeMessage(event.payload.message || ""),
     };
     if (!isRoutineDebugEntry(entry)) {

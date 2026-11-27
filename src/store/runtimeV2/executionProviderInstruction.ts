@@ -161,24 +161,30 @@ export function providerModeInstruction(
       ? `Previous child work did not complete (${failedSubagents.join("; ")}). Continue the objective directly; child failure is never a blocker.`
       : "",
     activeSubagents.length > 0
-      ? `Child work is active (${activeSubagents.join("; ")}). Do not reread files already assigned to active children; continue independent non-overlapping parent work and call wait_subagents only when a child result or staged mutation becomes a dependency.`
+      ? `Child work is active (${activeSubagents.join("; ")}). Continue independent parent work. Use wait_subagents only for a result or staged mutation required by your next action. Name the child handle and describe that blocked action in dependency.`
       : "",
     allSubagentsSettled
       ? "All spawned subagents have finished and settled; no active subagents remain. Do NOT call wait_subagents again; continue directly from the delivered results or conclude."
+      : "",
+    toolSurface.hasSpawnSubagent && Array.isArray(command.payload.delegationHints) && command.payload.delegationHints.length
+      ? `Independent work candidates backed by the Run ledger: ${JSON.stringify(command.payload.delegationHints.slice(0, 4))}. Use primaryEvidence references for the child and name the path you can work on in parent_work.`
       : "",
     toolSurface.hasSpawnSubagent && remainingSubagentCapacity > 0
       ? (() => {
           const requestMode = typeof command.payload.collaborationRequestMode === "string"
             ? command.payload.collaborationRequestMode
             : "";
-          const serializedLane = remainingSubagentCapacity <= 1 || requestMode === "serialized";
+          // Capacity counts child requests after the lane reserves the parent.
+          // A single child slot can still run concurrently with that parent.
+          const serializedLane = requestMode === "serialized";
+          const freeSlots = Math.max(0, remainingSubagentCapacity - activeSubagents.length);
           return [
             command.payload.collaborationPreferred === true
               ? serializedLane
-                ? `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity} (${requestMode || "serialized"}, sequential model lane), so child requests run sequentially rather than concurrently. Keep each child objective and success criteria within the user's requested deliverable and depth. Prefer one focused child or direct parent execution unless bounded context isolation justifies queuing.`
-                : `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, and independent tasks may queue. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
+                ? "The user prefers collaboration. The current lane runs requests sequentially rather than concurrently. Continue the parent task directly while parallel capacity is unavailable."
+                : `The user prefers collaboration. There are ${freeSlots} free child request slots. Propose a distinct, actionable deliverable only. Provide primary required_paths, success_criteria, evidence_refs (ledger IDs or exact evidence paths), and concrete independent parent_work. Keep known versions, a single diagnostic chain, and already delivered findings in the parent. Continue directly when the work is sequential or capacity is busy.`
               : serializedLane
-                ? `Delegation is optional. Current child-request capacity is ${remainingSubagentCapacity} (${requestMode || "serialized"}, sequential model lane), so child requests run sequentially rather than concurrently; prefer direct parent execution unless bounded context isolation justifies queuing.`
+                ? "Delegation is optional. The current lane runs requests sequentially rather than concurrently. Continue the parent task directly while parallel capacity is unavailable."
                 : "Delegation is optional.",
             "Use read-only children for parallel investigation. Use implement/write only under an approved WorkPlan ready frontier (even during initial observing) or a recorded parent execution contract: provide an explicit operation, implementation_plan, success criteria, and exact non-overlapping file targets; never grant a directory and let the child choose writes. The child stages coherent write transactions within its exclusive targets and Runtime atomically validates and commits them at join; the parent still owns cross-file integration, dependency order, and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
           ].join(" ");

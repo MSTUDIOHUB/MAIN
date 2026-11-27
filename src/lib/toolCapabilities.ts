@@ -9,7 +9,7 @@ import type { ResolvedUserIntent } from "./runIntent";
 import type { ToolCatalog } from "./toolCatalog";
 import type { ToolDefinition } from "./toolSchemas";
 import { looksDangerousShellCommand } from "./toolExecutionContract";
-import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "./runtime-v2/workspaceReadPolicy";
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL, RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "./runtime-v2/workspaceReadPolicy";
 
 export type PromptLanguageStrategy = "english_core_localized_output" | "model_aware" | "pure_english" | "pure_user_language";
 
@@ -43,7 +43,7 @@ export interface ToolCapability {
   description?: string;
   serverName?: string;
   serverUrl?: string;
-  mcpConnector?: "unity";
+  mcpConnector?: "unity" | "unity_official";
 }
 
 export interface ToolCapabilityRegistry {
@@ -733,6 +733,7 @@ export function classifyKnownBuiltInTool(name: string): ToolRiskLevel | null {
   if (BROWSER_CONTROL_BUILT_INS.has(name)) return "browser_control";
   if (DESKTOP_CONTROL_BUILT_INS.has(name)) return "desktop_control";
   if (DESTRUCTIVE_BUILT_INS.has(name)) return "destructive";
+  if (name === ENABLE_UNITY_OFFICIAL_MCP_TOOL) return "external_write";
   return null;
 }
 
@@ -752,13 +753,14 @@ export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): Tool
 export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLevel {
   const remoteName = getMcpToolRemoteName(tool);
   const text = normalizeText(`${server?.name || ""} ${remoteName} ${tool.description || ""}`);
-  const unityConnector = getMcpToolOrigin(tool)?.connector === "unity";
+  const connector = getMcpToolOrigin(tool)?.connector;
+  const unityConnector = connector === "unity";
   if (unityConnector && remoteName === "read_console") return "external_write";
-  if (EXTERNAL_READ_MCP_TOOL_NAMES.has(remoteName)) return "external_read";
+  if (connector !== "unity_official" && EXTERNAL_READ_MCP_TOOL_NAMES.has(remoteName)) return "external_read";
   const risk = classifyMcpToolDescription(text);
   // A raw Editor tool may run code or combine actions. Only the explicit
   // read-only tools above and the fixed built-in aliases can grant reads.
-  return unityConnector && risk === "external_read" ? "external_write" : risk;
+  return connector && risk === "external_read" ? "external_write" : risk;
 }
 
 function classifyMcpToolDescription(text: string): ToolRiskLevel {
@@ -914,7 +916,7 @@ export function getToolRiskLevelForCall(
   const capability = registry?.tools[name];
   // The Editor contract owns this risk. Generic SQL/argument heuristics
   // must not reinterpret a raw Editor action as a read.
-  if (capability?.mcpConnector === "unity") return capability.risk;
+  if (capability?.mcpConnector) return capability.risk;
   const localFileReadPath = getLocalFileReadPathForToolCall(name, args, context.workspace);
   if (
     localFileReadPath &&

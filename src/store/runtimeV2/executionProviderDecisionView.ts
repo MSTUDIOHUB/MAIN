@@ -63,7 +63,17 @@ function runtimeDecisionMessageCopy(
       /^\[runtime-v2 provider feedback: [^\]\r\n]+\](?:\n|$)/.test(message.content) &&
       Object.keys(message).every((key) => key === "role" || key === "content")
     ) {
-      if (feedbackSeen.has(message.content)) continue;
+      if (feedbackSeen.has(message.content)) {
+        const previous = messages[index - 1];
+        if (message.content.startsWith("[runtime-v2 provider feedback: non_actionable_response]") &&
+            previous?.role === "assistant" && typeof previous.content === "string" &&
+            Object.keys(previous).every((key) => key === "role" || key === "content")) {
+          // Keep the most recent draft with its corrective feedback. The
+          // repeated summaries still belong to the canonical transcript.
+          index -= 1;
+        }
+        continue;
+      }
       feedbackSeen.add(message.content);
     }
     selected.push(message);
@@ -625,8 +635,9 @@ export function buildRuntimeV2DecisionView(
     const diagnostic = result ? messageText(result).trim() : "";
     if (!call || !diagnostic) return null;
     const args = parsedToolArguments(call.function.arguments);
+    const rejection = effects?.correctiveMutationRequirementsByToolCallId?.get(call.id);
     const target = boundedCorrectiveFailureTarget(
-      args.path ?? args.file_path ?? args.target,
+      rejection?.target || args.path || args.file_path || args.target,
     );
     return {
       role: "system" as const,
@@ -635,7 +646,8 @@ export function buildRuntimeV2DecisionView(
         "ACTION_NOT_EXECUTED: the latest workspace mutation was rejected and changed no files.",
         target ? `target: ${target}` : "",
         "effect: none",
-        "Keep this exact diagnostic active across recovery reads. Derive a materially different, smaller mutation from the visible current source; do not reconstruct the rejected patch.",
+        "Keep this exact diagnostic active across recovery reads. Propose a focused mutation using the exact current source visible in this decision.",
+        "If a later read_file result already supplies the relevant current window, use that result directly.",
         diagnostic.slice(0, 6_000),
       ].filter(Boolean).join("\n"),
     };
@@ -715,6 +727,7 @@ export function boundRuntimeV2ProviderConversation(
     readonly contextLimit: number;
     readonly reservedOutputTokens: number;
     readonly inputBudget?: number;
+    readonly preferWorkset?: boolean;
   },
   effects?: RuntimeV2ProviderEffectFacts,
 ): AgentMessage[] {
@@ -722,7 +735,7 @@ export function boundRuntimeV2ProviderConversation(
   const inputBudget = options.inputBudget ?? computeContextBudgets(
     options.contextLimit, options.reservedOutputTokens,
   ).inputBudget;
-  if (estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
+  if (!options.preferWorkset && estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
   const decision = buildRuntimeV2DecisionView(messages, effects);
   const guidance = activeRuntimeV2SkillGuidanceWindows(decision);
   const priorityToolCallIds = new Set(guidance.map((window) => window.callId));

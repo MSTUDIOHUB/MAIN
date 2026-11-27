@@ -649,7 +649,8 @@ export function tryTransition(
         event.jobs.some((job) =>
           !isValidRuntimeV2SubagentJob(job, event.run) ||
           (job.proactiveKey && !state.scheduledCommands.some(command =>
-            command.kind === "schedule_subagents" && command.payload.proactiveKey === job.proactiveKey))
+            command.kind === "schedule_subagents" && command.payload.proactiveKey === job.proactiveKey &&
+            (command.payload.toolCallId || undefined) === job.sourceToolCallId))
         )
       ) {
         return rejection(state, "subagent_invalid");
@@ -675,7 +676,9 @@ export function tryTransition(
       const index = state.subagents.findIndex((job) => job.id === event.jobId);
       if (index < 0) return rejection(state, "subagent_not_found");
       const current = state.subagents[index]!;
-      if (current.status !== "running" || current.closedAt === null) {
+      const canceledBeforeStart = current.status === "queued" && event.status === "canceled" &&
+        event.evidence.length === 0 && !event.inheritedEvidence?.length && !event.report;
+      if (!canceledBeforeStart && (current.status !== "running" || current.closedAt === null)) {
         return rejection(state, "subagent_telemetry_invalid");
       }
       if (
@@ -691,6 +694,7 @@ export function tryTransition(
       subagents[index] = {
         ...current,
         status: event.status,
+        ...(canceledBeforeStart ? { closedAt: event.at } : {}),
         summary: event.summary.trim() || null,
         report: event.report || null,
       };

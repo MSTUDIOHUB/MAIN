@@ -26,6 +26,7 @@ import {
 } from "../../lib/runtime-v2";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { approvedPlanExecutionRepair, retryableUnityEditorCheck, unresolvedUnityEditorCheck } from "../../lib/runtime-v2/unityCompilation";
+import { runtimeV2UnityPlayModeUnavailable } from "../../lib/runtime-v2/unityPlayMode";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import type { ConversationTurn } from "../../lib/workflowModels";
@@ -47,6 +48,7 @@ import {
 import {
   runtimeV2ExecuteTerminalDecision,
   runtimeV2PhaseTransitionMessage,
+  recoverRuntimeV2Validation,
 } from "./executionOutcome";
 import {
   createRuntimeV2RunnerIdentity,
@@ -59,7 +61,7 @@ import { restoreRuntimeV2ExecutionHistory } from "./executionProviderHistory";
 import { projectFiniteValidationCommands } from "./executionProviderContext";
 import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
 import { pausedAgentLoopOutcome } from "../../lib/runOutcome";
-import { projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
+import { executionRecoveryOptions, finishPendingExecutionVerification, projectRuntimeV2ExecutionBlocker } from "./executionBlocker";
 import { admitExecuteSessionSourceCarryover } from "./sessionSourceCarryover";
 import { createRuntimeV2PlanReviewCommit, resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 import { deriveProactiveCollaboration } from "./proactiveSubagents";
@@ -218,6 +220,7 @@ export async function runSubmitRuntimeV2Execute(
         run: identity.run,
         strategy: continuationReference ? "plan" : "execute",
         objective: continuationSource ? continuationSource.aggregate.objective.text : admission.objective,
+        subagentRequirement: input.context.turnInputContextSignals?.subagentRequirement,
         completionRequirement: continuationSource ? undefined : admission.completionRequirement,
         networkRead: input.context.networkRead,
         knowledgeContext: input.context.knowledgeContext,
@@ -237,7 +240,7 @@ export async function runSubmitRuntimeV2Execute(
           ),
         initialPhase: continuationReference ? "planning" : isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "") || admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
       });
-      await admitExecuteSessionSourceCarryover({ state: input.get(), sessionKey: identity.turn.sessionKey, workspaceKey: identity.turn.workspaceKey, turnId: identity.turn.turnId, runId: identity.run.runId, capabilityRestrictions: admission.capabilityRestrictions, approvalRequiredCapabilities: admission.approvalRequiredCapabilities, live, signal: input.context.abortCtrl.signal, recordObservation: (evidence) => controller.recordObservation(evidence), logStoreEvent: input.logStoreEvent });
+      await admitExecuteSessionSourceCarryover({ state: input.get(), sessionKey: identity.turn.sessionKey, workspaceKey: identity.turn.workspaceKey, turnId: identity.turn.turnId, runId: identity.run.runId, sourceTurnId: input.context.sourceInvestigationTurnId, sessionEpoch: identity.turn.sessionEpoch, capabilityRestrictions: admission.capabilityRestrictions, approvalRequiredCapabilities: admission.approvalRequiredCapabilities, live, signal: input.context.abortCtrl.signal, recordObservation: (evidence) => controller.recordObservation(evidence), logStoreEvent: input.logStoreEvent });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
       await controller.resumeTerminalProjection();
@@ -356,14 +359,21 @@ export async function runSubmitRuntimeV2Execute(
       if (before.run?.status === "paused") {
         if (before.run.blocker?.decision && before.run.blocker.decision !== "stop") {
           await controller.resumeRun(before.run.blocker.requestId);
-          live.messages.push({ role: "system", content: before.run.blocker.decisionSource === "editor_reconnected"
-            ? "The exact project Editor became available. Recheck the committed files under the existing authority."
-            : "The user requested a recheck of the paused prerequisite. Re-observe the exact prerequisite before retrying; no extra permissions or acceptance were granted." });
+          if (before.run.blocker.decision === "recheck") {
+            live.messages.push({ role: "system", content: before.run.blocker.decisionSource === "editor_reconnected"
+              ? "The exact project Editor became available. Recheck the committed files under the existing authority."
+              : "The user requested a recheck of the paused prerequisite. Re-observe the exact prerequisite before retrying; no extra permissions or acceptance were granted." });
+          }
           input.set((state: any) => ({ activeActionRequest: null, conversationTurns: state.conversationTurns.map((turn: any) => turn.id === before.turn.turnId ? { ...turn, status: "executing", runtimeOutcome: undefined } : turn) }));
           continue;
         }
         projectRuntimeV2ExecutionBlocker({ aggregate: before, get: input.get, set: input.set, language: input.context.phaseLanguage });
         return createRuntimeV2RunnerSettlement(input.context, pausedAgentLoopOutcome(before.run.blocker?.reasonCode || "action_required", "action_required"));
+      }
+      const finishPending = finishPendingExecutionVerification(before, input.context.phaseLanguage);
+      if (finishPending) {
+        await controller.driveOnce(finishPending);
+        continue;
       }
       const providerRecoveryWindow =
         deriveRuntimeV2ProviderRecoveryWindow(before);
@@ -440,30 +450,24 @@ export async function runSubmitRuntimeV2Execute(
           continue;
         }
       }
-      // Persist the compiler operation after the successful write receipt,
-      // before the next provider decision or any pending test call.
+      // Persist Editor checks and diagnostic reads before the next model or test action.
       if (!before.recovery.exhausted && await controller.driveOnce({ checkUnityCompilation: true })) continue;
+      const playModePending = runtimeV2UnityPlayModeUnavailable(before);
       const editorCheck = retryableUnityEditorCheck(before);
-      const finishedProviderWork = editorCheck && latestRuntimeV2Answer(before);
-      if (editorCheck && finishedProviderWork && !input.context.abortCtrl.signal.aborted && !before.recovery.exhausted) {
+      const validationPending = playModePending ?? (editorCheck && latestRuntimeV2Answer(before) ? editorCheck : undefined);
+      if (validationPending && !before.pendingToolCalls.length && !before.scheduledCommands.length &&
+          !input.context.abortCtrl.signal.aborted && !before.recovery.exhausted) {
         const en = input.context.phaseLanguage === "en";
-        const pending = before.run?.blocker;
-        if (pending?.reasonCode === "unity_editor_verification_pending" &&
-            pending.evidenceSequence === editorCheck.sequence && pending.decision === "continue") {
-          const reason = en ? "Changes retained. Editor verification is pending." : "修改已保留，等待 Editor 验证。";
-          await controller.driveOnce({ resultKind: "partial", resultReason: reason,
-            finalMarkdown: [reason, editorCheck.result.message].filter(Boolean).join("\n\n") });
-        } else {
-          await controller.pauseRun({
-            requestId: nextId("editor-verification"),
-            reasonCode: "unity_editor_verification_pending",
-            evidenceSequence: editorCheck.sequence,
-            message: en ? "The current Editor did not return a verified result. Recheck when the exact project Editor is ready, or finish with the changes retained."
-              : "当前 Editor 未返回可核验结果。对应项目的 Editor 就绪后可重新检查，也可以保留修改并结束本轮。",
-            options: ["recheck", "continue", "stop"],
-            independentWork: ["report_pending_editor_verification"],
-          });
-        }
+        await controller.pauseRun({
+          requestId: nextId("editor-verification"),
+          reasonCode: "unity_editor_verification_pending",
+          evidenceSequence: validationPending.sequence,
+          message: playModePending
+            ? en ? "The bound Editor did not provide the required PlayMode result." : "当前 Editor 未返回所需的 Play Mode 验证结果。"
+            : en ? "The current Editor did not return a verified result." : "当前 Editor 未返回可核验结果。",
+          options: ["recheck", "continue", "stop"],
+          independentWork: ["report_pending_editor_verification"],
+        });
         continue;
       }
       const terminal = runtimeV2ExecuteTerminalDecision({
@@ -475,6 +479,12 @@ export async function runSubmitRuntimeV2Execute(
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }
+      const projectValidators = before.phase === "validating" && !isRuntimeV2EditorDiagnosticRepair(before) &&
+        providerRecoveryPressure?.reason === "non_actionable_response" ? projectFiniteValidationCommands(input) : [];
+      if (await recoverRuntimeV2Validation(controller, {
+        aggregate: before, language: input.context.phaseLanguage,
+        hasProjectValidation: projectValidators.length > 0,
+      }, nextId)) continue;
       if (
         providerRecoveryPressure &&
         runtimeV2ProviderRecoveryStallExpired(
@@ -494,7 +504,7 @@ export async function runSubmitRuntimeV2Execute(
           },
         );
         await controller.pauseRun({ requestId: nextId("execution-choice"), reasonCode: "recovery_stalled", evidenceSequence: before.events[before.events.length - 1]!.sequence,
-          message: input.context.phaseLanguage === "zh" ? "恢复过程持续未产生新进展。请检查所需资源或权限后重新检查，或停止任务。" : "Recovery made no new progress. Check prerequisites and recheck, or stop.", options: ["recheck", "stop"] });
+          message: input.context.phaseLanguage === "zh" ? "恢复过程持续未产生新进展。请检查所需资源或权限后重新检查，或停止任务。" : "Recovery made no new progress. Check prerequisites and recheck, or stop.", ...executionRecoveryOptions(before) });
         continue;
       }
       const phaseTransition = decideRuntimeV2ExecutePhaseTransition(before, {
@@ -536,10 +546,9 @@ export async function runSubmitRuntimeV2Execute(
         input.get().config,
       );
       const subagentPreference = input.context.turnInputContextSignals.subagentPreference;
-      const projectValidators = before.phase === "validating" && !isRuntimeV2EditorDiagnosticRepair(before) && providerRecoveryPressure?.reason === "non_actionable_response"
-        ? projectFiniteValidationCommands(input).filter(option => option.capability === "test") : [];
+      const projectTestValidators = projectValidators.filter(option => option.capability === "test");
       const drove = await controller.driveOnce({
-        projectValidationRecovery: projectValidators.length === 1 ? projectValidators[0] : undefined,
+        projectValidationRecovery: projectTestValidators.length === 1 ? projectTestValidators[0] : undefined,
         subagentPreference,
         subagentCapacity: subagentPolicy.maxActiveRequests,
         subagentRequestMode: subagentPolicy.modelRequestMode,

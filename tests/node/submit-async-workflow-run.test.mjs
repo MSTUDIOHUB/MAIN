@@ -660,6 +660,106 @@ test("submit async workflow run keeps stage order from context build to engine l
   );
 });
 
+test("source-free Chat in a workspace keeps its Session and skips project admission", async () => {
+  let captured;
+  let admissions = 0;
+  const harness = createHarness({ input: {
+    text: "你好", effectiveRunIntent: "respond", runtimeRunIntent: "respond",
+    semanticIntent: { objective: "Reply to greeting", workType: "answer", answerFormat: "answer",
+      requiredCapabilities: [], forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
+    mentionSnapshot: [], attachedFilesSnapshot: [],
+    shouldExecuteOnceFromReplyOption: false,
+    turnInputContextSignals: { imageParts: 0, mentionedFilePaths: [], attachedFilePaths: [] },
+    refreshWorkspaceAdmission: async () => { admissions++; return { instructions: null, baseline: null }; },
+    phaseRunners: { runRuntime: async ({ context }) => { captured = context; return true; } },
+  } });
+  await runSubmitAsyncWorkflowRun(harness.input);
+  assert.equal(admissions, 0);
+  assert.equal(harness.calls.some(([name]) => name === "workspace_tree"), false);
+  assert.equal(captured.runWorkspace, "/tmp/workspace");
+  assert.equal(captured.runSessionKey, "workspace::7");
+  assert.equal(captured.workspaceInstructionContext, "");
+  assert.equal(harness.state.agentMessages.at(-1).content, "你好");
+});
+
+test("a typed source inspection passes code mentions as paths and skips optional baseline and MCP", async () => {
+  const reads = [];
+  let captured;
+  const harness = createHarness({ input: {
+    text: "检查这里", effectiveRunIntent: "analyze", runtimeRunIntent: "analyze",
+    semanticIntent: { objective: "Inspect named script", workType: "investigate", answerFormat: "analysis",
+      requiredCapabilities: ["workspace_read"], forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
+    mentionSnapshot: ["Assets/Timer.cs"], attachedFilesSnapshot: [],
+    turnInputContextSignals: { imageParts: 0, mentionedFilePaths: ["Assets/Timer.cs"], attachedFilePaths: [] },
+    readFile: async (file) => { reads.push(file); return "source"; },
+    refreshWorkspaceAdmission: async (workspace, _prompt, options) => {
+      assert.equal(workspace, "/tmp/workspace");
+      assert.deepEqual(options, { includeProjectBaseline: false, includeMcp: false });
+      return { instructions: null, baseline: null };
+    },
+    phaseRunners: { runRuntime: async ({ context }) => { captured = context; return true; } },
+  } });
+  await runSubmitAsyncWorkflowRun(harness.input);
+  assert.deepEqual(reads, []);
+  assert.equal(harness.calls.some(([name]) => name === "workspace_tree"), false);
+  assert.deepEqual(captured.mentionSnapshot, ["Assets/Timer.cs"]);
+  assert.match(harness.state.agentMessages.at(-1).content, /path: Assets\/Timer\.cs/);
+});
+
+test("typed Console repair requests admit Editor tools when preflight only names workspace capabilities", async () => {
+  for (const request of ["修复console窗口的错误", "Fix the Console errors"]) {
+    const admissions = [];
+    const harness = createHarness({ input: {
+      text: request, effectiveRunIntent: "execute", runtimeRunIntent: "execute",
+      semanticIntent: { objective: request, workType: "implement", answerFormat: "answer",
+        requiredCapabilities: ["workspace_read", "workspace_write"], forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
+      refreshWorkspaceAdmission: async (workspace, prompt, options) => {
+        admissions.push({ workspace, prompt, options });
+        return { instructions: null, baseline: null };
+      },
+    } });
+    await runSubmitAsyncWorkflowRun(harness.input);
+    assert.deepEqual(admissions, [{ workspace: "/tmp/workspace", prompt: request, options: undefined }]);
+  }
+});
+
+test("a natural repair includes its exact prior investigation and omits the duplicate transcript", async () => {
+  const { createRuntimeV2Checkpoint, replayRuntimeV2Events } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
+  const { providerHistory } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderHistory.ts"));
+  const prior = { workspaceKey: "/tmp/workspace", sessionKey: "workspace::7", sessionEpoch: "runtime-v2:turn-1",
+    clientSubmissionId: "investigation", turnId: "investigation" };
+  const run = { sessionKey: prior.sessionKey, sessionEpoch: prior.sessionEpoch, turnId: prior.turnId,
+    runId: "investigation-run", parentRunId: null, attemptId: "investigation-run" };
+  const outcome = { resultKind: "success", reason: "answer_delivered", completedAt: 5, finalProjectionId: "final-investigation" };
+  const projection = { id: outcome.finalProjectionId, audience: "final", markdown: "Current iterator issue", kind: "final", dedupeKey: "investigation-final" };
+  const events = [
+    { type: "turn.admitted", turn: prior, strategy: "analyze", objective: "Inspect Timer", constraints: [], acceptanceCriteria: [] },
+    { type: "run.started", run, phase: "observing" },
+    { type: "observation.recorded", run, evidence: { id: "E1", kind: "source", version: `sha256-${"a".repeat(64)}`, target: "Assets/Timer.cs" } },
+    { type: "phase.changed", run, phase: "finalizing", reason: "terminal_outcome_preparation" },
+    { type: "run.completed", run, outcome, finalProjection: projection },
+    { type: "projection.published", run, audience: "final", projectionId: projection.id, projection },
+    { type: "turn.completed", turn: prior, runId: run.runId, outcome },
+  ].map((event, sequence) => ({ ...event, schemaVersion: "runtime-v2-event.v1", sequence, at: sequence + 1, eventId: `investigation-${sequence}` }));
+  const aggregate = replayRuntimeV2Events(events);
+  const checkpoint = createRuntimeV2Checkpoint({ aggregate, revision: events.length, updatedAt: 5 });
+  let captured;
+  const harness = createHarness({ state: {
+    runtimeV2Checkpoints: { investigation: checkpoint },
+    conversationTurns: [executionTurn({ id: "investigation", userPrompt: "Inspect Timer", summary: "Current iterator issue", status: "done" }), executionTurn({ userPrompt: "修复" })],
+  }, input: {
+    text: "修复", sourceInvestigationTurnId: "investigation", mentionSnapshot: [], attachedFilesSnapshot: [], shouldContinuePreviousTurnIntent: false,
+    phaseRunners: { runRuntime: async ({ context }) => { captured = context; return true; } },
+  } });
+  await runSubmitAsyncWorkflowRun(harness.input);
+  assert.equal(captured.sourceInvestigationTurnId, "investigation");
+  const request = providerHistory({ messages: [] }, { get: () => harness.state, context: captured });
+  const actual = request.messages.filter(message => message.role !== "system");
+  assert.equal(actual.length, 1);
+  assert.match(actual[0].content, /Current iterator issue/);
+  assert.match(actual[0].content, /Assets\/Timer\.cs/);
+});
+
 test("composite workspace admission freezes one baseline and skips the legacy tree prefetch", async () => {
   const baseline = Object.freeze({
     kind: "project_baseline_context",

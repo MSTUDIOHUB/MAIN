@@ -7,6 +7,7 @@ export type WorkspaceToolFailureCode =
   | "subagent_path_limit_exceeded"
   | "subagent_path_invalid"
   | "subagent_duplicate_or_overlap"
+  | "subagent_optional_proposal_rejected"
   | "subagent_capacity_unavailable"
   | "subagent_insufficient_runway"
   | "subagent_write_unauthorized"
@@ -127,6 +128,11 @@ export function describeWorkspaceToolFailure(
       return {
         cardMessage: zh ? "子智能体任务与现有子任务重复或写入范围重叠。" : "Subagent duplicates an existing task or overlaps an active write scope.",
         modelHint: "Delegate a genuinely distinct task/scope or continue parent work.",
+      };
+    case "subagent_optional_proposal_rejected":
+      return {
+        cardMessage: zh ? "本次可选子任务未派发，主线程继续处理。" : "The optional child was skipped; parent work continues.",
+        modelHint: "Continue in the parent, or propose a separate deliverable supported by current primary evidence.",
       };
     case "subagent_capacity_unavailable":
       return {

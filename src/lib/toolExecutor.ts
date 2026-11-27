@@ -47,7 +47,9 @@ import {
 import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
 import { isMcpTool, executeMcpTool, getMcpServerUrl, getMcpToolOrigin } from "./mcpClient";
-import { executeUnityMcpObservation, normalizeMcpWorkspace } from "./workspaceMcp";
+import { executeUnityMcpObservation, normalizeMcpWorkspace, workspaceUnityCliConsoleBinding, workspaceUnityOfficialConsoleBinding } from "./workspaceMcp";
+import { executeUnityOfficialMcp, executeUnityOfficialMcpConsole } from "./unityOfficialMcp";
+import { UNITY_CLI_CONSOLE_TOOL, UNITY_OFFICIAL_MCP_CONSOLE_TOOL } from "./runtime-v2/workspaceReadPolicy";
 import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import {
   classifyBuiltInTool,
@@ -61,6 +63,7 @@ import { formatDirectoryNodesForTool } from "./workspacePaths";
 import { builtInToolRequiresWorkspace } from "./workspaceToolScope";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import { inferMutationRecoveryRange, WorkspaceMutationSourceMismatch } from "./workspaceMutationPreflight";
 import { sha256Hex } from "./sha256";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
@@ -237,11 +240,14 @@ export interface ToolExecutionOptions {
   writeFileTarget?: import("./workspaceMutationPreflight").WorkspaceWriteFileTargetFact;
   unitySceneAuthority?: { signal: AbortSignal; lifecycleDeadlineAt?: number };
   unityConsoleRepairScope?: true;
+  unityConsoleSignal?: AbortSignal;
+  isUnityOfficialMcpEnabled?: () => boolean;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
   toolCatalog?: ToolCatalog;
   availableToolNames?: ReadonlySet<string>;
+  advertisedToolNames?: ReadonlySet<string>;
   workspaceMcpSnapshot?: import("./workspaceMcp").WorkspaceMcpSnapshot | null;
   skillCatalog?: SkillCatalogSnapshot | null;
   /** Captured message scope; model-supplied kb/source ids cannot widen it. */
@@ -320,6 +326,13 @@ export async function executeTool(
       }
       const binding = options.workspaceMcpSnapshot?.unityBindings?.[resolution.entry.serverUrl];
       const origin = resolution.entry.mcpTool && getMcpToolOrigin(resolution.entry.mcpTool);
+      if (origin?.connector === "unity_official") {
+        const official = options.workspaceMcpSnapshot?.unityOfficialMcp;
+        if (!official || official.workspace !== normalizeMcpWorkspace(workspace)) throw new Error("UNITY_OFFICIAL_MCP_SCOPE_MISMATCH");
+        if (options.isUnityOfficialMcpEnabled?.() === false) throw new Error("UNITY_OFFICIAL_MCP_DISABLED");
+        return executeUnityOfficialMcp(official, origin.remoteName, args,
+          options.unityConsoleSignal ?? new AbortController().signal);
+      }
       if (origin?.connector === "unity" && (!binding || options.workspaceMcpSnapshot?.workspace !== normalizeMcpWorkspace(workspace))) {
         throw new Error("MCP_UNITY_OBSERVATION_SCOPE_MISMATCH");
       }
@@ -360,6 +373,21 @@ export async function executeTool(
   if (executionName === "unity_mcp_scene" || executionName === "unity_mcp_console") {
     return executeUnityMcpObservation({ snapshot: options.workspaceMcpSnapshot, workspace, name: executionName, args, repairScope: options.unityConsoleRepairScope });
   }
+  if (executionName === UNITY_OFFICIAL_MCP_CONSOLE_TOOL) {
+    const binding = workspaceUnityOfficialConsoleBinding(options.workspaceMcpSnapshot);
+    if (!binding || binding.workspace !== normalizeMcpWorkspace(workspace) || Object.keys(args).length) {
+      throw new Error("UNITY_OFFICIAL_MCP_SCOPE_MISMATCH");
+    }
+    if (options.isUnityOfficialMcpEnabled?.() === false) throw new Error("UNITY_OFFICIAL_MCP_DISABLED");
+    return executeUnityOfficialMcpConsole(binding, options.unityConsoleSignal ?? new AbortController().signal);
+  }
+  if (executionName === UNITY_CLI_CONSOLE_TOOL) {
+    const binding = workspaceUnityCliConsoleBinding(options.workspaceMcpSnapshot, workspace, args);
+    if (!binding) throw new Error("UNITY_CONSOLE_SCOPE_MISMATCH");
+    return JSON.stringify(await runUnityEditorOperation(UNITY_CLI_CONSOLE_TOOL, {
+      workspace, editorVersion: binding.editorVersion, expectedPid: binding.editorPid,
+    }, options.unityConsoleSignal ?? new AbortController().signal, Date.now() + 12_000));
+  }
 
   // Runtime-owned Skill loading must win over the legacy process-wide MCP
   // name map. The Turn catalog already resolved this exact call as built-in.
@@ -371,6 +399,7 @@ export async function executeTool(
       sessionKey,
       toolCatalog: options.toolCatalog,
       availableToolNames: options.availableToolNames,
+      advertisedToolNames: options.advertisedToolNames,
     });
   }
   if (executionName === UNITY_CREATE_SCENE_TOOL) {
@@ -513,7 +542,7 @@ export async function executeTool(
     // ── Custom Tauri IPC commands ─────────────────────────────
 
     case "glob_search":
-      return await globSearch(args.pattern as string, workspace);
+      return await globSearch(args.pattern as string, workspace, true);
 
     case "grep_search": {
       const query = args.query as string;
@@ -930,7 +959,9 @@ export async function executeTool(
         ? await readChatTempFile(sessionKey!, replacePath)
         : await readFile(replacePath, workspace);
       if (!original.includes(searchText)) {
-        throw new Error("search_text mismatch. The file content has likely changed. Please use the read_file tool or grep_search to view the current file content before attempting to edit again.");
+        throw new WorkspaceMutationSourceMismatch(
+          replacePath, inferMutationRecoveryRange(original, searchText), "search_text no longer matches the file.",
+        );
       }
       const firstMatch = original.indexOf(searchText);
       if (original.indexOf(searchText, firstMatch + 1) >= 0) {
@@ -950,7 +981,7 @@ export async function executeTool(
       return JSON.stringify({
         success: true,
         changedPaths: [replacePath],
-        mutationVersions: [{ path: replacePath, version: `sha256-${sha256Hex(updated)}` }],
+        mutationVersions: [{ path: replacePath, version: `sha256-${sha256Hex(updated)}`, previousVersion: `sha256-${sha256Hex(original)}` }],
         message: `File ${replacePath} updated successfully.`,
       });
     }
@@ -979,7 +1010,8 @@ export async function executeTool(
         return temporaryPath
           ? buildChatTempSuccessMessage("written", writePath, temporaryPath)
           : JSON.stringify({ success: true, changedPaths: [writePath],
-              mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}` }],
+              mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}`,
+                previousVersion: reviewed.exists ? `sha256-${sha256Hex(reviewed.content)}` : "deleted" }],
               message: `File ${writePath} written successfully.` });
       }
       if (shouldUseChatTempStorage(workspace, sessionKey)) {
@@ -994,19 +1026,21 @@ export async function executeTool(
         const temporaryPath = await writeChatTempFile(sessionKey!, writePath, writeContent);
         return buildChatTempSuccessMessage("written", writePath, temporaryPath);
       }
+      let previousVersion: string | null = null;
       try {
         const original = await readFile(writePath, workspace);
         if (original === writeContent) {
           return JSON.stringify({ success: true, noOp: true, message: `File ${writePath} already matched requested content.` });
         }
-      } catch {
-        // Missing file is fine; the write below will create it.
+        previousVersion = `sha256-${sha256Hex(original)}`;
+      } catch (error) {
+        if (String(error instanceof Error ? error.message : error).startsWith("READ_TARGET_NOT_FOUND:")) previousVersion = "deleted";
       }
       await writeFile(writePath, writeContent, workspace);
       return JSON.stringify({
         success: true,
         changedPaths: [writePath],
-        mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}` }],
+        mutationVersions: [{ path: writePath, version: `sha256-${sha256Hex(writeContent)}`, previousVersion }],
         message: `File ${writePath} written successfully.`,
       });
     }
@@ -1070,6 +1104,10 @@ export async function executeTool(
         probePath: probePatchPath,
       });
       if (!result.ok) {
+        if (result.sourceMismatch) {
+          const { target, oldText, currentContent } = result.sourceMismatch;
+          throw new WorkspaceMutationSourceMismatch(target, inferMutationRecoveryRange(currentContent, oldText), result.error || "Patch anchor no longer matches.");
+        }
         throw new Error(result.error || "apply_patch failed.");
       }
       const versions = new Map<string, { before: string | null; after: string | null }>();
@@ -1086,6 +1124,7 @@ export async function executeTool(
         changedFiles: result.changes.map((change) => change.path),
         mutationVersions: [...versions].flatMap(([path, { before, after }]) => before === after ? [] : [{
           path, version: after === null ? "deleted" : `sha256-${sha256Hex(after)}`,
+          previousVersion: before === null ? "deleted" : `sha256-${sha256Hex(before)}`,
         }]),
       });
     }
@@ -1100,10 +1139,12 @@ export async function executeTool(
           message: `Temporary chat path ${targetPath} deleted successfully.`,
         });
       }
-      await deleteWorkspacePath(targetPath, workspace);
+      const deletion = await deleteWorkspacePath(targetPath, workspace);
       return JSON.stringify({
         success: true,
-        mutationVersions: [{ path: targetPath, version: "deleted" }],
+        ...(deletion?.changed === false ? { noOp: true } : {
+          mutationVersions: [{ path: targetPath, version: "deleted", previousVersion: deletion?.previousVersion }],
+        }),
         message: `Path ${targetPath} deleted successfully.`,
       });
     }

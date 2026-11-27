@@ -34,7 +34,7 @@ const followupQuestionCall = (prompt = acceptanceQuestion.prompt) => ({ content:
   arguments: JSON.stringify({ title: "Confirm the acceptance target", questions: [{ ...acceptanceQuestion, prompt }] }) }], protocolViolation: null });
 const documentCall = () => ({ content: "", toolCalls: [{ id: "save", name: "submit_plan_document", arguments: JSON.stringify({ title: "Confirmed design", markdown: "# Plan\n\nUse the confirmed simple offline design.\n" }) }], protocolViolation: null });
 
-function harness({ workspace = "", purpose = "plan", responses = [questionCall(), documentCall()], legacyDraftFixture = false, versionedReads = false, toolResults = {} } = {}) {
+function harness({ workspace = "", purpose = "plan", responses = [questionCall(), documentCall()], legacyDraftFixture = false, versionedReads = false, toolResults = {}, subagentCapacity = 0 } = {}) {
   const sessionKey = workspace ? `${workspace}:1` : "__MAIN_GLOBAL_CHAT__:1";
   const context = { turnId: "turn-interview", uiDisplayTurnId: "turn-interview", runWorkspace: workspace, runScopeKey: workspace || "__MAIN_GLOBAL_CHAT__", runSessionKey: sessionKey, runSessionId: 1, runSessionEpoch: "epoch-1", harnessRunId: "run-interview", phaseLanguage: "en", planPurpose: purpose,
     abortCtrl: new AbortController(), timerInterval: undefined, turnInputContextSignals: { subagentPreference: "forbidden", subagentRequirement: "optional", attachedFilePaths: [] },
@@ -50,7 +50,7 @@ function harness({ workspace = "", purpose = "plan", responses = [questionCall()
     ["../../lib/providerLaneSettings", { deriveBudgetedStreamSettings: () => ({ provider: "fixture", toolProtocol: "auto" }), deriveProviderAdapterCapabilities: () => ({ nativeToolRoundTrip: true, reasoningToggle: false }) }],
     ["../../lib/modelLaneCoordinator", { acquireModelLane: async () => ({ release() {}, markFirstToken() {}, reportFailure() {}, setPressureHandler() {} }) }],
     ["../../lib/streaming", { isStreamOutputLimited: () => false, streamChatCompletion: async (...args) => { calls.push(args); if (!responses.length) { context.abortCtrl.abort("fixture exhausted without convergence"); assert.fail("fixture must not silently loop"); } return responses.shift(); } }],
-    ["../../lib/subagents", { resolveSubagentCapacityPolicy: () => ({ maxActiveRequests: 0, modelRequestMode: "serialized" }) }],
+    ["../../lib/subagents", { resolveSubagentCapacityPolicy: () => ({ maxActiveRequests: subagentCapacity, modelRequestMode: subagentCapacity ? "parallel" : "serialized" }) }],
     ["../../lib/ipc", { inspectProjectInitTarget: async () => { inspections.push(workspace); return { canonicalWorkspace: workspace, targetPath: `${workspace}/AGENTS.md`, exists: true, content: "# Existing rules\n", contentVersion: "base-version" }; },
       savePlanDocument: async input => { saves.push(input); if (saveFault) throw new Error(saveFault); const key = `${input.owner.sessionKey}:${input.documentId}`;
         if (stored.has(key)) { assert.deepEqual(stored.get(key).input, input, "lost-ack recovery must use exact immutable save input"); return stored.get(key).reference; }
@@ -62,15 +62,16 @@ function harness({ workspace = "", purpose = "plan", responses = [questionCall()
         assert.deepEqual(reference, document.reference);
         return { ...document.reference, markdown: document.input.markdown };
       } }],
-    ["../../lib/toolExecutor", { executeTool: async (name, args) => { effects.push(name); if (name === "read_file") {
+    ["../../lib/toolExecutor", { executeTool: async (name, args, _workspace, sessionKey, options) => { effects.push(name); if (name === "read_file") {
       const content = "Observed project facts.";
       return versionedReads ? formatReadFileWindowPayloadForModel(args.path, {
         content, contentVersion: `sha256-${sha(content)}`, startLine: 1, endLine: 1, totalLines: 1, totalChars: content.length, truncated: false,
       }) : content;
     } if (name === "get_project_skeleton") return "src/main.js\npackage.json";
-      if (Object.hasOwn(toolResults, name)) return toolResults[name];
+      if (Object.hasOwn(toolResults, name)) return typeof toolResults[name] === "function" ? toolResults[name](args, sessionKey, options) : toolResults[name];
       throw new Error(`unexpected effect ${name}`); } }],
     ["./checkpointPort", { getRuntimeV2Checkpoint: (_state, owner) => state.runtimeV2Checkpoints[owner.turnId] || null,
+      getRuntimeV2EmergencyTerminalEnvelope: (_state, owner) => state.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null,
       createRuntimeV2CheckpointPort: () => ({ append: async input => {
         const result = runtime.appendRuntimeV2Checkpoint({ checkpoint: state.runtimeV2Checkpoints[input.owner.turnId] || null, owner: input.owner, expectedRevision: input.expectedRevision, event: input.event });
         assert.equal(result.disposition, "committed", result.reason);
@@ -138,6 +139,33 @@ test("a global Plan confirms real choices, resumes the same Run and saves a conc
   assert.equal(aggregate.events.filter(e => e.type === "turn.completed").length, 1);
   assert.equal(h.effects.length, 0);
   assert.equal(h.load("src/lib/planDocumentRecords.ts").resolvePlanDocumentFromAggregate(aggregate).markdown, h.saves[0].markdown);
+});
+
+test("a Plan tool response projects the provider's public prose once and records causal request metrics", async () => {
+  const response = {
+    ...documentCall(),
+    content: "Public model update. This is the scope I examined.",
+    semanticContent: "Public model update. This is the scope I examined.",
+    reasoningContent: "Hidden diagnostic input",
+    streamDiagnostics: { firstSemanticVisibleElapsedMs: 1200, firstToolElapsedMs: 1500 },
+    usage: { inputTokens: 3_000, cachedInputTokens: 2_100, outputTokens: 50, totalTokens: 3_050 },
+  };
+  const h = harness({ responses: [response] });
+  h.context.planPurpose = undefined;
+  assert.equal((await h.run()).outcome.resultKind, "success");
+  const milestones = h.projections.filter(entry => entry.audience === "chat_milestone");
+  assert.equal(milestones.length, 1);
+  assert.equal(milestones[0].projection.markdown, response.semanticContent);
+  assert.equal(h.projections.filter(entry => entry.audience === "final").length, 1);
+  const shape = h.logs.find(entry => entry.event === "runtime_v2_plan_provider_response_shape").data;
+  const summary = h.logs.find(entry => entry.event === "runtime_v2_plan_run_summary").data;
+  assert.equal(shape.firstPublicTextMs, 1200);
+  assert.equal(shape.firstToolMs, 1500);
+  assert.equal(shape.providerUsage.cachedInputTokens, 2100);
+  assert.equal(summary.responsesWithPublicCommentary, 1);
+  assert.equal(summary.commentaryProjectionCount, 1);
+  assert.equal(summary.providerInputTokens, 3000);
+  assert.doesNotMatch(JSON.stringify(h.logs), /Hidden diagnostic input|scope I examined/);
 });
 
 test("an executable Plan retains a second question after resuming from persisted state", async () => {
@@ -448,6 +476,115 @@ for (const corrected of [true, false]) test(`a repeated identical candidate gets
   }
 });
 const readinessRead = (id, file) => ({ id, name: "read_file", arguments: JSON.stringify({ path: file }) });
+
+const unavailableVerificationSearch = (id, query) => ({ content: "", toolCalls: [{ id, name: "tool_search", arguments: JSON.stringify({ query }) }] });
+const validationProbe = { kind: "finite_command", command: "unity command console get --level error", expectedOutcome: "The console is clear." };
+
+test("Plan pivots after equivalent settled capability searches and reopens discovery when a safe read adds evidence", async () => {
+  const responses = [questionCall(), readinessSubmission("unbounded-probe", validationProbe),
+    unavailableVerificationSearch("find-runner", "nonexistent-verifier-a"),
+    unavailableVerificationSearch("find-runner-again", "nonexistent-verifier-b"),
+    { content: "", toolCalls: [readinessRead("real-check-source", "package.json")] },
+    readinessSubmission("runnable", executableReadinessCheck)];
+  const h = harness({ workspace: "/fixture", versionedReads: true, responses, toolResults: {
+    tool_search(args, sessionKey, options) {
+      return h.load("src/lib/toolSearch.ts").executeToolSearch(args, { sessionKey, ...options });
+    },
+  } });
+  assert.equal((await h.run()).outcome.status, "paused");
+  assert.equal((await h.answer("executable")).ok, true);
+  assert.equal((await h.run()).outcome.status, "paused");
+  assert.equal(h.get().activeActionRequest.kind, "plan_review");
+  const names = (request) => request[4].map(tool => tool.function.name);
+  assert.ok(names(h.calls[3]).includes("tool_search"), "a first unsuccessful search may be followed by a useful discovery query");
+  assert.ok(names(h.calls[4]).includes("read_file"));
+  assert.ok(names(h.calls[4]).includes("ask_plan_questions"));
+  assert.ok(names(h.calls[4]).includes("submit_runtime_v2_work_plan"));
+  assert.ok(!names(h.calls[4]).includes("tool_search"), "same capability result triggers a scoped pivot");
+  assert.ok(names(h.calls[5]).includes("tool_search"), "new source permits ordinary discovery again");
+  assert.equal(h.get().runtimeV2Checkpoints[h.context.turnId].aggregate.sealedWorkPlan.draft.validations[0].command, "npm test");
+});
+
+test("Plan preserves a rejected candidate as a draft after closed capability discovery, including on cold restore", async () => {
+  const failedRepair = { content: JSON.stringify({ planMarkdown: "Keep the proposed collector changes.", validations: [validationProbe] }), toolCalls: [] };
+  const responses = [questionCall(), readinessSubmission("invalid-probe", validationProbe),
+    unavailableVerificationSearch("runner-first", "unavailable-runner"),
+    unavailableVerificationSearch("runner-second", "another-verifier"),
+    unavailableVerificationSearch("runner-still", "unavailable-runner"), failedRepair];
+  const h = harness({ workspace: "/fixture", responses, toolResults: {
+    tool_search(args, sessionKey, options) {
+      return h.load("src/lib/toolSearch.ts").executeToolSearch(args, { sessionKey, ...options });
+    },
+  } });
+  await h.run();
+  assert.equal((await h.answer("executable")).ok, true);
+  assert.equal((await h.run()).outcome.resultKind, "partial");
+  assert.equal(h.calls[5][6].responseFormat.json_schema.name, "runtime_v2_work_plan_validation_repair");
+  assert.equal(h.effects.filter(name => name === "tool_search").length, 2, "the closed discovery call does not dispatch again");
+
+  const events = h.get().runtimeV2Checkpoints[h.context.turnId].aggregate.events;
+  const focus = events.find(event => event.type === "command.scheduled" && event.command.payload.planValidationDiscoveryFocus === true);
+  const response = events.find(event => event.type === "provider.responded" && event.idempotencyKey === focus.command.idempotencyKey);
+  rewindTo(h, response);
+  h.stored.clear();
+  h.saves.length = 0;
+  responses.push(failedRepair);
+  assert.equal((await h.run()).outcome.resultKind, "partial");
+  assert.equal(h.calls.length, 7, "restore proceeds straight to the focused structured repair");
+  assert.equal(h.calls[6][6].responseFormat.json_schema.name, "runtime_v2_work_plan_validation_repair");
+  const aggregate = h.get().runtimeV2Checkpoints[h.context.turnId].aggregate;
+  const record = h.load("src/lib/planDocumentRecords.ts").resolvePlanDraftFromAggregate(aggregate);
+  assert.ok(record?.diagnostics.some(item => item.code === "plan_validation_not_required"));
+  assert.equal(aggregate.sealedWorkPlan, null);
+  assert.equal(h.saves.length, 1);
+  assert.equal(aggregate.events.filter(event => event.type === "turn.completed").length, 1);
+});
+
+test("Plan tool discovery reports current access, preserves unlocks and never supplies project evidence", async () => {
+  const makeSearch = (id, query) => ({ content: "", toolCalls: [{ id, name: "tool_search", arguments: JSON.stringify({ query }) }] });
+  const ready = readinessSubmission("ready", executableReadinessCheck);
+  const candidate = JSON.parse(ready.toolCalls[0].arguments);
+  candidate.changes[0].basis = ["E2"];
+  ready.toolCalls[0].arguments = JSON.stringify(candidate);
+  const h = harness({ workspace: "/fixture", versionedReads: true, subagentCapacity: 1, responses: [
+    makeSearch("test-one", "Unity test runner assembly"),
+    makeSearch("test-two", "Unity Editor compile test"),
+    makeSearch("find-child", "subagent delegate"),
+    makeSearch("no-match", "unavailable-example-tool"),
+    { content: "", toolCalls: [readinessRead("real-source", "src/main.js")] },
+    ready,
+  ], toolResults: {
+    tool_search(args, sessionKey, options) {
+      return h.load("src/lib/toolSearch.ts").executeToolSearch(args, { sessionKey, ...options });
+    },
+  } });
+  h.context.planPurpose = undefined;
+  h.context.allowVoluntaryPlanQuestions = true;
+  h.context.turnInputContextSignals = { ...h.context.turnInputContextSignals, subagentPreference: "allowed" };
+  assert.equal((await h.run()).outcome.status, "paused");
+  assert.equal(h.get().activeActionRequest.kind, "plan_review");
+
+  const { events } = h.get().runtimeV2Checkpoints[h.context.turnId].aggregate;
+  const searchKeys = new Set(events.flatMap(event => event.type === "command.scheduled" && event.command.payload.toolName === "tool_search" ? [event.command.idempotencyKey] : []));
+  const searchReceipts = events.filter(event => event.type === "tool.completed" && searchKeys.has(event.idempotencyKey));
+  assert.equal(searchReceipts.length, 4);
+  assert.ok(searchReceipts.every(receipt => receipt.status === "succeeded" && receipt.evidence.length === 0));
+  const [first, repeated, child, empty] = searchReceipts.map(receipt => JSON.parse(receipt.modelContent));
+  assert.deepEqual(first.newlyUnlocked, ["get_project_skeleton"]);
+  assert.deepEqual(repeated.newlyUnlocked, []);
+  assert.deepEqual(repeated.alreadyAvailable, ["get_project_skeleton"]);
+  assert.deepEqual(child.alreadyAvailable, []);
+  assert.deepEqual(child.unlockedTools, [], "discovery cannot unlock a collaboration tool without its live preconditions");
+  assert.deepEqual(child.matchedAdvertised, []);
+  assert.equal(empty.matchedCount, 0);
+  assert.doesNotMatch(empty.hint, /run_command|query='all'/);
+  assert.match(h.calls[3][0].map(message => message.content).join("\n"), /non_novel_evidence/);
+  assert.deepEqual(h.logs.filter(item => item.event === "runtime_v2_plan_tool_discovery_completed").map(item => [
+    item.data.outcome, item.data.matchedAdvertisedCount, item.data.newlyUnlockedCount,
+  ]), [["unlocked", 0, 1], ["already_available", 1, 0], ["no_match", 0, 0], ["no_match", 0, 0]]);
+  assert.ok(h.calls[4][4].some(tool => tool.function.name === "read_file"));
+  assert.ok(h.calls[4][4].some(tool => tool.function.name === "submit_runtime_v2_work_plan"));
+});
 
 test("an implementation Plan keeps investigating after confirmation and a rejected tool request", async () => {
   const tool = (id, name, args) => ({ id, name, arguments: JSON.stringify(args) });

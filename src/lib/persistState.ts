@@ -2,6 +2,7 @@ import { retireRemovedFeatures } from "./retiredFeatureMigration";
 import { normalizeExternalSkillSelections } from "./externalSkillSelections";
 import { normalizeExternalSkillSources } from "./externalSkillSources";
 import { normalizeGithubSkillSource } from "./githubSkillSource";
+import { planSessionTerminalCredentialCleanup } from "./terminalCredentialHistory";
 
 export const LOCAL_PERSIST_SCHEMA_VERSION = 3;
 
@@ -69,9 +70,14 @@ export function stripLegacyConfigFields(config: unknown): Record<string, unknown
   return nextConfig;
 }
 
+function cleanLocalSessionHistory<T>(session: T): T {
+  const plan = planSessionTerminalCredentialCleanup(session);
+  return plan.disposition === "deferred" ? session : retireRemovedFeatures(plan.snapshot);
+}
+
 function stripSessionDetailsForLocalPersist(session: any): any | null {
   if (session?.recordingDisabled && session?.storageStatus !== "temporary") return null;
-  if (session?._retirementMigrationPending === true) return retireRemovedFeatures(session);
+  if (session?._retirementMigrationPending === true) return cleanLocalSessionHistory(session);
   const { messages: _messages, runtimeSnapshot: _runtimeSnapshot, ...meta } = session || {};
   return {
     ...meta,
@@ -117,7 +123,7 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
   if (nextState.sessionsByWorkspace) {
     // Keep legacy full snapshots in memory until the startup migration has
     // committed them to native storage. Only the persistence writer slims them.
-    nextState.sessionsByWorkspace = Object.fromEntries(Object.entries(retireRemovedFeatures(nextState.sessionsByWorkspace) as Record<string, any[]>).map(([workspace, sessions]) => [workspace, (sessions || []).filter(session => !session.recordingDisabled || session.storageStatus === "temporary").map(session => ({ ...session,
+    nextState.sessionsByWorkspace = Object.fromEntries(Object.entries(persistedState.sessionsByWorkspace as Record<string, any[]>).map(([workspace, sessions]) => [workspace, (sessions || []).filter(session => !session.recordingDisabled || session.storageStatus === "temporary").map(session => ({ ...cleanLocalSessionHistory(session),
       ...((session.messages?.length || session.runtimeSnapshot) && !session.recordingDisabled && session.storageStatus !== "temporary" ? { _retirementMigrationPending: true } : {}),
     }))]));
   }

@@ -23,7 +23,7 @@ async function loadCommonJs(relativePath, dependencies = {}) {
   const module = { exports: {} };
   const loadTs = createTsModuleLoader();
   const localRequire = (id) => Object.hasOwn(dependencies, id) ? dependencies[id]
-    : ["./runtime-v2/checkpoint", "./runtime-v2/checkpointMerge"].includes(id)
+    : ["./runtime-v2/checkpoint", "./runtime-v2/checkpointMerge", "./terminalCredentials"].includes(id)
       ? loadTs("src/lib/" + id.slice(2) + ".ts")
       : require(id);
   const factory = new Function("exports", "module", "require", transpiled);

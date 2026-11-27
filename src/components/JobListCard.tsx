@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { IconChevronUp, IconChevronDown, IconCheck } from "./Icons";
-import { useAppStore, useTheme } from "../store/useAppStore";
+import { useAppStore } from "../store/useAppStore";
 import type { JobItem } from "../store/useAppStore";
+import { useActiveThemePalette } from "./useThemePalette";
 
 interface JobListCardProps {
   jobs: JobItem[];
@@ -9,7 +10,7 @@ interface JobListCardProps {
 
 export default function JobListCard({ jobs }: JobListCardProps) {
   const [expanded, setExpanded] = useState(true);
-  const theme = useTheme();
+  const theme = useActiveThemePalette().accentTokens;
   const language = useAppStore((s) => s.config.language);
 
   const doneCount = jobs.filter((j) => j.status === "completed").length;

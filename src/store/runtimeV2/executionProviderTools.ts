@@ -1,20 +1,23 @@
-import { isChatContext } from "./readOnlyPolicy";
-import { RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { isChatContext, runtimeV2ChatToolNames } from "./readOnlyPolicy";
 import { type ToolDefinition } from "../../lib/toolSchemas";
 import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
 import { isWorkspaceMutationToolName, UNITY_CREATE_SCENE_TOOL } from "../../lib/workspaceMutationTools";
 import {
   RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME,
+  runtimeV2CanAdvertiseSubagentSpawn,
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
+  ENABLE_UNITY_OFFICIAL_MCP_TOOL,
+  UNITY_GAME_VIEW_TOOL,
   RUNTIME_V2_ATTACHMENT_READ_TOOL_NAMES,
+  RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
+  RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES,
   RUNTIME_V2_SKILL_READ_TOOL_NAMES,
   RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES,
   RUNTIME_V2_WORKSPACE_SOURCE_TOOL_NAMES,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { filterToCoreAndUnlockedTools } from "../../lib/toolSearch";
-import { UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME,
@@ -32,7 +35,7 @@ const VALIDATION_TOOL_NAMES = new Set([
   "computer_use",
 ]);
 
-function collaborationToolNames(input: {
+function runtimeV2CollaborationProviderToolNames(input: {
   readonly ports: RuntimeV2ExecutionPortsInput;
   readonly command: RuntimeV2Command;
 }): ReadonlySet<string> {
@@ -55,13 +58,16 @@ function collaborationToolNames(input: {
   if (mode === "chat" || !hasWorkspace || isChatContext(input.ports)) {
     return names;
   }
-  // Keep the collaboration tool schema surface stable across non-conclude
-  // workspace turns whenever collaboration is admitted so KV cache prefixes
-  // are not invalidated when activeSubagents or remainingSubagentCapacity
-  // flips between 0 and >0. Runway and capacity are enforced at admission/schedule.
-  names.add("spawn_subagent");
-  names.add("wait_subagents");
+  if (runtimeV2CanAdvertiseSubagentSpawn(input.command.payload)) names.add("spawn_subagent");
+  if (active.length > 0) names.add("wait_subagents");
   return names;
+}
+
+/** A catalog search can reflect collaboration already exposed to its parent request. */
+export function runtimeV2CollaborationDiscoveryToolNames(ports: RuntimeV2ExecutionPortsInput, runId: string): ReadonlySet<string> {
+  const request = [...(aggregateForCurrentTurn(ports)?.events || [])].reverse().find(event =>
+    event.type === "command.scheduled" && event.run.runId === runId && event.command.kind === "request_model");
+  return request?.type === "command.scheduled" ? runtimeV2CollaborationProviderToolNames({ ports, command: request.command }) : new Set();
 }
 
 /**
@@ -79,6 +85,10 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   readonly correctiveValidationCommand?: string;
 }): ToolDefinition[] {
   const mode = String(input.command.payload.mode || "").trim();
+  if (mode !== "conclude" && (mode === "chat" || isChatContext(input.ports))) {
+    const names = runtimeV2ChatToolNames(input.ports);
+    return input.available.filter(definition => names.has(definition.function.name));
+  }
   const mcpRiskFor = (name: string) => {
     const capability = input.capabilityRegistry?.tools[name];
     return capability?.source === "mcp" && capability.enabled
@@ -99,7 +109,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       risk === "desktop_control" ||
       risk === "destructive";
   };
-  const collaboration = collaborationToolNames(input);
+  const collaboration = runtimeV2CollaborationProviderToolNames(input);
   const aggregate = typeof input.ports.get === "function"
     ? aggregateForCurrentTurn(input.ports)
     : null;
@@ -108,7 +118,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   const hasWorkspace = !!String(input.ports.context.runWorkspace || "").trim();
   const isBoundEditorObservation = (name: string) => {
     const capability = input.capabilityRegistry?.tools[name];
-    return hasWorkspace && UNITY_MCP_OBSERVATION_NAMES.has(name) &&
+    return hasWorkspace && RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(name) &&
+      (name !== UNITY_GAME_VIEW_TOOL || !input.ports.live?.unityGameViewImageRejected) &&
       capability?.source === "built_in" && capability.enabled;
   };
   const globalNetworkTools = hasWorkspace ? [] :
@@ -130,13 +141,6 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     return input.available.filter((definition) =>
       definition.function.name === "wait_subagents" &&
       collaboration.has("wait_subagents")
-    );
-  }
-  if (mode === "chat" || isChatContext(input.ports)) {
-    return input.available.filter((definition) =>
-      ["load_skill", "tool_search", "web_search", "web_fetch"].includes(
-        definition.function.name,
-      ) || knowledgeTool(definition.function.name)
     );
   }
   if (mode === "analyze") {
@@ -167,9 +171,8 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     });
   }
 
-  // Execute & Validate modes: keep a consistent, static tool surface across
-  // steps so local models never lose their KV cache or get trapped in a
-  // tool-confiscated recovery window.
+  // Execute and Validate retain their authorized workspace tools throughout
+  // recovery. Collaboration reflects the work available in this request.
   const hasCompletedReviewSubagent = Boolean(
     aggregate?.subagents.some((job) => job.taskKind === "review" && job.status === "completed"),
   );
@@ -178,6 +181,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       step.targets.some(target => target.endsWith(".unity")));
   const executeCandidates = input.available.filter((definition) => {
     const name = definition.function.name;
+    if (name === ENABLE_UNITY_OFFICIAL_MCP_TOOL) return mode === "execute";
     if (name === UNITY_CREATE_SCENE_TOOL) return unitySceneApproved === true;
     if (name === RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME) return hasCompletedReviewSubagent;
     if (name === RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL_NAME) {
@@ -202,6 +206,7 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
       ...(hasCompletedReviewSubagent ? [RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME] : []),
       ...globalNetworkTools, ...activeKnowledgeTools,
       ...visibleObservations, ...executeCandidates.map(tool => tool.function.name).filter(isMcpEffect),
+      ...(executeCandidates.some(tool => tool.function.name === ENABLE_UNITY_OFFICIAL_MCP_TOOL) ? [ENABLE_UNITY_OFFICIAL_MCP_TOOL] : []),
       ...(unitySceneApproved ? [UNITY_CREATE_SCENE_TOOL] : [])]),
   });
   const contract = deriveRuntimeV2ExecutionContract(aggregate);

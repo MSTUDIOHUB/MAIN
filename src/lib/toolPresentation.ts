@@ -1,3 +1,5 @@
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL, UNITY_CLI_CONSOLE_TOOL, UNITY_OFFICIAL_MCP_CONSOLE_TOOL } from "./runtime-v2/workspaceReadPolicy";
+
 export type ToolPresentationLanguage = "zh" | "en";
 export type ToolExecutionPhase = "discover" | "inspect" | "edit" | "command" | "verify" | "blocked" | "message";
 
@@ -32,6 +34,10 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   execute_command: { zh: "执行命令", en: "Run command" },
   run_command: { zh: "运行命令", en: "Run command" },
   unity_compile_project: { zh: "检查引擎编译", en: "Check Editor compilation" },
+  capture_unity_game_view: { zh: "截取 Unity 游戏画面", en: "Capture Unity Game View" },
+  [ENABLE_UNITY_OFFICIAL_MCP_TOOL]: { zh: "启用 Unity 官方 MCP", en: "Enable Unity Official MCP" },
+  [UNITY_OFFICIAL_MCP_CONSOLE_TOOL]: { zh: "通过 Unity 官方 MCP 读取 Console", en: "Read Console through Unity Official MCP" },
+  [UNITY_CLI_CONSOLE_TOOL]: { zh: "通过 Unity CLI 读取 Console", en: "Read Console through Unity CLI" },
   unity_import_shader: { zh: "检查 Shader 导入", en: "Check Shader import" },
   browser_evaluate: { zh: "浏览器验证", en: "Validate in browser" },
   computer_use: { zh: "控制桌面应用", en: "Control desktop app" },

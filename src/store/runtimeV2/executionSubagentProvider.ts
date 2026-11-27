@@ -1,4 +1,5 @@
 import type { AgentMessage } from "../../lib/agentMessages";
+import { buildRuntimeLanguageDirective } from "../../lib/languageContract";
 import { acquireModelLane, ModelLaneResourceInterruption } from "../../lib/modelLaneCoordinator";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { deriveBudgetedStreamSettings } from "../../lib/providerLaneSettings";
@@ -75,6 +76,10 @@ export async function requestRuntimeV2ChildStep(input: {
     try {
       const requestMessages: AgentMessage[] = [
         ...input.messages,
+        {
+          role: "system" as const,
+          content: buildRuntimeLanguageDirective(input.ports.context.phaseLanguage),
+        },
         ...(input.responseMode === "action_or_final" &&
             input.recoveryOccurrence > 0
           ? [{
@@ -160,7 +165,8 @@ export async function requestRuntimeV2ChildStep(input: {
               agentKind: "subagent",
               subagentId: input.job.id,
               parentRunId: input.job.parentRunId,
-              ...(input.job.proactiveKey ? { optionalOverlap: true as const } : {}),
+              ...(input.job.proactiveKey && !input.ports.live.childTelemetry.get(input.job.id)?.dependencyRequired
+                ? { optionalOverlap: true as const } : {}),
               signal: requestController.signal,
               onDebugEvent: (event, data) => {
                 if (event === "model_lane_admission") memoryWait = data.decision === "queued" &&

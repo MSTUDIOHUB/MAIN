@@ -23,6 +23,7 @@ import {
 } from "./Icons";
 import { listDirectory, type FileNode } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import { shouldHideWorkspaceEntry } from "../utils/fsUtils";
 
 interface WorkspaceTreePanelProps {
@@ -178,7 +179,7 @@ export default function WorkspaceTreePanel({
   const deletePersistedPlanFiles = useAppStore((s) => s.deletePersistedPlanFiles);
   const deleteBrowserValidationArtifacts = useAppStore((s) => s.deleteBrowserValidationArtifacts);
   const workspaceContentVersion = useAppStore((s) => s.workspaceContentVersion);
-  const themeMode = useAppStore((s) => s.config.themeMode);
+  const themeMode = useEffectiveThemeMode();
   const [treeNodesByPath, setTreeNodesByPath] = useState<Record<string, FileNode[]>>({});
   const [expandedPaths, setExpandedPaths] = useState<Record<string, boolean>>({});
   const [loadingPaths, setLoadingPaths] = useState<Record<string, boolean>>({});

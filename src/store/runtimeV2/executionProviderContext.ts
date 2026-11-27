@@ -241,13 +241,16 @@ export function projectFiniteValidationCommands(input: Pick<RuntimeV2ExecutionPo
 export function projectValidationRecoveryReceipt(aggregate: TurnAggregateV1 | null): string {
   if (!aggregate?.run) return "";
   const runId = aggregate.run.identity.runId;
-  const commandKeys = new Set(aggregate.events.flatMap(event => event.type === "command.scheduled" &&
-    event.run.runId === runId && event.command.payload.projectValidationManifestVersion ? [event.command.idempotencyKey] : []));
+  const commands = new Map(aggregate.events.flatMap(event => event.type === "command.scheduled" &&
+    event.run.runId === runId && (event.command.payload.projectValidationManifestVersion || event.command.payload.unityPlayModeBinding)
+    ? [[event.command.idempotencyKey, event.command.payload] as const] : []));
   const result = [...aggregate.events].reverse().find(event => event.type === "validation.completed" &&
-    event.run.runId === runId && commandKeys.has(event.idempotencyKey));
+    event.run.runId === runId && commands.has(event.idempotencyKey));
   if (result?.type !== "validation.completed" || result.mutationBoundarySequence !== deriveRuntimeV2ValidationBoundary(aggregate, []).mutationBoundarySequence) return "";
   const status = result.passed ? "passed" : isRuntimeV2ValidationAttempt(result) ? "failed" : "not executed";
-  return `[Project validation receipt] ${result.presentation?.target || "run_command"}: ${status}${result.failureReasonCode ? ` (${result.failureReasonCode})` : ""}.`;
+  const details = commands.get(result.idempotencyKey)?.unityPlayModeBinding && !result.passed ? result.presentation?.message : undefined;
+  return [`[Project validation receipt] ${result.presentation?.target || "run_command"}: ${status}${result.failureReasonCode ? ` (${result.failureReasonCode})` : ""}.`,
+    details].filter(Boolean).join("\n");
 }
 
 export function normalizeRuntimeV2WorkspacePath(

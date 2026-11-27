@@ -90,10 +90,12 @@ test("legal capability-free Plan semantics reach the production read-only runner
     publishOwnerScopedRuntimeProjection: () => ({ published: true, disposition: "published" }), persistSessionRecord: async () => undefined, logStoreEvent: () => undefined };
   const result = await runSubmitRuntime(input);
   assert.equal(result.outcome.resultKind, "success");
-  assert.deepEqual(providerModes, ["analyze"]);
+  assert.deepEqual(providerModes, ["chat"]);
   assert.equal(planDispatches, 0);
   assert.equal(effectCalls, 0);
-  assert.equal(events.find((event) => event.type === "turn.admitted").strategy, "analyze");
+  const admission = events.find((event) => event.type === "turn.admitted");
+  assert.equal(admission.strategy, "chat");
+  assert.equal(admission.turn.workspaceKey, "/fixture");
   assert.equal(events.filter((event) => event.type === "run.completed").length, 1);
   assert.equal(events.filter((event) => event.type === "turn.completed").length, 1);
   assert.equal(events.some((event) => event.type === "command.scheduled" && ["execute_mutation", "execute_validation", "commit_work_plan"].includes(event.command.kind)), false);

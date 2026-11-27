@@ -27,6 +27,7 @@ function isVisibleStreamRepetitionError(error: unknown, errorMessage: string): b
  */
 export function classifyAndRecordRuntimeV2ProviderAttemptError(input: {
   readonly error: unknown;
+  readonly signal?: AbortSignal;
   readonly textEnvelope: boolean;
   readonly attemptVariant: RuntimeV2TransportVariant;
   readonly command: RuntimeV2Command;
@@ -36,6 +37,15 @@ export function classifyAndRecordRuntimeV2ProviderAttemptError(input: {
   readonly lastError: unknown;
   readonly protocolFallbackAllowed: boolean;
 } {
+  if (input.signal?.aborted) {
+    input.logStoreEvent("runtime_v2_provider_attempt_canceled", {
+      turnId: input.command.run.turnId,
+      runId: input.command.run.runId,
+      commandKey: input.command.idempotencyKey,
+      transport: input.attemptVariant,
+    });
+    input.signal.throwIfAborted();
+  }
   const requestTimedOut = isRuntimeV2ExecutionProviderTimeout(input.error);
   const errorMessage = input.error instanceof Error
     ? input.error.message

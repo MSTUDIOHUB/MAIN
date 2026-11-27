@@ -105,12 +105,7 @@ export type RuntimeV2PersistedCheckpointMap =
   Record<string, RuntimeV2PersistedCheckpointV5>;
 
 export interface RuntimeV2CheckpointRejection {
-  readonly code: "invalid_value" | "unsupported_schema" | "unsupported_engine" |
-    "invalid_revision" | "invalid_updated_at" | "invalid_owner" | "owner_mismatch" |
-    "serialization_failed" | "size_budget_exceeded" | "legacy_replay_failed" |
-    "events_missing" | "event_budget_exceeded" | "event_replay_rejected" |
-    "replay_owner_mismatch" | "aggregate_digest_mismatch" | "aggregate_cache_mismatch" |
-    "scheduled_cache_mismatch" | "updated_at_stale";
+  readonly code: "invalid_value" | "unsupported_schema" | "unsupported_engine" | "invalid_revision" | "invalid_updated_at" | "invalid_owner" | "owner_mismatch" | "serialization_failed" | "size_budget_exceeded" | "legacy_replay_failed" | "events_missing" | "event_budget_exceeded" | "event_replay_rejected" | "replay_owner_mismatch" | "aggregate_digest_mismatch" | "aggregate_cache_mismatch" | "scheduled_cache_mismatch" | "updated_at_stale";
   readonly turnId?: string;
   readonly sessionKey?: string;
   readonly sessionEpoch?: string;
@@ -121,8 +116,6 @@ export interface RuntimeV2CheckpointRejection {
 
 export interface RuntimeV2CheckpointNormalizationOptions {
   readonly onRejected?: (diagnostic: RuntimeV2CheckpointRejection) => void;
-  /** Read/restore may quarantine a damaged entry. A save must not acknowledge
-   * a snapshot after silently removing its own canonical event ledger. */
   readonly rejectInvalid?: boolean;
 }
 
@@ -130,14 +123,11 @@ function boundedIdentity(value: unknown): string | undefined {
   return typeof value === "string" ? value.replace(/[\u0000\r\n]/g, "").slice(0, 180) : undefined;
 }
 
-function checkpointRejection(
-  value: unknown,
-  code: RuntimeV2CheckpointRejection["code"],
-  serializedChars?: number,
-): RuntimeV2CheckpointRejection {
+function checkpointRejection(value: unknown, code: RuntimeV2CheckpointRejection["code"], serializedChars?: number): RuntimeV2CheckpointRejection {
   const record = isPlainRecord(value) ? value : {};
   const owner = isPlainRecord(record.owner) ? record.owner : {};
-  return { code,
+  return {
+    code,
     ...(boundedIdentity(owner.turnId) ? { turnId: boundedIdentity(owner.turnId) } : {}),
     ...(boundedIdentity(owner.sessionKey) ? { sessionKey: boundedIdentity(owner.sessionKey) } : {}),
     ...(boundedIdentity(owner.sessionEpoch) ? { sessionEpoch: boundedIdentity(owner.sessionEpoch) } : {}),
@@ -575,12 +565,12 @@ export function normalizeRuntimeV2CheckpointMap(
   options: RuntimeV2CheckpointNormalizationOptions = {},
 ): RuntimeV2CheckpointMap {
   if (!isPlainRecord(value)) return {};
-  const rejected: RuntimeV2CheckpointRejection[] = [];
+  const rejected: (RuntimeV2CheckpointRejection & { expectedTurnId?: string })[] = [];
   const result: RuntimeV2CheckpointMap = {};
   let invalidOwnLedger = false;
   for (const [turnId, checkpoint] of Object.entries(value)) {
     const normalized = normalizeRuntimeV2Checkpoint(checkpoint, { ...expectedOwner, turnId }, diagnostic => {
-      rejected.push(diagnostic);
+      rejected.push({ ...diagnostic, expectedTurnId: boundedIdentity(turnId) });
       options.onRejected?.(diagnostic);
       const owner = isPlainRecord(checkpoint) ? checkpointOwner(checkpoint) : null;
       const unrelatedOwner = owner && expectedOwner &&
@@ -592,7 +582,16 @@ export function normalizeRuntimeV2CheckpointMap(
   }
   if (rejected.length && !options.onRejected) {
     // Emit only identities and machine reasons, never event/source bodies.
-    console.warn("[runtime_v2_checkpoint_filtered]", JSON.stringify({ rejectedCount: rejected.length, diagnostics: rejected.slice(0, 8) }));
+    console.warn("[runtime_v2_checkpoint_filtered]", JSON.stringify({
+      rejectedCount: rejected.length,
+      expectedOwner: expectedOwner ? {
+        workspaceKey: boundedIdentity(expectedOwner.workspaceKey),
+        sessionKey: boundedIdentity(expectedOwner.sessionKey),
+        sessionEpoch: boundedIdentity(expectedOwner.sessionEpoch),
+        clientSubmissionId: boundedIdentity(expectedOwner.clientSubmissionId),
+      } : null,
+      diagnostics: rejected.slice(0, 8),
+    }));
   }
   if (options.rejectInvalid && invalidOwnLedger) {
     throw new RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed");

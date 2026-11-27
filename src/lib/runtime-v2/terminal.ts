@@ -62,6 +62,23 @@ export interface RuntimeV2TerminalCheckpointInput {
   readonly nextId: (scope: string) => string;
 }
 
+/** Reserve the longest normal conclusion, including a possible cancellation. */
+export function runtimeV2TerminalEventReserve(aggregate: TurnAggregateV1): number {
+  if (aggregate.terminalOutcome) {
+    return Number(aggregate.finalProjectionId !== aggregate.terminalOutcome.finalProjectionId) +
+      Number(!aggregate.events.some(event => event.type === "turn.completed"));
+  }
+  const hasFinalizeIntent = aggregate.events.some(event =>
+    event.type === "command.scheduled" && event.command.kind === "finalize_turn" &&
+    event.command.payload.runtimeControlPlane === true,
+  );
+  const hasAbort = aggregate.events.some(event => event.type === "run.aborted");
+  // Pending receipts, finalize intent/result, abort, phase change, and the
+  // run.completed → final projection → turn.completed sequence.
+  return aggregate.scheduledCommands.length + (hasFinalizeIntent ? 0 : 2) +
+    Number(!hasAbort) + Number(aggregate.phase !== "finalizing") + 3;
+}
+
 /**
  * Close one already-admitted Run from its durable checkpoint. This is shared
  * by non-controller boundaries (Plan generation and approved-Plan handoff)

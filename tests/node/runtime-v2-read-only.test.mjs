@@ -467,6 +467,117 @@ test("Chat tools use the snapshot, reject workspace tools, and conclude has an e
   assert.equal(auth.providerToolDefinitionsForCommand(legacy, { payload: { mode: "chat" } }).some((item) => item.function.name === "web_search"), false);
 });
 
+test("source-free Chat in a coding workspace does not build a tool catalog or replay project source", () => {
+  const selector = loadTs(path.join(workspaceRoot, "src/lib/runtimeEngineSelection.ts"));
+  const selection = { effectiveIntent: "respond", runtimeIntent: "respond", runWorkspace: "/fixture", requiredCapabilities: [] };
+  assert.equal(selector.resolveRuntimeV2VisibleRunnerKind(selection), "chat");
+  assert.equal(selector.resolveRuntimeV2VisibleRunnerKind({ ...selection, hasAttachedFiles: true }), "workspace_read");
+  assert.equal(selector.resolveRuntimeV2VisibleRunnerKind({ ...selection, requiredCapabilities: ["workspace_read"] }), "workspace_read");
+  assert.equal(selector.resolveRuntimeV2VisibleRunnerKind({ ...selection, checkpointStrategy: "analyze" }), "workspace_read");
+
+  const state = {
+    config: {},
+    conversationTurns: [{ id: "prior", userPrompt: "Earlier question", summary: "Earlier visible answer" }, { id: turn.turnId, userPrompt: "Current question" }],
+    agentMessages: [{ role: "user", content: "Appended earlier source bytes" }, { role: "user", content: "Current question", runtimeTurnId: turn.turnId }],
+    mcpDiscoveredTools: [{ name: "unrelated_mcp" }],
+  };
+  const input = {
+    get: () => state,
+    context: { runtimeRunIntent: "respond", runWorkspace: "/fixture", requiredCapabilities: [], readOnlyStrategy: "chat", phaseLanguage: "en", turnId: turn.turnId, workspaceInstructionContext: "Project-only rule" },
+    live: types.createRuntimeV2LiveExecutionState(),
+  };
+  assert.deepEqual(auth.providerToolDefinitionsForCommand(input, { payload: { mode: "chat" } }), []);
+  assert.equal(input.live.authorization, null);
+  const contents = providerHistory.providerHistory(input.live, input).messages.map(message => message.content).join("\n");
+  assert.match(contents, /Earlier question\nEarlier visible answer\nCurrent question/);
+  assert.doesNotMatch(contents, /\/fixture|Appended earlier source bytes|Project-only rule|unrelated_mcp/);
+});
+
+test("prepared Chat streams through its canonical activity, is adopted once, and falls back when unavailable", async () => {
+  const provider = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderPort.ts"));
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const activity = loadTs(path.join(workspaceRoot, "src/lib/capsuleLiveActivity.ts"));
+  const request = (port, key, signal = new AbortController().signal) => port.request({ run, signal,
+    command: { kind: "request_model", idempotencyKey: key, run, phase: "observing", payload: { mode: "chat" } },
+  });
+  const userPrompt = "请只回复 BENCH-742。";
+  const state = { config: { activeProfile: "local", local: { provider: "omlx", endpoint: "http://fixture.invalid", model: "fixture", toolProtocol: "native" } },
+    conversationTurns: [{ id: turn.turnId, userPrompt }],
+  };
+  const makePort = (read) => provider.createRuntimeV2ProviderPort({ get: () => state,
+    context: { runtimeRunIntent: "respond", runWorkspace: "/fixture", requiredCapabilities: [], readOnlyStrategy: "chat", phaseLanguage: "en", turnId: turn.turnId, preparedChatAnswer: { read } },
+    live: types.createRuntimeV2LiveExecutionState(), logStoreEvent() {},
+  });
+  const original = streaming.streamChatCompletion;
+  let wireCount = 0;
+  streaming.streamChatCompletion = async (messages, _settings, _callbacks, _signal, tools) => {
+    wireCount++;
+    assert.deepEqual(tools, []);
+    const latestUser = [...messages].reverse().find(message => message.role === "user");
+    assert.deepEqual(latestUser, { role: "user", content: userPrompt });
+    if (messages.every(message => message.role !== "assistant")) assert.equal(messages.at(-1), latestUser);
+    return { content: "Ordinary answer.", semanticContent: "Ordinary answer.", toolCalls: [], finishReason: "stop" };
+  };
+  try {
+    let preparedReads = 0;
+    const port = makePort(async ({ onText }) => {
+      preparedReads++;
+      onText("Prepared ");
+      onText("answer.");
+      assert.equal(activity.getCapsuleLiveActivitySnapshot().find(item => item.run.runId === run.runId)?.publicCommentary, "Prepared answer.");
+      return { visibleText: "Prepared answer." };
+    });
+    assert.equal((await request(port, "prepared")).visibleText, "Prepared answer.");
+    assert.equal(wireCount, 0);
+    assert.equal((await request(port, "next")).visibleText, "Ordinary answer.");
+    assert.equal(wireCount, 1);
+    assert.equal(preparedReads, 1);
+    assert.equal((await request(makePort(async () => null), "fallback")).visibleText, "Ordinary answer.");
+    assert.equal(wireCount, 2);
+    const canceled = new AbortController();
+    canceled.abort();
+    await assert.rejects(() => request(makePort(async () => { preparedReads++; return null; }), "canceled", canceled.signal));
+    assert.equal(preparedReads, 1);
+    assert.equal(wireCount, 2);
+  } finally { streaming.streamChatCompletion = original; }
+});
+
+test("prepared Analyze accepts only currently advertised, schema-valid source proposals", async () => {
+  const provider = loadTs(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderPort.ts"));
+  const streaming = loadTs(path.join(workspaceRoot, "src/lib/streaming.ts"));
+  const createPort = (name, args, capabilityRestrictions) => provider.createRuntimeV2ProviderPort({
+    get: () => ({ config: { activeProfile: "local", local: { provider: "omlx", endpoint: "http://fixture.invalid", model: "fixture", toolProtocol: "native" } } }),
+    context: { runtimeRunIntent: "analyze", runWorkspace: "/fixture", readOnlyStrategy: "analyze", phaseLanguage: "en", turnId: turn.turnId, capabilityRestrictions,
+      preparedWorkspaceRead: { toolCalls: [{ index: 0, id: "prepared-read", name, arguments: JSON.stringify(args) }] } },
+    live: types.createRuntimeV2LiveExecutionState(), nextId: () => "canonical-call", now: Date.now, logStoreEvent() {},
+  });
+  const request = (port, key) => port.request({ run, signal: new AbortController().signal,
+    command: { kind: "request_model", idempotencyKey: key, run, phase: "observing", payload: { mode: "analyze" } },
+  });
+  const original = streaming.streamChatCompletion;
+  let wireCount = 0;
+  streaming.streamChatCompletion = async (_messages, _settings, _callbacks, _signal, tools) => {
+    wireCount++;
+    assert.ok(tools.every(tool => !["write_file", "run_command"].includes(tool.function.name)));
+    return { content: "Ordinary answer.", semanticContent: "Ordinary answer.", toolCalls: [], finishReason: "stop" };
+  };
+  try {
+    const port = createPort("read_file", { path: "src/example.cs" });
+    const result = await request(port, "prepare-read");
+    assert.deepEqual(result.toolCalls, [{ id: "canonical-call", name: "read_file", arguments: { path: "src/example.cs" } }]);
+    assert.equal(wireCount, 0);
+    await request(port, "next");
+    for (const [name, args, restrictions] of [
+      ["write_file", { path: "src/example.cs", content: "void X() {}" }],
+      ["read_file", {}],
+      ["read_file", { path: "../outside.cs" }],
+      ["read_file", { path: "/other_workspace/Outside.cs" }],
+      ["read_file", { path: "src/example.cs" }, ["workspace_read"]],
+    ]) assert.equal((await request(createPort(name, args, restrictions), `reject-${wireCount}`)).visibleText, "Ordinary answer.");
+    assert.equal(wireCount, 6);
+  } finally { streaming.streamChatCompletion = original; }
+});
+
 test("enabled Chat and analyze require source checks for current facts without forcing ordinary chat to search", () => {
   const question = "请分析今天上午的股票和基金行情。";
   for (const workspace of ["", "/fixture"]) {

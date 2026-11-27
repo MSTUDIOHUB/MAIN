@@ -2,8 +2,11 @@ import { runtimeV2PendingGuidance } from "./guidance";
 import type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 export type { RuntimeV2ProviderRecoveryPressure, RuntimeV2ProviderRecoveryWindow } from "./providerRecovery";
 import type { TurnAggregateV1 } from "./aggregate";
-import type { RuntimeV2ProactiveSkipReason } from "./collaborationDecision";
+import { runtimeV2DelegationHints, runtimeV2DelegationRequiresProposal, runtimeV2OptionalDelegationProposal, type RuntimeV2ProactiveCollaboration } from "./collaborationDecision";
 import { deriveUnityCompilation, deriveUnityShaderImport, nextUnityEditorCheck, unresolvedUnityEditorCheck, UNITY_COMPILE_PROJECT_TOOL } from "./unityCompilation";
+import { nextRuntimeV2UnityRepairStep } from "./unityRepairLoop";
+import { nextRuntimeV2UnityPlayModeValidation } from "./unityPlayMode";
+import { runtimeV2NovelExecutionObservationSequences } from "./executionObservationProgress";
 import { analyzeValidationCommand } from "../validationContract";
 import { deriveReadOnlyRecoveryWindow } from "./readOnlyProgress";
 import { exhaustedRuntimeV2ResultKind } from "./completion";
@@ -13,7 +16,7 @@ import type { RuntimeV2Event } from "./events";
 import { runtimeV2ActionFingerprint } from "./recovery";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
-import { resolveRuntimeV2SubagentReferences, runtimeV2SubagentModelHandle, type RuntimeV2SubagentScopeCandidate } from "./subagents";
+import { resolveRuntimeV2SubagentReferences, runtimeV2SubagentModelHandle } from "./subagents";
 import { deriveRuntimeV2PlanExecutionCoverage, resolveRuntimeV2PlanValidationScope, runtimeV2PlanValidationAuthority } from "./planExecution";
 import { deriveRuntimeV2ReviewDispositionLedger } from "./reviewFindings";
 import { isRuntimeV2ValidationToolCall, runtimeV2DirectExecuteReadyForConclusion } from "./phaseTransition";
@@ -39,7 +42,7 @@ export interface RuntimeV2DecisionInput {
   readonly subagentCapacity?: number;
   /** Whether the admitted parent/child provider requests can really overlap. */
   readonly subagentRequestMode?: "parallel" | "serialized";
-  readonly proactiveCollaboration?: { readonly candidate: RuntimeV2SubagentScopeCandidate } | { readonly reason: RuntimeV2ProactiveSkipReason };
+  readonly proactiveCollaboration?: RuntimeV2ProactiveCollaboration;
   readonly settledProactiveJobIds?: readonly string[];
   readonly checkUnityCompilation?: boolean;
   readonly projectValidationRecovery?: { readonly command: string; readonly manifestVersion: string };
@@ -90,7 +93,7 @@ export function runtimeV2CollaborationPayload(
   input: RuntimeV2DecisionInput,
 ): Readonly<Record<string, unknown>> {
   const collaborationAllowed =
-    input.subagentPreference === "allowed" ||
+    state.subagentRequirement === "required" || input.subagentPreference === "allowed" ||
     input.subagentPreference === "preferred";
   const currentCapacity = Math.max(
     0,
@@ -129,6 +132,7 @@ export function runtimeV2CollaborationPayload(
     runSubagents.length > 0 && activeSubagents.length === 0;
   return {
     collaborationAllowed,
+    collaborationRequiresProposal: runtimeV2DelegationRequiresProposal(input.subagentPreference, state.subagentRequirement),
     collaborationPreferred:
       input.subagentPreference === "preferred",
     collaborationRequestMode:
@@ -141,14 +145,15 @@ export function runtimeV2CollaborationPayload(
     ...((input.proactiveCollaboration && "reason" in input.proactiveCollaboration)
       ? { proactiveSkipReason: input.proactiveCollaboration.reason }
       : {}),
+    delegationHints: runtimeV2DelegationHints(input.proactiveCollaboration),
     activeSubagents,
     failedSubagents,
     settledSubagentCount,
     allSubagentsSettled,
     maxActiveSubagents,
     maxChildRuns,
-    // Explicitly requested jobs can queue. Proactive dispatch checks free
-    // slots separately, and the lane admits only as many streams as it can run.
+    // Explicitly requested jobs can queue. Optional proposals need spare
+    // capacity, and the lane admits only as many streams as it can run.
     remainingSubagentCapacity: maxActiveSubagents,
   };
 }
@@ -333,17 +338,7 @@ export function deriveRuntimeV2ProviderRecoveryWindow(
   let occurrence = 0;
   let latestReason: RuntimeV2ProviderRecoveryPressure["reason"] | null = null;
   let startedAt = 0;
-  const novelSequences = new Set<number>();
-  const facts = new Set<string>();
-  for (const event of state.events) {
-    const evidence = event.type === "tool.completed" && event.status === "succeeded" && event.receiptOrigin !== "replayed" ? event.evidence
-      : event.type === "observation.recorded" ? [event.evidence]
-      : event.type === "subagent.completed" && event.status === "completed" ? event.evidence : [];
-    for (const item of evidence) {
-      const key = JSON.stringify([item.kind, item.target, item.version, event.type === "tool.completed" ? event.modelContent : undefined]);
-      if (!facts.has(key)) { facts.add(key); novelSequences.add(event.sequence); }
-    }
-  }
+  const novelSequences = runtimeV2NovelExecutionObservationSequences(state);
   const toolCallProgress = providerToolCallProgress(state.events, novelSequences);
 
   for (let index = state.events.length - 1; index >= 0; index -= 1) {
@@ -624,12 +619,16 @@ export function decideNextCommands(
         target: compilation.targets.join(", "),
       })];
     }
-    return [];
+    const repair = nextRuntimeV2UnityRepairStep(state);
+    return repair ? [boundedCommand(state, "execute_tool", { ...repair, target: repair.sourcePaths.join(", ") })] : [];
   }
   if (state.pendingToolCalls.length > 0) {
     const toolCall = state.pendingToolCalls[0];
     if (toolCall.name === "spawn_subagent") {
       const collaboration = runtimeV2CollaborationPayload(state, input);
+      const proposal = runtimeV2DelegationRequiresProposal(input.subagentPreference, state.subagentRequirement)
+        ? runtimeV2OptionalDelegationProposal({ state, collaboration: input.proactiveCollaboration, arguments: toolCall.arguments })
+        : {};
       return [boundedCommand(state, "schedule_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
@@ -637,6 +636,7 @@ export function decideNextCommands(
         maxChildRuns: collaboration.maxChildRuns,
         collaborationRequestMode:
           collaboration.collaborationRequestMode,
+        ...proposal,
       })];
     }
     if (toolCall.name === "wait_subagents") {
@@ -650,13 +650,16 @@ export function decideNextCommands(
         jobs: activeJobs,
         requested,
       });
+      const dependency = typeof toolCall.arguments.dependency === "string" && toolCall.arguments.dependency.trim();
+      const requestedIds = requested.length > 0 ? resolution.jobIds : activeJobs.map(job => job.id);
+      const jobIds = activeJobs.filter(job => requestedIds.includes(job.id) &&
+        (!job.proactiveKey || requested.length > 0 && dependency)).map(job => job.id);
       return [boundedCommand(state, "join_subagents", {
         toolCallId: toolCall.id,
         arguments: toolCall.arguments,
         requestedJobIds: requested,
-        jobIds: requested.length > 0
-          ? resolution.jobIds
-          : activeJobs.map((job) => job.id),
+        jobIds,
+        optionalJoinRejected: requestedIds.length > 0 && jobIds.length === 0,
         unresolvedJobIds: resolution.unresolved,
       })];
     }
@@ -728,6 +731,8 @@ export function decideNextCommands(
   const settledProactive = currentRunSubagents(state).filter(job => job.proactiveKey &&
     (job.status === "queued" || job.status === "running") && input.settledProactiveJobIds?.includes(job.id));
   if (settledProactive.length) return [boundedCommand(state, "join_subagents", { jobIds: settledProactive.map(job => job.id) })];
+  const unityPlayMode = nextRuntimeV2UnityPlayModeValidation(state);
+  if (unityPlayMode) return [boundedCommand(state, "execute_validation", { ...unityPlayMode })];
   const approvedPlanCoverage = state.strategy === "plan" && state.workPlan?.status === "approved"
     ? deriveRuntimeV2PlanExecutionCoverage(state)
     : null;
@@ -739,21 +744,6 @@ export function decideNextCommands(
     const remainingJoin = finalJoinActiveSubagentsCommand(state);
     if (remainingJoin) return [remainingJoin];
   }
-  if (input.subagentPreference === "preferred" && state.subagentRequirement !== "required" &&
-      input.subagentRequestMode === "parallel" && input.subagentCapacity &&
-      input.proactiveCollaboration && "candidate" in input.proactiveCollaboration) {
-    const candidate = input.proactiveCollaboration.candidate;
-    if (candidate.proactiveKey && candidate.accessMode === "read" && candidate.taskKind !== "implement") {
-      return [boundedCommand(state, "schedule_subagents", {
-        proactiveKey: candidate.proactiveKey,
-        arguments: { task_key: candidate.scopeKey, name: candidate.name, task_kind: candidate.taskKind, access_mode: "read",
-          objective: candidate.objective, success_criteria: candidate.successCriteria, allowed_paths: candidate.allowedPaths.join("\n") },
-        maxActiveSubagents: input.subagentCapacity,
-        collaborationRequestMode: input.subagentRequestMode,
-      })];
-    }
-  }
-
   switch (state.phase) {
     case "preparing":
       return [boundedCommand(state, "collect_observation", {

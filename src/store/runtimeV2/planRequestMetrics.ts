@@ -1,5 +1,6 @@
 import type { AgentMessage } from "../../lib/agentMessages";
 import { estimateMessagesTokens, estimateTokens } from "../../lib/contextTrim";
+import { sha256Hex } from "../../lib/sha256";
 
 /** Measures the exact outbound message view without logging its contents.
  * Native submission arguments are often much larger than visible prose. */
@@ -18,6 +19,7 @@ export function planRequestMetrics(input: {
     promptToolArgumentChars: input.messages.reduce((sum, message) => sum + (message.tool_calls || []).reduce((total, call) => total + call.function.arguments.length, 0), 0),
     promptSerializedMessageChars: JSON.stringify(input.messages).length,
     toolSchemaChars: toolSchema.length,
+    toolSchemaHash: toolSchema ? sha256Hex(toolSchema) : null,
     responseSchemaChars: responseSchema.length,
     estimatedInputTokens: estimateMessagesTokens([...input.messages]) + estimateTokens(toolSchema) + estimateTokens(responseSchema),
   };

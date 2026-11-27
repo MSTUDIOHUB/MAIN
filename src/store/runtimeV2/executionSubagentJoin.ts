@@ -15,6 +15,12 @@ import type {
 export const SUBAGENT_WAIT_NO_ACTIVE_RESPONSE =
   "SUBAGENT_WAIT_NO_ACTIVE: All spawned subagents have already completed and been joined above. No active subagents remain; do not call wait_subagents again. Continue directly or conclude.";
 
+function optionalChildFindings(result: RuntimeV2ChildResult) {
+  if (result.status !== "completed" || !result.report) return [];
+  const known = new Set(result.evidence.map(evidence => evidence.id));
+  return result.report.findings.filter(finding => finding.evidenceIds.some(id => known.has(id)));
+}
+
 /** Close an explicit wait_subagents call when no active children remain. */
 export function closeNoActiveSubagentWaitCall(
   input: RuntimeV2ExecutionPortsInput,
@@ -33,19 +39,25 @@ export function recordRuntimeV2JoinedChildAnchor(
   readonly delivered: boolean;
 } {
   const contextEntryId = `child:${result.job.id}`;
-  const evidenceIds = [...new Set(result.evidence.map((evidence) => evidence.id))];
-  const reviewFindingLines = result.job.taskKind === "review" && result.status === "completed" && result.report?.findings.length
-    ? result.report.findings.map((finding, index) => {
+  const proposed = !!(result.job.proactiveKey && result.job.sourceToolCallId);
+  const findings = proposed ? optionalChildFindings(result) : result.report?.findings || [];
+  const citedEvidence = new Set(findings.flatMap(finding => finding.evidenceIds));
+  const evidenceIds = [...new Set(result.evidence.map(evidence => evidence.id).filter(id => !proposed || citedEvidence.has(id)))];
+  if (proposed && !evidenceIds.length) return { contextEntryId, evidenceIds, delivered: false };
+  const reviewFindingLines = result.status === "completed" && findings.length && (result.job.taskKind === "review" || proposed)
+    ? findings.map(finding => {
+        const index = result.report?.findings.indexOf(finding) ?? 0;
         const findingId = finding.id?.trim() || `${result.job.id}:f${index + 1}`;
         const severity = finding.severity || (/\[BLOCKING\]/i.test(finding.statement) ? "blocking" : "advisory");
-        return `- finding_id=${findingId} [${severity.toUpperCase()}]: ${finding.statement}`;
+        const refs = proposed ? ` (evidence: ${finding.evidenceIds.filter(id => evidenceIds.includes(id)).join(", ")})` : "";
+        return `- finding_id=${findingId} [${severity.toUpperCase()}]: ${finding.statement}${refs}`;
       })
     : [];
   const content = [
     `Scope: ${result.job.scopeKey} (${result.job.allowedPaths.join(", ")})`,
     `Status: ${result.status}`,
     `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
-    `Report: ${result.summary}`,
+    proposed ? "Report: Findings supported by the child’s scoped evidence." : `Report: ${result.summary}`,
     ...(reviewFindingLines.length > 0 ? ["Findings:", ...reviewFindingLines] : []),
     evidenceIds.length > 0
       ? "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer."
@@ -59,7 +71,7 @@ export function recordRuntimeV2JoinedChildAnchor(
     message.role === "system" &&
     typeof message.content === "string" &&
     message.content.startsWith(`[runtime-v2 context: ${contextEntryId}]`) &&
-    message.content.includes(`Report: ${result.summary}`) &&
+    message.content.includes(proposed ? "Report: Findings supported by the child’s scoped evidence." : `Report: ${result.summary}`) &&
     message.content.includes(`Evidence ids: ${evidenceIds.join(", ") || "none"}`)
   );
   return { contextEntryId, evidenceIds, delivered };
@@ -103,16 +115,19 @@ export function formatRuntimeV2SubagentJoinResults(
 ): string {
   return [
     "SUBAGENT_RESULTS",
-    ...results.flatMap((result) =>
-      result
-        ? [
+    ...results.flatMap((result) => {
+      if (!result) return [];
+      const proposed = result.job.proactiveKey && result.job.sourceToolCallId;
+      const findings = proposed ? optionalChildFindings(result) : [];
+      const citedEvidence = new Set(findings.flatMap(finding => finding.evidenceIds));
+      const evidenceIds = result.evidence.map(evidence => evidence.id).filter(id => !proposed || citedEvidence.has(id));
+      return [
             `Handle: ${runtimeV2SubagentModelHandle(result.job)}`,
             `Status: ${result.status}`,
-            `Evidence ids: ${result.evidence.map((evidence) => evidence.id).join(", ") || "none"}`,
-            `Summary: ${result.summary}`,
-          ]
-        : []
-    ),
+            `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
+            ...(proposed ? findings.map(finding => `Finding: ${finding.statement}`) : [`Summary: ${result.summary}`]),
+      ];
+    }),
     observedJobs.some((job) => job.status !== "completed")
       ? "One or more child tasks did not complete. Continue the objective directly using any retained evidence."
       : "Apply child findings only when they are relevant to the parent objective.",

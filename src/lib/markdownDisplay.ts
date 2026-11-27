@@ -44,11 +44,46 @@ function transformMathOutsideCode(content: string): string {
     });
 }
 
+function isMarkdownStructuralLine(line: string): boolean {
+  const raw = String(line || "");
+  if (!raw.trim()) return true;
+  if (/(?:  |\\)$/.test(raw)) return true;
+  return /^(?:\s{2,}\S|\s*#{1,6}\s+|\s*\d+[.)]\s+|\s*[-*+]\s+|\s*>|\s*\||\s*(?:---+|___+|\*\*\*+)\s*$|\s*<\/?[A-Za-z][^>]*>\s*$)/.test(raw);
+}
+
+function cjkSoftBreakJoinSeparator(previousLine: string, nextLine: string): "" | " " | null {
+  if (isMarkdownStructuralLine(previousLine) || isMarkdownStructuralLine(nextLine)) {
+    return null;
+  }
+  const prevLast = previousLine.slice(-1);
+  const nextFirst = nextLine.slice(0, 1);
+  if (/[\u3400-\u9fff]/.test(prevLast) && /[\u3400-\u9fff]/.test(nextFirst)) {
+    return "";
+  }
+  if (/[\u3400-\u9fff]/.test(prevLast) && /[A-Za-z0-9]/.test(nextFirst)) {
+    return " ";
+  }
+  if (/[A-Za-z0-9]/.test(prevLast) && /[\u3400-\u9fff]/.test(nextFirst)) {
+    return " ";
+  }
+  return null;
+}
+
 function transformCjkSoftBreaks(content: string): string {
-  return String(content || "")
-    .replace(/([\u3400-\u9fff])\n(?=[\u3400-\u9fff])/g, "$1")
-    .replace(/([\u3400-\u9fff])\n(?=[A-Za-z0-9])/g, "$1 ")
-    .replace(/([A-Za-z0-9])\n(?=[\u3400-\u9fff])/g, "$1 ");
+  const lines = String(content || "").split("\n");
+  if (lines.length <= 1) return lines.join("\n");
+  const merged: string[] = [lines[0] ?? ""];
+  for (let index = 1; index < lines.length; index += 1) {
+    const nextLine = lines[index] ?? "";
+    const previousLine = merged[merged.length - 1] ?? "";
+    const separator = cjkSoftBreakJoinSeparator(previousLine, nextLine);
+    if (separator !== null) {
+      merged[merged.length - 1] = `${previousLine}${separator}${nextLine}`;
+    } else {
+      merged.push(nextLine);
+    }
+  }
+  return merged.join("\n");
 }
 
 function transformOutsideFencedCode(content: string, transform: (chunk: string) => string): string {

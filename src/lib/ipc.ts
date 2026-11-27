@@ -10,6 +10,7 @@ import type { GithubSkillSource } from "./githubSkillSource";
 import type { WebSearchProvider } from "./networkRead";
 import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
 import { mergeRuntimeV2CheckpointMaps } from "./runtime-v2/checkpointMerge";
+import { redactTerminalCredentials } from "./terminalCredentials";
 import {
   createProjectSessionMutationCoordinator,
   isProjectSessionAdmissionProjectionOwned,
@@ -1150,6 +1151,10 @@ export function getFileMetadata(path: string, workspace?: string): Promise<FileM
   return invoke<FileMetadata>("get_file_metadata", { path, workspace });
 }
 
+export function observeWorktreeAbsence(workspace: string, paths: readonly string[]): Promise<readonly string[]> {
+  return invoke("observe_worktree_absence", { workspace, paths });
+}
+
 export function inspectProjectInitTarget(
   workspace: string,
 ): Promise<ProjectInitTargetSnapshot> {
@@ -1179,6 +1184,14 @@ export function setWorkspaceRoot(path: string): Promise<string> {
 
 export function canonicalizeWorkspacePath(path: string): Promise<string> {
   return invoke<string>("canonicalize_workspace_path", { path });
+}
+
+export function inspectWorkspaceEngineProfile(
+  workspace: string,
+  contextPaths: readonly string[],
+  projectRootHint?: string,
+): Promise<import("./workspaceEngineProfile").WorkspaceEngineProfile | null> {
+  return invoke("inspect_workspace_engine_profile", { workspace, contextPaths, projectRootHint });
 }
 
 export function writeFile(path: string, content: string, workspace?: string): Promise<void> {
@@ -1249,6 +1262,10 @@ export function compareAndSwapSessionSnapshot(input: {
   return invoke<ProjectSessionSnapshotRecord>("compare_and_swap_session_snapshot", { input });
 }
 
+export function finalizeTerminalCredentialHistoryCleanup(): Promise<boolean> {
+  return invoke("finalize_terminal_credential_history_cleanup");
+}
+
 export interface LegacySessionFile {
   workspace: string;
   sessionId: string;
@@ -1290,8 +1307,8 @@ export function listPlanDocuments(scope: PlanDocumentScope): Promise<PlanDocumen
   return invoke<PlanDocumentRef[]>("list_plan_documents", { scope });
 }
 
-export function deleteWorkspacePath(path: string, workspace?: string): Promise<void> {
-  return invoke<void>("delete_workspace_path", { path, workspace });
+export function deleteWorkspacePath(path: string, workspace?: string): Promise<{ changed: boolean; previousVersion: string }> {
+  return invoke("delete_workspace_path", { path, workspace });
 }
 
 export function deleteChatTempPath(sessionKey: string, path: string): Promise<void> {
@@ -1317,7 +1334,7 @@ export async function rebuildProjectSessionsIndex(workspace: string): Promise<an
 export function saveProjectSession(
   workspace: string,
   session: any,
-  options?: ProjectSessionSaveOptions & { allowPersistingWorkspaceReceiptId?: string },
+  options?: ProjectSessionSaveOptions & { allowPersistingWorkspaceReceiptId?: string; exactStorageRevision?: boolean },
 ): Promise<any> {
   const sessionId = String(session?.id ?? "unknown");
   const ownerKey = projectSessionOwnerKey(workspace, sessionId);
@@ -1328,8 +1345,8 @@ export function saveProjectSession(
   // A caller already behind the known owner revision is a genuine stale
   // write. Preserve its revision so SQLite can reject it instead of silently
   // rebasing stale content over a newer snapshot.
-  const mayAdvanceQueuedRevision = cachedRevisionAtEnqueue === undefined ||
-    capturedStorageRevision === cachedRevisionAtEnqueue;
+  const mayAdvanceQueuedRevision = !options?.exactStorageRevision &&
+    (cachedRevisionAtEnqueue === undefined || capturedStorageRevision === cachedRevisionAtEnqueue);
   const isCurrent = () => (
     isProjectSessionAdmissionProjectionOwned(
       session,
@@ -1479,8 +1496,8 @@ export async function listDirectory(path: string, workspace?: string): Promise<F
     : [];
 }
 
-export async function globSearch(pattern: string, workspace?: string): Promise<string[]> {
-  const result = await invoke<unknown>("glob_search", { pattern, workspace });
+export async function globSearch(pattern: string, workspace?: string, sourceSearch?: true): Promise<string[]> {
+  const result = await invoke<unknown>("glob_search", { pattern, workspace, ...(sourceSearch ? { sourceSearch } : {}) });
   return Array.isArray(result)
     ? result.filter((entry): entry is string => typeof entry === "string")
     : [];
@@ -1690,7 +1707,7 @@ export function runHookCommand(
 }
 
 export async function runUnityEditorOperation(
-  command: "unity_create_scene" | "unity_compile_project" | "unity_probe_editor" | "unity_test_project",
+  command: "unity_create_scene" | "unity_compile_project" | "unity_probe_editor" | "unity_cli_console" | "unity_official_mcp" | "unity_test_project" | "capture_unity_game_view",
   args: Record<string, unknown>,
   signal: AbortSignal,
   deadlineAt: number,
@@ -1708,6 +1725,10 @@ export async function runUnityEditorOperation(
   }
 }
 
+export function inspectUnityAssemblies(workspace: string, sourcePaths: readonly string[]): Promise<unknown> {
+  return invoke("unity_inspect_assemblies", { workspace, sourcePaths });
+}
+
 export function runCommand(
   command: string,
   input?: string,
@@ -1723,7 +1744,12 @@ export function runCommand(
     workspace,
     permissionApproval,
     workingDirectory,
-  });
+  }).then(output => ({
+    ...output,
+    command: redactTerminalCredentials(output.command),
+    stdout: redactTerminalCredentials(output.stdout),
+    stderr: redactTerminalCredentials(output.stderr),
+  }));
 }
 
 export function browserEvaluate(

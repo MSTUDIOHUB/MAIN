@@ -17,6 +17,7 @@ import {
 } from "../../lib/runtime-v2";
 import { resolveSubagentCapacityPolicy } from "../../lib/subagents";
 import { isProjectBaselineForWorkspace } from "../../lib/workspaceAdmission";
+import { resolveRuntimeV2VisibleRunnerKind } from "../../lib/runtimeEngineSelection";
 import type { ConversationTurn } from "../../lib/workflowModels";
 import { getRuntimeV2Checkpoint, createRuntimeV2CheckpointPort } from "./checkpointPort";
 import {
@@ -26,6 +27,7 @@ import {
   createRuntimeV2ToolPort,
 } from "./executionPorts";
 import { createRuntimeV2ProjectionPort } from "./projectionPort";
+import { deriveProactiveCollaboration } from "./proactiveSubagents";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
 import { resolveRuntimeV2SessionEpoch } from "./sessionIdentity";
 
@@ -106,19 +108,16 @@ function settlement(
 
 /**
  * Shared adapters and persistence for independent Chat/analyze policies.
- * Workspace and attachment scope, not the network switch, selects analyze.
+ * The Session owner is independent of the strategy's permitted sources.
  */
 export async function runSubmitRuntimeV2ReadOnly(
   input: RuntimeV2ReadOnlyRunnerInput,
-  strategy: "chat" | "analyze",
+  requestedStrategy: "chat" | "analyze",
 ): Promise<RuntimeRunSettlement> {
   const now = input.now || Date.now;
   const workspace = String(input.context.runWorkspace || "").trim();
-  const hasAttachedFiles =
-    input.context.turnInputContextSignals.attachedFilePaths.length > 0;
-  if (strategy === "analyze" && !workspace && !hasAttachedFiles) {
-    throw new Error("RUNTIME_V2_BOUNDED_READ_REQUIRES_SOURCE_SCOPE");
-  }
+  const signals = input.context.turnInputContextSignals;
+  const hasAttachedFiles = !!(signals.attachedFilePaths?.length || signals.mentionedFilePaths?.length);
   const initialState = input.get();
   const turn = currentTurn(initialState, input.context.turnId);
   if (!turn) {
@@ -135,10 +134,36 @@ export async function runSubmitRuntimeV2ReadOnly(
     });
     throw new Error("RUNTIME_V2_WORKSPACE_READ_STALE_RUN_CHECKPOINT");
   }
+  const savedStrategy = existing?.aggregate.strategy;
+  if (savedStrategy && savedStrategy !== "chat" && savedStrategy !== "analyze") {
+    throw new Error("RUNTIME_V2_READ_ONLY_REJECTS_NON_READ_ONLY_CHECKPOINT");
+  }
+  const strategy = savedStrategy ?? requestedStrategy;
+  if (!existing && strategy === "analyze" && !workspace && !hasAttachedFiles) {
+    throw new Error("RUNTIME_V2_BOUNDED_READ_REQUIRES_SOURCE_SCOPE");
+  }
+  if (!existing && strategy === "chat" && resolveRuntimeV2VisibleRunnerKind({
+    effectiveIntent: input.context.effectiveRunIntent,
+    runtimeIntent: input.context.runtimeRunIntent,
+    runWorkspace: workspace,
+    hasAttachedFiles,
+    requiredCapabilities: input.context.requiredCapabilities,
+  }) !== "chat") {
+    throw new Error("RUNTIME_V2_CHAT_REQUIRES_SOURCE_FREE_ADMISSION");
+  }
 
   // A checkpoint's admission fact wins over both UI state and a newer Turn projection.
-  input = { ...input, context: { ...input.context, networkRead: normalizeNetworkRead(existing ? existing.aggregate.networkRead : turn.networkRead), knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext,
-    workspaceInstructionContext: existing ? existing.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext : input.context.workspaceInstructionContext } };
+  const preparedChatAnswer = input.context.preparedChatAnswer;
+  input = { ...input, context: {
+    ...input.context,
+    readOnlyStrategy: strategy,
+    networkRead: normalizeNetworkRead(existing ? existing.aggregate.networkRead : turn.networkRead),
+    knowledgeContext: existing ? existing.aggregate.knowledgeContext : input.context.knowledgeContext,
+    workspaceInstructionContext: strategy === "chat" ? undefined : existing?.aggregate.workspaceInstructionContext ?? input.context.workspaceInstructionContext,
+    ...(strategy === "chat" ? { projectBaselineContext: null, workspaceMcpSnapshot: null } : {}),
+    preparedChatAnswer: !existing && strategy === "chat" ? preparedChatAnswer : undefined,
+    preparedWorkspaceRead: !existing && strategy === "analyze" ? input.context.preparedWorkspaceRead : undefined,
+  } };
   const live = createRuntimeV2LiveExecutionState();
   if (existing) restoreReadOnlyHistory(live, existing.aggregate);
   const checkpoint = createRuntimeV2CheckpointPort({
@@ -200,27 +225,40 @@ export async function runSubmitRuntimeV2ReadOnly(
     input.logStoreEvent(`runtime_v2_${strategy === "chat" ? "chat" : "workspace_read"}_${existing ? "resumed" : "admitted"}`, { turnId: identity.turn.turnId, runId: identity.run.runId, strategy });
     const result = await runRuntimeV2ReadOnlyLoop({
       ports, turn: identity.turn, run: identity.run, objective: turn.userPrompt,
+      subagentRequirement: input.context.turnInputContextSignals?.subagentRequirement,
       capabilityRestrictions: input.context.capabilityRestrictions,
       approvalRequiredCapabilities: input.context.approvalRequiredCapabilities,
-      // The admission baseline is already in provider history. Let the model
-      // name any missing source instead of forcing another full project map.
-      strategy, collectWorkspace: !(existing?.aggregate.objective.capabilityRestrictions || input.context.capabilityRestrictions)?.includes("workspace_read") && !(existing ? existing.aggregate.objective.approvalRequiredCapabilities : input.context.approvalRequiredCapabilities)?.includes("workspace_read") && !!workspace && !isProjectBaselineForWorkspace(
+      // New code investigations choose a concrete source tool in the first
+      // request. Keep overview collection for older unspecialized callers.
+      strategy, collectWorkspace: strategy === "analyze" && input.context.requiredCapabilities === undefined &&
+        !(existing?.aggregate.objective.capabilityRestrictions || input.context.capabilityRestrictions)?.includes("workspace_read") && !(existing ? existing.aggregate.objective.approvalRequiredCapabilities : input.context.approvalRequiredCapabilities)?.includes("workspace_read") && !!workspace && !isProjectBaselineForWorkspace(
         input.context.projectBaselineContext,
         workspace,
       ), networkRead: input.context.networkRead, knowledgeContext: input.context.knowledgeContext,
       workspaceInstructionContext: input.context.workspaceInstructionContext,
-      allowSkillLoad: !!buildLoadSkillToolDefinition(input.context.skillCatalog),
+      allowSkillLoad: (strategy !== "chat" || !!existing || !!input.context.skillCatalog?.explicitSkillIds.length) &&
+        !!buildLoadSkillToolDefinition(input.context.skillCatalog),
       signal: input.context.abortCtrl.signal,
       isExternalCancellationPending: () => getPendingSessionCancellation(identity.turn.sessionKey)?.turnId === identity.turn.turnId,
+      logEvent: input.logStoreEvent,
       now, deadlineMs: input.deadlineMs,
       initial: existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined,
       blocked: () => live.permissionRejection,
-      decisionInput: () => {
+      decisionInput: (state) => {
+        if (strategy === "chat") return {};
         const policy = resolveSubagentCapacityPolicy(input.get().config);
-        return strategy === "analyze" ? {
-          subagentPreference: input.context.turnInputContextSignals.subagentPreference,
+        const preference = input.context.turnInputContextSignals.subagentPreference;
+        const startedAt = state.events.find((event) => event.type === "run.started")?.at;
+        return {
+          subagentPreference: preference,
           subagentCapacity: policy.maxActiveRequests, subagentRequestMode: policy.modelRequestMode,
-        } : {};
+          proactiveCollaboration: deriveProactiveCollaboration({
+            state, preference, capacity: policy.maxActiveRequests, requestMode: policy.modelRequestMode,
+            baseline: input.context.projectBaselineContext, workspace, language: input.context.phaseLanguage, now: now(),
+            lifecycleDeadlineAt: input.deadlineMs === undefined || startedAt === undefined ? undefined : startedAt + input.deadlineMs,
+          }),
+          settledProactiveJobIds: [...live.childTelemetry].filter(([, telemetry]) => telemetry.closedAt !== null).map(([id]) => id),
+        };
       },
     });
     input.logStoreEvent(`runtime_v2_${strategy === "chat" ? "chat" : "workspace_read"}_terminal`, {

@@ -14,10 +14,12 @@ export interface RuntimeV2ReadOnlyLoopInput {
   readonly turn: RuntimeV2TurnIdentity;
   readonly run: RuntimeV2RunIdentity;
   readonly objective: string;
+  readonly subagentRequirement?: TurnAggregateV1["subagentRequirement"];
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
   readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
   readonly signal: AbortSignal;
   readonly isExternalCancellationPending?: () => boolean;
+  readonly logEvent?: (event: string, data: Record<string, unknown>) => void;
   readonly initial?: RuntimeV2ControllerSnapshot;
   readonly now: () => number;
   /** Explicit caller budget only; ordinary local-model Turns have no deadline. */
@@ -26,7 +28,7 @@ export interface RuntimeV2ReadOnlyLoopInput {
   readonly networkRead?: NetworkReadPolicy;
   readonly strategy?: "chat" | "analyze";
   readonly collectWorkspace?: boolean;
-  readonly decisionInput?: () => RuntimeV2DecisionInput;
+  readonly decisionInput?: (state: TurnAggregateV1) => RuntimeV2DecisionInput;
   readonly blocked?: () => { reason: string; finalMarkdown: string } | null;
 }
 export interface RuntimeV2ReadOnlyLoopResult {
@@ -40,9 +42,11 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
   const controller = new RuntimeV2Controller(input.ports, input.initial, {
     abortSignal: input.signal,
     isExternalCancellationPending: input.isExternalCancellationPending,
+    logEvent: input.logEvent,
   });
   if (!input.initial) await controller.admit({
     turn: input.turn, run: input.run, strategy: input.strategy || "chat", objective: input.objective,
+    subagentRequirement: input.subagentRequirement,
     capabilityRestrictions: input.capabilityRestrictions,
     approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     networkRead: input.networkRead, knowledgeContext: input.knowledgeContext, workspaceInstructionContext: input.workspaceInstructionContext, constraints: ["read_only", "no_external_side_effects"],
@@ -50,6 +54,7 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
   });
   const startedAt = controller.snapshot().aggregate?.events.find((event) => event.type === "run.started")?.at ?? input.now();
   if (input.initial?.aggregate?.terminalOutcome || input.initial?.aggregate?.phase === "finalizing") await controller.resumeTerminalProjection();
+  else if (input.initial?.aggregate?.strategy === "analyze" && !input.signal.aborted) await controller.restoreProactiveSubagents();
   while (true) {
     const state = controller.snapshot().aggregate;
     if (!state) throw new Error("RUNTIME_V2_READ_ONLY_AGGREGATE_MISSING");
@@ -95,7 +100,7 @@ export async function runRuntimeV2ReadOnlyLoop(input: RuntimeV2ReadOnlyLoopInput
       await controller.changePhase("observing", "已取得概览，继续读取缺失的证据或回答。");
       continue;
     }
-    if (!await controller.driveOnce(input.decisionInput?.())) {
+    if (!await controller.driveOnce(input.decisionInput?.(state))) {
       await controller.driveOnce({ resultKind: "error", resultReason: "没有可继续的只读动作或可发布的模型回答。" });
     }
   }

@@ -13,6 +13,8 @@ import {
 import { requestRuntimeV2ToolPermission } from "./executionToolPermission";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 import { getShellPermissionCommandForTool } from "../../lib/shellAutoApproval";
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { dismissRuntimeV2UnityOfficialMcpOffer } from "./executionUnityOfficialMcp";
 
 const shellDenialRecovery = new Map([
   ["trusted_execution::PathnameExpansion", {
@@ -111,7 +113,11 @@ export async function resolveRuntimeV2ToolAuthorization(input: {
         : externalRead
           ? `未读取 \`${requestedPath}\`：你拒绝了工作区外本地文件访问。本轮未导入或读取该文件。`
           : `未对 \`${requestedPath}\` 执行 \`${input.toolName}\`：你拒绝了这次单独授权。`;
-      input.ports.live.permissionRejection = { reason, finalMarkdown };
+      if (input.toolName === ENABLE_UNITY_OFFICIAL_MCP_TOOL) {
+        dismissRuntimeV2UnityOfficialMcpOffer(input.ports);
+      } else {
+        input.ports.live.permissionRejection = { reason, finalMarkdown };
+      }
       recordToolResultHistory({
         ports: input.ports,
         command: input.command,

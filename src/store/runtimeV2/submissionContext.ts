@@ -6,6 +6,7 @@ import type { SkillCatalogSnapshot } from "../../lib/agentSkills";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { ProjectBaselineContext } from "../../lib/projectBaseline";
 import type { TurnInputContextSignals } from "../../lib/turnIntake";
+import type { RuntimeV2PreparedChatAnswer, RuntimeV2PreparedWorkspaceRead } from "../../lib/submissionRuntimeContracts";
 import type {
 } from "../../lib/submit/turnSubmission";
 
@@ -37,6 +38,11 @@ export interface RuntimeV2SubmissionContext {
   readonly effectiveRunIntent: ResolvedRunIntent;
   readonly runtimeRunIntent: ResolvedRunIntent;
   readonly requiredCapabilities?: readonly TurnCapability[];
+  readonly preparedChatAnswer?: RuntimeV2PreparedChatAnswer;
+  readonly preparedWorkspaceRead?: RuntimeV2PreparedWorkspaceRead;
+  readonly sourceInvestigationTurnId?: string;
+  /** Frozen by the read-only runner from the exact Turn checkpoint on restore. */
+  readonly readOnlyStrategy?: "chat" | "analyze";
   readonly semanticWorkType?: SemanticTaskIntent["workType"];
   readonly effectiveCommandDirective?: CommandDirective | null;
   readonly intentClarification?: import("../../lib/turnClarification").TurnClarification;

@@ -134,6 +134,8 @@ export interface RuntimeV2EvidenceReference {
   readonly kind: "source" | "tool" | "mutation" | "validation" | "subagent" | "user";
   readonly target: string;
   readonly version: string | null;
+  /** Mutation baseline captured at the write boundary; 'deleted' means absent. */
+  readonly previousVersion?: string | null;
 }
 
 /** The evidence id and sequence identify the exact write covered by a validator. */
@@ -153,6 +155,7 @@ export interface RuntimeV2ExecutionValidationAuthority {
   readonly criterionIds: readonly string[];
   readonly targetPaths: readonly string[];
   readonly expectedTestCases?: number;
+  readonly expectedTestCaseNames?: readonly string[];
   readonly useProjectEditor?: true;
 }
 
@@ -322,7 +325,7 @@ export interface RuntimeV2SubagentJob {
   readonly parentRunId: string;
   /** Exact provider tool call that created this one-shot job. */
   readonly sourceToolCallId?: string;
-  /** Exact runtime-owned dispatch identity; never a provider tool call. */
+  /** Runtime-owned identity for a bound optional proposal or a legacy dispatch. */
   readonly proactiveKey?: string;
   readonly scopeKey: string;
   readonly taskKind?: "explore" | "review" | "validate" | "implement";

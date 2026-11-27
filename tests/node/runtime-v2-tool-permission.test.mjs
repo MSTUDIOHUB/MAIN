@@ -35,6 +35,8 @@ const { resolveRuntimeV2ToolAuthorization } = loadTs(path.join(root, "src/store/
 const { authorizeToolForCurrentTurn } = loadTs(path.join(root, "src/store/runtimeV2/executionAuthorization.ts"));
 const { createRuntimeV2LiveExecutionState } = loadTs(path.join(root, "src/store/runtimeV2/executionTypes.ts"));
 const { buildShellPermissionApproval } = loadTs(path.join(root, "src/lib/shellAutoApproval.ts"));
+const { createRuntimeV2ToolPort } = loadTs(path.join(root, "src/store/runtimeV2/executionToolPort.ts"));
+const { providerToolDefinitionsForCommand } = loadTs(path.join(root, "src/store/runtimeV2/executionAuthorizationContext.ts"));
 
 function fixture({ consent = null, command = "unity --version", decision = "allow", critical = false, autoApproveTools = false, autoApproveToolScopes = [], approvalRequiredCapabilities = [] } = {}) {
   const state = {
@@ -153,6 +155,48 @@ test("shell rejection cannot be revived by a later approval", async () => {
   assert.match(f.ports.live.permissionRejection.finalMarkdown, /denied/i);
   resolve({ action: "accept" });
   assert.equal((await pending).allowed, false);
+});
+
+test("Unity Official MCP activation asks once, updates the current Run on approval, and keeps CLI on rejection", async () => {
+  for (const action of ["accept", "reject"]) {
+    const f = fixture({ consent: { turnId: "turn", granted: true }, autoApproveTools: true, autoApproveToolScopes: ["mcp_action"] });
+    const toolName = "enable_unity_official_mcp";
+    const editorVersion = "6000.6.5f1";
+    const editorPid = 1234;
+    f.state.config.unityOfficialMcpEnabled = false;
+    f.state.setConfig = patch => Object.assign(f.state.config, patch);
+    f.ports.context.workspaceMcpSnapshot = { workspace: "/fixture", mcpServers: [], mcpDiscoveredTools: [], mcpToolServerMap: {},
+      unityOfficialMcpOfferVersion: editorVersion, unityCliConsole: { instanceId: `unity-cli:${editorPid}`, editorPid, editorVersion } };
+    let discoveries = 0;
+    ipc.runUnityEditorOperation = async (command, args) => {
+      discoveries++;
+      assert.equal(command, "unity_official_mcp");
+      assert.deepEqual(args, { workspace: "/fixture", editorVersion });
+      return { editorPid, tools: [{ name: "console", description: "Unity Console",
+        inputSchema: { type: "object", properties: { command: { type: "string", enum: ["get", "clear"] } }, required: ["command"] } }] };
+    };
+    const toolNames = mode => providerToolDefinitionsForCommand(f.ports, { kind: "request_model", payload: { mode } }).map(tool => tool.function.name);
+    assert.ok(toolNames("execute").includes(toolName));
+    assert.ok(!toolNames("analyze").includes(toolName));
+    const command = { ...f.request.command, payload: { toolName, arguments: {}, toolCallId: "enable-official" } };
+    const done = createRuntimeV2ToolPort(f.ports).execute({ command, signal: f.abort.signal });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(f.state.activeActionRequest?.toolName, toolName);
+    assert.equal(f.state.activeActionRequest?.approvalRequiredCapability, "external_interaction");
+    assert.equal(f.state.config.unityOfficialMcpEnabled, false);
+    assert.equal(discoveries, 0);
+
+    f.state.pendingReviewResolve({ action });
+    const completion = await done;
+    const allowed = action === "accept";
+    assert.equal(completion.status, allowed ? "succeeded" : "blocked");
+    assert.equal(f.state.config.unityOfficialMcpEnabled, allowed);
+    assert.equal(discoveries, allowed ? 1 : 0);
+    assert.equal(f.ports.live.permissionRejection, null);
+    assert.ok(!toolNames("execute").includes(toolName));
+    assert.ok(toolNames("execute").includes("unity_cli_console"));
+    assert.equal(toolNames("execute").includes("unity_official_mcp_console"), allowed);
+  }
 });
 
 test("a shell approval cannot authorize different command bytes", async () => {

@@ -11,6 +11,8 @@ import {
   type RecoveryReadLease,
 } from "./executeRecoveryTools";
 import { recordWorkspaceFileCheckpoint } from "./workspaceCheckpoints";
+import { introducedUnityPredefinedReferences } from "./unityAssemblyReferences";
+import { normalizeValidationWorkspaceCwd } from "./validationContract";
 
 export type WorkspaceMutationPreflightReason =
   | "not_applicable"
@@ -25,6 +27,7 @@ export type WorkspaceMutationPreflightReason =
   | "outside_workspace"
   | "invalid_patch"
   | "public_contract_break"
+  | "unity_predefined_assembly_reference"
   | "syntax_error";
 
 /** Current filesystem facts for one write_file preparation. This is produced
@@ -32,6 +35,19 @@ export type WorkspaceMutationPreflightReason =
 export type WorkspaceWriteFileTargetFact =
   | { readonly path: string; readonly exists: false }
   | { readonly path: string; readonly exists: true; readonly content: string };
+
+/** Raised before committing an editor operation. The fresh source itself is
+ * delivered only through an authorized read. */
+export class WorkspaceMutationSourceMismatch extends Error {
+  constructor(
+    readonly target: string,
+    readonly requestedRange: RecoveryReadLease["requestedRange"],
+    message: string,
+  ) {
+    super(message);
+    this.name = "WorkspaceMutationSourceMismatch";
+  }
+}
 
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
@@ -57,7 +73,11 @@ export interface WorkspaceMutationPreflightInput {
    * preview read or write is attempted. The executor still performs its
    * canonical filesystem authorization afterward. */
   workspaceRoot?: string;
+  /** Confirmed by the caller from this workspace's project metadata. */
+  unityProject?: boolean;
   readFile: (path: string) => Promise<string>;
+  /** Runtime v2 delivers source through an authorized read_file receipt. */
+  includeRecoverySource?: boolean;
   readFileMetadata?: (
     path: string,
   ) => Promise<{ sizeBytes: number; modifiedMs: number } | null>;
@@ -213,11 +233,12 @@ async function buildPatchRecoveryMismatchEvidence(input: {
   };
 }
 
-function inferReplaceMismatchRecoveryRange(
+export function inferMutationRecoveryRange(
   current: string,
   searchText: string,
 ): RecoveryReadLease["requestedRange"] {
   const lines = String(current || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
   const searchLines = String(searchText || "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
@@ -299,7 +320,7 @@ function buildMessage(input: {
       case "read_failed":
         return `MUTATION_PREFLIGHT_BLOCKED: Could not read ${input.path} before patching (${input.detail || "read failed"}). Do not ask for approval; read the correct target or report the blocker.`;
       case "search_text_mismatch":
-        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Copy the exact lines from the current source snippet below and retry:${input.detail ? `\n${input.detail}` : ""}`;
+        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. ${input.detail ? `Copy the exact lines from this source and retry:\n${input.detail}` : "Read the relevant current source before retrying."}`;
       case "search_text_ambiguous":
         return `MUTATION_PREFLIGHT_BLOCKED: search_text occurs more than once in ${input.path}. Expand it to one unique exact block from the visible source before retrying.`;
       case "empty_change":
@@ -316,6 +337,8 @@ function buildMessage(input: {
         return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Correct the patch from the active source observation; reread only for a changed version or a genuinely missing range.`;
       case "public_contract_break":
         return `MUTATION_PREFLIGHT_BLOCKED: The proposed change removes a module export that still has a workspace import (${input.detail || "public contract would be broken"}). No file was changed; preserve the export or update its callers in the same coherent repair.`;
+      case "unity_predefined_assembly_reference":
+        return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} would add a reference to Unity's predefined script assembly ${input.detail}. Find the owning named assembly for the required types and use its declared name or GUID. No file was changed.`;
       case "syntax_error":
         return `MUTATION_PREFLIGHT_BLOCKED: The proposed content for ${input.path} has a parser-confirmed syntax error (${input.detail || "invalid syntax"}). No file was changed; correct the edit from the active source observation.`;
     }
@@ -327,7 +350,7 @@ function buildMessage(input: {
     case "read_failed":
       return `MUTATION_PREFLIGHT_BLOCKED: patch 前无法读取 ${input.path}（${input.detail || "读取失败"}）。不要请求用户审批；请读取正确目标或明确阻塞。`;
     case "search_text_mismatch":
-      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中未精确匹配。请直接复制下方当前文件中的真实代码片段修正 search_text 后重试：${input.detail ? `\n${input.detail}` : ""}`;
+      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中未精确匹配。${input.detail ? `请复制以下当前源码，修正 search_text 后重试：\n${input.detail}` : "请读取相关的最新源码后再试。"}`;
     case "search_text_ambiguous":
       return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中出现多次。请依据已显示源码将其扩展为唯一的精确文本块后重试。`;
     case "empty_change":
@@ -344,6 +367,8 @@ function buildMessage(input: {
       return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。请依据当前源码观察修正 patch；只有版本变化或确实缺少范围时才重新读取。`;
     case "public_contract_break":
       return `MUTATION_PREFLIGHT_BLOCKED: 拟议修改删除了仍被工作区导入的模块导出（${input.detail || "会破坏公共契约"}）。文件尚未修改；请保留该导出，或在同一完整修复中同步更新调用方。`;
+    case "unity_predefined_assembly_reference":
+      return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 将新增对 Unity 预定义脚本程序集 ${input.detail} 的引用。请查明所需类型所在的命名程序集，并使用其声明名称或 GUID。文件尚未修改。`;
     case "syntax_error":
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 的拟写入内容存在解析器确认的语法错误（${input.detail || "语法无效"}）。文件尚未修改；请依据当前源码观察修正编辑。`;
   }
@@ -447,7 +472,7 @@ function blocked(input: {
   };
 }
 
-async function blockedSyntaxResult(
+async function blockedPostImageResult(
   input: WorkspaceMutationPreflightInput,
   path: string,
   content: string,
@@ -455,6 +480,20 @@ async function blockedSyntaxResult(
   previousContent?: string,
   patchPaths?: Readonly<Record<string, boolean>>,
 ): Promise<WorkspaceMutationPreflightResult | null> {
+  if (input.unityProject && /\.asmdef$/i.test(path)) {
+    const relative = normalizeValidationWorkspaceCwd(path, input.workspaceRoot);
+    if (relative && /^(?:Assets|Packages)\//i.test(relative)) {
+      const introduced = introducedUnityPredefinedReferences(previousContent, content);
+      if (introduced.length) return blocked({
+        reason: "unity_predefined_assembly_reference",
+        toolName: input.toolName,
+        path,
+        language,
+        detail: introduced.map(name => JSON.stringify(name)).join(", "),
+        recoveryKind: "mutation_rejected",
+      });
+    }
+  }
   if (!input.checkSyntax) return null;
   const checked = await input.checkSyntax(path, content, input.workspaceRoot, patchPaths);
   if (!checked.applicable || !checked.hasErrors) return null;
@@ -564,7 +603,7 @@ export async function preflightWorkspaceMutation(
       input.probeFileAvailability,
     );
     if (!preview.ok) {
-      const recoveryTarget = preview.changes[0]?.path || patchTarget;
+      const recoveryTarget = preview.sourceMismatch?.target || preview.changes[0]?.path || patchTarget;
       const recoveryKind = preview.failureKind === "source_mismatch"
         ? "source_mismatch"
         : preview.failureKind === "target_unavailable"
@@ -574,7 +613,9 @@ export async function preflightWorkspaceMutation(
         ? await buildPatchRecoveryMismatchEvidence({
             reason: "invalid_patch",
             target: recoveryTarget,
-            requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget),
+            requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget) || (preview.sourceMismatch && inferMutationRecoveryRange(
+              preview.sourceMismatch.currentContent, preview.sourceMismatch.oldText,
+            )),
             readFileMetadata: input.readFileMetadata,
           })
         : undefined;
@@ -630,7 +671,7 @@ export async function preflightWorkspaceMutation(
     const patchPaths = Object.fromEntries(preview.changes.map(change => [change.path, change.kind !== "delete"]));
     for (const change of preview.changes) {
       if (change.kind === "delete") continue;
-      const syntaxFailure = await blockedSyntaxResult(
+      const postImageFailure = await blockedPostImageResult(
         input,
         change.path,
         change.newContent,
@@ -638,7 +679,7 @@ export async function preflightWorkspaceMutation(
         change.kind === "update" ? change.oldContent : undefined,
         patchPaths,
       );
-      if (syntaxFailure) return syntaxFailure;
+      if (postImageFailure) return postImageFailure;
     }
     const publicContractFailure = await blockedPublicContractResult(
       input,
@@ -689,16 +730,16 @@ export async function preflightWorkspaceMutation(
       if (current === content) {
         return blocked({ reason: "identical_content", toolName, path, language });
       }
-      const syntaxFailure = await blockedSyntaxResult(input, path, content, language, current);
-      if (syntaxFailure) return syntaxFailure;
+      const postImageFailure = await blockedPostImageResult(input, path, content, language, current);
+      if (postImageFailure) return postImageFailure;
       recordWorkspaceFileCheckpoint({
         sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
         existedBefore: true, previousContent: current, toolName,
       });
       return { ok: true, writeFileTarget: { path, exists: true, content: current }, postImages: [{ path, content }] };
     }
-    const syntaxFailure = await blockedSyntaxResult(input, path, content, language);
-    if (syntaxFailure) return syntaxFailure;
+    const postImageFailure = await blockedPostImageResult(input, path, content, language);
+    if (postImageFailure) return postImageFailure;
     recordWorkspaceFileCheckpoint({
       sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
       existedBefore: false, previousContent: null, toolName,
@@ -736,7 +777,7 @@ export async function preflightWorkspaceMutation(
   if (!current.includes(searchText)) {
     const inferredRange =
       normalizeRecoveryReadRange(input.args) ||
-      inferReplaceMismatchRecoveryRange(current, searchText);
+      inferMutationRecoveryRange(current, searchText);
     const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
       reason: "search_text_mismatch",
       target: path,
@@ -753,7 +794,7 @@ export async function preflightWorkspaceMutation(
       .slice(snippetStart - 1, snippetEnd)
       .join("\n")
       .slice(0, 2400);
-    const detail = nearbyExcerpt
+    const detail = input.includeRecoverySource !== false && nearbyExcerpt
       ? `[${path}:${snippetStart}-${snippetEnd}]\n${nearbyExcerpt}`
       : undefined;
     return blocked({
@@ -797,14 +838,14 @@ export async function preflightWorkspaceMutation(
     });
   }
 
-  const syntaxFailure = await blockedSyntaxResult(
+  const postImageFailure = await blockedPostImageResult(
     input,
     path,
     updated,
     language,
     current,
   );
-  if (syntaxFailure) return syntaxFailure;
+  if (postImageFailure) return postImageFailure;
   recordWorkspaceFileCheckpoint({
     sessionKey: input.sessionKey,
     workspace: input.workspaceRoot,

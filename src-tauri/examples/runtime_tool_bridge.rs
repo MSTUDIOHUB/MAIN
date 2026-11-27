@@ -2,9 +2,11 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 use tauri_app_lib::{
@@ -250,6 +252,77 @@ async fn dispatch(request: &Value) -> Result<Value, String> {
             &root
         )?
         .to_string_lossy())),
+        "unity_cli_check_update" => serde_json::to_value(tauri_app_lib::check_unity_cli_updates(&root)?).map_err(|error| error.to_string()),
+        "unity_cli_apply_update" => serde_json::to_value(tauri_app_lib::apply_unity_cli_update(
+            &root,
+            args["expectedPath"].as_str().ok_or("Missing expected CLI path")?,
+            args["expectedVersion"].as_str().ok_or("Missing expected CLI version")?,
+            args["targetVersion"].as_str().ok_or("Missing target CLI version")?,
+        )?).map_err(|error| error.to_string()),
+        "unity_cli_console" => tauri_app_lib::run_unity_cli_console(
+            &root,
+            args["editorVersion"]
+                .as_str()
+                .ok_or("Missing admitted Editor version")?,
+            args["expectedPid"].as_u64(),
+            args["deadlineAt"]
+                .as_u64()
+                .ok_or("Missing Editor deadline")?,
+            &AtomicBool::new(false),
+        ),
+        "capture_unity_game_view" => Ok(tauri_app_lib::run_unity_game_view_capture(
+            &root,
+            args["deadlineAt"].as_u64(),
+            &AtomicBool::new(false),
+        )),
+        "unity_official_mcp" => tauri_app_lib::run_unity_official_mcp(
+            root,
+            args["editorVersion"].as_str().ok_or("Missing admitted Editor version")?.to_string(),
+            args["expectedPid"].as_u64(),
+            args.get("call").cloned(),
+            args["consoleObservation"].as_bool().unwrap_or(false),
+            args["deadlineAt"].as_u64().ok_or("Missing Editor deadline")?,
+            Arc::new(AtomicBool::new(false)),
+        ).await,
+        "unity_inspect_assemblies" => {
+            let sources: Vec<String> = serde_json::from_value(args["sourcePaths"].clone())
+                .map_err(|error| error.to_string())?;
+            tauri_app_lib::inspect_unity_assembly_dependencies(&root, &sources)
+        }
+        "unity_compile_project" => {
+            let targets: Vec<String> = serde_json::from_value(args["targets"].clone())
+                .map_err(|error| error.to_string())?;
+            let versions: HashMap<String, Option<String>> = serde_json::from_value(args["expectedVersions"].clone())
+                .map_err(|error| error.to_string())?;
+            let shader_targets: Option<Vec<String>> = serde_json::from_value(args["shaderImportTargets"].clone())
+                .map_err(|error| error.to_string())?;
+            let binding: Option<tauri_app_lib::UnityConsoleCheckBinding> = serde_json::from_value(args["consoleBinding"].clone())
+                .map_err(|error| error.to_string())?;
+            tauri_app_lib::run_unity_compile_project(
+                &root,
+                args["deferClosed"].as_bool().unwrap_or(true),
+                args["checkKind"].as_str().unwrap_or("csharp"),
+                &targets,
+                &versions,
+                shader_targets.as_deref(),
+                binding.as_ref(),
+                args["deadlineAt"].as_u64().ok_or("Missing Editor deadline")?,
+                &AtomicBool::new(false),
+            )
+        }
+        "unity_test_project" => {
+            let approval: Option<ShellPermissionApproval> = serde_json::from_value(args["permissionApproval"].clone())
+                .map_err(|error| error.to_string())?;
+            let versions: Option<HashMap<String, Option<String>>> = serde_json::from_value(args["expectedVersions"].clone())
+                .map_err(|error| error.to_string())?;
+            let binding: Option<tauri_app_lib::UnityConsoleCheckBinding> = serde_json::from_value(args["consoleBinding"].clone())
+                .map_err(|error| error.to_string())?;
+            let result = tauri_app_lib::run_unity_test_project(&root,
+                args["approvedCommand"].as_str().ok_or("Missing admitted test command")?,
+                approval.as_ref(), binding.as_ref(), versions.as_ref(),
+                args["deadlineAt"].as_u64().ok_or("Missing Editor deadline")?, &AtomicBool::new(false))?;
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        }
         "shell_permission_preflight" => {
             let guard = PermissionGuard::from_workspace(&root).map_err(|e| e.to_string())?;
             serde_json::to_value(guard.inspect(command)).map_err(|e| e.to_string())

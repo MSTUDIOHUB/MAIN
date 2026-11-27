@@ -14,8 +14,64 @@ export interface RuntimeV2ConsoleDiagnostic {
 export interface RuntimeV2EditorConsoleEvidence {
   readonly instanceId: string;
   readonly editorVersion: string;
+  readonly editorPid?: number;
   readonly complete: boolean;
   readonly diagnostics: readonly RuntimeV2ConsoleDiagnostic[];
+  readonly retainedDiagnostics?: readonly RuntimeV2ConsoleDiagnostic[];
+  readonly pipeline?: {
+    readonly retainedWindowComplete: boolean;
+    readonly retainedErrors?: number;
+    readonly retainedWarnings?: number;
+    readonly session?: string;
+    readonly cursor?: number;
+    readonly live?: RuntimeV2PipelineConsoleSample;
+  };
+}
+
+export interface RuntimeV2PipelineConsoleSample {
+  readonly ageMs: number;
+  readonly sampledAt: number;
+  readonly compiling: boolean;
+  readonly compilationFailed: boolean;
+  readonly errors: number;
+  readonly warnings: number;
+}
+
+type EditorBinding = Pick<RuntimeV2EditorConsoleEvidence, "instanceId" | "editorVersion" | "editorPid">;
+const PIPELINE_SAMPLE_MAX_AGE_MS = 2_000;
+
+function consoleRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function nonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function pipelineConsoleSample(value: unknown): RuntimeV2PipelineConsoleSample | undefined {
+  const sample = consoleRecord(value);
+  if (!sample || typeof sample.compiling !== "boolean" || typeof sample.compilationFailed !== "boolean") return;
+  const ageMs = nonnegativeInteger(sample.ageMs);
+  const errors = nonnegativeInteger(sample.consoleErrors);
+  const warnings = nonnegativeInteger(sample.consoleWarnings);
+  const sampledAt = typeof sample.sampledUtc === "string" ? Date.parse(sample.sampledUtc) : NaN;
+  if (ageMs === undefined || errors === undefined || warnings === undefined || !Number.isFinite(sampledAt)) return;
+  return { ageMs, sampledAt, errors, warnings, compiling: sample.compiling, compilationFailed: sample.compilationFailed };
+}
+
+export function freshRuntimeV2PipelineConsoleSample(sample: RuntimeV2PipelineConsoleSample | undefined) {
+  return sample && nonnegativeInteger(sample.ageMs) !== undefined && sample.ageMs <= PIPELINE_SAMPLE_MAX_AGE_MS &&
+    Number.isFinite(sample.sampledAt) && sample.compiling === false ? sample : undefined;
+}
+
+export function sameRuntimeV2ConsoleEditor(left: EditorBinding, right: EditorBinding) {
+  return left.editorVersion === right.editorVersion && (left.editorPid !== undefined && right.editorPid !== undefined
+    ? left.editorPid === right.editorPid
+    : left.instanceId === right.instanceId);
+}
+
+function isPipelineBinding(binding: EditorBinding) {
+  return /^unity-(?:cli|official-mcp):/.test(binding.instanceId);
 }
 
 function parseDiagnostic(entry: unknown, workspace: string): RuntimeV2ConsoleDiagnostic | undefined {
@@ -43,7 +99,7 @@ function parseDiagnostic(entry: unknown, workspace: string): RuntimeV2ConsoleDia
 
 export function runtimeV2EditorConsoleEvidence(input: {
   readonly workspace: string;
-  readonly binding: Pick<RuntimeV2EditorConsoleEvidence, "instanceId" | "editorVersion">;
+  readonly binding: EditorBinding;
   readonly args: Readonly<Record<string, unknown>>;
   readonly result: Record<string, unknown> | null;
 }): RuntimeV2EditorConsoleEvidence | undefined {
@@ -52,6 +108,24 @@ export function runtimeV2EditorConsoleEvidence(input: {
   const page = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : null;
   const entries = Array.isArray(data) ? data : page?.items;
   if (!Array.isArray(entries)) return;
+  const diagnostics = entries.slice(0, 100).flatMap(entry => parseDiagnostic(entry, input.workspace) ?? []);
+  const { instanceId, editorVersion, editorPid } = input.binding;
+  const binding = { instanceId, editorVersion, ...(editorPid === undefined ? {} : { editorPid }) };
+  const retained = consoleRecord(page?.consoleEvidence);
+  if (isPipelineBinding(binding) || retained?.rowSource === "retained") {
+    const sample = pipelineConsoleSample(page?.groundTruth);
+    const pipeline = retained?.rowSource === "retained" ? {
+      retainedWindowComplete: retained.retainedWindowComplete === true,
+      retainedErrors: nonnegativeInteger(retained.retainedErrors),
+      retainedWarnings: nonnegativeInteger(retained.retainedWarnings),
+      session: typeof retained.session === "string" && retained.session.length <= 80 ? retained.session : undefined,
+      cursor: nonnegativeInteger(retained.cursor),
+      live: sample,
+    } : undefined;
+    const live = freshRuntimeV2PipelineConsoleSample(pipeline?.live);
+    return { ...binding, complete: live?.errors === 0 && !live.compilationFailed, diagnostics: [],
+      retainedDiagnostics: diagnostics, ...(pipeline ? { pipeline } : {}) };
+  }
   const { args } = input;
   // The raw MCP Console schema defaults to ten rows. A full capped window
   // cannot establish that all original errors were observed.
@@ -65,8 +139,14 @@ export function runtimeV2EditorConsoleEvidence(input: {
   const complete = unfilteredErrors && entries.length <= 100 && (page
     ? page.truncated === false && Number(page.cursor ?? 0) === 0 && Number(page.total ?? entries.length) === entries.length
     : Number.isInteger(count) && count > 0 && entries.length < count);
-  const diagnostics = entries.slice(0, 100).flatMap(entry => parseDiagnostic(entry, input.workspace) ?? []);
-  return { instanceId: input.binding.instanceId, editorVersion: input.binding.editorVersion, complete, diagnostics };
+  return { ...binding, complete, diagnostics };
+}
+
+/** Older official/CLI receipts treated the captured rows as editor rows. */
+function currentConsoleEvidence(scope: RuntimeV2EditorConsoleEvidence) {
+  return isPipelineBinding(scope) && !scope.pipeline
+    ? { ...scope, complete: false, diagnostics: [], retainedDiagnostics: scope.retainedDiagnostics ?? scope.diagnostics }
+    : scope;
 }
 
 export function isRuntimeV2EditorDiagnosticRepair(state: TurnAggregateV1 | null): boolean {
@@ -74,19 +154,47 @@ export function isRuntimeV2EditorDiagnosticRepair(state: TurnAggregateV1 | null)
   return requirement?.kind === "workspace_change" && requirement.editorDiagnostics === true;
 }
 
+export function runtimeV2EditorConsoleDebugSummary(evidence: RuntimeV2EditorConsoleEvidence | undefined) {
+  if (!evidence) return {};
+  const live = evidence.pipeline?.live;
+  return {
+    editorDiagnosticCount: evidence.diagnostics.length,
+    editorRetainedDiagnosticCount: evidence.retainedDiagnostics?.length ?? null,
+    editorLiveErrorCount: live?.errors ?? null,
+    editorConsoleSampleAgeMs: live?.ageMs ?? null,
+    editorConsoleCompiling: live?.compiling ?? null,
+  };
+}
+
 const scopes = new WeakMap<TurnAggregateV1, RuntimeV2EditorConsoleEvidence | undefined>();
 
-/** Keep the initial error set after a repair starts. Subsequent Console
- * reads cannot remove acceptance targets while their fixes are unverified. */
+/** Keep early error targets for the current Editor. A verified replacement
+ * process starts a new evidence scope. */
 export function runtimeV2EditorDiagnosticScope(state: TurnAggregateV1): RuntimeV2EditorConsoleEvidence | undefined {
   if (!isRuntimeV2EditorDiagnosticRepair(state)) return;
   if (scopes.has(state)) return scopes.get(state);
-  const firstWrite = runtimeV2WorkspaceChangeReceipts(state)[0]?.sequence ?? Infinity;
-  const observed = state.events.flatMap(event => event.type === "tool.completed" && event.status === "succeeded" &&
-    event.run.runId === state.run?.identity.runId && event.editorConsole?.diagnostics.length ? [{ sequence: event.sequence, scope: event.editorConsole }] : []);
-  const initial = observed[0];
-  const scope = initial && (initial.scope.complete ? initial.scope : observed.find(item => item.sequence < firstWrite &&
-    item.scope.complete && item.scope.instanceId === initial.scope.instanceId && item.scope.editorVersion === initial.scope.editorVersion)?.scope ?? initial.scope);
+  const observed = state.events.flatMap(event => {
+    if (event.type !== "tool.completed" || event.status !== "succeeded" ||
+        event.run.runId !== state.run?.identity.runId || !event.editorConsole) return [];
+    const scope = currentConsoleEvidence(event.editorConsole);
+    const live = freshRuntimeV2PipelineConsoleSample(scope.pipeline?.live);
+    return scope.diagnostics.length || scope.retainedDiagnostics?.length || live
+      ? [{ sequence: event.sequence, scope }] : [];
+  });
+  let bindingStart = 0;
+  for (let index = 1; index < observed.length; index += 1) {
+    const first = observed[bindingStart]!.scope;
+    const next = observed[index]!.scope;
+    if (first.editorPid && next.editorPid && !sameRuntimeV2ConsoleEditor(first, next) &&
+        (freshRuntimeV2PipelineConsoleSample(next.pipeline?.live) || next.complete)) bindingStart = index;
+  }
+  const initial = observed[bindingStart];
+  const firstWrite = runtimeV2WorkspaceChangeReceipts(state).find(event => event.sequence > (initial?.sequence ?? -1))?.sequence ?? Infinity;
+  const candidates = observed.slice(bindingStart);
+  const scope = initial && (initial.scope.complete && initial.scope.diagnostics.length ? initial.scope : candidates.find(item => item.sequence < firstWrite &&
+    item.scope.complete && item.scope.diagnostics.length && sameRuntimeV2ConsoleEditor(item.scope, initial.scope))?.scope ??
+    candidates.find(item => item.sequence < firstWrite && sameRuntimeV2ConsoleEditor(item.scope, initial.scope) &&
+      freshRuntimeV2PipelineConsoleSample(item.scope.pipeline?.live)?.compilationFailed)?.scope ?? initial.scope);
   if (!scope || scope.diagnostics.every(item => item.kind !== "shader_import" || item.path)) {
     scopes.set(state, scope);
     return scope;
@@ -121,11 +229,17 @@ export function runtimeV2EditorDiagnosticFocus(state: TurnAggregateV1, checked: 
   return diagnostics.find(item => !checked.includes(item.kind) && (!item.path || !modified.has(item.path)));
 }
 
-export function runtimeV2EditorRepairInstruction(state: TurnAggregateV1 | null, checked: readonly RuntimeV2ConsoleDiagnostic["kind"][] = []): string {
+export function runtimeV2EditorRepairInstruction(
+  state: TurnAggregateV1 | null,
+  checked: readonly RuntimeV2ConsoleDiagnostic["kind"][],
+  consoleTool: string | undefined,
+): string {
   if (!state || !isRuntimeV2EditorDiagnosticRepair(state)) return "";
   const focus = runtimeV2EditorDiagnosticFocus(state, checked);
   if (focus?.path) return `Console repair still needs a verified fix. Start with ${JSON.stringify(focus.path)}${focus.line ? ` at line ${focus.line}` : ""}${focus.code ? ` (${focus.code})` : ""}. Reuse the current source window when available, make the smallest justified change, and continue from the Editor's check.`;
   if (focus?.shaderName) return `Locate the declaration of Shader ${JSON.stringify(focus.shaderName)} in the workspace and inspect the reported source before editing.`;
   if (latestRuntimeV2WorkspaceChange(state)) return "Continue from the actual C# compilation and Shader import receipts. Runtime exceptions also require a corresponding reproduction or test.";
-  return "Read the bound Editor Console with unity_mcp_console when available. Choose one diagnostic target, make the smallest justified change, and continue from the Editor check.";
+  return consoleTool
+    ? `Read the bound Editor Console with ${consoleTool}. Choose one diagnostic target, make the smallest justified change, and continue from the Editor check.`
+    : "A connected Unity Console reader is unavailable. Use available project evidence to investigate and report any missing Editor verification.";
 }

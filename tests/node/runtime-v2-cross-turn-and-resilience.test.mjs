@@ -472,6 +472,27 @@ test("single-owner cancellation barrier prevents controller checkpoint race and 
   );
 });
 
+test("an aborted Run does not report provider transport failure or negotiate another transport", () => {
+  const { run } = makeTurnAndRun("turn-abort-provider", "run-abort-provider");
+  const cancellation = new AbortController();
+  const reason = new DOMException("User stopped the Run", "AbortError");
+  const events = [];
+  const input = {
+    error: new Error("Aborted"),
+    signal: cancellation.signal,
+    textEnvelope: false,
+    attemptVariant: "native_tools",
+    command: { kind: "request_model", run, phase: "acting", idempotencyKey: "provider-attempt", payload: {} },
+    live: { messages: [], provenStructuredToolTransports: new Set() },
+    logStoreEvent: (event) => events.push(event),
+  };
+  errorClassifier.classifyAndRecordRuntimeV2ProviderAttemptError(input);
+  assert.deepEqual(events, ["runtime_v2_provider_transport_failed"]);
+  cancellation.abort(reason);
+  assert.throws(() => errorClassifier.classifyAndRecordRuntimeV2ProviderAttemptError(input), (error) => error === reason);
+  assert.deepEqual(events, ["runtime_v2_provider_transport_failed", "runtime_v2_provider_attempt_canceled"]);
+});
+
 test("semantic log levels, blocked tool causal details, root-filtered baseline probes, and stream_options HTTP 400 fallback", async () => {
   assert.equal(storeLogLevel.resolveStoreEventLogLevel("runtime_v2_execute_infrastructure_failure"), "error");
   assert.equal(storeLogLevel.resolveStoreEventLogLevel("runtime_v2_tool_execution_blocked"), "warn");

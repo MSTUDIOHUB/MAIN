@@ -4,6 +4,7 @@ import { withTurnRuntimePhaseStatus } from "../../lib/turnPhase";
 import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAttempt";
 import { describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 import { runtimeV2ToolOutcomePresentation } from "./toolOutcomePresentation";
+import { createTerminalCredentialProjection } from "../../lib/terminalCredentialHistory";
 
 /** Derive settled timeline rows from canonical command and effect receipts.
  * This projection has no store or lifecycle authority of its own. */
@@ -31,7 +32,7 @@ export function reconcileRuntimeV2TimelineBlocks(
       )
       .map((event) => [event.idempotencyKey, event] as const),
   );
-  return taskFlow.flatMap((block) => {
+  const projected = taskFlow.flatMap((block): TaskBlock[] => {
     if (
       (block.type !== "progress" && block.type !== "tool") ||
       block.turnId !== run.turnId ||
@@ -153,4 +154,5 @@ export function reconcileRuntimeV2TimelineBlocks(
       updatedAt: timestampMs,
     }];
   });
+  return createTerminalCredentialProjection(aggregate.events)(projected);
 }

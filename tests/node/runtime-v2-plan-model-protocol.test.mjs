@@ -190,6 +190,14 @@ test("Plan exposes only bounded read-only collaboration tools from live capacity
     remainingSubagentCapacity: 1,
     activeSubagentCount: 0,
   });
+  const withoutProposalScope = protocol.selectPlanModelTools({
+    submissionStage: false,
+    collaborationAllowed: true,
+    spawnAllowed: false,
+    remainingSubagentCapacity: 1,
+    activeSubagentCount: 0,
+  });
+  assert.ok(withoutProposalScope.every(tool => !/subagent/.test(tool.function.name)));
   const spawn = withCapacity.find((tool) =>
     tool.function.name === "spawn_subagent"
   );

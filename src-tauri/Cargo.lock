@@ -4518,7 +4518,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "2.4.1"
+version = "2.4.3"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -4533,6 +4533,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "security-framework",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

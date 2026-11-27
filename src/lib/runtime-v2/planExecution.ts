@@ -105,9 +105,7 @@ function uniquePaths(values: readonly string[]): string[] {
 }
 
 function normalizedCommand(value: unknown): string {
-  return typeof value === "string"
-    ? value.replace(/\s+/g, " ").trim()
-    : "";
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function argumentsForEvent(

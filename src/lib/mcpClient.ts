@@ -5,7 +5,7 @@
 
 export interface MCPServer {
   name: string;
-  type: "http";
+  type: "http" | "stdio";
   url: string;
   enabled?: boolean;
 }
@@ -27,7 +27,7 @@ export interface MCPToolOrigin {
   serverName: string;
   serverUrl: string;
   remoteName: string;
-  connector?: "unity";
+  connector?: "unity" | "unity_official";
 }
 
 export interface UnityMcpWorkspaceBinding {

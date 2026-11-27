@@ -329,6 +329,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   );
   const hasRealChoiceOptions = realChoiceOptions.length > 0;
   const hasApprovalActionOptions = approvalActionOptions.length > 0;
+  const verificationChoice = choiceRequest?.verification;
 
   // region: ExecutionCapsule 展开时机
   const hasStructuredQuestions = !!choiceRequest?.questionnaire;
@@ -705,7 +706,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                   <div className={`min-w-0 font-medium ${primaryText}`} style={choiceTextStyle}>
                     {hasStructuredQuestions
                       ? (choiceRequest?.questionnaire?.title || (language === "zh" ? "确认问题" : "Confirm the details"))
-                      : copy.chooseToContinue}
+                      : verificationChoice ? choiceRequest?.title : copy.chooseToContinue}
                   </div>
                   <button
                     type="button"
@@ -717,7 +718,23 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                     {copy.collapseOptions}
                   </button>
                 </div>
-                {!hasStructuredQuestions && (
+                {verificationChoice && (
+                  <dl data-testid="execution-capsule-verification" className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2" style={choiceTextStyle}>
+                    <div className="contents">
+                      <dt className={`font-medium ${primaryText}`}>{language === "zh" ? "已确认" : "Confirmed"}</dt>
+                      <dd className={`break-words ${secondaryText}`}>{verificationChoice.verified}</dd>
+                    </div>
+                    <div className="contents">
+                      <dt className={`font-medium ${primaryText}`}>{language === "zh" ? "仍待完成" : "Still pending"}</dt>
+                      <dd className={`break-words ${secondaryText}`}>{verificationChoice.pending}</dd>
+                    </div>
+                    <div className="contents">
+                      <dt className={`font-medium ${primaryText}`}>{language === "zh" ? "如何选择" : "How to choose"}</dt>
+                      <dd className={`break-words ${secondaryText}`}>{verificationChoice.next}</dd>
+                    </div>
+                  </dl>
+                )}
+                {!hasStructuredQuestions && !verificationChoice && (
                   <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
                     {canApprovePlan
                       ? language === "zh"
@@ -913,22 +930,22 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         </div>
                       ) : (
                         <div>
-                          {!hasOperationProposalApproval && (
+                          {!hasOperationProposalApproval && !verificationChoice && (
                             <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
                               {copy.choicesSectionTitle}
                             </div>
                           )}
-                          <div className={`${hasOperationProposalApproval ? "" : "mt-2"} space-y-2`}>
+                          <div className={verificationChoice ? "flex flex-wrap gap-2" : `${hasOperationProposalApproval ? "" : "mt-2"} space-y-2`}>
                             {realChoiceOptions.map((option, index) => (
                               <div
                                 key={`${option.value}-${index}`}
-                                className="group flex min-w-0 items-center gap-2"
+                                className={verificationChoice ? "min-w-0" : "group flex min-w-0 items-center gap-2"}
                               >
-                                <span data-testid={`execution-capsule-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>
+                                {!verificationChoice && <span data-testid={`execution-capsule-reply-option-badge-${index}`} className={choiceNumberClass} style={choiceTextStyle}>{index + 1}.</span>}
                                 <button
                                   data-testid={`execution-capsule-reply-option-${index}`}
                                   onClick={() => onSelectReplyOption?.(option)}
-                                  className={choiceOptionButtonClass}
+                                  className={verificationChoice && option.value === "stop" ? `${neutralActionButtonClass} px-3 py-2.5` : choiceOptionButtonClass}
                                   style={choiceTextStyle}
                                   title={option.action === "approve_operation_once" ? copy.approveOperationInfo : copy.replyOptionInfo}
                                 >
@@ -999,7 +1016,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         </div>
                       </form>
                     )}
-                    {!tabGroups && (
+                    {!tabGroups && !verificationChoice && (
                       <button
                         onClick={onCancelTurn}
                         title={copy.cancelTurnInfo}

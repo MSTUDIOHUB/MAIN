@@ -259,6 +259,9 @@ export function buildMainDebugPrompt(feedback: string): string {
 }
 
 export interface SubmitPipelineOptions {
+  preparedChatAnswer?: import("../submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+  preparedWorkspaceRead?: import("../submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+  sourceInvestigationTurnId?: string;
   workspaceInstructionClaim?: import("../workspaceInstruction").WorkspaceInstructionDispatchClaim;
   hidden?: boolean;
   reuseCurrentTurn?: boolean;
@@ -1825,7 +1828,10 @@ export function resolveSubmitPreflightEffectAction<
     text: params.effect.originalText,
     images: params.effect.originalImages,
     options: buildSubmitPreflightResumeOptions({
-      options: params.effect.originalOptions,
+      options: params.preflight?.preparedChatAnswer || params.preflight?.preparedWorkspaceRead || params.preflight?.sourceInvestigationTurnId
+        ? { ...params.effect.originalOptions as TOptions, preparedChatAnswer: params.preflight.preparedChatAnswer,
+          preparedWorkspaceRead: params.preflight.preparedWorkspaceRead, sourceInvestigationTurnId: params.preflight.sourceInvestigationTurnId }
+        : params.effect.originalOptions,
       decision: preflightDecision,
     }),
   };

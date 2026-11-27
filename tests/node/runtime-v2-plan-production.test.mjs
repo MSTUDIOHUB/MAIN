@@ -192,7 +192,7 @@ test("Plan tool_search discovers only admitted read-only candidates and unlocks 
       assert.ok(candidates.includes("web_search"), "discovery must receive the admitted Plan catalog");
       assert.equal(candidates.includes("write_file"), false);
       assert.equal(candidates.includes("submit_runtime_v2_work_plan"), false);
-      return discovery.executeToolSearch(args, { sessionKey, toolCatalog: options.toolCatalog });
+      return discovery.executeToolSearch(args, { sessionKey, toolCatalog: options.toolCatalog, advertisedToolNames: options.advertisedToolNames });
     } }],
   ]));
   await planEvidence.executeReadOnlyPlanTool({ context,
@@ -201,7 +201,7 @@ test("Plan tool_search discovers only admitted read-only candidates and unlocks 
     messages, evidence: [], evidenceContents: new Map(), parallelReadCount: 1, logStoreEvent() {},
   });
   assert.equal(settlements[0].status, "succeeded");
-  assert.equal(settlements[0].evidence[0].kind, "tool");
+  assert.deepEqual(settlements[0].evidence, [], "discovering capability does not observe a fact about the project");
   assert.ok(discovery.getUnlockedToolsForSession(context.runSessionKey).has("web_search"));
 });
 
@@ -958,6 +958,7 @@ async function runProductionPlanScenario(
   let taskId = 0;
   const logs = [];
   const savedDocuments = [];
+  const projections = [];
   const runSessionKey = options.runSessionKey || turn.sessionKey;
   const revision = options.revision;
   let state = {
@@ -1002,6 +1003,9 @@ async function runProductionPlanScenario(
   const checkpointPort = {
     getRuntimeV2Checkpoint(current, owner) {
       return current.runtimeV2Checkpoints?.[owner.turnId] || null;
+    },
+    getRuntimeV2EmergencyTerminalEnvelope(current, owner) {
+      return current.runtimeV2EmergencyTerminalEnvelopes?.[owner.turnId] || null;
     },
     createRuntimeV2CheckpointPort() {
       return {
@@ -1120,6 +1124,8 @@ async function runProductionPlanScenario(
               access_mode: { type: "string", enum: ["read", "write"] },
               objective: { type: "string" },
               success_criteria: { type: "string" },
+              evidence_refs: { type: "string" },
+              parent_work: { type: "string" },
               required_paths: { type: "string" },
               allowed_paths: { type: "string" },
               implementation_operation: { type: "string" },
@@ -1138,6 +1144,7 @@ async function runProductionPlanScenario(
             properties: {
               subagent_ids: { type: "string" },
               collaboration_task_ids: { type: "string" },
+              dependency: { type: "string" },
             },
             required: [],
           },
@@ -1147,7 +1154,7 @@ async function runProductionPlanScenario(
     ["../../lib/runtime-v2", runtime],
     ["./checkpointPort", checkpointPort],
     ["./projectionPort", {
-      createRuntimeV2ProjectionPort: () => ({ async publish() {} }),
+      createRuntimeV2ProjectionPort: () => ({ async publish(value) { projections.push(value.projection); } }),
     }],
     ["./workPlanAdapter", adapter],
   ]);
@@ -1215,6 +1222,7 @@ async function runProductionPlanScenario(
     state,
     checkpoint: state.runtimeV2Checkpoints[turn.turnId],
     logs,
+    projections,
   };
 }
 
@@ -1227,7 +1235,7 @@ function testModelLaneLease() {
   };
 }
 
-test("production Plan queues three independent native spawns on an unknown lane before proving overlap", async () => {
+test("production Plan preserves the requested native task queue on an unknown lane before proving overlap", async () => {
   const lanes = loadTs(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
   lanes.resetModelLaneCoordinatorForTests();
   lanes.setModelLaneMemoryReaderForTests(async () => ({
@@ -1293,7 +1301,7 @@ test("production Plan queues three independent native spawns on an unknown lane 
     }, {
       config, acquireModelLane: lanes.acquireModelLane,
       subagentCapacityPolicy: { maxActiveRequests: initial.maxActiveSubagents, modelRequestMode: "parallel" },
-      turnInputContextSignals: { subagentPreference: "preferred" },
+      turnInputContextSignals: { subagentPreference: "allowed", subagentRequirement: "required" },
       capabilityRestrictions: [], approvalRequiredCapabilities: [],
       onAbortCtrl(value) {
         controller = value;
@@ -1522,7 +1530,7 @@ test("Plan admission selects Runtime v2 and the production runner owns the Plan 
   assert.doesNotMatch(planRunner, /PLAN_MODEL_DEADLINE_MS/);
 });
 
-test("optional preferred Plan advertises collaboration without the hard spawn gate", async () => {
+test("optional preferred Plan starts without collaboration tools when no independent scope is evidenced", async () => {
   const requests = [];
   let round = 0;
   const result = await runProductionPlanScenario(
@@ -1602,7 +1610,6 @@ test("optional preferred Plan advertises collaboration without the hard spawn ga
   const firstToolNames = requests[0].tools.map((tool) => tool.function.name);
   assert.deepEqual(firstToolNames, [
     "read_file",
-    "spawn_subagent",
     "submit_runtime_v2_work_plan",
   ]);
   assert.equal(requests[0].requestOptions.toolChoice, "required");
@@ -3540,7 +3547,7 @@ test("production Plan runs, joins, and adopts one read-only child before review"
       throw new Error(`unexpected tool ${name}`);
     },
     {
-      turnInputContextSignals: { subagentPreference: "preferred" },
+      turnInputContextSignals: { subagentPreference: "allowed", subagentRequirement: "required" },
       subagentCapacityPolicy: {
         maxActiveRequests: 1,
         modelRequestMode: "parallel",
@@ -3689,7 +3696,7 @@ test("production Plan quarantines implement/write spawn arguments outside the ad
       throw new Error(`unexpected tool ${name}`);
     },
     {
-      turnInputContextSignals: { subagentPreference: "preferred" },
+      turnInputContextSignals: { subagentPreference: "allowed", subagentRequirement: "required" },
       subagentCapacityPolicy: {
         maxActiveRequests: 1,
         modelRequestMode: "parallel",
@@ -3709,11 +3716,9 @@ test("production Plan quarantines implement/write spawn arguments outside the ad
   assert.deepEqual(
     parentRequests[1].toolNames,
     parentRequests[0].toolNames,
-    "an argument rejection must preserve the ordinary discovery surface",
+    "an argument rejection must preserve the explicit required task surface",
   );
-  assert.ok(parentRequests[1].toolNames.includes(
-    "submit_runtime_v2_work_plan",
-  ));
+  assert.deepEqual(parentRequests[1].toolNames, ["spawn_subagent"]);
   assert.equal(result.checkpoint.aggregate.subagents.length, 0);
   const events = result.checkpoint.aggregate.events;
   assert.equal(
@@ -3990,10 +3995,11 @@ test("production Plan runner seals the first valid evidence-grounded plan and pa
   assert.equal(resolved.commit.artifact.content, writtenPlan);
   assert.equal(resolved.commit.artifact.documentRef.contentHash, createHash("sha256").update(writtenPlan).digest("hex"));
   assert.equal(resolved.commit.artifact.path, result.state.activeActionRequest.documentRef.path);
-  assert.ok(result.checkpoint.aggregate.events.some((event) =>
+  assert.ok(result.projections.some((projection) => projection.audience === "capsule_live"));
+  assert.equal(result.checkpoint.aggregate.events.some((event) =>
     event.type === "projection.published" &&
     event.audience === "capsule_live"
-  ));
+  ), false);
   const acceptedSubmissionText = acceptedSubmissionRequest
     .map((message) => String(message.content || ""))
     .join("\n");
@@ -6209,7 +6215,7 @@ function simplePlanSubmission(target = "src/new-fixture.js") {
   };
 }
 
-test("production Plan actively starts a scoped child and keeps the parent moving without a spawn call", async () => {
+test("production Plan starts an independently evidenced child only after the parent proposes it", { timeout: 30_000 }, async () => {
   let parentRound = 0;
   let childStarted = false;
   let releaseChild;
@@ -6228,12 +6234,25 @@ test("production Plan actively starts a scoped child and keeps the parent moving
       })), usage: {},
     };
     if (parentRound === 2) {
+      assert.equal(childStarted, false);
+      return planProviderReply("proposal", "spawn_subagent", {
+        task_kind: "explore", objective: "Find the exact verification entry point for the planned change.",
+        required_paths: "package.json", evidence_refs: "package.json",
+        success_criteria: "Return a concrete verification command and its source.", parent_work: "Inspect src/other.js to design the change.",
+      });
+    }
+    if (parentRound === 3) {
       assert.equal(childStarted, true);
       releaseChild();
       return planProviderReply("parent-continues", "read_file", { path: "src/other.js" });
     }
     return planProviderReply("plan", "submit_runtime_v2_work_plan", simplePlanSubmission());
-  }, (name, args) => planFixtureTool(name, args), {
+  }, async (name, args) => {
+    const text = await planFixtureTool(name, args);
+    if (name !== "read_file" || args.__raw) return text;
+    const { ensureVersionedReadFileResultForModel } = loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts"));
+    return ensureVersionedReadFileResultForModel(args.path, text, `sha256-${createHash("sha256").update(text).digest("hex")}`);
+  }, {
     initialCheckpoint: planningCheckpointWithRequirement("optional"),
     turnInputContextSignals: { subagentPreference: "preferred" },
     subagentCapacityPolicy: { maxActiveRequests: 1, modelRequestMode: "parallel" },
@@ -6243,14 +6262,14 @@ test("production Plan actively starts a scoped child and keeps the parent moving
   });
   assert.equal(result.settlement.outcome.status, "paused");
   const { events, subagents } = result.checkpoint.aggregate;
-  assert.equal(subagents.length, 1);
+  assert.equal(subagents.length, 1, JSON.stringify(result.logs.filter(entry => /subagent|collaboration/.test(entry.eventName))));
   assert.ok(subagents[0].proactiveKey);
-  assert.equal(subagents[0].sourceToolCallId, undefined);
+  assert.ok(subagents[0].sourceToolCallId);
   assert.ok(events.some(event => event.type === "subagent.telemetry" && event.telemetry.phase === "first_token"));
   assert.ok(events.some(event => event.type === "tool.completed" && event.evidence.some(item => item.target === "src/other.js")));
 });
 
-test("approved Plan revision opens a child on the exact changed target before the parent provider", async () => {
+test("approved Plan revision admits a model proposal backed by the exact changed-target read", { timeout: 30_000 }, async () => {
   const sessionKey = `${turn.workspaceKey}:1`;
   const sourceTurn = { ...turn, sessionKey, turnId: "reviewed-plan", clientSubmissionId: "reviewed-plan-receipt" };
   const sourceRun = { ...run, sessionKey, turnId: sourceTurn.turnId, runId: "reviewed-run", attemptId: "reviewed-run" };
@@ -6278,6 +6297,7 @@ test("approved Plan revision opens a child on the exact changed target before th
   const currentSource = "export const changed = true;\n";
   const observed = [];
   const dispatches = [];
+  let parentRound = 0;
   let abort;
   let releaseChild;
   const parentEntered = new Promise(resolve => { releaseChild = resolve; });
@@ -6290,9 +6310,18 @@ test("approved Plan revision opens a child on the exact changed target before th
       return { content: "The exact source is available for review.", toolCalls: [], usage: {} };
     }
     dispatches.push("parent");
-    releaseChild();
     assert.match(transcript, /CURRENT REVISION PATH CHECKS/);
     assert.match(transcript, /export const changed = true/);
+    if (++parentRound === 1) {
+      assert.deepEqual(dispatches, ["parent"]);
+      return planProviderReply("revision-review-proposal", "spawn_subagent", {
+        task_kind: "review", objective: "Identify the change that must be preserved in the revised implementation.",
+        required_paths: target, evidence_refs: target,
+        success_criteria: "Return the preservation constraint backed by the exact reviewed source.",
+        parent_work: "Update the affected validation requirements independently.",
+      });
+    }
+    releaseChild();
     abort.abort("fixture verified overlapping provider requests");
     return { content: "", toolCalls: [], usage: {} };
   }, async name => { throw new Error(`unexpected workspace tool ${name}`); }, {
@@ -6318,7 +6347,7 @@ test("approved Plan revision opens a child on the exact changed target before th
     subagentCapacityPolicy: { maxActiveRequests: 1, modelRequestMode: "parallel" },
   });
   assert.deepEqual(observed, [target]);
-  assert.deepEqual(dispatches, ["child", "parent"]);
+  assert.deepEqual(dispatches, ["parent", "child", "parent"], JSON.stringify(result.logs.filter(entry => /subagent|collaboration/.test(entry.eventName))));
   const { events, subagents } = result.checkpoint.aggregate;
   assert.equal(subagents.length, 1);
   assert.deepEqual(subagents[0].allowedPaths, [target]);
@@ -6326,7 +6355,7 @@ test("approved Plan revision opens a child on the exact changed target before th
   assert.equal(subagents[0].taskKind, "review");
   const childOpened = events.findIndex(event => event.type === "subagent.telemetry" && event.telemetry.phase === "request_opened");
   const parentScheduled = events.findIndex(event => event.type === "command.scheduled" && event.command.kind === "request_model");
-  assert.ok(childOpened >= 0 && childOpened < parentScheduled);
+  assert.ok(parentScheduled >= 0 && parentScheduled < childOpened);
   assert.ok(!events.some(event => event.type === "work_plan.approved"));
 });
 
@@ -6433,28 +6462,22 @@ test("advisory Plan validation reports its unsupported required coverage instead
   });
 });
 
-test("incident advisory-only Plan saves a reviewable draft once and concludes partial without regeneration", async () => {
+test("ordinary advisory-only Plan seals as reviewable once without blocking on draft approval", async () => {
   const candidate = simplePlanSubmission();
   candidate.planMarkdown = "# Collector game plan\n\nUse Player, Coin_1/Coin_2/Coin_3 and CollectorGame with read-only Score/Won.\n";
   candidate.validations = ["Move with WASD", "Collect coins", "Show score", "Show victory", "Reset with R"].map(expectedOutcome => ({ kind: "advisory", required: true, expectedOutcome }));
   let requests = 0;
   const result = await runProductionPlanScenario(async () => {
     requests++;
-    if (requests > 1) throw new Error("semantic validation gaps must preserve the draft instead of requesting another whole plan");
+    if (requests > 1) throw new Error("ordinary advisory Plan must seal on first valid submission");
     return planProviderReply("incident-advisory-plan", "submit_runtime_v2_work_plan", candidate);
   }, planFixtureTool);
   assert.equal(requests, 1);
-  assert.equal(result.settlement.outcome.resultKind, "partial");
-  assert.equal(result.savedDocuments.length, 1);
-  assert.match(result.savedDocuments[0].markdown, /Collector game plan/);
-  assert.equal(result.checkpoint.aggregate.sealedWorkPlan, null);
-  assert.equal(result.state.activeActionRequest?.kind === "plan_review", false);
-  const record = loadTs(path.join(workspaceRoot, "src/lib/planDocumentRecords.ts")).resolvePlanDraftFromAggregate(result.checkpoint.aggregate);
-  assert.ok(record);
-  assert.ok(record.diagnostics.some(item => item.criterionIds.includes("criterion-user-objective")));
-  assert.equal(record.source.toolCallId, "incident-advisory-plan");
-  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "run.completed").length, 1);
-  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "turn.completed").length, 1);
+  assert.equal(result.checkpoint.aggregate.phase, "reviewing");
+  assert.ok(result.checkpoint.aggregate.sealedWorkPlan);
+  assert.equal(result.state.activeActionRequest?.kind, "plan_review");
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "run.completed").length, 0);
+  assert.equal(result.checkpoint.aggregate.events.filter(entry => entry.type === "turn.completed").length, 0);
 });
 
 for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan responds to first pre-action ${firstStop} with bounded recovery and safe reads`, async () => {
@@ -6474,7 +6497,7 @@ for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan respond
     }
       : planProviderReply("bounded-recovery-draft", "submit_runtime_v2_work_plan", candidate);
   }, planFixtureTool, options);
-  assert.equal(completed.settlement.outcome.resultKind, "partial");
+  assert.equal(completed.checkpoint.aggregate.phase, "reviewing");
   assert.equal(requests[0].maxTokens, 8192);
   assert.equal(requests[0].options.reasoningOnlyTimeoutMs, 60_000);
   assert.equal(requests[1].maxTokens, 4096);
@@ -6488,7 +6511,7 @@ for (const firstStop of ["length", "reasoning_only_timeout"]) test(`Plan respond
     assert.ok(tools.some(tool => tool.function.name === "read_file"));
     return planProviderReply("bounded-recovery-restored-draft", "submit_runtime_v2_work_plan", candidate);
   }, planFixtureTool, { ...options, initialCheckpoint: checkpointThrough(completed.checkpoint, truncated.sequence) });
-  assert.equal(restored.settlement.outcome.resultKind, "partial");
+  assert.equal(restored.checkpoint.aggregate.phase, "reviewing");
 });
 
 test("a sealed Plan with a downgraded advisory check survives the Session JSON boundary", async () => {

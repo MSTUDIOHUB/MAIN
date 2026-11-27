@@ -46,6 +46,7 @@ export interface RuntimeV2Admission {
   readonly run: RuntimeV2RunIdentity;
   readonly strategy: RuntimeV2Strategy;
   readonly objective: string;
+  readonly subagentRequirement?: TurnAggregateV1["subagentRequirement"];
   readonly completionRequirement?: RuntimeV2CompletionRequirement;
   readonly capabilityRestrictions?: readonly import("../turnCapabilities").TurnCapability[];
   readonly approvalRequiredCapabilities?: readonly import("../turnCapabilities").TurnCapability[];
@@ -64,7 +65,6 @@ export class RuntimeV2Controller {
   private aggregate: TurnAggregateV1 | null = null;
   private revision = 0;
   private readonly abortSignal: AbortSignal | null;
-
   constructor(private readonly ports: RuntimeV2Ports, initial?: RuntimeV2ControllerSnapshot, private readonly options?: { readonly abortSignal?: AbortSignal; readonly isExternalCancellationPending?: () => boolean; readonly logEvent?: (event: string, data: Record<string, unknown>) => void }) {
     this.aggregate = initial?.aggregate || null;
     this.revision = initial?.revision || 0;
@@ -92,6 +92,11 @@ export class RuntimeV2Controller {
     // The durable append may include user guidance admitted during the request.
     this.aggregate = checkpoint.checkpoint.aggregate ?? next;
     this.revision = checkpoint.checkpoint.revision;
+    if (checkpoint.disposition === "committed" && event.type === "subagent.handoff_applied") {
+      this.options?.logEvent?.("runtime_v2_subagent_handoff_adopted", {
+        turnId: event.run.turnId, runId: event.run.runId, jobId: event.jobId, evidenceCount: event.evidenceIds.length, source: event.source,
+      });
+    }
     return this.aggregate;
   }
 
@@ -111,6 +116,7 @@ export class RuntimeV2Controller {
       turn: input.turn,
       strategy: input.strategy,
       objective: input.objective,
+      ...(input.subagentRequirement ? { subagentRequirement: input.subagentRequirement } : {}),
       ...(input.completionRequirement ? { completionRequirement: input.completionRequirement } : {}),
       ...(input.capabilityRestrictions !== undefined ? {
         capabilityRestrictions: normalizeTurnCapabilityRestrictions(input.capabilityRestrictions),

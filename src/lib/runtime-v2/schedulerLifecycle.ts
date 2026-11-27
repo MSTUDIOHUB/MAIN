@@ -8,7 +8,8 @@ import type { TurnAggregateV1 } from "./aggregate";
 
 export function runtimeV2JobMatchesSchedule(job: RuntimeV2SubagentJob, command: RuntimeV2Command): boolean {
   if (job.parentRunId !== command.run.runId) return false;
-  if (typeof command.payload.proactiveKey === "string") return job.proactiveKey === command.payload.proactiveKey;
+  if (typeof command.payload.proactiveKey === "string") return job.proactiveKey === command.payload.proactiveKey &&
+    job.sourceToolCallId === (command.payload.toolCallId || undefined);
   const callId = command.payload.toolCallId;
   return typeof callId === "string" && callId ? job.sourceToolCallId === callId : !job.proactiveKey;
 }

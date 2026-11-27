@@ -24,7 +24,7 @@ export const TOOL_SEARCH_DEFINITION: ToolDefinition = {
   function: {
     name: TOOL_SEARCH_TOOL_NAME,
     description:
-      "按关键词按需搜索并解锁扩展工具（如 git、AST/符号引用、文档/表格分析、浏览器验证 browser_evaluate、桌面控制 computer_use、子智能体 spawn_subagent 及 MCP 外部工具）。调用后匹配的工具会在当前会话中解锁并可直接调用。",
+      "按关键词按需搜索并解锁扩展工具（如 git、AST/符号引用、文档/表格分析、浏览器验证 browser_evaluate、桌面控制 computer_use 及 MCP 外部工具）。调用后匹配的工具会在当前会话中解锁并可直接调用。",
     parameters: {
       type: "object",
       properties: {
@@ -221,6 +221,7 @@ export function executeToolSearch(
     readonly sessionKey?: string;
     readonly toolCatalog?: ToolCatalog;
     readonly availableToolNames?: ReadonlySet<string>;
+    readonly advertisedToolNames?: ReadonlySet<string>;
   } = {},
 ): string {
   const rawQuery = String(args.query || "").trim();
@@ -229,24 +230,31 @@ export function executeToolSearch(
     Math.min(20, Number(args.limit) > 0 ? Math.floor(Number(args.limit)) : 8),
   );
   const catalogDefinitions = options.toolCatalog?.toolDefinitions || [];
-  const candidates = catalogDefinitions.filter(
-    (def) => !CORE_DEFAULT_TOOL_NAMES.has(def.function.name) &&
-      (!options.availableToolNames || options.availableToolNames.has(def.function.name)),
-  );
+  const advertised = options.advertisedToolNames;
+  const eligible = catalogDefinitions.filter((def) =>
+    !options.availableToolNames || options.availableToolNames.has(def.function.name));
+  const candidates = eligible.filter((def) => !CORE_DEFAULT_TOOL_NAMES.has(def.function.name));
+  const previousUnlocks = getUnlockedToolsForSession(options.sessionKey);
+  const isAlreadyAvailable = (name: string) => advertised?.has(name) || previousUnlocks.has(name);
 
   if (!rawQuery || rawQuery === "*" || rawQuery.toLowerCase() === "all") {
-    const unlockedNow = unlockToolsForSession(
-      options.sessionKey,
-      candidates.slice(0, limit).map((def) => def.function.name),
-    );
+    const names = candidates.map((def) => def.function.name);
+    const alreadyAvailable = names.filter(isAlreadyAvailable);
+    const unlockCandidates = advertised ? names.filter((name) => !isAlreadyAvailable(name)) : names;
+    const unlockedNow = unlockToolsForSession(options.sessionKey, unlockCandidates.slice(0, limit));
+    const unlockedInSession = [...getUnlockedToolsForSession(options.sessionKey)];
     return JSON.stringify(
       {
         type: "tool_search.result",
         query: rawQuery || "all",
-        unlockedInSession: [
-          ...getUnlockedToolsForSession(options.sessionKey),
-        ],
+        unlockedInSession: advertised ? unlockedInSession.filter((name) => names.includes(name)) : unlockedInSession,
         newlyUnlocked: unlockedNow,
+        ...(advertised ? {
+          matchedCount: candidates.length,
+          matchedAdvertised: names.filter((name) => advertised.has(name)),
+          alreadyAvailable,
+          hint: unlockedNow.length ? "使用已提供或刚解锁的工具执行具体调查。" : "目录没有新增可用工具。请使用已有工具完成具体调查或提交计划。",
+        } : {}),
         availableExtendedTools: candidates.map((def) => ({
           name: def.function.name,
           description: def.function.description.slice(0, 160),
@@ -264,7 +272,9 @@ export function executeToolSearch(
     .map((t) => t.trim())
     .filter(Boolean);
 
-  const scored = candidates
+  const searchable = advertised ? eligible.filter((def) => def.function.name !== TOOL_SEARCH_TOOL_NAME &&
+    (!CORE_DEFAULT_TOOL_NAMES.has(def.function.name) || advertised.has(def.function.name))) : candidates;
+  const scored = searchable
     .map((def) => {
       const name = def.function.name.toLowerCase();
       const desc = def.function.description.toLowerCase();
@@ -292,22 +302,31 @@ export function executeToolSearch(
 
   const matchedDefs = scored.map((item) => item.def);
   const matchedNames = matchedDefs.map((def) => def.function.name);
-  unlockToolsForSession(options.sessionKey, matchedNames);
+  const matchedAdvertised = matchedNames.filter((name) => advertised?.has(name));
+  const alreadyAvailable = matchedNames.filter(isAlreadyAvailable);
+  const newlyUnlocked = unlockToolsForSession(options.sessionKey, matchedNames.filter((name) => !advertised?.has(name)));
+  let hint = matchedDefs.length > 0 ? `已解锁 ${matchedNames.join(", ")}，现在可以在下一步直接调用这些工具。`
+    : "未找到匹配的扩展工具，请尝试使用 query='all' 查看全部可用扩展工具列表，或直接使用 read_file / grep_search / glob_search / run_command 等核心工具。";
+  if (advertised) {
+    hint = newlyUnlocked.length ? `新增可用工具 ${newlyUnlocked.join(", ")}，可在下一步直接调用。`
+      : alreadyAvailable.length ? `匹配工具 ${alreadyAvailable.join(", ")} 已可直接调用，无需换词重复搜索。`
+      : "当前工具范围内无匹配能力。使用已提供的工具核实具体缺口、询问需要用户决定的事项，或根据已有证据提交计划。";
+  }
+  const unlockedDefs = advertised ? matchedDefs.filter((def) => newlyUnlocked.includes(def.function.name)) : matchedDefs;
 
   return JSON.stringify(
     {
       type: "tool_search.result",
       query: rawQuery,
       matchedCount: matchedDefs.length,
-      unlockedTools: matchedDefs.map((def) => ({
+      newlyUnlocked,
+      ...(advertised ? { matchedAdvertised, alreadyAvailable } : {}),
+      unlockedTools: unlockedDefs.map((def) => ({
         name: def.function.name,
         description: def.function.description,
         parameters: def.function.parameters,
       })),
-      hint:
-        matchedDefs.length > 0
-          ? `已解锁 ${matchedNames.join(", ")}，现在可以在下一步直接调用这些工具。`
-          : "未找到匹配的扩展工具，请尝试使用 query='all' 查看全部可用扩展工具列表，或直接使用 read_file / grep_search / glob_search / run_command 等核心工具。",
+      hint,
     },
     null,
     2,

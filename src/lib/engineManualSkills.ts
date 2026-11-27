@@ -31,8 +31,8 @@ description: Unity 6 (6000.x) 代码规范、版本红线与知识库/MCP工具�
   - 当前已绑定 **Unity 6 代码手册知识库**（采用零首轮预塞模式保护 KV Cache）。
   - 编写或修改涉及不确定的 Unity 6 API、新包接口（如 InputSystem、UI Toolkit、Netcode、RenderGraph、Awaitable）时，**先调用 \`knowledge_search({ query: "类名或方法名" })\`**。
   - 优先核对已安装的包版本。打开网络搜索时，可用 \`allow_web_fallback: true\` 让本地正文和官方目录未命中的查询走搜索服务。
-- **查/改实时工程场景与日志 → 用 Unity MCP 工具**：
-  - 使用已绑定的 \`unity_mcp_scene\` 和 \`unity_mcp_console\` 观察实时场景与报错。需要其他编辑器能力时，用 \`tool_search\` 查看已准入的工具和参数。
+- **查看实时场景与 Console → 用已提供的 Editor 工具**：
+  - 使用 \`unity_mcp_scene\` 查看场景。读取 Console 时，使用当前提供的 \`unity_mcp_console\` 或 \`unity_cli_console\`。其他编辑器能力可通过 \`tool_search\` 查询。
   - 纯 C# 脚本逻辑编写直接用 \`read_file\` / \`replace_in_file\` / \`write_file\`，不要无故轮询 MCP。
 
 ## 2. Unity 6 强制版本红线（严禁混用旧版过时 API）

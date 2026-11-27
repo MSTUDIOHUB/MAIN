@@ -6,7 +6,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import ts from "typescript";
 
-function loadPreflight(candidate, transport) {
+function loadPreflight(candidate, transport, entry = "intentPreflight") {
   const cache = new Map();
   function load(file) {
     const resolved = path.resolve(file);
@@ -19,6 +19,9 @@ function loadPreflight(candidate, transport) {
         return { resolveJsonObjectOutputOptions: () => ({ responseFormat: { type: "json_object" } }), streamChatCompletion: async (...args) => transport
           ? transport(...args)
           : ({ content: JSON.stringify(candidate), finishReason: "stop", toolCalls: [] }) };
+      }
+      if (name === "./modelLaneCoordinator") {
+        return { acquireModelLane: async () => ({ markFirstToken() {}, release() {} }) };
       }
       if (name.startsWith(".")) {
         const base = path.resolve(path.dirname(resolved), name);
@@ -33,7 +36,7 @@ function loadPreflight(candidate, transport) {
     }).outputText)(module.exports, module, requireModule);
     return module.exports;
   }
-  return load("src/lib/intentPreflight.ts").runIntentPreflight;
+  return load(`src/lib/${entry}.ts`)[entry === "intentFirstResponse" ? "runIntentFirstResponse" : "runIntentPreflight"];
 }
 
 const params = {
@@ -72,7 +75,8 @@ test("one tool-free semantic request distinguishes continuing, revising and disc
     ["Explain how an unrelated browser API works.", "new", "respond", "en"],
   ]) {
     const relation = kind === "new" ? { kind } : { kind, candidateId: planContinuationCandidates[0].id };
-    const wire = { ...candidate({ forbiddenCapabilities: ["command"] }), planContinuation: relation, approved: true };
+    const wire = { ...candidate({ forbiddenCapabilities: ["command"] }), planContinuation: relation, approved: true,
+      ...(kind === "revise" ? { planRequestExcerpt: "Revise the brick breaker plan" } : {}) };
     let requests = 0;
     const preflight = loadPreflight(null, async (messages, _settings, _callbacks, _signal, tools) => {
       requests += 1;
@@ -118,7 +122,7 @@ test("a missing continuation decision can retain read-only semantics or explicit
     ["answer", [], undefined, "respond"],
     ["investigate", ["workspace_read"], undefined, "analyze"],
     ["plan", ["workspace_read"], "plan", "plan"],
-    ["plan", ["workspace_read"], undefined, null],
+    ["plan", ["workspace_read"], undefined, "analyze"],
     ["implement", ["workspace_write"], undefined, null],
     ["operate", ["command"], undefined, null],
   ]) {
@@ -303,7 +307,7 @@ test("work and capabilities determine execution independently of response format
     ["investigate", ["command"], "report", "execute", "shell"],
     ["operate", ["external_interaction"], "summary", "execute", "mcp"],
     ["investigate", ["workspace_read"], "report", "analyze", "none"],
-    ["plan", ["workspace_read"], "plan", "plan", "none"],
+    ["plan", ["workspace_read"], "plan", "analyze", "none"],
     ["answer", [], "analysis", "respond", "none"],
   ]) {
     const result = await loadPreflight(candidate({ workType, requiredCapabilities, answerFormat, forbiddenCapabilities: [] }))(params);
@@ -332,7 +336,92 @@ for (const [language, input, objective] of [
   assert.deepEqual(explicit.semantic, wire.semantic);
   for (const requiredCapabilities of [["workspace_read"], ["workspace_read", "workspace_write", "command"]]) {
     const operational = await loadPreflight({ semantic: { ...wire.semantic, requiredCapabilities } })({ ...params, input, language, hasWorkspace: true });
-    assert.equal(operational.intent, "plan", "nonempty capability sets keep the existing Plan mapping");
+    assert.equal(operational.intent, "analyze", "capability requirements alone do not request a reviewable plan");
+  }
+});
+
+test("a literal request to receive a plan enters Plan while unsupported planning hints stay read-only", async () => {
+  const wire = candidate({ workType: "plan", answerFormat: "plan", requiredCapabilities: ["workspace_read"], forbiddenCapabilities: [] });
+  const input = "Inspect the files, then give me a plan before making changes.";
+  assert.equal((await loadPreflight({ ...wire, planRequestExcerpt: "give me a plan" })({ ...params, input, hasWorkspace: true })).intent, "plan");
+  assert.equal((await loadPreflight({ ...wire, planRequestExcerpt: "draft a WorkPlan" })({ ...params, input, hasWorkspace: true })).intent, "analyze");
+});
+
+test("a short repair may refer only to the captured prior investigation, never a provider-supplied turn identity", async () => {
+  const wire = { ...candidate({ workType: "implement", requiredCapabilities: ["workspace_read", "workspace_write"], forbiddenCapabilities: [] }),
+    continueInvestigation: true, sourceInvestigationTurnId: "wrong-session" };
+  const input = { ...params, input: "修复", language: "zh", hasWorkspace: true };
+  assert.equal((await loadPreflight(wire)(input)).sourceInvestigationTurnId, undefined);
+  const result = await loadPreflight(wire)({ ...input, previousInvestigation: { turnId: "current-session-review", request: "检查代码", findings: "AudioManager.cs:130" } });
+  assert.equal(result.intent, "execute");
+  assert.equal(result.sourceInvestigationTurnId, "current-session-review");
+});
+
+test("a bare admitted repair reuses the immediate investigation when the model omits the optional link", async () => {
+  const wire = candidate({ workType: "implement", requiredCapabilities: ["workspace_read", "workspace_write"], forbiddenCapabilities: [] });
+  const review = { turnId: "current-session-review", request: "Inspect the sources", findings: "AudioManager.cs:130" };
+  for (const [input, language] of [["修复。", "zh"], ["Fix it!", "en"]]) {
+    const request = { ...params, input, language, hasWorkspace: true, previousInvestigation: review };
+    const result = await loadPreflight(wire)(request);
+    assert.equal(result.intent, "execute");
+    assert.equal(result.sourceInvestigationTurnId, review.turnId);
+    assert.equal((await loadPreflight({ ...wire, continueInvestigation: false })(request)).sourceInvestigationTurnId, undefined);
+    const readOnly = candidate({ workType: "investigate", requiredCapabilities: ["workspace_read"], forbiddenCapabilities: ["workspace_write"] });
+    assert.equal((await loadPreflight(readOnly)(request)).sourceInvestigationTurnId, undefined);
+  }
+  const unrelated = await loadPreflight(wire)({ ...params, input: "修复菜单布局。", language: "zh", hasWorkspace: true, previousInvestigation: review });
+  assert.equal(unrelated.sourceInvestigationTurnId, undefined);
+});
+
+const firstResponseParams = { ...params, config: { ...params.config, local: { ...params.config.local, provider: "OMLX", toolProtocol: "native" } },
+  hasWorkspace: true, replyLanguage: "en", recentConversation: [], onOutcome() {} };
+
+test("first response adopts validated Chat before stream completion and never displays the routing header", async () => {
+  const header = `MAIN_INTENT ${JSON.stringify(candidate())}\n`;
+  let finish;
+  const pause = new Promise(resolve => { finish = resolve; });
+  let requests = 0;
+  const run = loadPreflight(null, async (_messages, _settings, callbacks, _signal, tools) => {
+    requests += 1;
+    assert.deepEqual(tools, []);
+    callbacks.onPublicText(header.slice(0, 8));
+    callbacks.onPublicText(`${header}The result`);
+    await pause;
+    const content = `${header}The result is recorded.`;
+    callbacks.onPublicText(content);
+    return { content, finishReason: "stop", toolCalls: [] };
+  }, "intentFirstResponse");
+  const result = await run(firstResponseParams);
+  const deltas = [];
+  const handoff = result.preparedChatAnswer.read({ signal: new AbortController().signal, onText: delta => deltas.push(delta) });
+  assert.deepEqual(deltas, ["The result"]);
+  finish();
+  assert.equal((await handoff).visibleText, "The result is recorded.");
+  assert.equal(deltas.join(""), "The result is recorded.");
+  assert.equal(requests, 1);
+  assert.equal(await result.preparedChatAnswer.read({ signal: new AbortController().signal, onText() {} }), null);
+});
+
+test("first response carries only validated read proposals and falls back before adopting malformed routing", async () => {
+  const decision = candidate({ workType: "investigate", requiredCapabilities: ["workspace_read"] });
+  const tool = { name: "read_file", arguments: { path: "Assets/AudioManager.cs" } };
+  const valid = { ...decision, firstReads: [tool] };
+  for (const [content, expected] of [
+    [`MAIN_INTENT ${JSON.stringify(valid)}\n`, true],
+    [`\`\`\`json\n${JSON.stringify(valid, null, 2)}\n\`\`\`\n`, true],
+    ["plaintext", false],
+    [JSON.stringify({ ...decision, firstReads: [{ ...tool, name: "write_file" }] }), false],
+  ]) {
+    const run = loadPreflight(null, async (_messages, _settings, callbacks, _signal, tools) => {
+      assert.deepEqual(tools, []);
+      callbacks.onPublicText(content);
+      return { content, finishReason: "stop", toolCalls: [] };
+    }, "intentFirstResponse");
+    const result = await run({ ...firstResponseParams, offerWorkspaceReads: true });
+    if (expected) assert.deepEqual(result.preparedWorkspaceRead.toolCalls, [
+      { index: 0, id: "first-read-0", name: tool.name, arguments: JSON.stringify(tool.arguments) },
+    ]);
+    else assert.equal(result, null);
   }
 });
 

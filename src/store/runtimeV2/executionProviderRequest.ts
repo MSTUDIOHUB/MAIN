@@ -1,4 +1,5 @@
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
+import { createTerminalCredentialProjection, projectTerminalCredentialModelMessages } from "../../lib/terminalCredentialHistory";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { buildCapsuleModelActivityContext } from "../../lib/capsuleModelContext";
@@ -15,10 +16,14 @@ import {
   type OpenAiToolChoice,
 } from "../../lib/streaming";
 import { runtimeV2ExecutionEditorGuidance } from "./executionEditorGuidance";
+import { runtimeV2UnityCompilerDecision } from "../../lib/runtime-v2/unityRepairLoop";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES, UNITY_GAME_VIEW_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { runtimeV2GameViewRequestContext, withRuntimeV2GameViewFallback } from "./executionUnityGameView";
 import type { ToolDefinition } from "../../lib/toolSchemas";
 import {
   normalizeProviderResponseV1,
   runtimeV2DirectExecuteContractCoverage,
+  latestRuntimeV2ProactiveSkipReason,
   type RuntimeV2Command,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2ProviderRecoveryPressure,
@@ -57,6 +62,7 @@ import {
   RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT,
   RUNTIME_V2_EXECUTION_REASONING_ONLY_TIMEOUT_MS,
   RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT,
+  beginRuntimeV2ActionReasoningScope,
   buildRuntimeV2ConcludePrompt,
   providerMessageChars,
   runtimeV2CurrentToolSurfaceInstruction,
@@ -64,6 +70,7 @@ import {
   runtimeV2ExecutionProviderOutputTokenLimit,
   runtimeV2ExecutionReasoningRequest,
   runtimeV2ProviderOutputWasTruncated,
+  runtimeV2ProviderWireShape,
   runtimeV2RecoveryRequiresStructuredAction,
   shouldRetryRuntimeV2WithoutReasoning,
 } from "./executionProviderRequestPolicy";
@@ -71,14 +78,12 @@ import {
   createRuntimeV2RetryMessageRebuilder,
   createRuntimeV2WireCallbacks,
   retryRuntimeV2ProviderLanguageMismatch,
+  suppressMismatchedToolCommentary,
 } from "./executionProviderLanguageRetry";
 
 export * from "./executionProviderRequestPolicy";
 
-export {
-  providerModeInstruction,
-  runtimeV2EditableSourceAnchor,
-} from "./executionProviderInstruction";
+export { providerModeInstruction, runtimeV2EditableSourceAnchor } from "./executionProviderInstruction";
 
 interface RuntimeV2ProviderRequestInput {
   live: RuntimeV2LiveExecutionState;
@@ -95,13 +100,12 @@ type RuntimeV2ProviderRequestResult = RuntimeV2NormalizedProviderResult & {
   /** Consumed by the provider port after it admits the normalized tool call. */
   readonly reasoningActionScope?: string;
 };
-
 export async function requestRuntimeV2ProviderOnce(
   input: RuntimeV2ProviderRequestInput,
 ): Promise<RuntimeV2ProviderRequestResult> {
   const activity = beginCapsuleModelActivity(input.command.run, input.command.idempotencyKey, input.signal);
   try {
-    return await performRuntimeV2ProviderRequest(input, activity);
+    return await withRuntimeV2GameViewFallback(input.ports, input.command, input.signal, () => performRuntimeV2ProviderRequest(input, activity));
   } finally {
     activity.finish();
   }
@@ -122,26 +126,20 @@ async function performRuntimeV2ProviderRequest(
   const requestMode = String(input.command.payload.mode || "").trim();
   let streamedText = "";
   const aggregate = aggregateForCurrentTurn(input.ports);
+  const gameView = runtimeV2GameViewRequestContext(input.ports, input.command, aggregate);
   const approvedPlan = recordApprovedPlanContext(input.ports, aggregate);
   const projectValidationReceipt = projectValidationRecoveryReceipt(aggregate);
-  const editorGuidance = runtimeV2ExecutionEditorGuidance(aggregate);
-  const { editorRepair } = editorGuidance;
-  const reasoningActionScope = approvedPlan && input.tools.length > 0 &&
-    state.config.activeProfile === "local" && settings.reasoningRequest === "auto" &&
-    adapterCapabilities.reasoningToggle && (requestMode === "execute" || requestMode === "validate")
-      ? JSON.stringify([
-          input.command.run.runId, input.command.run.attemptId, approvedPlan.approvalKey, requestMode,
-          settings.provider, settings.baseUrl, settings.model, settings.toolProtocol, input.textEnvelope,
-        ])
-      : undefined;
-  const reuseReasoningFallback = !!reasoningActionScope &&
-    input.live.approvedActionReasoningScope === reasoningActionScope;
-  // Carry the preference forward only if the provider port admits a call
-  // from this response. Rejection, cancellation and scope changes clear it.
-  delete input.live.approvedActionReasoningScope;
+  const compilerDecision = runtimeV2UnityCompilerDecision(aggregate);
+  const compilerRecoveryScope = approvedPlan ? undefined : compilerDecision?.key;
+  const { reasoningActionScope, reuseReasoningFallback } = beginRuntimeV2ActionReasoningScope({
+    live: input.live, run: input.command.run, mode: requestMode, approvalKey: approvedPlan?.approvalKey,
+    compilerKey: compilerRecoveryScope, settings, textEnvelope: input.textEnvelope,
+    eligible: input.tools.length > 0 && state.config.activeProfile === "local" && adapterCapabilities.reasoningToggle,
+  });
   restoreRuntimeV2ProviderRecoveryHistory(input.ports, aggregate, input.command);
   appendRuntimeV2GuidanceHistory(input.live.messages, aggregate, input.command.run, input.command.idempotencyKey);
   const history = providerHistory(input.live, input.ports, approvedPlan ? aggregate : null);
+  const projectHistory = createTerminalCredentialProjection({ events: aggregate?.events, agentMessages: history.messages });
   const sealedPreferredValidation = String(input.command.payload.mode || "") === "validate"
     ? preferredFiniteValidationCommand(input.ports)
     : "";
@@ -161,13 +159,13 @@ async function performRuntimeV2ProviderRequest(
     input.live.latestProviderActionWindow,
   );
   const readOnly = requestMode === "chat" || requestMode === "analyze" || input.command.payload.conclusionKind === "read_only";
-  const canonicalDecisionConversation = requestMode === "conclude"
+  const canonicalDecisionConversation = projectTerminalCredentialModelMessages(requestMode === "conclude"
     ? buildCompactRuntimeV2ConcludeConversation({
         messages: history.messages,
         aggregate,
         language: input.ports.context.phaseLanguage,
       })
-    : history.messages;
+    : history.messages, projectHistory);
   input.live.latestProviderRequestSourceCoverage =
     materializedRuntimeV2SourceCoverage(
       canonicalDecisionConversation,
@@ -180,9 +178,9 @@ async function performRuntimeV2ProviderRequest(
     hasMaterializedSourceEvidence:
       input.live.latestProviderRequestSourceCoverage.length > 0,
   });
-  const toolNames = new Set(
-    providerTools.map((tool) => tool.function.name),
-  );
+  const toolNames = new Set(providerTools.map(tool => tool.function.name));
+  const editorGuidance = runtimeV2ExecutionEditorGuidance(aggregate, toolNames);
+  const { editorRepair } = editorGuidance;
   const projectValidationCommands = requestMode === "validate" && !editorRepair && toolNames.has("run_command") &&
     !approvedPlan && !executionContract && !validationCorrection.active && !validationCorrection.validationCommandUnavailable &&
     !aggregate?.evidence.some(evidence => evidence.kind === "mutation" && evidence.target === "package.json")
@@ -314,6 +312,7 @@ async function performRuntimeV2ProviderRequest(
         providerTools,
         structuredActionRequired,
       ),
+      gameView.instruction(toolNames.has(UNITY_GAME_VIEW_TOOL)),
     ].join(" "),
   });
   const textEnvelopeInstructions = input.textEnvelope
@@ -336,7 +335,9 @@ async function performRuntimeV2ProviderRequest(
   const concludePrompt = buildRuntimeV2ConcludePrompt(
     input.ports.context.phaseLanguage,
   );
-  const concludeInstructions = toolsClosed ? [{ role: "user" as const, content: concludePrompt }] : [];
+  const needsConcludePrompt = toolsClosed && requestMode !== "chat";
+  const directChat = requestMode === "chat" && providerTools.length === 0 && !recoveryPressure;
+  const concludeInstructions = needsConcludePrompt ? [{ role: "user" as const, content: concludePrompt }] : [];
   const initialCoverage = input.live.latestProviderRequestSourceCoverage;
   const inputBudget = budget ? budget.inputBudget ?? computeContextBudgets(budget.contextLimit, maxOutputTokens).inputBudget : null;
   const toolSchemaTokens = estimateTokens(JSON.stringify(input.textEnvelope ? [] : providerTools));
@@ -347,12 +348,13 @@ async function performRuntimeV2ProviderRequest(
     // Reserve both guidance shapes before pressure eviction. The empty-source
     // branch may be longer than a short source anchor.
     const fixedTokens = Math.max(...[sourceCoverage, []].map((coverage) =>
-      estimateMessagesTokens([decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions] as TrimMessage[])
+      estimateMessagesTokens([decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions, ...gameView.messages] as TrimMessage[])
     ));
     const standard = budget && inputBudget !== null
       ? boundRuntimeV2ProviderConversation(conversation, {
           contextLimit: budget.contextLimit, reservedOutputTokens: maxOutputTokens,
           inputBudget: inputBudget - toolSchemaTokens - fixedTokens,
+          preferWorkset: !!compilerDecision && (reuseReasoningFallback || compilerDecision.repeated || recoveryPressure?.stage === "reframe"),
         }, providerEffectFacts)
       : conversation;
     const coverage = materializedRuntimeV2SourceCoverage(
@@ -361,7 +363,7 @@ async function performRuntimeV2ProviderRequest(
     // Recovery changes the frontier guidance, never the roles or bytes of
     // surviving canonical assistant/tool groups. Source authority derives
     // only from those exact receipts in the request being sent.
-    const assembled = [...standard, decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions];
+    const assembled = [...projectHistory([...standard, decisionInstructionFor(coverage), ...textEnvelopeInstructions, ...concludeInstructions]), ...gameView.messages];
     const tokens = estimateMessagesTokens(assembled as TrimMessage[]) + toolSchemaTokens;
     if (inputBudget !== null && tokens > inputBudget) {
       input.live.latestProviderRequestSourceCoverage = [];
@@ -371,24 +373,24 @@ async function performRuntimeV2ProviderRequest(
   };
   const executeRequest = readOnly ? null : assembleExecuteRequest(canonicalDecisionConversation);
   const standardConversation = executeRequest?.standard || canonicalDecisionConversation;
-  const boundedConversation = executeRequest?.standard || canonicalDecisionConversation;
-  const decisionInstruction = decisionInstructionFor(initialCoverage);
+  const decisionInstruction = projectHistory(decisionInstructionFor(initialCoverage));
   const unboundedMessages = [
     // Keep stable instructions, objectives and receipt pairs as the cacheable
     // prefix. Per-decision authority and protocol guidance belong at the
     // current frontier, after the evidence they govern.
-    ...boundedConversation,
-    decisionInstruction,
+    ...standardConversation,
+    ...(directChat ? [] : [decisionInstruction]),
     ...textEnvelopeInstructions,
+    ...gameView.messages,
   ];
   const boundedMessages = readOnly && budget ? boundReadOnlyHistory(unboundedMessages, {
     contextLimit: budget.contextLimit,
-    reservedOutputTokens: maxOutputTokens + (toolsClosed ? 40 : 0),
+    reservedOutputTokens: maxOutputTokens + (needsConcludePrompt ? 40 : 0),
     tools: providerTools,
     preserveUserMessages: unboundedMessages.some(message => "runtimeGuidanceId" in message && !!message.runtimeGuidanceId),
   }) : unboundedMessages;
   const messages = executeRequest?.messages || (
-    toolsClosed && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
+    needsConcludePrompt && boundedMessages[boundedMessages.length - 1]?.content !== concludePrompt
       ? [...boundedMessages, { role: "user" as const, content: concludePrompt }]
       : boundedMessages);
   input.live.latestProviderRequestSourceCoverage = executeRequest?.coverage || materializedRuntimeV2SourceCoverage(
@@ -412,7 +414,7 @@ async function performRuntimeV2ProviderRequest(
     sourceReadAvailable: toolNames.has("read_file"),
     sourceEvidenceCount: (aggregate?.evidence || []).filter((entry) => entry.kind === "source" && Boolean(entry.version)).length,
     mutationToolAvailable: hasMutationTool,
-    conversationHistoryMessages: boundedConversation.length,
+    conversationHistoryMessages: standardConversation.length,
     unboundedConversationHistoryMessages: history.historyMessages,
     priorConversationTurns: history.priorTurns,
     approximateMessageChars: messages.reduce(
@@ -424,7 +426,7 @@ async function performRuntimeV2ProviderRequest(
     allowedToolCount: providerTools.length,
     nativeToolCount: input.textEnvelope ? 0 : providerTools.length,
     allowedToolNames: providerTools.map((tool) => tool.function.name),
-    editorObservationTools: providerTools.map(tool => tool.function.name).filter(name => name.startsWith("unity_mcp_")),
+    editorObservationTools: [...toolNames].filter(name => RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(name)),
     projectBaselineFingerprint: input.ports.context.projectBaselineContext?.fingerprints.overall || null,
     toolChoice: effectiveToolChoice || null,
     collaborationAllowed:
@@ -432,6 +434,8 @@ async function performRuntimeV2ProviderRequest(
     collaborationPreferred:
       input.command.payload.collaborationPreferred === true,
     spawnSubagentAvailable: toolNames.has("spawn_subagent"),
+    proactiveCollaborationSkipReason: latestRuntimeV2ProactiveSkipReason(aggregate) ?? null,
+    proactiveCollaborationCandidateCount: Array.isArray(input.command.payload.delegationHints) ? input.command.payload.delegationHints.length : 0,
     collaborationRequestMode:
       String(input.command.payload.collaborationRequestMode || "serialized"),
     remainingSubagentCapacity: Math.max(
@@ -470,6 +474,7 @@ async function performRuntimeV2ProviderRequest(
     reasoningRequest: requestSettings.reasoningRequest || null,
     reasoningOnlyTimeoutMs: reasoningOnlyTimeoutMs ?? null,
     reuseReasoningFallback,
+    compilerDiagnosticsRepeated: compilerDecision?.repeated ?? null,
     effectPressureActionDecoding:
       reasoningRequest === "off" &&
       settings.reasoningRequest !== "off",
@@ -485,7 +490,7 @@ async function performRuntimeV2ProviderRequest(
     visibleSkillGuidanceDocuments: new Set(input.live.latestProviderRequestSkillGuidanceWindows.map(window => window.documentKey)).size,
     removedDecisionMessages: Math.max(
       0,
-      readOnly ? unboundedMessages.length - messages.length : history.messages.length - boundedConversation.length,
+      readOnly ? unboundedMessages.length - messages.length : history.messages.length - standardConversation.length,
     ),
   });
   const requestTokenBudget = Math.max(
@@ -553,6 +558,10 @@ async function performRuntimeV2ProviderRequest(
     lane,
     activity,
     logRequestTiming,
+    // Action requests can return convincing prose without settling any effect.
+    // Their public commentary is published only with the admitted tool action.
+    allowPublicText: !input.textEnvelope && (readOnly || requestMode === "conclude"),
+    phaseLanguage: input.ports.context.phaseLanguage,
     appendStreamedText: (token) => {
       streamedText += token;
     },
@@ -568,6 +577,7 @@ async function performRuntimeV2ProviderRequest(
       maxOutputTokens,
       {
         ...(effectiveToolChoice ? { toolChoice: effectiveToolChoice } : {}),
+        ...gameView.options,
         timeoutMs: input.timeoutMs,
         contextOwnership: "caller",
         reasoningOnlyCharLimit,
@@ -598,6 +608,9 @@ async function performRuntimeV2ProviderRequest(
       const reasoningOnly = !!result.reasoningContent?.trim() && !partialToolCall &&
         !(result.actionableContent || result.semanticContent || result.content).trim();
       carryReasoningFallback = !!reasoningActionScope && reasoningOnly;
+      if (compilerRecoveryScope && reasoningActionScope && !partialToolCall && !input.signal.aborted) {
+        input.live.actionReasoningScope = reasoningActionScope;
+      }
       input.ports.logStoreEvent(
         "runtime_v2_provider_reasoning_truncated",
         {
@@ -663,6 +676,7 @@ async function performRuntimeV2ProviderRequest(
         maxOutputTokens,
         {
           ...(effectiveToolChoice ? { toolChoice: effectiveToolChoice } : {}),
+          ...gameView.options,
           timeoutMs: input.timeoutMs,
           contextOwnership: "caller",
           reasoningOnlyCharLimit,
@@ -695,6 +709,7 @@ async function performRuntimeV2ProviderRequest(
       activity,
       rebuildRetryMessages,
       wireCallbacks,
+      ...gameView.options,
     });
   } catch (error) {
     lane.reportFailure(error);
@@ -702,38 +717,22 @@ async function performRuntimeV2ProviderRequest(
   } finally {
     lane.release();
   }
-  const protocolContent =
-    result.actionableContent || result.content || streamedText;
-  const visibleText =
-    result.semanticContent || streamedText;
+  gameView.record(result.visualTransportReceipt);
+  const protocolContent = result.actionableContent || result.content || streamedText;
+  const visibleText = suppressMismatchedToolCommentary({
+    visibleText: result.semanticContent || streamedText,
+    toolCallCount: result.toolCalls.length,
+    targetLanguage: input.ports.context.phaseLanguage,
+    live: input.live,
+    ports: input.ports,
+    command: input.command,
+    mode: requestMode,
+  });
   input.ports.logStoreEvent("runtime_v2_provider_wire_shape", {
-    turnId: input.command.run.turnId,
-    runId: input.command.run.runId,
-    commandKey: input.command.idempotencyKey,
-    phase: input.command.phase,
-    mode: String(input.command.payload.mode || ""),
-    textEnvelope: input.textEnvelope,
-    finishReason: result.finishReason || null,
-    clientStopReason: result.clientStopReason || null,
-    rawContentChars: result.content.length,
-    actionableContentChars: result.actionableContent?.length || 0,
-    semanticContentChars: result.semanticContent?.length || 0,
-    reasoningChars: result.reasoningContent?.length || 0,
-    mirrorKind: result.streamDiagnostics?.mirrorKind || null,
-    nativeToolCalls: result.toolCalls.length,
-    envelopeOpenMarkers:
-      protocolContent.match(/<runtime-v2-tools>/g)?.length || 0,
-    envelopeCloseMarkers:
-      protocolContent.match(/<\/runtime-v2-tools>/g)?.length || 0,
-    protocolViolation: result.protocolViolation || null,
-    reasoningFallbackApplied,
-    inputTokens: result.usage?.inputTokens ?? null,
-    outputTokens: result.usage?.outputTokens ?? null,
-    cachedInputTokens: result.usage?.cachedInputTokens ?? null,
-    uncachedInputTokens: result.usage?.cachedInputTokens === undefined ? null
-      : result.usage.inputTokens - result.usage.cachedInputTokens,
-    firstSemanticVisibleElapsedMs: result.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
-    firstToolElapsedMs: result.streamDiagnostics?.firstToolElapsedMs ?? null,
+    turnId: input.command.run.turnId, runId: input.command.run.runId,
+    commandKey: input.command.idempotencyKey, phase: input.command.phase,
+    mode: String(input.command.payload.mode || ""), textEnvelope: input.textEnvelope,
+    ...runtimeV2ProviderWireShape(result, protocolContent, reasoningFallbackApplied),
   });
   const providerReasoning = String(result.reasoningContent || "").trim();
   if (

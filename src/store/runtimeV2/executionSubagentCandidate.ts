@@ -9,6 +9,8 @@ import {
   RUNTIME_V2_SUBAGENT_TASK_KINDS,
 } from "../../lib/toolSchemas";
 
+export const RUNTIME_V2_SUBAGENT_MAX_SCOPE_PATHS = 6;
+
 function boundedArgument(value: unknown, max: number): string {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
@@ -29,7 +31,7 @@ function commaSeparatedPaths(value: unknown): {
         .replace(/\/+$/, "")
     )
     .filter(Boolean);
-  const overLimit = entries.length > 6;
+  const overLimit = entries.length > RUNTIME_V2_SUBAGENT_MAX_SCOPE_PATHS;
   const invalidPath =
     (provided && entries.length === 0) ||
     entries.some((entry) =>
@@ -119,8 +121,8 @@ export function runtimeV2ModelSelectedSubagentCandidate(
       "explore, review, and validate subagents must remain read-only.",
     );
   }
-  if (proactiveKey && (sourceToolCallId || writeJob || !/^[a-f0-9]{64}$/.test(proactiveKey))) {
-    throw new Error("Runtime-owned delegation requires a scoped read-only candidate and its own dispatch identity.");
+  if (proactiveKey && (!sourceToolCallId || writeJob || !/^[a-f0-9]{64}$/.test(proactiveKey))) {
+    throw new Error("Optional delegation requires a scoped read-only proposal and a provider tool call.");
   }
   const explicitlyAllowedScope = commaSeparatedPaths(args.allowed_paths);
   const requiredScope = commaSeparatedPaths(args.required_paths);
@@ -132,7 +134,7 @@ export function runtimeV2ModelSelectedSubagentCandidate(
   }
   if (explicitlyAllowedScope.overLimit || requiredScope.overLimit) {
     throw attachFailureReasonCode(
-      new Error("spawn_subagent allowed_paths and required_paths must contain at most 6 narrow workspace-relative paths; split larger scopes across multiple spawn_subagent calls."),
+      new Error(`spawn_subagent allowed_paths and required_paths must contain at most ${RUNTIME_V2_SUBAGENT_MAX_SCOPE_PATHS} narrow workspace-relative paths; split larger independent scopes across multiple spawn_subagent calls.`),
       "subagent_path_limit_exceeded",
     );
   }

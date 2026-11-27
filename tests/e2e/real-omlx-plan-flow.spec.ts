@@ -53,6 +53,13 @@ import { createRealOmlxChatTelemetry } from "./realOmlxChatTelemetry";
 import { canonicalChatNetworkRead, expectActualWebReadProviders, expectGlobalReadOnlyChatReply, type RealOmlxWebInvocation } from "./realOmlxChatReadOnlyAssertions";
 import { verifyUnityCollector } from "./realUnityCollectorOracle";
 import { observeRuntimeTask } from "./runtimeTaskObservation";
+import {
+  classifyBenchmarkFirstResponse,
+  readBenchmarkWorkspaceFingerprint,
+  readChatCompletionUsage,
+  summarizeBenchmarkUsage,
+  summarizeMainBenchmark,
+} from "../../scripts/coding-agent-benchmark.mjs";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
@@ -1734,6 +1741,12 @@ test.beforeEach(async ({ page }, testInfo) => {
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
+    if (process.env.REAL_OMLX_CODING_BENCHMARK) {
+      return JSON.stringify({
+        command, cwd: workspace, exitCode: 126, success: false, durationMs: 0, stdout: "",
+        stderr: "The benchmark replays source files from an Assets-only archive. Shell and engine verification are unavailable in this fixture.",
+      });
+    }
     console.log(`[real-omlx-validation-command] ${JSON.stringify({
       command: command.slice(0, 1_000),
     })}`);
@@ -1837,6 +1850,7 @@ test.beforeEach(async ({ page }, testInfo) => {
   });
 
   type RealOmlxChatStream = {
+    id: string;
     reader: ReadableStreamDefaultReader<Uint8Array> | null;
     decoder: TextDecoder;
     controller: AbortController;
@@ -1849,6 +1863,17 @@ test.beforeEach(async ({ page }, testInfo) => {
   const chatStreams = new Map<string, RealOmlxChatStream>();
   const canceledBeforeOpen = new Set<string>();
   const finishStreamEvidence = async (stream: RealOmlxChatStream, complete: boolean, reason: string | null) => {
+    if (process.env.REAL_OMLX_CODING_BENCHMARK) {
+      const wire = providerWire.find(entry => entry.streamId === stream.id);
+      if (wire && wire.durationMs === undefined) {
+        wire.durationMs = Date.now() - Date.parse(wire.at);
+        wire.usage = readChatCompletionUsage(stream.capture.responseText);
+        if (wire.isFirstResponse) {
+          wire.firstResponseShape = classifyBenchmarkFirstResponse(stream.capture.responseText);
+          wire.firstResponseCompleted = complete;
+        }
+      }
+    }
     try { await stream.capture.finish(complete, reason, stream.inactivity.phase); }
     catch (error) { console.warn(`[real-omlx-stream-evidence-error] ${String(error)}`); }
   };
@@ -2001,6 +2026,15 @@ test.beforeEach(async ({ page }, testInfo) => {
     const responseOrigin = replayConfirmation ? "recorded_breakout_confirmation" : "real_omlx";
     providerWire.push({ at: new Date().toISOString(), streamId, model,
       responseOrigin,
+      ...(process.env.REAL_OMLX_CODING_BENCHMARK ? {
+        isFirstResponse: parsedBody?.max_tokens === 2048 &&
+          String((parsedBody?.messages as any[] | undefined)?.[0]?.content || "").includes("MAIN_INTENT"),
+        isLegacyPreflight: parsedBody?.max_tokens === 512 &&
+          String((parsedBody?.messages as any[] | undefined)?.[0]?.content || "")
+            .includes("Return one complete JSON object only; no prose, markdown or tools."),
+        investigationReferences: (parsedBody?.messages as any[] | undefined)?.reduce((count, message) =>
+          count + (typeof message.content === "string" ? message.content.split("[PREVIOUS INVESTIGATION]").length - 1 : 0), 0) ?? 0,
+      } : {}),
       ...(replayConfirmation ? { sourceSessionId: breakoutConfirmation.sessionId, sourceProviderSequence: breakoutConfirmation.providerSequence } : {}),
       responseFormat: responseFormat?.type, responseSchema: responseFormat?.json_schema?.name,
       toolChoice: parsedBody?.tool_choice, template: parsedBody?.chat_template_kwargs, maxTokens: parsedBody?.max_tokens,
@@ -2137,6 +2171,7 @@ test.beforeEach(async ({ page }, testInfo) => {
       : null;
     const controller = new AbortController();
     const stream: RealOmlxChatStream = {
+      id: streamId,
       reader: null,
       decoder: new TextDecoder(),
       controller,
@@ -2449,6 +2484,23 @@ test.beforeEach(async ({ page }, testInfo) => {
       if (cmd === "append_debug_log") {
         const raw = args || {};
         const message = String(raw.message || "");
+        const benchmarkEvents = (window as any).__REAL_OMLX_BENCHMARK_EVENTS__;
+        const source = String(raw.source || "");
+        if (benchmarkEvents && (source === "store.intent_first_response" ||
+          /^store\.runtime_v2_(?:(?:chat|workspace_read|execute|plan)_(?:admitted|terminal)|provider_request_(?:timing|opened)|provider_(?:wire_shape|action_rejected|transport_failed)|plan_provider_(?:request_opened|response_shape|unavailable)|plan_(?:run_summary|read_completed|submission_rejected|unhandled_failure)|tool_execution_(?:completed|blocked|failed)|tool_permission_requested|projection_published)$/.test(source))) {
+          try {
+            const payload = JSON.parse(message);
+            if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+              benchmarkEvents.push({ timestamp: String(raw.timestamp || new Date().toISOString()), event: source, payload });
+            }
+          } catch { /* Only valid structured measurements belong in the benchmark. */ }
+        }
+        if (raw.source === "store.source_investigation_continued") {
+          try {
+            const record = JSON.parse(message);
+            ((window as any).__REAL_OMLX_INVESTIGATION_LINKS__ ??= []).push(record);
+          } catch { /* Invalid debug payload does not affect the test runtime. */ }
+        }
         debugEntries.push({
           timestamp: String(raw.timestamp || ""),
           level: String(raw.level || ""),
@@ -3175,16 +3227,18 @@ async function attachRealOmlxFailureDiagnostics(
   }
 }
 
-async function expectRealWorkspaceTerminal(page: Page, testInfo: TestInfo, label: string, approveTools = false): Promise<any> {
+async function expectRealWorkspaceTerminal(page: Page, testInfo: TestInfo, label: string,
+  approveTools: boolean | ((tool: { toolName: string; target: string }) => boolean) = false, timeout = 120_000): Promise<any> {
   let snapshot: any;
   try {
     await expect.poll(async () => {
       snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
-      if (approveTools && snapshot.activeActionRequest?.kind === "tool_permission") {
+      if (snapshot.activeActionRequest?.kind === "tool_permission" &&
+          (typeof approveTools === "function" ? approveTools(snapshot.activeActionRequest) : approveTools)) {
         await page.evaluate(() => (window as any).__CODELY_E2E__.approvePendingTool());
       }
       return !!snapshot.runtimeV2?.terminalOutcome && !snapshot.isGenerating;
-    }, { timeout: 120_000, intervals: [500] }).toBe(true);
+    }, { timeout, intervals: [500] }).toBe(true);
   } finally {
     snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
     await fs.writeFile(testInfo.outputPath(`${label}.json`), JSON.stringify(snapshot, null, 2));
@@ -3219,6 +3273,162 @@ test.afterEach(async ({ page }, testInfo) => {
 
 
 for (const model of models) {
+  test(`real OMLX coding benchmark with ${model}`, async ({ page }, testInfo) => {
+    const scenario = process.env.REAL_OMLX_CODING_BENCHMARK;
+    test.skip(!runRealOmlx || !scenario);
+    if (!["chat", "analyze", "repair", "plan"].includes(scenario!)) throw new Error("Invalid coding benchmark scenario");
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const fixture = JSON.parse(await fs.readFile(path.join(workspace, "..", "manifest.json"), "utf8"));
+    expect(await fs.realpath(fixture.workspace)).toBe(workspace);
+    expect(path.basename(path.dirname(workspace))).toMatch(/^main-twinny-baseline-/);
+    expect(path.dirname(path.dirname(workspace))).toBe(await fs.realpath(os.tmpdir()));
+    expect((await readBenchmarkWorkspaceFingerprint(workspace)).sha256).toBe(fixture.sha256);
+    const baseline = await fingerprintPlanOnlyWorkspace(workspace);
+    const requestedBudget = Number(process.env.REAL_OMLX_BENCHMARK_BUDGET_MS);
+    const budgetMs = Number.isFinite(requestedBudget) && requestedBudget > 0 ? requestedBudget : undefined;
+    const benchmarkStartedAt = Date.now();
+    test.setTimeout(15 * 60_000);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+    if (scenario === "chat") {
+      await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    } else {
+      // Twinny's active editor was MFramework.cs when the request was sent.
+      await page.evaluate(file => (window as any).__CODELY_E2E__.setRealInputContext([file], []),
+        path.join(workspace, "MFramework/Core/MFramework.cs"));
+    }
+    const firstResponseExperiment = process.env.REAL_OMLX_FIRST_RESPONSE === "1";
+    if (firstResponseExperiment) {
+      await page.evaluate(async () => {
+        const { useAppStore } = await import("/src/store/useAppStore.ts");
+        useAppStore.getState().setConfig({ experimentalOmlxFirstResponse: true });
+      });
+    }
+
+    const benchmarkSnapshot = () => page.evaluate(async () => {
+      const snapshot = (window as any).__CODELY_E2E__.getSnapshot();
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const state = useAppStore.getState();
+      const terminal = state.runtimeEvents.findLast(event => event.type === "turn.completed" && event.turnId === snapshot.currentTurnId);
+      return {
+        ...snapshot,
+        completedTurn: terminal?.type === "turn.completed" ? terminal.resultKind || "success" : null,
+        visibleFinals: state.taskFlow.filter(block => block.turnId === snapshot.currentTurnId &&
+          block.type === "agent" && block.visibility === "assistant_final" && !block.streaming).length,
+      };
+    });
+    const submit = async (prompt: string, kind: "chat" | "analyze" | "execute" | "plan") => {
+      const previousTurn = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot().currentTurnId);
+      const providerWire = (page as any).__realOmlxProviderWire as Array<{
+        at: string; tools: string[]; durationMs?: number; usage?: Record<string, number> | null;
+        isFirstResponse?: boolean; firstResponseShape?: string; firstResponseCompleted?: boolean;
+        isLegacyPreflight?: boolean; investigationReferences?: number;
+      }>;
+      const wireStart = providerWire.length;
+      const input = page.getByTestId("composer-textarea");
+      if (kind !== "plan") await input.fill(prompt);
+      await page.evaluate(() => { (window as any).__REAL_OMLX_BENCHMARK_EVENTS__ = []; });
+      const submittedAt = Date.now();
+      if (kind === "plan") {
+        await page.evaluate(text => {
+          const bridge = (window as any).__CODELY_E2E__;
+          void bridge.sendCloudMessage(text);
+        }, prompt);
+      } else {
+        await page.getByTestId("composer-send-button").click();
+      }
+      let last: any;
+      try {
+        await expect.poll(async () => {
+          last = await benchmarkSnapshot();
+          const runtime = last.runtimeV2?.turnId === last.currentTurnId ? last.runtimeV2 : null;
+          return !!last.currentTurnId && last.currentTurnId !== previousTurn && !last.isGenerating &&
+            (!!last.completedTurn || !!runtime?.terminalOutcome || (kind === "plan" && !!runtime?.planReviewCommit) ||
+              (!!runtime && !!last.activeActionRequest));
+        }, { timeout: Math.max(250, Math.min(600_000, realOmlxExecutionTimeoutMs,
+          budgetMs === undefined ? Infinity : budgetMs - (Date.now() - benchmarkStartedAt))), intervals: [250, 500, 1000] }).toBe(true);
+      } finally {
+        last = await benchmarkSnapshot();
+        const run = last.runtimeV2?.turnId === last.currentTurnId ? last.runtimeV2 : null;
+        const events = await page.evaluate(() => {
+          const events = (window as any).__REAL_OMLX_BENCHMARK_EVENTS__ || [];
+          delete (window as any).__REAL_OMLX_BENCHMARK_EVENTS__;
+          return events;
+        });
+        const metrics = run?.runId ? summarizeMainBenchmark(events, { runId: run.runId, submittedAt })[0] : null;
+        const wire = providerWire.slice(wireStart);
+        const candidate = wire.find(entry => entry.isFirstResponse);
+        const observedOutcome = events.findLast((entry: any) =>
+          entry.event === "store.intent_first_response" && entry.payload.turnId === run?.turnId)?.payload.outcome;
+        const firstResponseOutcome = ["admitted", "fallback", "canceled"].includes(observedOutcome) ? observedOutcome : null;
+        const sourceInvestigationContinued = await page.evaluate((turnId) => {
+          const continuation = ((window as any).__REAL_OMLX_INVESTIGATION_LINKS__ || [])
+            .findLast((entry: any) => entry.turnId === turnId);
+          return continuation ? { sourceTurnId: continuation.sourceTurnId, fileHints: continuation.files } : null;
+        }, last.currentTurnId);
+        const finals = (run?.projections || []).filter((entry: any) => entry.audience === "final");
+        const workspaceChanged = (await fingerprintPlanOnlyWorkspace(workspace)) !== baseline;
+        const syntheticChatAnswer = kind === "chat" && !process.env.REAL_OMLX_BENCHMARK_PROMPT
+          ? String(finals[0]?.markdown || "").trim() : null;
+        const diagnostics = events.filter((entry: any) => entry.payload.runId === run?.runId &&
+          /(?:action_rejected|transport_failed|submission_rejected|unhandled_failure|provider_unavailable|execution_blocked|execution_failed|permission_requested)$/.test(entry.event))
+          .slice(-8).map((entry: any) => ({
+            event: entry.event,
+            detail: String(entry.payload.detailCode || entry.payload.reasonCode || entry.payload.reason || entry.payload.error || "").slice(0, 300),
+            tool: entry.payload.toolName ?? null,
+          }));
+        const report = {
+          requestedScenario: kind, fixtureSha256: fixture.sha256, model, firstResponseExperiment,
+          runtimeStrategy: run?.strategy || null, terminal: run?.terminalOutcome?.resultKind || last.completedTurn || null,
+          terminalReason: run?.terminalOutcome?.reason || finals[0]?.reason || null,
+          diagnostics,
+          activeRequest: last.activeActionRequest?.kind || null, planReviewReady: !!run?.planReviewCommit,
+          finalCount: run ? finals.length : last.visibleFinals, submittedAt: new Date(submittedAt).toISOString(), observedElapsedMs: Date.now() - submittedAt,
+          providerRequests: wire.length, firstProviderDispatchMs: wire[0] ? Date.parse(wire[0].at) - submittedAt : null,
+          providerWallMs: wire.length && wire.every(entry => entry.durationMs !== undefined)
+            ? wire.reduce((total, entry) => total + entry.durationMs!, 0) : null,
+          providerUsage: summarizeBenchmarkUsage(wire.map(entry => entry.usage || {})),
+          firstResponseShape: candidate?.firstResponseShape ?? null,
+          firstResponseCompleted: candidate?.firstResponseCompleted ?? null,
+          firstResponseOutcome,
+          legacyPreflightObserved: wire.some(entry => entry.isLegacyPreflight),
+          sourceInvestigationContinued,
+          firstRequestInvestigationReferences: wire.find(entry => (entry.investigationReferences ?? 0) > 0)
+            ?.investigationReferences ?? 0,
+          firstToolSchemaCount: wire.find(entry => entry.tools.length > 0)?.tools.length ?? 0,
+          exactChatAnswer: syntheticChatAnswer === null ? null : syntheticChatAnswer === "BENCH-742",
+          syntheticChatAnswerChars: syntheticChatAnswer?.length ?? null,
+          syntheticChatAnswerSample: syntheticChatAnswer?.slice(0, 120) ?? null,
+          workspaceChanged, validationAvailability: "source_only_fixture",
+          // Match evidence against the independently known compiler-facing defect.
+          audioSourceRead: (run?.evidence || []).some((entry: any) => entry.kind === "source" &&
+            String(entry.target).endsWith("MFramework/Audio/AudioManager.cs")),
+          firstAudioSourceDefectReported: (run?.projections || []).some((entry: any) => entry.audience === "final" &&
+            /AudioManager/.test(entry.markdown || "") && /ServiceBase/.test(entry.markdown || "") &&
+            /transform|Destroy/.test(entry.markdown || "")),
+          metrics,
+        };
+        await fs.writeFile(testInfo.outputPath(`coding-benchmark-${kind}.json`), JSON.stringify(report, null, 2));
+        console.log(`[coding-benchmark] ${JSON.stringify(report)}`);
+      }
+      return last;
+    };
+
+    if (scenario === "chat") {
+      await submit(process.env.REAL_OMLX_BENCHMARK_PROMPT || "请只回复 BENCH-742。", "chat");
+    } else if (scenario === "plan") {
+      await submit(process.env.REAL_OMLX_BENCHMARK_PROMPT ||
+        "检查当前代码的问题。给出可审批的修复计划，写清涉及文件与如何验证。此轮仅计划。", "plan");
+    } else {
+      const analysis = await submit(process.env.REAL_OMLX_BENCHMARK_PROMPT || "检查当前代码的问题", "analyze");
+      expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(baseline);
+      if (scenario === "repair" && (analysis.runtimeV2?.terminalOutcome?.resultKind || analysis.completedTurn) === "success") {
+        await submit("修复", "execute");
+      }
+    }
+    if (scenario !== "repair") expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(baseline);
+  });
+
   test(`deterministic production repeated mutation rejections recover through validation with ${model}`, async ({ page }, testInfo) => {
     test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
     test.setTimeout(60_000);
@@ -4868,9 +5078,9 @@ test(`real OMLX starts semantic collaboration after runtime admission with ${sub
   }, { timeout: 60_000 }).toBe(true);
 });
 
-test(`real OMLX ordinary Execute starts a proactive read-only subagent with ${subagentModel}`, async ({ page }, testInfo) => {
+test(`real OMLX single-chain Execute keeps known version facts in the parent with ${subagentModel}`, async ({ page }, testInfo) => {
   test.skip(realOmlxFixture !== "csv");
-  test.skip(!!process.env.REAL_OMLX_WORKSPACE, "Proactive collaboration regression uses its own disposable project.");
+  test.skip(!!process.env.REAL_OMLX_WORKSPACE, "Single-chain collaboration regression uses its own disposable project.");
   test.setTimeout(150_000);
   const workspace = (page as any).__realOmlxWorkspace as string;
   const editorVersionPath = "ProjectSettings/ProjectVersion.txt";
@@ -4893,26 +5103,14 @@ test(`real OMLX ordinary Execute starts a proactive read-only subagent with ${su
   try {
     await expect.poll(async () => {
       runtime = (await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot())).runtimeV2;
-      const jobs = runtime?.events.flatMap((event: any) => event.jobs || []) || [];
-      const proactive = jobs.find((job: any) => job.scopeKey?.startsWith("proactive:"));
-      return !!(proactive && runtime.subagents.some((job: any) => job.id === proactive.id && job.firstTokenAt))
-        || !!runtime?.terminalOutcome;
+      return !!runtime?.terminalOutcome;
     }, { timeout: 100_000, intervals: [500] }).toBe(true);
     expect(runtime.strategy).toBe("execute");
     expect(runtime.workPlan).toBeNull();
-    const proactive = runtime.events.flatMap((event: any) => event.jobs || [])
-      .find((job: any) => job.scopeKey?.startsWith("proactive:"));
-    expect(proactive).toMatchObject({ accessMode: "read", allowedPaths: expect.arrayContaining([editorVersionPath, lockPath]) });
-    expect(runtime.subagents.find((job: any) => job.id === proactive.id)?.firstTokenAt).toBeGreaterThan(0);
-    const scheduled = runtime.events.find((event: any) => event.jobs?.some((job: any) => job.id === proactive.id));
-    const completed = runtime.events.find((event: any) => event.type === "subagent.completed" && event.jobId === proactive.id);
-    const parentReadsBeforeSchedule = runtime.commands.filter((command: any) => command.sequence < scheduled.sequence &&
-      command.toolName === "read_file" && command.status === "succeeded").map((command: any) => command.target);
-    expect(parentReadsBeforeSchedule).toContain("src/hooks/useCsvParser.ts");
-    expect(parentReadsBeforeSchedule).not.toContain(editorVersionPath);
-    expect(parentReadsBeforeSchedule).not.toContain(lockPath);
-    expect(runtime.events.some((event: any) => event.type === "command.scheduled" && event.commandKind === "request_model" &&
-      event.sequence > scheduled.sequence && (!completed || event.sequence < completed.sequence))).toBe(true);
+    expect(runtime.subagents).toEqual([]);
+    const parentReads = runtime.commands.filter((command: any) => command.toolName === "read_file" &&
+      command.status === "succeeded").map((command: any) => command.target);
+    expect(parentReads).toContain("src/hooks/useCsvParser.ts");
   } finally {
     await fs.writeFile(testInfo.outputPath("proactive-execute-v2.json"), JSON.stringify(runtime || {}, null, 2));
     await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
@@ -5459,6 +5657,151 @@ for (const model of models) {
     const answer = snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown || "";
     for (const version of ["1.10.4", "2022.3.62t16", "14.2.0-t1"]) expect(answer).toContain(version);
     expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+  });
+
+  for (const [connector, env, observation, nativeOperation] of [
+    ["Unity Official MCP", "REAL_OMLX_UNITY_OFFICIAL_MCP", "unity_official_mcp_console", "unity_official_mcp"],
+    ["Unity CLI", "REAL_OMLX_UNITY_CLI_CONSOLE", "unity_cli_console", "unity_cli_console"],
+  ] as const) test(`real OMLX reads TestCli Console through ${connector} with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env[env] !== "1", "Requires the explicitly selected TestCli project with an open Editor.");
+    expect(process.env.REAL_OMLX_WORKSPACE).toBeTruthy();
+    expect(realOmlxFixture).toBe("unity");
+    test.setTimeout(180_000);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.getByRole("button", { name: /^(系统设置|设置|System Settings|Settings)$/ }).click();
+    await page.getByTestId("settings-tab-mcp").click();
+    const official = page.getByRole("switch", { name: /^(Unity 官方 MCP|Unity Official MCP)$/ });
+    await expect(official).not.toBeChecked();
+    if (nativeOperation === "unity_official_mcp") {
+      await official.click();
+      await expect(official).toBeChecked();
+    }
+    await page.getByTestId("settings-close").click();
+    const submitted = await page.evaluate(async () => {
+      const host = window as any;
+      const bridge = host.__CODELY_E2E__;
+      const invoke = host.__TAURI_INTERNALS__.invoke;
+      host.__TAURI_INTERNALS__.invoke = (command: string, args: unknown) => {
+        if (command === "unity_cli_console" || command === "unity_official_mcp") {
+          (host.__MAIN_E2E_CONSOLE_INVOCATIONS ??= []).push({ command, args });
+          return host.__MAIN_E2E_NATIVE_TOOL(command, args);
+        }
+        // This fixture checks the Console route in a real project.
+        if (["write_file", "write_file_atomic", "write_file_create_new", "replace_in_file", "delete_workspace_path", "run_command"].includes(command)) {
+          throw new Error(`CONSOLE_ROUTE_FIXTURE_UNEXPECTED_EFFECT: ${command}`);
+        }
+        return invoke(command, args);
+      };
+      const discovered = await bridge.setRealMcpFixture("http://localhost:8080/mcp", false, false);
+      bridge.setPreferSubagents?.(true);
+      return { discovered, accepted: await bridge.sendDirectEditMessage("修复console窗口的错误") };
+    });
+    expect(submitted).toEqual({ discovered: 0, accepted: true });
+    const firstToolRequest = () => ((page as any).__realOmlxProviderWire as any[]).find(request => request.tools.length > 0);
+    await expect.poll(() => !!firstToolRequest(), { timeout: 90_000 }).toBe(true);
+    const firstRuntime = firstToolRequest();
+    expect(firstRuntime?.tools).toContain(observation);
+    expect(firstRuntime?.tools).not.toContain("unity_mcp_console");
+    if (nativeOperation === "unity_official_mcp") expect(firstRuntime?.tools).not.toContain("unity_cli_console");
+    await expect.poll(() => page.evaluate(() =>
+      (window as any).__CODELY_E2E__.getSnapshot().runtimeV2?.events.some(
+        (event: any) => event.type === "tool.completed" && event.editorConsole?.editorPid > 0,
+      ) ?? false,
+    ), { timeout: 90_000 }).toBe(true);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, observation);
+    expect(snapshot.runtimeV2.strategy).toBe("execute");
+    expect(realWorkspaceToolSucceeded(snapshot, observation)).toBe(true);
+    const console = snapshot.runtimeV2.events.find((event: any) => event.editorConsole?.editorPid);
+    expect(console?.editorConsole.retainedDiagnostics ?? console?.editorConsole.diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        path: "Assets/Tests/BreakoutTests.cs", code: "CS0246",
+      })]),
+    );
+    if (nativeOperation === "unity_official_mcp") {
+      const invocations = await page.evaluate(() => (window as any).__MAIN_E2E_CONSOLE_INVOCATIONS);
+      expect(invocations).toEqual(expect.arrayContaining([expect.objectContaining({
+        command: "unity_official_mcp",
+        args: expect.objectContaining({
+          expectedPid: console.editorConsole.editorPid,
+          call: { name: "console", arguments: { command: "get", args: { tail: 100, level: "warn" } } },
+        }),
+      })]));
+    }
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("canceled");
+  });
+
+  test(`real OMLX repairs the isolated TestCli Console through official MCP with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env.REAL_OMLX_TESTCLI_REPAIR !== "1", "Requires an isolated TestCli copy with its own running Editor.");
+    test.setTimeout(780_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const editorPid = Number(process.env.REAL_OMLX_TESTCLI_EDITOR_PID);
+    expect(process.env.REAL_OMLX_WORKSPACE).toBeTruthy();
+    expect(realOmlxFixture).toBe("unity");
+    expect(editorPid).toBeGreaterThan(0);
+    expect((await fs.readFile(path.join(workspace, ".main-unity-disposable"), "utf8")).trim()).toBe("isolated test workspace");
+    const testsPath = path.join(workspace, "Assets/Tests/BreakoutTests.cs");
+    const caseNames = (source: string) => [...source.matchAll(/\[(?:UnityTest|Test)\]\s*(?:public\s+)?[\w.<>]+\s+(\w+)\s*\(/g)].map(match => match[1]);
+    const originalCases = caseNames(await fs.readFile(testsPath, "utf8"));
+    expect(originalCases.length).toBeGreaterThan(0);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.getByRole("button", { name: /^(系统设置|设置|System Settings|Settings)$/ }).click();
+    await page.getByTestId("settings-tab-mcp").click();
+    const official = page.getByRole("switch", { name: /^(Unity 官方 MCP|Unity Official MCP)$/ });
+    if (!(await official.isChecked())) await official.click();
+    await page.getByTestId("settings-close").click();
+    expect(await page.evaluate(async () => {
+      const host = window as any;
+      const bridge = host.__CODELY_E2E__;
+      const invoke = host.__TAURI_INTERNALS__.invoke;
+      host.__TAURI_INTERNALS__.invoke = (command: string, args: unknown) => {
+        if (["unity_official_mcp", "unity_cli_console", "unity_compile_project", "unity_inspect_assemblies", "unity_test_project"].includes(command)) {
+          (host.__MAIN_E2E_CONSOLE_INVOCATIONS ??= []).push({ command, args });
+          return host.__MAIN_E2E_NATIVE_TOOL(command, args);
+        }
+        return invoke(command, args);
+      };
+      await bridge.setRealMcpFixture("http://localhost:8080/mcp", false, false);
+      bridge.setPreferSubagents?.(true);
+      return bridge.sendDirectEditMessage("修复console窗口的错误");
+    })).toBe(true);
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "testcli-official-repair", tool => tool.toolName === "run_command" &&
+      /^unity test \. --mode PlayMode --filter [A-Za-z_][A-Za-z0-9_.+]*$/.test(tool.target), 600_000);
+    expect(snapshot.runtimeV2.strategy).toBe("execute");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    expect(realWorkspaceToolSucceeded(snapshot, "unity_official_mcp_console")).toBe(true);
+    expect(realWorkspaceToolSucceeded(snapshot, "unity_compile_project")).toBe(true);
+    const observations = snapshot.runtimeV2.events.map((event: any) => event.editorConsole).filter(Boolean);
+    expect(observations[0]).toMatchObject({ editorPid, pipeline: { live: { compilationFailed: true } } });
+    const ledger = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+    const baseline = ledger.events.find((event: any) => event.type === "command.scheduled" && event.command.payload.runtimeOwnedUnityBaselineCompile === true);
+    const firstWrite = ledger.events.find((event: any) => event.type === "tool.completed" && event.status === "succeeded" && event.effectKind === "workspace_change");
+    expect(baseline?.sequence).toBeLessThan(firstWrite?.sequence);
+    const inspection = ledger.events.find((event: any) => event.type === "tool.completed" && event.presentation?.toolName === "unity_inspect_assemblies");
+    expect(inspection?.status).toBe("succeeded");
+    expect(inspection.sequence).toBeLessThan(firstWrite.sequence);
+    const compileChecks = ledger.events.filter((event: any) => event.type === "tool.completed" &&
+      event.presentation?.toolName === "unity_compile_project" && event.modelContent).map((event: any) => JSON.parse(event.modelContent));
+    const passing = compileChecks.findLast((result: any) => result.status === "passed");
+    expect(passing).toMatchObject({ editorPid });
+    expect(passing?.postCompileConsole ?? observations.at(-1)?.pipeline?.live).toMatchObject({
+      errors: 0, compiling: false, compilationFailed: false,
+    });
+    expect(ledger.subagents).toHaveLength(0);
+    expect(caseNames(await fs.readFile(testsPath, "utf8"))).toEqual(expect.arrayContaining(originalCases));
+    const playMode = ledger.events.filter((event: any) => event.type === "validation.completed" && event.passed &&
+      event.authority?.useProjectEditor === true && Array.isArray(event.authority.expectedTestCaseNames));
+    expect(playMode.length).toBeGreaterThan(0);
+    const final = ledger.events.find((event: any) => event.type === "run.completed");
+    expect(playMode.every((event: any) => event.run.runId === final?.run.runId &&
+      event.mutationBoundarySequence >= firstWrite.sequence && event.sequence < final?.sequence)).toBe(true);
+    expect(playMode.at(-1)?.postPlayModeConsole).toMatchObject({ errors: 0, compiling: false, compilationFailed: false });
+    const playModeCases = playMode.flatMap((event: any) => event.authority.expectedTestCaseNames)
+      .map((name: string) => name.split('(')[0]?.split('.').at(-1));
+    expect(playModeCases).toEqual(expect.arrayContaining(originalCases));
+    const attempts = await page.evaluate(() => (window as any).__MAIN_E2E_CONSOLE_INVOCATIONS);
+    expect(attempts.some((item: any) => item.command === "unity_test_project" && item.args.consoleBinding?.editorPid === editorPid)).toBe(true);
+    await fs.writeFile(testInfo.outputPath("testcli-playmode.json"), JSON.stringify(playMode, null, 2));
   });
 
   for (const [request, strategy] of [

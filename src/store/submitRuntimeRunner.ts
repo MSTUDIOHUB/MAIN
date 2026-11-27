@@ -1,4 +1,4 @@
-import { normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
+import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../lib/turnCapabilities";
 import type {
   SubmissionRuntimeContext,
   SubmissionRuntimeStorePorts,
@@ -9,7 +9,7 @@ import {
   resolveRuntimeV2VisibleRunnerKind,
   resolveRuntimeEngineVersion,
 } from "../lib/runtimeEngineSelection";
-import { resolveRuntimeContextBudget } from "../lib/runtimeContextBudget";
+import { computeRuntimeContextBudget, resolveRuntimeContextBudget } from "../lib/runtimeContextBudget";
 import { runSubmitRuntimeV2Chat } from "./runtimeV2/chatRunner";
 import { runSubmitRuntimeV2Execute } from "./runtimeV2/executeRunner";
 import { runSubmitRuntimeV2Plan } from "./runtimeV2/planRunner";
@@ -21,6 +21,7 @@ import { estimateMessagesTokens } from "../lib/contextTrim";
 import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
 import { resolveActiveEngineKnowledgeReferences } from "../lib/engineManualBinding";
 import { mergeEngineNavigatorSkillsIntoCatalog } from "../lib/agentSkills";
+import { resolveWorkspaceEngineProfile } from "../lib/workspaceEngineProfile";
 
 type SubmitRuntimeStoreGet = () => any;
 type SubmitRuntimeStoreSet = any;
@@ -52,7 +53,10 @@ export async function runSubmitRuntime(
     runtimeIntent: input.context.runtimeRunIntent,
     runWorkspace: input.context.runWorkspace,
     hasAttachedFiles:
-      input.context.turnInputContextSignals.attachedFilePaths.length > 0,
+      input.context.turnInputContextSignals.attachedFilePaths.length > 0 ||
+      !!input.context.turnInputContextSignals.mentionedFilePaths?.length,
+    requiredCapabilities: input.context.requiredCapabilities,
+    checkpointStrategy: input.context.restoredReadOnlyStrategy,
   });
   if (admittedVersion !== "v2") {
     input.logStoreEvent("runtime_v2_turn_marker_missing", {
@@ -65,37 +69,67 @@ export async function runSubmitRuntime(
   }
   const clarification = await handleRuntimeV2IntentClarification({ ...input, persistSessionRecord: input.persistSessionRecord || saveProjectSession }, runtimeV2RunnerKind);
   if (clarification) return clarification;
-  const runtimeContextBudget = await resolveRuntimeContextBudget(
-    input.get().config || {},
-  );
-  const budgetedContext = withRuntimeV2ContextBudget(
-    input.context,
-    runtimeContextBudget,
-  );
+  const runtimeConfig = input.get().config || {};
+  const runtimeContextBudgetPromise = runtimeV2RunnerKind === "chat" && input.context.preparedChatAnswer
+    ? computeRuntimeContextBudget({ configuredContextLimit: runtimeConfig.local?.contextLimit, providerContextLimit: null,
+      modelLoaded: null, availableMemoryBytes: null })
+    : resolveRuntimeContextBudget(runtimeConfig);
   const rawExplicitReferences =
     input.context.knowledgeReferences || input.context.options?.knowledgeReferencesSnapshot || [];
   const explicitReferences = normalizeKnowledgeReferences(rawExplicitReferences);
-  const resolvedEngineManuals = explicitReferences
-    ? await resolveActiveEngineKnowledgeReferences({
-        workspace: normalizeTurnCapabilityRestrictions(input.context.capabilityRestrictions).includes("workspace_read")
-          ? undefined
-          : input.context.runWorkspace,
-        knowledgeBases: Array.isArray(input.get().knowledgeBases) ? input.get().knowledgeBases : [],
-        explicitReferences,
-      })
-    : null;
+  const contextPaths = [...new Set([
+    ...(input.context.turnInputContextSignals.mentionedFilePaths || []),
+    ...input.context.turnInputContextSignals.attachedFilePaths,
+  ])];
+  const prompt = turn?.userPrompt || "";
+  const engineSpecificRequest =
+    /\b(?:unity|tuanjie|godot|unreal|ue[456]|uefn|monobehaviour|uobject|projectversion|build\.cs)\b|团结引擎|引擎版本/i.test(prompt);
+  const engineSourcePaths = contextPaths.some(path =>
+    /\.(?:cs|asmdef|asmref|gd|gdshader|godot|uproject|uefnproject|cpp|h|hpp|verse)(?:#L\d+(?:-L\d+)?|:\d+(?::\d+)?)?$/i.test(path));
+  const projectDetailsRelevant = engineSpecificRequest || input.context.requiredCapabilities?.includes("command") ||
+    ((runtimeV2RunnerKind === "execute" || runtimeV2RunnerKind === "plan") &&
+      (engineSourcePaths || !!input.context.sourceInvestigationTurnId));
+  const canInspectEngine = runtimeV2RunnerKind !== "chat" && !!input.context.runWorkspace && projectDetailsRelevant &&
+    !normalizeTurnCapabilityRestrictions(input.context.capabilityRestrictions).includes("workspace_read") &&
+    !normalizeTurnApprovalCapabilities(input.context.approvalRequiredCapabilities).includes("workspace_read");
+  const engineContextPromise = (async () => {
+    const engineProfile = canInspectEngine ? await resolveWorkspaceEngineProfile(input.context.runWorkspace, { contextPaths }) : null;
+    const needsManual = Boolean(explicitReferences?.length) || (engineSpecificRequest &&
+      /\b(?:api|manual|docs?|documentation|compatib\w*|version)\b|文档|手册|版本|兼容|接口用法/i.test(prompt));
+    const manuals = needsManual && engineProfile?.manualPresetId
+      ? await resolveActiveEngineKnowledgeReferences({
+          workspaceEngineProfile: engineProfile,
+          knowledgeBases: Array.isArray(input.get().knowledgeBases) ? input.get().knowledgeBases : [],
+          explicitReferences: explicitReferences || undefined,
+        })
+      : null;
+    return { engineProfile, manuals };
+  })();
+  const [runtimeContextBudget, { engineProfile, manuals: resolvedEngineManuals }] = await Promise.all([
+    runtimeContextBudgetPromise, engineContextPromise,
+  ]);
+  const budgetedContext = withRuntimeV2ContextBudget(input.context, runtimeContextBudget);
   const effectiveReferences = resolvedEngineManuals ? resolvedEngineManuals.references : rawExplicitReferences;
-  const knowledgeContext = await prepareKnowledgeContext({
+  const knowledgeContext = effectiveReferences.length ? await prepareKnowledgeContext({
     references: effectiveReferences,
     query: turn?.userPrompt || "",
     budget: runtimeContextBudget,
     reservedInputTokens: estimateMessagesTokens(input.get().agentMessages || []),
     signal: input.context.abortCtrl.signal,
-  });
+  }) : undefined;
   const skillCatalog = resolvedEngineManuals?.activePresetIds.length
     ? mergeEngineNavigatorSkillsIntoCatalog(budgetedContext.skillCatalog, resolvedEngineManuals.activePresetIds)
     : budgetedContext.skillCatalog;
-  const runtimeContext = { ...budgetedContext, knowledgeContext, skillCatalog };
+  const runtimeContext = {
+    ...budgetedContext,
+    knowledgeContext,
+    skillCatalog,
+    ...(canInspectEngine ? {
+      workspaceInstructionContext: [budgetedContext.workspaceInstructionContext,
+        engineProfile ? `[WORKSPACE ENGINE METADATA]\n${JSON.stringify(engineProfile)}\nRead-only project facts. Use existing project validation commands from this root when authorized. A version, editor diagnostic, or language parse is not proof of a project build or test.`
+          : "[WORKSPACE ENGINE METADATA]\nNo unique engine project root was resolved inside the admitted workspace. Source inspection can proceed. Use an existing workspace validation command when available. If a project-level check needs another root and there are multiple plausible choices, ask for the intended project. Report unavailable verification when the workspace only contains source files."].filter(Boolean).join("\n\n"),
+    } : {}),
+  };
   input.logStoreEvent("runtime_v2_context_budget_resolved", {
     turnId: input.context.turnId,
     runId: input.context.harnessRunId,

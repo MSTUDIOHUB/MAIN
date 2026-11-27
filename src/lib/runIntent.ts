@@ -129,6 +129,9 @@ export type PlanContinuationDecision = {
 
 export interface IntentPreflightResult {
   semantic: SemanticTaskIntent;
+  preparedChatAnswer?: import("./submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+  preparedWorkspaceRead?: import("./submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+  sourceInvestigationTurnId?: string;
   planContinuation?: PlanContinuationDecision;
   intent: ResolvedUserIntent;
   confidence: number;

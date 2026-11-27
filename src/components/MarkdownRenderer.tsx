@@ -7,6 +7,7 @@ import { oneLight, vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/
 import { IconClose, IconExpand } from "./Icons";
 import MermaidBlock from "./MermaidBlock";
 import { useAppStore } from "../store/useAppStore";
+import { useActiveThemePalette } from "./useThemePalette";
 import {
   decodeInlineMathCode,
   extractMarkdownNodeSource,
@@ -96,7 +97,7 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
   const [isCodeExpanded, setIsCodeExpanded] = useState(false);
   const [isWrapped, setIsWrapped] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
-  const themeMode = useAppStore((s) => s.config.themeMode);
+  const themePalette = useActiveThemePalette();
   const uiLanguage = useAppStore((s) => s.config.language) === "en" ? "en" : "zh";
   const copy = uiLanguage === "zh"
     ? {
@@ -127,14 +128,9 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
         copySource: "Copy Source",
         closeExpanded: "Close expanded view",
       };
-  const isLightTheme = themeMode === "light";
-  const isBlackTheme = themeMode === "black";
+  const isLightTheme = themePalette.effectiveMode === "light";
   const syntaxTheme = isLightTheme ? oneLight : vscDarkPlus;
-  const codeSurfaceTone = isLightTheme
-    ? { border: "#d4d4d8", background: "#fafafa", text: "#1f2937" }
-    : isBlackTheme
-    ? { border: "#202026", background: "#000000", text: "#dedee3" }
-    : { border: "#1f1f23", background: "#09090b", text: "#d4d4d8" };
+  const codeSurfaceTone = themePalette.codeSurface;
   const match = /language-([\w-]+)/.exec(className || "");
   const language = match ? match[1].toLowerCase() : "";
   const codeStr = String(children).replace(/\n$/, "");
@@ -151,31 +147,7 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
   const slimHeaderClass = "flex items-center justify-between gap-2 border-b px-3 py-1.5";
   const actionGroupClass = "flex flex-wrap items-center justify-end gap-1 opacity-75 transition-opacity group-hover/code:opacity-100 focus-within:opacity-100";
   const ghostActionButtonClass = "rounded-md px-1.5 py-0.5 text-[11px] leading-4 text-[var(--surface-text-subtle)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--surface-text-strong)]";
-  const expandedTone = isLightTheme
-    ? {
-        overlay: "rgba(15,23,42,0.24)",
-        modalBorder: "#cbd5e1",
-        modalBackground: "#ffffff",
-        modalShadow: "0 28px 80px rgba(15,23,42,0.18)",
-        headerBorder: "#e2e8f0",
-        titleText: "#1e293b",
-        buttonBorder: "#cbd5e1",
-        buttonBackground: "#f8fafc",
-        buttonText: "#475569",
-        bodyBackground: "#f8fafc",
-      }
-    : {
-        overlay: "rgba(0,0,0,0.68)",
-        modalBorder: isBlackTheme ? "#202026" : "#34343b",
-        modalBackground: isBlackTheme ? "#030304" : "#1d1d20",
-        modalShadow: "0 28px 80px rgba(0,0,0,0.45)",
-        headerBorder: isBlackTheme ? "#141418" : "#2c2c32",
-        titleText: "#d4d4d8",
-        buttonBorder: isBlackTheme ? "#202026" : "#34343b",
-        buttonBackground: isBlackTheme ? "#070708" : "#181818",
-        buttonText: "#c4c4cc",
-        bodyBackground: isBlackTheme ? "#000000" : "#181818",
-      };
+  const expandedTone = themePalette.expandedModalTone;
 
   useEffect(() => {
     if (!isExpanded && !isPreviewOpen) return;
@@ -256,7 +228,7 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
       >
         <div
           className={`${slimHeaderClass} justify-end`}
-          style={{ borderColor: codeSurfaceTone.border }}
+          style={{ borderColor: codeSurfaceTone.border, backgroundColor: codeSurfaceTone.headerBackground }}
         >
           <div className={actionGroupClass}>
             {canCollapseCode && (
@@ -315,7 +287,7 @@ function CodeBlock({ inline = true, className, children, baseFontSize = 13, ...r
       >
         <div
           className={slimHeaderClass}
-          style={{ borderColor: codeSurfaceTone.border }}
+          style={{ borderColor: codeSurfaceTone.border, backgroundColor: codeSurfaceTone.headerBackground }}
         >
           <div className="flex min-w-0 items-center gap-1.5">
             <span className="font-mono text-[11px] leading-4 text-[var(--surface-text-subtle)]">

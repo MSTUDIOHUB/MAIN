@@ -2,8 +2,14 @@
 #[path = "unity_shader_includes.rs"]
 mod shader_includes;
 pub(crate) use shader_includes::check_shader_includes;
+pub(crate) use shader_includes::installed_package;
 #[path = "unity_shader_import.rs"]
 mod shader_import;
+#[path = "unity_playmode_evidence.rs"]
+mod playmode_evidence;
+#[path = "unity_game_view.rs"]
+mod game_view;
+pub use game_view::run_unity_game_view_capture;
 #[cfg(test)]
 use shader_import::connected_shader_import_result;
 use shader_import::import_shaders_connected;
@@ -59,8 +65,11 @@ fn available_time(deadline_at: u64, canceled: &AtomicBool, cap: u64) -> Result<D
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    if canceled.load(Ordering::Acquire) || now >= deadline_at {
+    if canceled.load(Ordering::Acquire) {
         return Err("UNITY_OPERATION_CANCELED: no new Editor action was dispatched".to_string());
+    }
+    if now >= deadline_at {
+        return Err("UNITY_OPERATION_TIMEOUT: the Editor operation exceeded its deadline".to_string());
     }
     Ok(Duration::from_millis((deadline_at - now).min(cap * 1_000)))
 }
@@ -80,6 +89,8 @@ use crate::{
     trusted_execution::{resolve_workspace_path, TrustedShellInspection, WorkspacePathMode},
     TerminalCommandOutput, WorkspaceState,
 };
+
+use crate::mcp::stdio::StdioMcpClient;
 
 pub(crate) struct BatchReportExpectation {
     path: PathBuf,
@@ -396,6 +407,23 @@ fn reports_exact_project(project: &Path, envelope: &Value) -> bool {
         == Some(project)
 }
 
+// Newer Pipeline versions stream the Editor result without routing metadata.
+// Use that form only for a native command pinned to the project and Editor PID.
+fn playmode_command_result<'a>(project: &Path, expected_pid: u64, output: &'a Value, pid_pinned: bool) -> Option<&'a Value> {
+    if output.get("data").is_some() {
+        let target = output.pointer("/data/target")?;
+        let pid = target.get("pid").or_else(|| target.get("processId"));
+        return (output["success"] == true && reports_exact_project(project, output) &&
+            pid.is_none_or(|pid| pid.as_u64() == Some(expected_pid)))
+            .then(|| output.pointer("/data/result")).flatten();
+    }
+    if !pid_pinned || !output.is_object() || output.get("target").is_some() ||
+        output.get("projectPath").is_some() || output.get("success").is_some_and(|success| success != true) {
+        return None;
+    }
+    Some(output)
+}
+
 fn run_cli(project: &Path, label: &str, args: &[&str], timeout: Duration) -> Result<Value, String> {
     let (code, envelope) = run_cli_result(project, label, args, timeout, None)?;
     if code != 0 || envelope.get("success").and_then(Value::as_bool) != Some(true) {
@@ -421,8 +449,11 @@ fn run_cli_result(
     canceled: Option<&AtomicBool>,
 ) -> Result<(i32, Value), String> {
     let command = unity_cli_command(project, args)?;
-    let output = capture_command_output_with_cancel(command, label, None, timeout, canceled)
-        .map_err(|error| format!("UNITY_CLI_UNAVAILABLE: {label}: {error}"))?;
+    let output = capture_command_output_with_cancel(command, label, None, timeout, canceled);
+    if canceled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(format!("UNITY_OPERATION_CANCELED: {label} was interrupted."));
+    }
+    let output = output.map_err(|error| format!("UNITY_CLI_UNAVAILABLE: {label}: {error}"))?;
     if output.timed_out {
         return Err(format!("UNITY_COMMAND_TIMEOUT: {label}"));
     }
@@ -435,10 +466,10 @@ fn run_cli_result(
     Ok((output.exit_code, envelope))
 }
 
-fn unity_cli_command(project: &Path, args: &[&str]) -> Result<Command, String> {
+pub(crate) fn resolve_unity_cli(workspace: Option<&Path>) -> Result<PathBuf, String> {
     let mut command = Command::new("unity");
     apply_process_terminal_env(&mut command);
-    let executable = command
+    command
         .get_envs()
         .find_map(|(name, value)| (name == "PATH").then_some(value).flatten())
         .and_then(|path| {
@@ -447,24 +478,50 @@ fn unity_cli_command(project: &Path, args: &[&str]) -> Result<Command, String> {
                 .find_map(|dir| {
                     let path = dir.join(if cfg!(windows) { "unity.exe" } else { "unity" });
                     let path = fs::canonicalize(path).ok()?;
-                    (path.is_file() && !path.starts_with(project)).then_some(path)
+                    (path.is_file() && workspace.is_none_or(|root| !path.starts_with(root)))
+                        .then_some(path)
                 })
         })
-        .ok_or_else(|| "UNITY_CLI_UNAVAILABLE: install Unity CLI on the login PATH".to_string())?;
-    command = Command::new(executable);
+        .ok_or_else(|| "UNITY_CLI_UNAVAILABLE: install Unity CLI on the login PATH".to_string())
+}
+
+fn unity_cli_command(project: &Path, args: &[&str]) -> Result<Command, String> {
+    let executable = resolve_unity_cli(Some(project))?;
+    Ok(unity_cli_process(&executable, project, args))
+}
+
+pub(crate) fn unity_cli_process(executable: &Path, working_dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(executable);
     apply_process_terminal_env(&mut command);
     let forward = args
         .iter()
         .position(|arg| *arg == "--")
         .unwrap_or(args.len());
     command
-        .current_dir(project)
+        .current_dir(working_dir)
         .args(&args[..forward])
         .args(["--format", "json", "--non-interactive", "--no-pager"])
         .args(&args[forward..])
         .env("UNITY_NO_UPDATE_CHECK", "1");
     isolate_process_group(&mut command);
-    Ok(command)
+    command
+}
+
+pub(crate) fn parse_unity_cli_version(output: &str) -> Option<semver::Version> {
+    let envelope = serde_json::from_str::<Value>(output).ok();
+    let version = envelope
+        .as_ref()
+        .and_then(|result| result.pointer("/data/version")?.as_str())
+        .unwrap_or_else(|| output.trim());
+    (version.len() <= 96).then(|| version.parse().ok()).flatten()
+}
+
+fn unsupported_unity_mcp_cli_version(output: &str) -> Option<String> {
+    let version = parse_unity_cli_version(output)?;
+    version
+        .cmp_precedence(&semver::Version::new(1, 0, 0))
+        .is_lt()
+        .then(|| version.to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -634,6 +691,19 @@ fn editor_route(
     if project_editor_closed(project, editor, deadline_at, canceled) {
         return Ok(EditorRoute::Closed);
     }
+    if let Some(pid) = connected_editor_pid(project, editor, deadline_at, canceled)? {
+        return Ok(EditorRoute::Connected { pid });
+    }
+    Err(format!("UNITY_EDITOR_UNREACHABLE: {} {} has a project lock but its connector is unavailable. Wait for the exact Editor to become ready or close it to use batch mode.",
+        editor.name(), editor.version))
+}
+
+fn connected_editor_pid(
+    project: &Path,
+    editor: &ProjectEditor,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Option<u64>, String> {
     let project_path = project_argument(project);
     let (exit, status) = run_cli_result(
         project,
@@ -642,13 +712,11 @@ fn editor_route(
         available_time(deadline_at, canceled, 8)?,
         Some(canceled),
     )?;
-    if exit == 0 && status.get("success") == Some(&json!(true)) {
-        if let Some(pid) = exact_editor_instance(project, editor, &status) {
-            return Ok(EditorRoute::Connected { pid });
-        }
-    }
-    Err(format!("UNITY_EDITOR_UNREACHABLE: {} {} has a project lock but its connector is unavailable. Wait for the exact Editor to become ready or close it to use batch mode.",
-        editor.name(), editor.version))
+    Ok(if exit == 0 && status.get("success") == Some(&Value::Bool(true)) {
+        exact_editor_instance(project, editor, &status)
+    } else {
+        None
+    })
 }
 
 fn exact_editor_instance(project: &Path, editor: &ProjectEditor, status: &Value) -> Option<u64> {
@@ -682,6 +750,285 @@ fn exact_editor_instance(project: &Path, editor: &ProjectEditor, status: &Value)
         .or_else(|| instance.get("processId"))?
         .as_u64()
         .filter(|pid| *pid > 0)
+}
+
+const UNITY_CONSOLE_LIMIT: usize = 100;
+
+fn cli_console_result(envelope: &Value) -> Option<Value> {
+    if envelope.pointer("/data/command")?.as_str()? != "console get" {
+        return None;
+    }
+    console_snapshot_result(envelope.pointer("/data/result")?)
+}
+
+fn console_snapshot_result(result: &Value) -> Option<Value> {
+    let entries = result.get("entries")?.as_array()?;
+    let mut counts = [0, 0];
+    let items: Vec<Value> = entries
+        .iter()
+        .take(UNITY_CONSOLE_LIMIT)
+        .map(|entry| {
+            let kind = match entry.get("level")?.as_str()? {
+                "error" => {
+                    counts[0] += 1;
+                    entry
+                        .get("logType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Error")
+                }
+                "warn" => {
+                    counts[1] += 1;
+                    "Warning"
+                }
+                _ => return None,
+            };
+            let message = entry
+                .get("message")?
+                .as_str()?
+                .chars()
+                .take(2_000)
+                .collect::<String>();
+            let stack = entry
+                .get("stackTrace")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(json!({ "type": kind, "message": message, "seq": entry.get("seq").and_then(Value::as_u64),
+                "stackTrace": stack.chars().take(1_000).collect::<String>() }))
+        })
+        .collect::<Option<_>>()?;
+    let error_count = result.pointer("/counts/error").and_then(Value::as_u64);
+    let warning_count = result.pointer("/counts/warn").and_then(Value::as_u64);
+    let ground_truth = result.get("groundTruth").unwrap_or(&Value::Null);
+    // Capture coverage says how much of the retained buffer we returned.
+    // The separately sampled Editor counters do not identify its live rows.
+    let retained_window_complete = entries.len() == items.len()
+        && result.get("dropped").and_then(Value::as_bool) == Some(false)
+        && result.get("reset").and_then(Value::as_bool) == Some(false)
+        && error_count == Some(counts[0])
+        && warning_count == Some(counts[1]);
+    Some(
+        json!({ "success": true, "data": { "items": items, "cursor": 0,
+        "total": error_count.zip(warning_count).map(|(errors, warnings)| errors.saturating_add(warnings)),
+        "truncated": !retained_window_complete, "groundTruth": ground_truth,
+        "consoleEvidence": {
+            "rowSource": "retained",
+            "retainedWindowComplete": retained_window_complete,
+            "retainedErrors": error_count,
+            "retainedWarnings": warning_count,
+            "session": result.get("session").and_then(Value::as_str).filter(|value| value.len() <= 80),
+            "cursor": result.get("cursor").and_then(Value::as_u64)
+        } } }),
+    )
+}
+
+pub fn run_unity_cli_console(
+    project: &Path,
+    editor_version: &str,
+    expected_pid: Option<u64>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Value, String> {
+    let editor = ProjectEditor::read(project)?
+        .filter(|editor| editor.version == editor_version)
+        .ok_or("UNITY_CONSOLE_SCOPE_MISMATCH: this project's Editor version changed.")?;
+    inspect_editor_check_permission(project, "unity status")?;
+    inspect_editor_check_permission(project, "unity command console get")?;
+    let pid = connected_editor_pid(project, &editor, deadline_at, canceled)?
+        .filter(|pid| expected_pid.is_none_or(|expected| expected == *pid))
+        .ok_or("UNITY_CONSOLE_EDITOR_UNAVAILABLE: the exact Editor is not connected.")?;
+    let project_path = project_argument(project);
+    let pid_arg = pid.to_string();
+    let mut args = if expected_pid.is_some() {
+        vec!["command", "console", "get"]
+    } else {
+        vec!["command", "--query", "^console get$"]
+    };
+    args.extend([
+        "--project-path",
+        &project_path,
+        "--pid",
+        &pid_arg,
+        "--caller",
+        "plugin",
+        "--skill",
+        "unity-cli",
+    ]);
+    let limit = UNITY_CONSOLE_LIMIT.to_string();
+    if expected_pid.is_some() {
+        args.extend(["--", "--level", "warn", "--tail", &limit]);
+    }
+    let (exit, envelope) = run_cli_result(
+        project,
+        "Unity Console",
+        &args,
+        available_time(deadline_at, canceled, 5)?,
+        Some(canceled),
+    )?;
+    // Newer Editors stream the JSON result directly. The command is already
+    // scoped by the project and the PID verified through Unity CLI status.
+    if exit == 0 && expected_pid.is_some() && envelope.get("success").is_none() {
+        return console_snapshot_result(&envelope)
+            .ok_or_else(|| "UNITY_CONSOLE_RESULT_INVALID: missing Console entries.".into());
+    }
+    if exit != 0
+        || envelope.get("success") != Some(&Value::Bool(true))
+        || !reports_exact_project(project, &envelope)
+    {
+        return Err(
+            "UNITY_CONSOLE_UNAVAILABLE: the exact Editor did not return a Console result.".into(),
+        );
+    }
+    if expected_pid.is_some() {
+        return cli_console_result(&envelope)
+            .ok_or_else(|| "UNITY_CONSOLE_RESULT_INVALID: missing Console entries.".into());
+    }
+    let available = envelope
+        .pointer("/data/search/matches")
+        .and_then(Value::as_array)
+        .is_some_and(|matches| {
+            matches.iter().any(|command| {
+                command.get("kind").and_then(Value::as_str) == Some("pipeline")
+                    && command.get("path").and_then(Value::as_str) == Some("console get")
+            })
+        });
+    if !available {
+        return Err(
+            "UNITY_CONSOLE_UNAVAILABLE: the installed Pipeline does not expose console get.".into(),
+        );
+    }
+    Ok(json!({"editorPid": pid, "editorVersion": editor.version}))
+}
+
+/// Start a scoped stdio exchange. Each request owns its process so a failed or
+/// canceled invocation cannot leave a shared Editor selection behind.
+pub async fn run_unity_official_mcp(
+    project: PathBuf,
+    editor_version: String,
+    expected_pid: Option<u64>,
+    call: Option<Value>,
+    console_observation: bool,
+    deadline_at: u64,
+    canceled: Arc<AtomicBool>,
+) -> Result<Value, String> {
+    let cancel_prepare = canceled.clone();
+    let discovery = call.is_none();
+    let (command, pid) = tauri::async_runtime::spawn_blocking(move || {
+        let editor = ProjectEditor::read(&project)?
+            .filter(|editor| {
+                editor.tuanjie_version.is_none()
+                    && editor.version.starts_with("6000.")
+                    && editor.version == editor_version
+            })
+            .ok_or("UNITY_OFFICIAL_MCP_PROJECT_MISMATCH")?;
+        inspect_editor_check_permission(&project, "unity mcp")?;
+        if discovery {
+            let version_command = unity_cli_command(&project, &["--version"])?;
+            let timeout = available_time(deadline_at, &cancel_prepare, 2)?;
+            let unsupported = capture_command_output_with_cancel(
+                version_command,
+                "unity --version",
+                None,
+                timeout,
+                Some(&cancel_prepare),
+            )
+            .ok()
+            .filter(|output| output.exit_code == 0)
+            .and_then(|output| unsupported_unity_mcp_cli_version(&output.stdout));
+            if let Some(version) = unsupported {
+                return Err(format!("UNITY_OFFICIAL_MCP_CLI_TOO_OLD: {version}"));
+            }
+        }
+        let pid = connected_editor_pid(&project, &editor, deadline_at, &cancel_prepare)?
+            .filter(|pid| expected_pid.is_none_or(|expected| expected == *pid))
+            .ok_or("UNITY_OFFICIAL_MCP_EDITOR_UNAVAILABLE")?;
+        let command = unity_cli_command(
+            &project,
+            &[
+                "mcp",
+                "--tool-groups",
+                "--project-path",
+                &project_argument(&project),
+                "--pid",
+                &pid.to_string(),
+            ],
+        )?;
+        Ok::<_, String>((command, pid))
+    })
+    .await
+    .map_err(|_| "UNITY_OFFICIAL_MCP_PREPARE_FAILED")??;
+    let timeout = available_time(deadline_at, &canceled, 120)?;
+    let exchange = async move {
+        let mut mcp = StdioMcpClient::connect(command, "unity-mcp").await?;
+        if let Some(call) = call {
+            if expected_pid.is_none() || !call["name"].is_string() || !call["arguments"].is_object()
+            {
+                return Err("UNITY_OFFICIAL_MCP_CALL_INVALID".into());
+            }
+            if console_observation
+                && call
+                    != json!({
+                        "name": "console",
+                        "arguments": { "command": "get", "args": { "tail": UNITY_CONSOLE_LIMIT, "level": "warn" } }
+                    })
+            {
+                return Err("UNITY_OFFICIAL_MCP_CONSOLE_CALL_INVALID".into());
+            }
+            let result = mcp.request("tools/call", call).await?;
+            if !console_observation || result["isError"] == true {
+                return Ok(result);
+            }
+            let snapshot = if let Some(value) = result.get("structuredContent") {
+                console_snapshot_result(value)
+            } else {
+                result["content"]
+                    .as_array()
+                    .and_then(|blocks| match blocks.as_slice() {
+                        [block] if block["type"] == "text" => {
+                            serde_json::from_str::<Value>(block["text"].as_str()?).ok()
+                        }
+                        _ => None,
+                    })
+                    .as_ref()
+                    .and_then(console_snapshot_result)
+            }
+            .ok_or("UNITY_OFFICIAL_MCP_CONSOLE_RESULT_INVALID")?;
+            return Ok(json!({ "structuredContent": snapshot }));
+        }
+        let mut tools = Vec::new();
+        let mut params = json!({});
+        for _ in 0..8 {
+            let page = mcp.request("tools/list", params).await?;
+            let items = page["tools"]
+                .as_array()
+                .ok_or("UNITY_OFFICIAL_MCP_LIST_INVALID")?;
+            if items.len() + tools.len() > 256 {
+                return Err("UNITY_OFFICIAL_MCP_LIST_TOO_LARGE".into());
+            }
+            tools.extend(items.iter().cloned());
+            match page["nextCursor"].as_str() {
+                Some(cursor) if !cursor.is_empty() => params = json!({ "cursor": cursor }),
+                _ => return Ok(json!({"editorPid": pid, "tools": tools})),
+            }
+        }
+        Err("UNITY_OFFICIAL_MCP_LIST_TOO_LARGE".into())
+    };
+    let wait_for_cancel = async {
+        while !canceled.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    use futures_util::future::{select, Either};
+    match select(
+        Box::pin(tokio::time::timeout(timeout, exchange)),
+        Box::pin(wait_for_cancel),
+    )
+    .await
+    {
+        Either::Left((result, _)) => {
+            result.map_err(|_| "UNITY_OFFICIAL_MCP_TIMEOUT".to_string())?
+        }
+        Either::Right(_) => Err("UNITY_OPERATION_CANCELED".into()),
+    }
 }
 
 fn hub_install_root(product: &str) -> Option<PathBuf> {
@@ -1010,6 +1357,28 @@ fn compile_closed(
 const EDITOR_CHECK_TARGET_LIMIT: usize = 24;
 const EDITOR_CHECK_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityConsoleCheckBinding {
+    pub editor_version: String,
+    pub editor_pid: u64,
+}
+
+fn is_unity_asset_path(path: &Path) -> bool {
+    let Some(std::path::Component::Normal(first)) = path.components().next() else { return false };
+    first.to_str().is_some_and(|part| {
+        if cfg!(windows) {
+            part.eq_ignore_ascii_case("Assets") || part.eq_ignore_ascii_case("Packages")
+        } else {
+            matches!(part, "Assets" | "Packages")
+        }
+    })
+}
+
+fn same_lexical_path(left: &Path, right: &Path) -> bool {
+    left == right || cfg!(windows) && left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
 fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value>, String> {
     if targets.len() > EDITOR_CHECK_TARGET_LIMIT {
         return Err("UNITY_CHECK_TARGET_LIMIT".to_string());
@@ -1023,7 +1392,7 @@ fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value
                 .and_then(|ext| ext.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if !(relative.starts_with("Assets") || relative.starts_with("Packages"))
+            if !is_unity_asset_path(relative)
                 || !relative
                     .components()
                     .all(|part| matches!(part, std::path::Component::Normal(_)))
@@ -1037,7 +1406,7 @@ fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value
             let resolved =
                 resolve_workspace_path(project, relative, WorkspacePathMode::AllowMissing)
                     .map_err(|_| "UNITY_CHECK_TARGET_UNAVAILABLE".to_string())?;
-            if resolved.path() != project.join(relative) {
+            if !same_lexical_path(resolved.path(), &project.join(relative)) {
                 return Err("UNITY_INVALID_CHECK_TARGET".to_string());
             }
             let version = match fs::File::open(resolved.path()) {
@@ -1059,6 +1428,114 @@ fn editor_check_versions(project: &Path, targets: &[String]) -> Result<Vec<Value
         .collect()
 }
 
+fn unity_fragment_source(project: &Path, targets: &[String]) -> bool {
+    // Check the admitted sources, since Assets is also common outside Unity.
+    static UNITY_SOURCE: OnceLock<Regex> = OnceLock::new();
+    let unity_source = UNITY_SOURCE.get_or_init(|| {
+        Regex::new(r"(?m)(?:^\s*(?:global\s+)?using\s+Unity(?:Engine|Editor)\b|\bUnity(?:Engine|Editor)\.|:\s*(?:MonoBehaviour|ScriptableObject)\b|^\s*Shader\s+\x22)").unwrap()
+    });
+    targets.iter().take(32).any(|target| {
+        let path = Path::new(target);
+        if !is_unity_asset_path(path) {
+            return false;
+        }
+        let Ok(source) = resolve_workspace_path(project, path, WorkspacePathMode::Existing) else {
+            return false;
+        };
+        if !source.path().is_file() {
+            return false;
+        }
+        let Ok(file) = fs::File::open(source.path()) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file.take(32 * 1024).read_to_end(&mut bytes).is_err() {
+            return false;
+        }
+        let source = String::from_utf8_lossy(&bytes);
+        if matches!(path.extension().and_then(|ext| ext.to_str()), Some("asmdef" | "asmref")) {
+            return serde_json::from_str::<Value>(&source).is_ok_and(|descriptor| {
+                descriptor.get("name").is_some() || descriptor.get("reference").is_some()
+            });
+        }
+        unity_source.is_match(&source)
+    })
+}
+
+fn csharp_target_project(workspace: &Path, target: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(target);
+    if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return Err("UNITY_INVALID_CHECK_TARGET".into());
+    }
+    let trusted = resolve_workspace_path(workspace, relative, WorkspacePathMode::AllowMissing)
+        .map_err(|_| "UNITY_CHECK_TARGET_UNAVAILABLE".to_string())?;
+    if !same_lexical_path(trusted.path(), &workspace.join(relative)) {
+        return Err("UNITY_INVALID_CHECK_TARGET".into());
+    }
+    let mut fragment_root = None;
+    for ancestor in trusted.path().ancestors().skip(1).take_while(|path| path.starts_with(workspace)) {
+        let inside = trusted.path().strip_prefix(ancestor).map_err(|_| "UNITY_INVALID_CHECK_TARGET")?;
+        if !is_unity_asset_path(inside) {
+            continue;
+        }
+        if ProjectEditor::read(ancestor)?.is_some() {
+            return Ok(ancestor.to_path_buf());
+        }
+        fragment_root.get_or_insert_with(|| ancestor.to_path_buf());
+    }
+    fragment_root.ok_or_else(|| "UNITY_INVALID_CHECK_TARGET".into())
+}
+
+fn run_scoped_csharp_check(
+    workspace: &Path,
+    defer_closed: bool,
+    targets: &[String],
+    expected_versions: &HashMap<String, Option<String>>,
+    console_binding: Option<&UnityConsoleCheckBinding>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Value, String> {
+    available_time(deadline_at, canceled, 1)?;
+    if targets.len() > EDITOR_CHECK_TARGET_LIMIT {
+        return Err("UNITY_CHECK_TARGET_LIMIT".into());
+    }
+    let mut projects = targets.iter().map(|target| csharp_target_project(workspace, target));
+    let project = projects.next().transpose()?.unwrap_or_else(|| workspace.to_path_buf());
+    for candidate in projects {
+        if candidate? != project {
+            return Ok(json!({"status": "unavailable", "kind": "csharp",
+                "message": "UNITY_MULTIPLE_PROJECT_TARGETS: C# changes span multiple Unity project roots. Verify each admitted project separately."}));
+        }
+    }
+    let root = super::portable_relative_path(project.strip_prefix(workspace).map_err(|_| "UNITY_INVALID_PROJECT_ROOT")?)
+        .ok_or_else(|| "UNITY_INVALID_PROJECT_ROOT".to_string())?;
+    let root = if cfg!(windows) { root.to_ascii_lowercase() } else { root };
+    let relative = |target: &str| -> Result<String, String> {
+        let path = if root == "." { Some(target) } else { target.strip_prefix(&root).and_then(|suffix| suffix.strip_prefix('/')) };
+        path.map(str::to_string).ok_or_else(|| "UNITY_INVALID_CHECK_TARGET".to_string())
+    };
+    let local_targets = targets.iter().map(|target| relative(target)).collect::<Result<Vec<_>, _>>()?;
+    let local_versions = expected_versions.iter().map(|(target, version)| {
+        Ok((relative(target)?, version.clone()))
+    }).collect::<Result<HashMap<_, _>, String>>()?;
+    let mut output = run_editor_check_in_workspace(workspace, &project, defer_closed, "csharp", &local_targets, &local_versions, None, console_binding, deadline_at, canceled)
+        .unwrap_or_else(|message| json!({"status": "unavailable", "kind": "csharp", "message": message}));
+    if root != "." {
+        for (list, field) in [("targets", "path"), ("diagnostics", "file")] {
+            if let Some(items) = output.get_mut(list).and_then(Value::as_array_mut) {
+                for item in items {
+                    if let Some(path) = item.get(field).and_then(Value::as_str).filter(|path| is_unity_asset_path(Path::new(path))) {
+                        item[field] = json!(format!("{root}/{path}"));
+                    }
+                }
+            }
+        }
+    }
+    output["projectRoot"] = json!(root);
+    Ok(output)
+}
+
+#[cfg(test)]
 fn run_editor_check(
     project: &Path,
     defer_closed: bool,
@@ -1069,10 +1546,35 @@ fn run_editor_check(
     deadline_at: u64,
     canceled: &AtomicBool,
 ) -> Result<Value, String> {
+    run_editor_check_in_workspace(project, project, defer_closed, kind, targets, expected_versions,
+        shader_import_targets, None, deadline_at, canceled)
+}
+
+fn run_editor_check_in_workspace(
+    workspace: &Path,
+    project: &Path,
+    defer_closed: bool,
+    kind: &str,
+    targets: &[String],
+    expected_versions: &HashMap<String, Option<String>>,
+    shader_import_targets: Option<&[String]>,
+    console_binding: Option<&UnityConsoleCheckBinding>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Value, String> {
     available_time(deadline_at, canceled, 1)?;
     let Some(editor) = ProjectEditor::read(project)? else {
+        if unity_fragment_source(project, targets) {
+            return Ok(json!({
+                "status": "project_fragment", "kind": kind,
+                "message": "UNITY_PROJECT_FRAGMENT: Unity source is present, but ProjectSettings/ProjectVersion.txt is missing from the admitted workspace. No Editor compilation or import was run."
+            }));
+        }
         return Ok(json!({"status":"not_unity_project", "kind":kind}));
     };
+    if console_binding.is_some_and(|binding| project != workspace || binding.editor_version != editor.version) {
+        return Err("UNITY_EDITOR_INSTANCE_CHANGED: the checked project differs from the Console binding.".into());
+    }
     let before = editor_check_versions(project, targets)?;
     if expected_versions.iter().any(|(path, expected)| {
         !before.iter().any(|target| {
@@ -1082,14 +1584,21 @@ fn run_editor_check(
     }) {
         return Ok(json!({
             "status":"unavailable", "kind":kind,
-            "message":"UNITY_CHECK_TARGET_CHANGED: checked bytes differ from the committed mutation."
+            "message":"UNITY_CHECK_TARGET_CHANGED: checked bytes differ from the expected version."
         }));
+    }
+    if workspace != project {
+        inspect_editor_check_permission(workspace, "unity status")?;
+        inspect_editor_check_permission(project, "unity status")?;
     }
     let route = editor_route(project, &editor, deadline_at, canceled)?;
     let pid = match route {
         EditorRoute::Connected { pid } => Some(pid),
         EditorRoute::Closed => None,
     };
+    if console_binding.is_some_and(|binding| Some(binding.editor_pid) != pid) {
+        return Err("UNITY_EDITOR_INSTANCE_CHANGED: the Console's Editor process is no longer connected.".into());
+    }
     if defer_closed && pid.is_none() {
         return Ok(
             json!({"status":"deferred_closed", "editor":"closed", "kind":kind, "targets":before}),
@@ -1134,12 +1643,26 @@ fn run_editor_check(
             "unity run ."
         };
         inspect_editor_check_permission(project, operation)?;
+        if workspace != project {
+            inspect_editor_check_permission(workspace, operation)?;
+        }
         match pid {
-            Some(_) => compile_connected(project, deadline_at, canceled),
+            Some(pid) => compile_connected(project, deadline_at, canceled).map(|mut result| {
+                if console_binding.is_some() && result["status"] == "passed" {
+                    if let Some(playmode) = playmode_evidence::affected_playmode(project, pid, targets, deadline_at, canceled) {
+                        result["playMode"] = playmode;
+                    }
+                }
+                result
+            }),
             None => compile_closed(project, &editor, deadline_at, canceled),
         }
     };
     let mut result = match outcome {
+        Ok(_) if !ProjectEditor::read(project)?.is_some_and(|current|
+            current.version == editor.version && current.tuanjie_version == editor.tuanjie_version) => {
+            json!({"status":"unavailable", "message":"UNITY_PROJECT_VERSION_CHANGED: the project's Editor version changed during validation."})
+        }
         Ok(result) if editor_check_versions(project, targets)? == before => {
             if let Some(pid) = pid {
                 if !matches!(editor_route(project, &editor, deadline_at, canceled), Ok(EditorRoute::Connected { pid: current }) if current == pid)
@@ -1214,12 +1737,25 @@ pub(crate) fn run_live_playmode(
     filter: &str,
     timeout: Duration,
     canceled: Option<&AtomicBool>,
+    pinned_start_pid: Option<u64>,
     start: impl FnOnce(Duration) -> Result<TerminalCommandOutput, String>,
 ) -> Result<TerminalCommandOutput, String> {
     if project != directory {
         return Err("UNITY_PLAYMODE_PROJECT_SCOPE: run the reviewed check from the exact Unity workspace root".to_string());
     }
     let started = Instant::now();
+    let deadline_at = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default() + timeout).as_millis() as u64;
+    let never_canceled = AtomicBool::new(false);
+    let guard = canceled.unwrap_or(&never_canceled);
+    let Some(editor) = ProjectEditor::read(project)? else {
+        return Err("UNITY_PROJECT_REQUIRED: no bound test project".to_string());
+    };
+    let EditorRoute::Connected { pid } = editor_route(project, &editor, deadline_at, guard)? else {
+        return Err("UNITY_EDITOR_INSTANCE_CHANGED: no connected PlayMode Editor.".to_string());
+    };
+    if pinned_start_pid.is_some_and(|expected| expected != pid) {
+        return Err("UNITY_EDITOR_INSTANCE_CHANGED: the bound PlayMode Editor changed.".to_string());
+    }
     let remaining = || {
         if canceled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             Duration::ZERO
@@ -1228,9 +1764,12 @@ pub(crate) fn run_live_playmode(
         }
     };
     let project_arg = project_argument(project);
+    let pid_arg = pid.to_string();
     let common = [
         "--project-path",
         &project_arg,
+        "--pid",
+        &pid_arg,
         "--caller",
         "plugin",
         "--skill",
@@ -1240,17 +1779,16 @@ pub(crate) fn run_live_playmode(
         .into_iter()
         .chain(common)
         .collect::<Vec<_>>();
-    let status = run_cli(
+    let (status_exit, status) = run_cli_result(
         project,
         "unity test status",
         &query,
         remaining().min(Duration::from_secs(8)),
+        canceled,
     )?;
-    if !reports_exact_project(project, &status)
+    if status_exit != 0
         || !matches!(
-            status
-                .pointer("/data/result/status")
-                .and_then(Value::as_str),
+            playmode_command_result(project, pid, &status, true).and_then(|result| result.get("status")).and_then(Value::as_str),
             Some("no_tests" | "completed" | "error")
         )
     {
@@ -1264,17 +1802,15 @@ pub(crate) fn run_live_playmode(
         .into_iter()
         .chain(common)
         .collect::<Vec<_>>();
-    let editor = run_cli(
+    let (readiness_exit, readiness) = run_cli_result(
         project,
         "unity Editor readiness",
         &query,
         remaining().min(Duration::from_secs(8)),
+        canceled,
     )?;
-    if !reports_exact_project(project, &editor)
-        || editor
-            .pointer("/data/result/result")
-            .and_then(Value::as_bool)
-            != Some(false)
+    if readiness_exit != 0 || playmode_command_result(project, pid, &readiness, true)
+        .and_then(|result| result.get("result")).and_then(Value::as_bool) != Some(false)
         || remaining().is_zero()
     {
         return Err(
@@ -1288,15 +1824,13 @@ pub(crate) fn run_live_playmode(
         .and_then(|metadata| metadata.modified().ok());
     let invoked = SystemTime::now();
     let mut output = start(remaining())?;
-    if !output.success {
+    if !output.success || output.stdout_truncated {
         return Ok(output);
     }
-    let envelope = serde_json::from_str::<Value>(&output.stdout)
-        .ok()
-        .filter(|envelope| reports_exact_project(project, envelope));
+    let envelope = serde_json::from_str::<Value>(&output.stdout).ok();
     let ack = envelope
         .as_ref()
-        .and_then(|envelope| envelope.pointer("/data/result"));
+        .and_then(|envelope| playmode_command_result(project, pid, envelope, pinned_start_pid == Some(pid)));
     let filter_applied = ack
         .as_ref()
         .and_then(|result| result.get("FilterApplied"))
@@ -1326,6 +1860,10 @@ pub(crate) fn run_live_playmode(
         if let Some(mut report) = fresh_live_report(project, &status_path, before, invoked) {
             match report.get("status").and_then(Value::as_str) {
                 Some("completed") => {
+                    if !ProjectEditor::read(project)?.is_some_and(|current| current.version == editor.version && current.tuanjie_version == editor.tuanjie_version) ||
+                        !matches!(editor_route(project, &editor, deadline_at, guard)?, EditorRoute::Connected { pid: current } if current == pid) {
+                        return Err("UNITY_EDITOR_INSTANCE_CHANGED: the PlayMode report's Editor could not be revalidated.".to_string());
+                    }
                     report["success"] = json!(true);
                     report["mode"] = json!("PlayMode");
                     report["filterApplied"] = json!(format!("testname: {filter}"));
@@ -1360,15 +1898,13 @@ fn managed_playmode_filter(command: &str) -> Option<&str> {
     (unity.eq_ignore_ascii_case("unity")
         && test.eq_ignore_ascii_case("test")
         && mode.eq_ignore_ascii_case("playmode")
-        && filter.len() <= 200
-        && filter
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-        && filter
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_')))
+        && valid_playmode_filter(filter))
     .then_some(*filter)
+}
+
+fn valid_playmode_filter(filter: &str) -> bool {
+    filter.len() <= 200 && filter.as_bytes().first().is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') &&
+        filter.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+'))
 }
 
 fn test_project_playmode(
@@ -1379,21 +1915,21 @@ fn test_project_playmode(
 ) -> Result<TerminalCommandOutput, String> {
     let editor = ProjectEditor::read(project)?
         .ok_or_else(|| "UNITY_PROJECT_REQUIRED: ProjectVersion.txt is unavailable".to_string())?;
-    if matches!(
-        editor_route(project, &editor, deadline_at, canceled)?,
-        EditorRoute::Connected { .. }
-    ) {
+    if let EditorRoute::Connected { pid } = editor_route(project, &editor, deadline_at, canceled)? {
         let compilation = compile_connected(project, deadline_at, canceled)?;
         if compilation.get("status").and_then(Value::as_str) != Some("passed") {
             return Err(format!("UNITY_COMPILE_FAILED: {compilation}"));
         }
         let project_path = project_argument(project);
+        let pid_arg = pid.to_string();
         let args = [
             "command",
             "test",
             "run",
             "--project-path",
             &project_path,
+            "--pid",
+            &pid_arg,
             "--caller",
             "plugin",
             "--skill",
@@ -1413,6 +1949,7 @@ fn test_project_playmode(
             filter,
             available_time(deadline_at, canceled, 100)?,
             Some(canceled),
+            Some(pid),
             |remaining| {
                 capture_command_output_with_cancel(
                     process,
@@ -1701,21 +2238,35 @@ pub async fn unity_create_scene(
 pub async fn unity_probe_editor(
     state: State<'_, WorkspaceState>,
     workspace: String,
+    project_root: Option<String>,
     operation_id: String,
     deadline_at: u64,
 ) -> Result<Value, String> {
     if workspace.trim().is_empty() {
         return Err("UNITY_PROJECT_REQUIRED".to_string());
     }
-    let project = resolve_workspace_root(&state, Some(workspace))?;
+    let workspace = resolve_workspace_root(&state, Some(workspace))?;
     let canceled = editor_cancellation(&operation_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let result = (|| {
-            let Some(editor) = ProjectEditor::read(&project)? else {
+            let requested = Path::new(project_root.as_deref().unwrap_or("."));
+            if requested.is_absolute() {
+                return Err("UNITY_INVALID_PROJECT_ROOT".into());
+            }
+            let project = resolve_workspace_path(&workspace, requested, WorkspacePathMode::Existing)
+                .map_err(|_| "UNITY_INVALID_PROJECT_ROOT".to_string())?;
+            let project = project.path();
+            if !same_lexical_path(project, &workspace.join(requested)) {
+                return Err("UNITY_INVALID_PROJECT_ROOT".into());
+            }
+            let Some(editor) = ProjectEditor::read(project)? else {
                 return Ok(json!({"route": "unavailable"}));
             };
-            inspect_editor_check_permission(&project, "unity status")?;
-            let route = editor_route(&project, &editor, deadline_at, &canceled)?;
+            inspect_editor_check_permission(&workspace, "unity status")?;
+            if project != workspace {
+                inspect_editor_check_permission(project, "unity status")?;
+            }
+            let route = editor_route(project, &editor, deadline_at, &canceled)?;
             Ok(match route {
                 EditorRoute::Connected { pid } => json!({"route": "connected", "pid": pid, "version": editor.version}),
                 EditorRoute::Closed => json!({"route": "closed", "version": editor.version}),
@@ -1731,14 +2282,11 @@ pub async fn unity_probe_editor(
 }
 
 #[tauri::command]
-pub async fn unity_compile_project(
+pub async fn unity_cli_console(
     state: State<'_, WorkspaceState>,
     workspace: String,
-    defer_closed: bool,
-    check_kind: Option<String>,
-    targets: Option<Vec<String>>,
-    expected_versions: Option<HashMap<String, Option<String>>>,
-    shader_import_targets: Option<Vec<String>>,
+    editor_version: String,
+    expected_pid: Option<u64>,
     operation_id: String,
     deadline_at: u64,
 ) -> Result<Value, String> {
@@ -1748,20 +2296,141 @@ pub async fn unity_compile_project(
     let project = resolve_workspace_root(&state, Some(workspace))?;
     let canceled = editor_cancellation(&operation_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let kind = check_kind.as_deref().unwrap_or("csharp");
-        let result = match kind {
-            "csharp" | "shader_import" => run_editor_check(
-                &project,
-                defer_closed,
-                kind,
-                targets.as_deref().unwrap_or_default(),
-                &expected_versions.unwrap_or_default(),
-                shader_import_targets.as_deref(),
-                deadline_at,
-                &canceled,
-            ),
-            _ => Err("UNITY_INVALID_CHECK_KIND".to_string()),
-        };
+        let result = run_unity_cli_console(
+            &project,
+            &editor_version,
+            expected_pid,
+            deadline_at,
+            &canceled,
+        );
+        if let Ok(mut active) = editor_cancellations().lock() {
+            active.remove(&operation_id);
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("UNITY_CONSOLE_TASK_FAILED: {error}"))?
+}
+
+#[tauri::command]
+pub async fn capture_unity_game_view(
+    state: State<'_, WorkspaceState>,
+    workspace: String,
+    operation_id: Option<String>,
+    deadline_at: Option<u64>,
+) -> Result<Value, String> {
+    if workspace.trim().is_empty() {
+        return Ok(game_view::unavailable("Open the Unity project in MAIN before capturing Game View."));
+    }
+    let project = resolve_workspace_root(&state, Some(workspace))?;
+    let canceled = match operation_id.as_deref() {
+        Some(operation_id) => editor_cancellation(operation_id)?,
+        None => Arc::new(AtomicBool::new(false)),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_unity_game_view_capture(&project, deadline_at, &canceled);
+        if let Some(operation_id) = operation_id {
+            if let Ok(mut active) = editor_cancellations().lock() {
+                active.remove(&operation_id);
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("UNITY_GAME_VIEW_TASK_FAILED: {error}"))
+}
+
+#[tauri::command]
+pub async fn unity_official_mcp(
+    state: State<'_, WorkspaceState>,
+    workspace: String,
+    editor_version: String,
+    expected_pid: Option<u64>,
+    call: Option<Value>,
+    console_observation: Option<bool>,
+    operation_id: String,
+    deadline_at: u64,
+) -> Result<Value, String> {
+    if workspace.trim().is_empty() {
+        return Err("UNITY_PROJECT_REQUIRED: no admitted workspace".into());
+    }
+    let project = resolve_workspace_root(&state, Some(workspace))?;
+    let canceled = editor_cancellation(&operation_id)?;
+    let result = run_unity_official_mcp(
+        project,
+        editor_version,
+        expected_pid,
+        call,
+        console_observation.unwrap_or(false),
+        deadline_at,
+        canceled,
+    )
+    .await;
+    if let Ok(mut active) = editor_cancellations().lock() {
+        active.remove(&operation_id);
+    }
+    result
+}
+
+pub fn run_unity_compile_project(
+    project: &Path,
+    defer_closed: bool,
+    kind: &str,
+    targets: &[String],
+    expected_versions: &HashMap<String, Option<String>>,
+    shader_import_targets: Option<&[String]>,
+    console_binding: Option<&UnityConsoleCheckBinding>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<Value, String> {
+    match kind {
+        "csharp" => run_scoped_csharp_check(project, defer_closed, targets, expected_versions,
+            console_binding, deadline_at, canceled),
+        "csharp_baseline" => {
+            let binding = console_binding
+                .filter(|binding| binding.editor_pid > 0 && !binding.editor_version.trim().is_empty())
+                .ok_or("UNITY_BASELINE_BINDING_REQUIRED: a live project Editor binding is required.")?;
+            // Retained Console rows only suggest source paths. The bound Editor
+            // can still report current compiler diagnostics if no path was found.
+            if targets.iter().any(|target| {
+                let path = Path::new(target);
+                !is_unity_asset_path(path)
+                    || !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("cs"))
+            }) {
+                return Err("UNITY_INVALID_BASELINE_TARGET: expected Unity C# source paths.".into());
+            }
+            run_scoped_csharp_check(project, true, targets, expected_versions,
+                Some(binding), deadline_at, canceled)
+        }
+        "shader_import" => run_editor_check_in_workspace(project, project, defer_closed, kind, targets,
+            expected_versions, shader_import_targets, console_binding, deadline_at, canceled),
+        _ => Err("UNITY_INVALID_CHECK_KIND".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn unity_compile_project(
+    state: State<'_, WorkspaceState>,
+    workspace: String,
+    defer_closed: bool,
+    check_kind: Option<String>,
+    targets: Option<Vec<String>>,
+    expected_versions: Option<HashMap<String, Option<String>>>,
+    shader_import_targets: Option<Vec<String>>,
+    console_binding: Option<UnityConsoleCheckBinding>,
+    operation_id: String,
+    deadline_at: u64,
+) -> Result<Value, String> {
+    if workspace.trim().is_empty() {
+        return Err("UNITY_PROJECT_REQUIRED: no admitted workspace".to_string());
+    }
+    let project = resolve_workspace_root(&state, Some(workspace))?;
+    let canceled = editor_cancellation(&operation_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = run_unity_compile_project(
+            &project, defer_closed, check_kind.as_deref().unwrap_or("csharp"), targets.as_deref().unwrap_or_default(),
+            &expected_versions.unwrap_or_default(), shader_import_targets.as_deref(), console_binding.as_ref(), deadline_at, &canceled,
+        );
         if let Ok(mut active) = editor_cancellations().lock() {
             active.remove(&operation_id);
         }
@@ -1777,6 +2446,8 @@ pub async fn unity_test_project(
     workspace: String,
     approved_command: String,
     permission_approval: Option<crate::harness::permissions::ShellPermissionApproval>,
+    console_binding: Option<UnityConsoleCheckBinding>,
+    expected_versions: Option<HashMap<String, Option<String>>>,
     operation_id: String,
     deadline_at: u64,
 ) -> Result<TerminalCommandOutput, String> {
@@ -1786,19 +2457,51 @@ pub async fn unity_test_project(
     let project = resolve_workspace_root(&state, Some(workspace))?;
     let canceled = editor_cancellation(&operation_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let result = (|| {
-            let filter = managed_playmode_filter(&approved_command)
-                .ok_or_else(|| "UNITY_PLAYMODE_COMMAND_INVALID: expected the reviewed exact project PlayMode command".to_string())?;
-            crate::harness::permissions::PermissionGuard::from_workspace(&project)
-                .and_then(|guard| guard.validate_with_approval(&approved_command, permission_approval.as_ref()))
-                .map_err(|error| error.to_string())?;
-            test_project_playmode(&project, filter, deadline_at, &canceled)
-        })();
+        let result = run_unity_test_project(&project, &approved_command, permission_approval.as_ref(), console_binding.as_ref(),
+            expected_versions.as_ref(), deadline_at, &canceled);
         if let Ok(mut active) = editor_cancellations().lock() {
             active.remove(&operation_id);
         }
         result
     }).await.map_err(|error| format!("UNITY_PLAYMODE_TASK_FAILED: {error}"))?
+}
+
+#[doc(hidden)]
+pub fn run_unity_test_project(
+    project: &Path,
+    approved_command: &str,
+    permission_approval: Option<&crate::harness::permissions::ShellPermissionApproval>,
+    console_binding: Option<&UnityConsoleCheckBinding>,
+    expected_versions: Option<&HashMap<String, Option<String>>>,
+    deadline_at: u64,
+    canceled: &AtomicBool,
+) -> Result<TerminalCommandOutput, String> {
+    let filter = managed_playmode_filter(approved_command)
+        .ok_or_else(|| "UNITY_PLAYMODE_COMMAND_INVALID: expected the reviewed exact project PlayMode command".to_string())?;
+    crate::harness::permissions::PermissionGuard::from_workspace(project)
+        .and_then(|guard| guard.validate_with_approval(approved_command, permission_approval))
+        .map_err(|error| error.to_string())?;
+    let verify = || {
+        if let Some(binding) = console_binding {
+            let editor = ProjectEditor::read(project)?.ok_or("UNITY_PROJECT_REQUIRED: no bound test project")?;
+            if editor.version != binding.editor_version ||
+                !matches!(editor_route(project, &editor, deadline_at, canceled)?, EditorRoute::Connected { pid } if pid == binding.editor_pid) {
+                return Err("UNITY_EDITOR_INSTANCE_CHANGED: the bound PlayMode Editor changed.".to_string());
+            }
+        }
+        if let Some(versions) = expected_versions {
+            let targets: Vec<String> = versions.keys().cloned().collect();
+            if editor_check_versions(project, &targets)?.iter().any(|target| {
+                target.get("path").and_then(Value::as_str).and_then(|path| versions.get(path))
+                    .is_none_or(|expected| target.get("version") != Some(&json!(expected)))
+            }) { return Err("UNITY_CHECK_TARGET_CHANGED: a file changed around PlayMode verification.".to_string()); }
+        }
+        Ok(())
+    };
+    verify()?;
+    let output = test_project_playmode(project, filter, deadline_at, canceled)?;
+    verify()?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1810,6 +2513,157 @@ mod tests {
 <test-run total="1" passed="1" failed="0" skipped="0" inconclusive="0" result="Passed">
   <test-suite><test-case result="Passed" fullname="Fixture.SceneLoads" /></test-suite>
 </test-run>"#;
+
+    #[test]
+    fn identifies_cli_versions_that_predate_official_mcp_tool_groups() {
+        assert_eq!(
+            unsupported_unity_mcp_cli_version("1.0.0-beta.14\n").as_deref(),
+            Some("1.0.0-beta.14")
+        );
+        assert_eq!(
+            unsupported_unity_mcp_cli_version(r#"{"data":{"version":"0.9.0"}}"#).as_deref(),
+            Some("0.9.0")
+        );
+        for output in [
+            "1.0.0+build",
+            r#"{"data":{"version":"1.1.0"}}"#,
+            "1.2.0-beta.4",
+            "unknown version format",
+        ] {
+            assert!(unsupported_unity_mcp_cli_version(output).is_none(), "{output}");
+        }
+    }
+
+    #[test]
+    fn cli_console_reports_retained_coverage_separately_from_editor_counts() {
+        let mut envelope = json!({"data": {"command": "console get", "result": {
+            "entries": [
+                {"level": "error", "logType": "Error", "message": "Assets/Fixture.cs(3,7): error CS1002: ; expected", "seq": 4},
+                {"level": "warn", "message": "Fixture warning"}
+            ],
+            "session": "fixture", "cursor": 5,
+            "counts": {"error": 1, "warn": 1},
+            "dropped": false,
+            "reset": false,
+            "groundTruth": {"compiling": false, "seeded": true, "consoleErrors": 1, "consoleWarnings": 1}
+        }}});
+        let result = cli_console_result(&envelope).unwrap();
+        assert_eq!(result.pointer("/data/truncated"), Some(&Value::Bool(false)));
+        assert_eq!(result.pointer("/data/consoleEvidence"), Some(&json!({
+            "rowSource": "retained", "retainedWindowComplete": true, "retainedErrors": 1,
+            "retainedWarnings": 1, "session": "fixture", "cursor": 5
+        })));
+        assert_eq!(result.pointer("/data/items/0/seq"), Some(&json!(4)));
+        assert_eq!(
+            result.pointer("/data/items/1/type").and_then(Value::as_str),
+            Some("Warning")
+        );
+
+        envelope["data"]["result"]["groundTruth"]["consoleErrors"] = json!(0);
+        let current = cli_console_result(&envelope).unwrap();
+        assert_eq!(current.pointer("/data/truncated"), Some(&Value::Bool(false)));
+        assert_eq!(current.pointer("/data/groundTruth/consoleErrors"), Some(&json!(0)));
+        envelope["data"]["result"]["dropped"] = json!(true);
+        assert_eq!(cli_console_result(&envelope).unwrap().pointer("/data/truncated"), Some(&Value::Bool(true)));
+        envelope["data"]["result"]["entries"] = json!([{"level": "error"}]);
+        assert!(cli_console_result(&envelope).is_none());
+    }
+
+    #[test]
+    fn unity_source_fragment_returns_no_compiler_verdict_for_service_base_fixture() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        fs::create_dir_all(root.join("Assets")).unwrap();
+        let source = "Assets/ServiceBase.cs".to_string();
+        fs::write(root.join(&source), "namespace Fixture { class ServiceBase : MonoBehaviour {} }").unwrap();
+        let canceled = AtomicBool::new(false);
+        let result = run_editor_check(&root, false, "csharp", std::slice::from_ref(&source), &HashMap::new(), None, u64::MAX, &canceled).unwrap();
+        assert_eq!(result["status"], "project_fragment");
+        assert!(result.get("editor").is_none());
+        assert!(result.get("errorCount").is_none());
+        fs::write(root.join(&source), "namespace Fixture { class ServiceBase {} }").unwrap();
+        let ordinary = run_editor_check(&root, false, "csharp", &[source], &HashMap::new(), None, u64::MAX, &canceled).unwrap();
+        assert_eq!(ordinary["status"], "not_unity_project");
+    }
+
+    #[test]
+    fn nested_unity_check_binds_the_exact_project_before_editor_dispatch() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let target = "Game/Assets/Player.cs".to_string();
+        let other = "Other/Assets/Player.cs".to_string();
+        for project in ["Game", "Other"] {
+            fs::create_dir_all(root.join(project).join("ProjectSettings")).unwrap();
+            fs::create_dir_all(root.join(project).join("Assets")).unwrap();
+            fs::write(root.join(project).join("ProjectSettings/ProjectVersion.txt"), "m_EditorVersion: 6000.6.5f1\n").unwrap();
+            fs::write(root.join(project).join("Assets/Player.cs"), "using UnityEngine; class Player : MonoBehaviour {}").unwrap();
+        }
+        assert_eq!(csharp_target_project(&root, &target).unwrap(), root.join("Game"));
+        let canceled = AtomicBool::new(false);
+        let stale = HashMap::from([(target.clone(), Some(format!("sha256-{}", "a".repeat(64))))]);
+        let bound = run_scoped_csharp_check(&root, false, std::slice::from_ref(&target), &stale, None, u64::MAX, &canceled).unwrap();
+        assert_eq!(bound["projectRoot"], "Game");
+        assert_eq!(bound["status"], "unavailable");
+        assert!(bound["message"].as_str().unwrap().starts_with("UNITY_CHECK_TARGET_CHANGED:"));
+        let editor = UnityConsoleCheckBinding { editor_version: "6000.6.5f1".into(), editor_pid: 42 };
+        let wrong_root = run_unity_compile_project(
+            &root, false, "csharp", std::slice::from_ref(&target), &HashMap::new(),
+            None, Some(&editor), u64::MAX, &canceled,
+        ).unwrap();
+        assert_eq!(wrong_root["status"], "unavailable");
+        assert!(wrong_root["message"].as_str().unwrap().starts_with("UNITY_EDITOR_INSTANCE_CHANGED:"));
+        let wrong_version = UnityConsoleCheckBinding { editor_version: "6000.6.5f2".into(), editor_pid: 42 };
+        let drift = run_unity_compile_project(
+            &root.join("Game"), false, "csharp", &["Assets/Player.cs".into()], &HashMap::new(),
+            None, Some(&wrong_version), u64::MAX, &canceled,
+        ).unwrap();
+        assert_eq!(drift["status"], "unavailable");
+        assert!(drift["message"].as_str().unwrap().starts_with("UNITY_EDITOR_INSTANCE_CHANGED:"));
+        let mixed = run_scoped_csharp_check(&root, false, &[target, other], &HashMap::new(), None, u64::MAX, &canceled).unwrap();
+        assert!(mixed["message"].as_str().unwrap().starts_with("UNITY_MULTIPLE_PROJECT_TARGETS:"));
+        assert!(csharp_target_project(&root, "../Game/Assets/Player.cs").is_err());
+    }
+
+    #[test]
+    fn compiler_baseline_requires_a_binding_and_scopes_optional_source_hints() {
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fs::canonicalize(fixture.path()).unwrap();
+        fs::create_dir_all(project.join("ProjectSettings")).unwrap();
+        fs::create_dir_all(project.join("Assets")).unwrap();
+        fs::write(project.join("ProjectSettings/ProjectVersion.txt"), "m_EditorVersion: 6000.6.5f1\n").unwrap();
+        fs::write(project.join("Assets/Player.cs"), "class Player {}").unwrap();
+        let canceled = AtomicBool::new(false);
+        let check = |targets: &[String], expected: &HashMap<String, Option<String>>, binding: Option<&UnityConsoleCheckBinding>| {
+            run_unity_compile_project(&project, false, "csharp_baseline", targets, expected,
+                None, binding, u64::MAX, &canceled)
+        };
+        let empty = HashMap::new();
+        assert!(check(&[], &empty, None).unwrap_err().starts_with("UNITY_BASELINE_BINDING_REQUIRED:"));
+        let original = UnityConsoleCheckBinding { editor_version: "6000.6.5f1".into(), editor_pid: 42 };
+        assert!(check(&["Assets/Tests.asmdef".into()], &empty, Some(&original))
+            .unwrap_err().starts_with("UNITY_INVALID_BASELINE_TARGET:"));
+
+        let outdated = UnityConsoleCheckBinding { editor_version: "6000.6.5f2".into(), editor_pid: 42 };
+        let drift = check(&[], &empty, Some(&outdated)).unwrap();
+        assert_eq!(drift["kind"], "csharp");
+        assert_eq!(drift["projectRoot"], ".");
+        assert_eq!(drift["status"], "unavailable");
+        assert!(drift["message"].as_str().unwrap().starts_with("UNITY_EDITOR_INSTANCE_CHANGED:"));
+
+        let target = "Assets/Player.cs".to_string();
+        let stale = HashMap::from([(target.clone(), Some(format!("sha256-{}", "a".repeat(64))))]);
+        let rejected = check(&[target], &stale, Some(&original)).unwrap();
+        assert_eq!(rejected["status"], "unavailable");
+        assert!(rejected["message"].as_str().unwrap().starts_with("UNITY_CHECK_TARGET_CHANGED:"));
+    }
+
+    #[test]
+    fn editor_deadline_expiry_is_distinct_from_user_cancellation() {
+        let canceled = AtomicBool::new(false);
+        assert!(available_time(0, &canceled, 1).unwrap_err().starts_with("UNITY_OPERATION_TIMEOUT:"));
+        canceled.store(true, Ordering::Release);
+        assert!(available_time(u64::MAX, &canceled, 1).unwrap_err().starts_with("UNITY_OPERATION_CANCELED:"));
+    }
 
     #[test]
     fn engine_and_exact_editor_version_come_from_the_project() {
@@ -1939,6 +2793,47 @@ mod tests {
             "unity test . --mode PlayMode --filter BreakoutTests && echo ok"
         )
         .is_none());
+    }
+
+    #[test]
+    fn playmode_command_result_checks_envelopes_and_requires_a_pinned_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let project = fs::canonicalize(root.path()).unwrap();
+        let status = json!({"status":"no_tests", "message":"No test run in progress"});
+        let list = json!({"Mode":"PlayMode", "Count":0, "Tests":[], "success":true, "result":null});
+        let start = json!({"success":true,"Mode":"PlayMode","StatusPath":"Temp/pipeline_test_status.json","FilterApplied":"testName: Example.Tests"});
+        for output in [&status, &list, &start] {
+            assert_eq!(playmode_command_result(&project, 24, output, true), Some(output));
+            assert!(playmode_command_result(&project, 24, output, false).is_none());
+        }
+        let mut envelope = json!({"success":true,"data":{"target":{"projectPath":project,"pid":24},"result":status}});
+        assert_eq!(playmode_command_result(&project, 24, &envelope, false), Some(&status));
+        assert!(playmode_command_result(&project, 25, &envelope, true).is_none());
+        envelope["data"]["target"]["projectPath"] = json!(project.join("different"));
+        assert!(playmode_command_result(&project, 24, &envelope, true).is_none());
+        assert!(playmode_command_result(&project, 24, &json!({"status":"completed", "success":false}), true).is_none());
+        assert!(playmode_command_result(&project, 24, &json!({"status":"completed", "target":{"projectPath":"/elsewhere"}}), true).is_none());
+    }
+
+    #[test]
+    fn managed_playmode_rejects_drift_before_testing() {
+        let root = tempfile::tempdir().unwrap();
+        let project = fs::canonicalize(root.path()).unwrap();
+        fs::create_dir(project.join("Assets")).unwrap();
+        fs::create_dir(project.join("ProjectSettings")).unwrap();
+        fs::write(project.join("Assets/TestFixture.cs"), "class TestFixture {}").unwrap();
+        fs::write(project.join("ProjectSettings/ProjectVersion.txt"), "m_EditorVersion: 6000.6.5f1\n").unwrap();
+        let command = "unity test . --mode PlayMode --filter Example.TestFixture";
+        let approval = crate::harness::permissions::ShellPermissionApproval {
+            command: command.to_string(), approved_at_ms: None, scope: Some("once".into()), rules: Vec::new(), risk_level: None,
+        };
+        let canceled = AtomicBool::new(false);
+        let previous = UnityConsoleCheckBinding { editor_version: "6000.6.4f1".into(), editor_pid: 24 };
+        let changed_editor = run_unity_test_project(&project, command, Some(&approval), Some(&previous), None, u64::MAX, &canceled).err();
+        assert!(changed_editor.as_deref().is_some_and(|error| error.starts_with("UNITY_EDITOR_INSTANCE_CHANGED")), "{changed_editor:?}");
+        let expected = HashMap::from([("Assets/TestFixture.cs".into(), Some(format!("sha256-{}", "a".repeat(64))))]);
+        let changed_file = run_unity_test_project(&project, command, Some(&approval), None, Some(&expected), u64::MAX, &canceled).err();
+        assert!(changed_file.as_deref().is_some_and(|error| error.starts_with("UNITY_CHECK_TARGET_CHANGED")), "{changed_file:?}");
     }
 
     #[test]

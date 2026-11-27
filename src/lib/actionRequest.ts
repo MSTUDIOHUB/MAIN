@@ -87,6 +87,11 @@ export interface PlanReviewActionRequest extends ActionRequestBase {
 export interface UserChoiceActionRequest extends ActionRequestBase {
   kind: "user_choice";
   readonly questionnaire?: UserQuestionnaire;
+  readonly verification?: {
+    readonly verified: string;
+    readonly pending: string;
+    readonly next: string;
+  };
   executionBlocker?: { readonly sessionEpoch: string };
   optionValues: string[];
   allowCustomReply: boolean;
@@ -554,10 +559,17 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
   if (kind === "user_choice") {
     const questionnaire = record.questionnaire === undefined ? undefined : normalizeUserQuestionnaire(record.questionnaire);
     if (record.questionnaire !== undefined && !questionnaire) return null;
+    const verificationRecord = record.verification && typeof record.verification === "object"
+      ? record.verification as Record<string, unknown>
+      : null;
+    const verified = normalizeNonEmptyString(verificationRecord?.verified);
+    const pending = normalizeNonEmptyString(verificationRecord?.pending);
+    const next = normalizeNonEmptyString(verificationRecord?.next);
     return {
       ...base,
       kind,
       ...(questionnaire ? { questionnaire } : {}),
+      ...(verified && pending && next ? { verification: { verified, pending, next } } : {}),
       ...(record.executionBlocker && typeof record.executionBlocker === "object" && typeof (record.executionBlocker as any).sessionEpoch === "string"
         ? { executionBlocker: { sessionEpoch: (record.executionBlocker as any).sessionEpoch } } : {}),
       optionValues: Array.isArray(record.optionValues)

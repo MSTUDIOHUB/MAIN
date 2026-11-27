@@ -6,6 +6,7 @@ import type {
   RuntimeV2ResultKind,
 } from "./contracts";
 import type { RuntimeV2Event } from "./events";
+import { buildInterimCommentaryHistory, trimRepeatedInterimCommentary } from "./interimCommentary";
 import {
   buildRuntimeV2DeterministicPlanSummary,
   deriveRuntimeV2TerminalAcceptanceFacts,
@@ -80,12 +81,13 @@ export function runtimeV2StructuredActionMarkdown(
   }
 }
 
-function visibleProviderCommentary(
+export function runtimeV2PublicProgressCommentary(
   result: Extract<
     RuntimeV2Event,
     { type: "provider.responded" }
   >["result"],
 ): string {
+  if (result.toolCalls.length === 0) return "";
   const commentary = String(
     result.commentary || result.visibleText || "",
   ).trim();
@@ -99,6 +101,10 @@ function visibleProviderCommentary(
     return "";
   }
   if (/```|<tool(?:_use)?>|<runtime-v2-tools>/i.test(commentary)) return "";
+  return commentary;
+}
+
+function boundVisibleProviderCommentary(commentary: string): string {
   const compact = commentary.replace(/\s+/g, " ").trim();
   if (compact.length <= 420) return compact;
   const completeSentences =
@@ -192,8 +198,11 @@ export function buildRuntimeV2MilestoneProjection(
   id: string,
 ): RuntimeV2Projection | null {
   if (event.type !== "provider.responded") return null;
-  if (event.result.toolCalls.length === 0) return null;
-  const commentary = visibleProviderCommentary(event.result);
+  const publicCommentary = runtimeV2PublicProgressCommentary(event.result);
+  if (!publicCommentary) return null;
+  const history = buildInterimCommentaryHistory(aggregate.events || [], event.run, event.idempotencyKey);
+  if (history.publishedCurrent) return null;
+  const commentary = boundVisibleProviderCommentary(trimRepeatedInterimCommentary(publicCommentary, history));
   if (!commentary) return null;
   return projection(
     aggregate,

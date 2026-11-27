@@ -43,10 +43,35 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   analyzeValidationCommand,
   createValidationCommandSpec,
+  commandContainsShellExecutable,
   evaluateValidationSpec,
   isAcceptanceCapableValidationSpec,
   validationPrimitiveClass,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/validationContract.ts"));
+
+test("Editor shell inspection identifies process listings and waits without reading arguments as commands", () => {
+  for (const command of ["sleep 8", "cd Assets && /bin/sleep 15 && stat Tests.csproj", "echo starting; command sleep 20"]) {
+    assert.equal(commandContainsShellExecutable(command, "sleep"), true, command);
+  }
+  for (const command of ["grep 'sleep 15' Editor.log", "printf 'done; sleep 8'", "unity command console get"]) {
+    assert.equal(commandContainsShellExecutable(command, "sleep"), false, command);
+  }
+  assert.equal(commandContainsShellExecutable("ps aux | grep Unity", "ps"), true);
+  assert.equal(commandContainsShellExecutable("grep 'ps aux' README.md", "ps"), false);
+});
+
+test("validation command and receipt identity preserve quoted source bytes", () => {
+  const command = "python3 -c 'if True:\n    assert \"a  b\" == \"a  b\"'";
+  const spec = createValidationCommandSpec(command);
+  assert.equal(spec?.command, command);
+  assert.equal(analyzeValidationCommand(command).segments[0]?.command, command);
+  assert.equal(evaluateValidationSpec(spec, [{ kind: "finite_command_result", command, completed: true, exitCode: 0 }]).acceptanceSatisfied, true);
+  assert.equal(evaluateValidationSpec(spec, [{ kind: "finite_command_result", command: command.replace("    assert", " assert"), completed: true, exitCode: 0 }]).acceptanceSatisfied, false);
+  assert.equal(analyzeValidationCommand("npm test\nnpm run build").rejectionReason, "non_fail_fast_connector");
+  assert.equal(analyzeValidationCommand("echo 'npm test'").spec, null);
+  assert.equal(analyzeValidationCommand("printf '%s' 'cargo build'").spec, null);
+  assert.equal(analyzeValidationCommand('echo \'python3 -c "assert True"\'').spec, null);
+});
 
 test("finite command analysis proves every fail-fast shell segment", () => {
   const analysis = analyzeValidationCommand("cd frontend && CI=1 npm test && npm run build");

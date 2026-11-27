@@ -10,10 +10,13 @@ import type {
 import type { EventStreamMode, ToolFeedbackFormat } from "./turnEvents";
 import type { ResponseLanguagePolicy } from "./workflowModels";
 import type { GithubSkillSource } from "./githubSkillSource";
+import type { BlackThemeConfig, ThemeVariantConfig } from "./themePresets";
 
 export type Lang = "en" | "zh";
 
-export type ThemeMode = "light" | "dark" | "black";
+export type ThemeMode = "system" | "light" | "dark" | "black";
+
+export type { BlackThemeConfig, ThemeVariantConfig };
 
 export type ThemeKey =
   | "blue"
@@ -67,14 +70,19 @@ export interface AppConfig {
   responseLanguagePolicy: ResponseLanguagePolicy;
   theme: ThemeKey;
   themeMode: ThemeMode;
+  lightTheme?: ThemeVariantConfig;
+  darkTheme?: ThemeVariantConfig;
+  blackTheme?: BlackThemeConfig;
   appIconVariant: "light" | "dark";
   workflowMode: "chat" | "edit" | "plan";
   promptLanguageStrategy: PromptLanguageStrategy;
   toolPermissionPolicy: ToolPermissionPolicy;
   mcpRouting: McpRoutingConfig;
+  unityOfficialMcpEnabled: boolean;
   instructionsEnabled: boolean;
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
+  experimentalOmlxFirstResponse?: boolean;
   chatFontSize: number;
   sessionRecordingEnabled: boolean;
   debugRecordFullTurnProcess: boolean;

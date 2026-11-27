@@ -152,6 +152,11 @@ export type RuntimeV2Event =
         readonly target: string;
         readonly operation: "create" | "modify" | "delete";
       }[];
+      /** Native post-command absence observations for Run-created paths. */
+      readonly observedWorkspaceRemovals?: readonly {
+        readonly target: string;
+        readonly priorMutationVersion: string;
+      }[];
       /** A replay closes the provider tool pair with an already committed
        * same-version receipt. It is not a new observation or progress
        * boundary and therefore carries no new evidence. */
@@ -181,6 +186,7 @@ export type RuntimeV2Event =
       /** Exact authority and criterion linkage used when this validation was
        * admitted. A receipt without it cannot prove Execute completion. */
       readonly authority?: RuntimeV2ExecutionValidationAuthority;
+      readonly postPlayModeConsole?: import("./editorConsoleEvidence").RuntimeV2PipelineConsoleSample;
       /** Exact mutation boundary observed by the validator. Any later
        * mutation makes this receipt stale. */
       readonly mutationBoundarySequence?: number;

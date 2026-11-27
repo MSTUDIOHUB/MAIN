@@ -1,7 +1,7 @@
 import type { KnowledgeBase } from "./ipc";
 import type { KnowledgeReference } from "./knowledgeReferences";
-
-type EngineManualPresetId = "unity6" | "tuanjie" | "ue6_verse";
+import type { EngineManualPresetId } from "./engineManualSkills";
+import type { WorkspaceEngineProfile } from "./workspaceEngineProfile";
 
 export function enginePresetFromProjectVersion(versionFile: string): EngineManualPresetId | null {
   const editorVersion = /^m_EditorVersion:[ \t]*(\S+)/mi.exec(versionFile)?.[1];
@@ -13,20 +13,13 @@ export function enginePresetFromProjectVersion(versionFile: string): EngineManua
 }
 
 export async function detectWorkspaceEnginePreset(workspace?: string): Promise<EngineManualPresetId | null> {
-  if (!workspace?.trim()) return null;
-  const { readFile, globSearch } = await import("./ipc");
-  const version = await readFile("ProjectSettings/ProjectVersion.txt", workspace).catch(() => "");
-  if (/^m_(?:Tuanjie)?EditorVersion:/mi.test(version)) {
-    return enginePresetFromProjectVersion(version);
-  }
-  const projects = await globSearch("*.uefnproject", workspace).catch(() => []);
-  if (projects.length) return "ue6_verse";
-  const sources = await globSearch("**/*.verse", workspace).catch(() => []);
-  return sources.length ? "ue6_verse" : null;
+  const { resolveWorkspaceEngineProfile } = await import("./workspaceEngineProfile");
+  return (await resolveWorkspaceEngineProfile(workspace))?.manualPresetId ?? null;
 }
 
 export async function resolveActiveEngineKnowledgeReferences(input: {
   readonly workspace?: string;
+  readonly workspaceEngineProfile?: WorkspaceEngineProfile | null;
   readonly knowledgeBases: readonly KnowledgeBase[];
   readonly explicitReferences?: readonly KnowledgeReference[];
 }, dependencies = {
@@ -38,7 +31,9 @@ export async function resolveActiveEngineKnowledgeReferences(input: {
   readonly detectedPresetId: EngineManualPresetId | null;
 }> {
   const explicit = [...(input.explicitReferences || [])];
-  const detectedPresetId = await dependencies.detect(input.workspace);
+  const detectedPresetId = input.workspaceEngineProfile === undefined
+    ? await dependencies.detect(input.workspace)
+    : input.workspaceEngineProfile?.manualPresetId ?? null;
   const bases = detectedPresetId
     ? await dependencies.listBases().catch(() => input.knowledgeBases)
     : input.knowledgeBases;

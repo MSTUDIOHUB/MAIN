@@ -1,22 +1,42 @@
 import {
+  MAX_RUNTIME_V2_CHECKPOINT_EVENTS,
   RUNTIME_V2_EVENT_SCHEMA_VERSION,
+  RuntimeV2CheckpointWriteBoundaryError,
   buildRuntimeV2CapsuleProjection,
+  buildRuntimeV2MilestoneProjection,
   buildRuntimeV2TimelineProjection,
   createRuntimeV2Checkpoint,
+  createRuntimeV2EmergencyTerminalEnvelope,
   finishRuntimeV2CheckpointTerminal,
+  runtimeV2TerminalEventReserve,
+  runtimeV2TerminalProjection,
+  sameRuntimeV2EmergencyTerminalRun,
   shouldRecordRuntimeV2SoftSignal,
   runtimeV2SubagentHandoffApplicationDrafts,
   type CheckpointPort,
   type ProjectionPort,
+  type RuntimeV2CheckpointV3,
   type RuntimeV2Command,
   type RuntimeV2Event,
   type RuntimeV2EventDraft,
+  type RuntimeV2EmergencyTerminalEnvelopeV1,
+  type RuntimeV2EmergencyTerminalReasonCode,
+  type RuntimeV2EmergencyTerminalResultKind,
   type RuntimeV2Projection,
   type RuntimeV2ResultKind,
   type RuntimeV2RunIdentity,
+  type RuntimeV2TerminalOutcome,
   type RuntimeV2TurnIdentity,
   type TurnAggregateV1,
 } from "../../lib/runtime-v2";
+import { summarizePlanRun } from "./planRunDiagnostics";
+
+export class PlanCheckpointTerminalReserveError extends RuntimeV2CheckpointWriteBoundaryError {
+  constructor() {
+    super("checkpoint_event_budget_exceeded");
+    this.name = "PlanCheckpointTerminalReserveError";
+  }
+}
 
 export class PlanLedger {
   private revision: number;
@@ -69,6 +89,12 @@ export class PlanLedger {
     this.revision = result.checkpoint.revision;
     this.aggregate = result.checkpoint.aggregate;
     const committed = this.aggregate.events.find(candidate => candidate.eventId === event.eventId) || event;
+    if (result.disposition === "committed" && committed.type === "subagent.handoff_applied") {
+      this.logEvent?.("runtime_v2_subagent_handoff_adopted", {
+        turnId: committed.run.turnId, runId: committed.run.runId, jobId: committed.jobId,
+        evidenceCount: committed.evidenceIds.length, source: committed.source,
+      });
+    }
     if (committed.type === "work_plan.sealed") {
       await this.appendSealedPlanHandoffs(committed);
     }
@@ -112,22 +138,18 @@ export class PlanLedger {
   ): Promise<RuntimeV2Event> {
     const event = await this.append(draft);
     if (this.aggregate?.run && !this.aggregate.terminalOutcome) {
-      await this.publish(buildRuntimeV2CapsuleProjection(
-        this.aggregate,
-        this.nextId("runtime-v2-plan-capsule"),
-      ));
+      const milestone = buildRuntimeV2MilestoneProjection(
+        this.aggregate, event, this.nextId("runtime-v2-plan-milestone"),
+      );
+      if (milestone) await this.publish(milestone);
+      await this.projectCapsule(event);
     }
     return event;
   }
 
   async appendProgress(draft: RuntimeV2EventDraft): Promise<RuntimeV2Event> {
     const event = await this.append(draft);
-    if (this.aggregate?.run && !this.aggregate.terminalOutcome) {
-      await this.publish(buildRuntimeV2CapsuleProjection(
-        this.aggregate,
-        this.nextId("runtime-v2-plan-capsule"),
-      ));
-    }
+    await this.projectCapsule(event);
     return event;
   }
 
@@ -150,31 +172,50 @@ export class PlanLedger {
   }
 
   async scheduleCommand(command: RuntimeV2Command): Promise<void> {
-    const phase = this.aggregate?.phase;
-    if (!phase || phase === "completed") {
+    const aggregate = this.aggregate;
+    const phase = aggregate?.phase;
+    if (!aggregate || !phase || phase === "completed") {
       throw new Error("RUNTIME_V2_PLAN_RUN_NOT_ACTIVE");
     }
     if (command.phase !== phase) {
       throw new Error("RUNTIME_V2_PLAN_COMMAND_PHASE_MISMATCH");
     }
-    await this.append({
+    const newWork = command.kind === "request_model" ||
+      (command.kind === "execute_tool" && command.payload.runtimeControlPlane !== true &&
+        command.payload.runtimeOwnedPlanArtifact !== true && command.payload.runtimeOwnedPlanDocumentSave !== true);
+    // A request or ordinary tool needs a schedule, result, and public
+    // projection. A plan submission can immediately need two more tool
+    // transactions, one to record the candidate and one to save the draft.
+    const actionEvents = command.kind === "request_model" ? 3 + 6 : 3;
+    if (newWork && aggregate.events.length + runtimeV2TerminalEventReserve(aggregate) + actionEvents > MAX_RUNTIME_V2_CHECKPOINT_EVENTS) {
+      throw new PlanCheckpointTerminalReserveError();
+    }
+    const event = await this.append({
       type: "command.scheduled",
       run: command.run,
       command,
     });
     const modelRequest = command.kind === "request_model" ? { turnId: command.run.turnId, runId: command.run.runId, commandKey: command.idempotencyKey } : null;
     if (modelRequest) this.logEvent?.("runtime_v2_model_schedule_committed", modelRequest);
-    const aggregate = this.aggregate!;
-    await this.publish(buildRuntimeV2CapsuleProjection(
-      aggregate,
-      this.nextId("runtime-v2-plan-capsule"),
-    ));
-    await this.publish(buildRuntimeV2TimelineProjection(
-      this.aggregate!,
-      command,
-      this.nextId("runtime-v2-plan-timeline"),
-    ));
+    await this.projectCapsule(event);
+    if (!modelRequest) {
+      await this.publish(buildRuntimeV2TimelineProjection(
+        this.aggregate!,
+        command,
+        this.nextId("runtime-v2-plan-timeline"),
+      ));
+    }
     if (modelRequest) this.logEvent?.("runtime_v2_model_schedule_projection_returned", modelRequest);
+  }
+
+  private async projectCapsule(event: RuntimeV2Event): Promise<void> {
+    const aggregate = this.aggregate;
+    if (!aggregate?.run || aggregate.terminalOutcome) return;
+    // The committed command or receipt already supplies all Capsule facts.
+    // Keep this disposable UI snapshot out of the authoritative ledger.
+    await this.publishToStore(buildRuntimeV2CapsuleProjection(
+      aggregate, this.nextId("runtime-v2-plan-capsule"),
+    ), event);
   }
 
   async publish(projection: RuntimeV2Projection): Promise<void> {
@@ -188,16 +229,19 @@ export class PlanLedger {
       projectionId: projection.id,
       projection,
     });
+    await this.publishToStore(projection, event);
+  }
+
+  private async publishToStore(projection: RuntimeV2Projection, event: RuntimeV2Event): Promise<void> {
     try {
       await this.projection.publish({
         aggregate: this.aggregate!,
         audience: projection.audience,
         projection,
-        event: event as Extract<RuntimeV2Event, { type: "projection.published" }>,
+        event,
       });
     } catch {
-      // The durable projection event is replay authority. Presentation failure
-      // must not strand a command or turn the Plan Run into a model retry.
+      // Presentation failure never retries an already committed decision.
     }
   }
 
@@ -263,5 +307,93 @@ export class PlanLedger {
     this.revision = checkpoint.revision;
     this.aggregate = checkpoint.aggregate;
     this.lastAt = checkpoint.aggregate.updatedAt;
+    if (!aggregate.terminalOutcome && this.logEvent) {
+      this.logEvent("runtime_v2_plan_run_summary", summarizePlanRun(checkpoint.aggregate, input.run));
+    }
+  }
+
+  async finishEmergencyTerminal(input: {
+    readonly checkpoint: RuntimeV2CheckpointV3;
+    readonly run: RuntimeV2RunIdentity;
+    readonly reasonCode: RuntimeV2EmergencyTerminalReasonCode;
+    readonly resultKind: RuntimeV2EmergencyTerminalResultKind;
+    readonly language: "zh" | "en";
+    readonly existingEnvelope: RuntimeV2EmergencyTerminalEnvelopeV1 | null;
+  }): Promise<RuntimeV2TerminalOutcome | null> {
+    const { checkpoint, run } = input;
+    const checkpointRun = checkpoint.aggregate.run?.identity;
+    if (!checkpointRun || !sameRuntimeV2EmergencyTerminalRun(checkpointRun, run)) return null;
+    let terminal = checkpoint.aggregate.terminalOutcome;
+    let aggregate = checkpoint.aggregate;
+    let projection = runtimeV2TerminalProjection(aggregate);
+    if (!terminal) {
+      let envelope = input.existingEnvelope;
+      if (envelope && (envelope.lastRevision !== checkpoint.revision || !sameRuntimeV2EmergencyTerminalRun(envelope.run, run))) return null;
+      if (!envelope) {
+        const committed = await this.port.commitEmergencyTerminal({
+          owner: this.owner,
+          run,
+          expectedRevision: checkpoint.revision,
+          envelope: createRuntimeV2EmergencyTerminalEnvelope({
+            owner: this.owner,
+            run,
+            reasonCode: input.reasonCode,
+            resultKind: input.resultKind,
+            language: input.language,
+            strategy: "plan",
+            at: Math.max(Date.now(), checkpoint.updatedAt),
+            lastRevision: checkpoint.revision,
+            hasMutation: false,
+          }),
+        });
+        envelope = committed.envelope;
+        if (!envelope) return null;
+      }
+      terminal = {
+        resultKind: envelope.resultKind,
+        reason: envelope.reason,
+        completedAt: envelope.at,
+        finalProjectionId: `emergency-final-${run.runId}-${envelope.lastRevision}`,
+      };
+      aggregate = {
+        ...aggregate,
+        phase: "completed",
+        terminalOutcome: terminal,
+        finalProjectionId: terminal.finalProjectionId,
+        run: { identity: run, phase: "completed", status: "completed", terminalOutcome: terminal },
+        scheduledCommands: [],
+        pendingToolCalls: [],
+      };
+      projection = {
+        id: terminal.finalProjectionId,
+        audience: "final",
+        kind: "final",
+        markdown: envelope.reason,
+        dedupeKey: terminal.finalProjectionId,
+      };
+    }
+    if (!projection) return null;
+    // The canonical checkpoint or the emergency envelope already owns this
+    // outcome. Only publish its final presentation, without appending events.
+    await this.projection.publish({
+      aggregate,
+      audience: "final",
+      projection,
+      event: {
+        schemaVersion: RUNTIME_V2_EVENT_SCHEMA_VERSION,
+        sequence: aggregate.nextSequence,
+        eventId: `${projection.id}:view`,
+        at: terminal.completedAt,
+        type: "projection.published",
+        run,
+        audience: "final",
+        projectionId: projection.id,
+        projection,
+      },
+    });
+    this.revision = checkpoint.revision;
+    this.aggregate = checkpoint.aggregate;
+    this.lastAt = checkpoint.aggregate.updatedAt;
+    return terminal;
   }
 }

@@ -10,9 +10,10 @@ import {
   type MCPServerTestResult,
   type MCPTool,
   discoverAllMcpTools,
-  setMcpToolServerMap,
+  getMcpToolOrigin,
   testMcpServer,
 } from "../lib/mcpClient";
+import { applyUnityCliUpdate, checkUnityCliUpdate, scanWorkspaceUnityOfficialMcp, type UnityCliUpdateStatus } from "../lib/unityOfficialMcp";
 import {
   buildOpenAiResponsesProbeRequestCandidates,
   buildAnthropicRequestBody,
@@ -73,6 +74,8 @@ import {
 } from "../lib/localConcurrencyEstimate";
 import ToggleSwitch from "./ToggleSwitch";
 import ManagedProjectRulesSettings from "./ManagedProjectRulesSettings";
+import AppearanceThemeSettings from "./AppearanceThemeSettings";
+import { useEffectiveThemeMode } from "./useThemePalette";
 import MarkdownRenderer from "./MarkdownRenderer";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
@@ -137,6 +140,7 @@ function resolveCloudRuntimeEndpoint(server: any, protocol: "openai" | "anthropi
 }
 const settingsOptionIdleClass = "border-[#27272a] hover:border-[#3f3f46] hover:bg-[#18181b] hover:text-white";
 const settingsSelectClass = "w-full rounded-md border border-[#27272a] bg-[#000000] p-2.5 text-[14px] text-white outline-none theme-ring transition-all cursor-pointer focus:border-[var(--accent)] focus:ring-1 focus:ring-inset focus:ring-[var(--accent-light)] disabled:cursor-not-allowed disabled:opacity-60";
+const mcpServerFieldClass = "h-9 w-full rounded-md border border-[var(--surface-border)] bg-[var(--surface-2)] px-2.5 text-[13px] text-[var(--surface-text)] outline-none placeholder:text-[var(--surface-text-subtle)] focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent-light)]";
 
 function settingsOptionButtonClass(isSelected: boolean, extra = "") {
   return `${settingsOptionBaseClass} ${isSelected ? settingsOptionSelectedClass : settingsOptionIdleClass} ${extra}`.trim();
@@ -178,21 +182,47 @@ const SETTINGS_COPY = {
     mcpServerTitle: "MCP 服务器",
     mcpScanTools: "扫描工具",
     mcpScanning: "扫描中...",
-    mcpDescription: "配置 MCP (Model Context Protocol) 服务器，使 AI 能够操控外部引擎（如 Unity）。支持 HTTP 传输协议。",
-    mcpNoServersConfigured: "暂无 MCP 服务器配置",
-    mcpNoServersHint: "点击下方「添加服务器」连接外部引擎",
+    mcpDescription: "扫描已启用的 Unity 官方 MCP 和 HTTP MCP 服务。",
+    unityOfficialMcp: "Unity 官方 MCP",
+    unityOfficialMcpDetail: "通过 Unity CLI 1.0 正式版或更新版本连接 Unity 6 工作区。",
+    unityOfficialMcpWorkspace: "扫描工作区",
+    unityOfficialMcpSelectWorkspace: "选择已添加的工作区",
+    unityOfficialMcpNoWorkspaces: "在左侧添加 Unity 6 工程目录后，即可在这里选择。",
+    unityOfficialMcpScanning: "正在扫描 Unity 官方 MCP…",
+    unityOfficialMcpWorkspaceRequired: "请选择本次扫描的工作区。",
+    unityOfficialMcpProjectMismatch: "所选工作区未识别为 Unity 6 工程。请选择 Unity 6 工程目录。",
+    unityOfficialMcpEditorUnavailable: "无法连接所选工作区的 Editor。请在 Unity 中打开该项目并启动 Pipeline HTTP 服务。",
+    unityOfficialMcpCliUnavailable: "找不到 Unity CLI。请确认 MAIN 能从登录 PATH 找到 unity 命令。",
+    unityOfficialMcpCliTooOld: (version: string) => `MAIN 找到的 Unity CLI 是 ${version}。官方 MCP 需要 1.0 正式版或更新版本。`,
+    unityOfficialMcpScanFailed: (code: string) => `官方 MCP 扫描失败（${code}）。`,
+    unityCliCheckUpdate: "检查 CLI 更新",
+    unityCliChecking: "正在检查 Unity CLI 更新…",
+    unityCliUpdate: "更新 Unity CLI",
+    unityCliUpdating: "正在更新 Unity CLI…",
+    unityCliAvailable: (current: string, latest: string) => `Unity CLI ${current} 可更新至 ${latest}。`,
+    unityCliLatest: (version: string) => `Unity CLI ${version} 暂无可用的稳定版更新。`,
+    unityCliUnchecked: (version: string) => `当前 Unity CLI 版本为 ${version}。暂时无法查询最新版本。`,
+    unityCliUpdated: (version: string) => `Unity CLI 已更新至 ${version}。`,
+    unityCliCheckFailed: (error: string) => `无法检查 Unity CLI 更新（${error}）。`,
+    unityCliUpdateFailed: (error: string) => `Unity CLI 更新失败（${error}）。`,
+    unityCliUpdateStale: "CLI 或可用版本已变化，请重新检查更新。",
+    unityCliManagedUpdate: "此安装由包管理器维护。请使用以下命令更新。",
+    mcpNoServersConfigured: "暂无 HTTP MCP 服务器",
+    mcpNoServersHint: "点击右上角的＋添加服务器",
     remove: "移除",
     mcpEnabled: "已启用",
     mcpDisabled: "已关闭",
-    addServer: "添加服务器",
+    addServer: "添加 HTTP MCP 服务器",
     serverNamePlaceholder: "名称 (如 unityMCP)",
+    mcpServerName: "服务器名称",
+    mcpServerAddress: "服务器地址",
+    mcpDuplicateServer: "已有同名服务器。",
     add: "添加",
     discoveredTools: "已发现的工具",
-    mcpDiscovered: (toolCount: number, serverCount: number) => `已发现 ${toolCount} 个工具（来自 ${serverCount} 个服务器）`,
-    mcpNoServers: "尚未配置 MCP 服务器",
-    mcpNoTools: "未发现任何工具，请检查服务器是否在线",
-    mcpDiscoveryFailed: (message: string) => `发现失败: ${message}`,
-    mcpTip: "MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为",
+    mcpDiscovered: (toolCount: number, serverCount: number) => `从 ${serverCount} 个 HTTP MCP 服务器发现 ${toolCount} 个工具`,
+    mcpNoServers: "请先启用要扫描的 MCP 服务。",
+    mcpNoTools: "HTTP MCP 未发现工具。请检查已启用的服务器是否在线。",
+    mcpDiscoveryFailed: (message: string) => `HTTP MCP 扫描失败（${message}）`,
     mcpTestingStatus: "正在测试连接...",
     mcpTestSuccess: (count: number) => `连接成功，发现 ${count} 个工具`,
     mcpTestEmptyTools: "连接成功，但未返回任何工具。请确认 Unity 会话已连接并暴露工具。",
@@ -398,21 +428,47 @@ const SETTINGS_COPY = {
     mcpServerTitle: "MCP Servers",
     mcpScanTools: "Scan Tools",
     mcpScanning: "Scanning...",
-    mcpDescription: "Configure MCP (Model Context Protocol) servers so the AI can control external engines such as Unity. HTTP transport is supported.",
-    mcpNoServersConfigured: "No MCP servers configured",
-    mcpNoServersHint: "Use Add Server below to connect an external engine",
+    mcpDescription: "Scan enabled Unity Official MCP and HTTP MCP services.",
+    unityOfficialMcp: "Unity Official MCP",
+    unityOfficialMcpDetail: "Connect to a Unity 6 workspace with Unity CLI 1.0 stable or later.",
+    unityOfficialMcpWorkspace: "Workspace to scan",
+    unityOfficialMcpSelectWorkspace: "Choose a workspace",
+    unityOfficialMcpNoWorkspaces: "Add a Unity 6 project folder in the sidebar to select it here.",
+    unityOfficialMcpScanning: "Scanning Unity Official MCP…",
+    unityOfficialMcpWorkspaceRequired: "Choose a workspace for this scan.",
+    unityOfficialMcpProjectMismatch: "The selected workspace was not recognized as a Unity 6 project. Select a Unity 6 project folder.",
+    unityOfficialMcpEditorUnavailable: "Cannot reach the selected workspace's Editor. Open that project in Unity and start its Pipeline HTTP Service.",
+    unityOfficialMcpCliUnavailable: "Unity CLI was unavailable. Make sure MAIN can find the unity command on the login PATH.",
+    unityOfficialMcpCliTooOld: (version: string) => `MAIN found Unity CLI ${version}. Official MCP requires 1.0 stable or later.`,
+    unityOfficialMcpScanFailed: (code: string) => `Official MCP scan failed (${code}).`,
+    unityCliCheckUpdate: "Check for CLI updates",
+    unityCliChecking: "Checking for Unity CLI updates…",
+    unityCliUpdate: "Update Unity CLI",
+    unityCliUpdating: "Updating Unity CLI…",
+    unityCliAvailable: (current: string, latest: string) => `Unity CLI ${current} can be updated to ${latest}.`,
+    unityCliLatest: (version: string) => `Unity CLI ${version} has no stable update available.`,
+    unityCliUnchecked: (version: string) => `Unity CLI ${version} is installed. The latest version could not be checked.`,
+    unityCliUpdated: (version: string) => `Unity CLI updated to ${version}.`,
+    unityCliCheckFailed: (error: string) => `Could not check for Unity CLI updates (${error}).`,
+    unityCliUpdateFailed: (error: string) => `Unity CLI update failed (${error}).`,
+    unityCliUpdateStale: "The installed or available CLI version changed. Check for updates again.",
+    unityCliManagedUpdate: "This installation is managed by a package manager. Use the following command to update it.",
+    mcpNoServersConfigured: "No HTTP MCP servers",
+    mcpNoServersHint: "Use the plus button to add a server",
     remove: "Remove",
     mcpEnabled: "Enabled",
     mcpDisabled: "Disabled",
-    addServer: "Add Server",
+    addServer: "Add HTTP MCP Server",
     serverNamePlaceholder: "Name (for example unityMCP)",
+    mcpServerName: "Server name",
+    mcpServerAddress: "Server address",
+    mcpDuplicateServer: "This server name is already in use.",
     add: "Add",
     discoveredTools: "Discovered Tools",
-    mcpDiscovered: (toolCount: number, serverCount: number) => `Discovered ${toolCount} tool(s) from ${serverCount} server(s)`,
-    mcpNoServers: "No MCP servers configured",
-    mcpNoTools: "No tools found. Check whether the servers are online.",
-    mcpDiscoveryFailed: (message: string) => `Discovery failed: ${message}`,
-    mcpTip: "Start the MCP server and make sure it is listening on the configured port, then click Scan Tools. Discovered tools become available to the AI automatically. Unity MCP defaults to",
+    mcpDiscovered: (toolCount: number, serverCount: number) => `Discovered ${toolCount} tool(s) from ${serverCount} HTTP MCP server(s)`,
+    mcpNoServers: "Enable an MCP service before scanning.",
+    mcpNoTools: "No HTTP MCP tools found. Check whether the enabled servers are online.",
+    mcpDiscoveryFailed: (message: string) => `HTTP MCP scan failed (${message})`,
     mcpTestingStatus: "Testing connection...",
     mcpTestSuccess: (count: number) => `Connected. Found ${count} tool(s).`,
     mcpTestEmptyTools: "Connected, but no tools were returned. Check Unity session exposure.",
@@ -610,7 +666,21 @@ type McpTestUiState = {
   toolCount: number;
 };
 
+type UnityOfficialScan = {
+  workspace: string;
+} & (
+  | { phase: "testing" }
+  | { phase: "success"; tools: MCPTool[] }
+  | { phase: "error"; message: string }
+);
+
+type UnityCliUpdateNotice =
+  | { kind: "updated"; version: string }
+  | { kind: "error"; action: "check" | "update"; message: string };
+
 function McpServerPanel({
+  unityOfficialMcpEnabled,
+  onUnityOfficialMcpChange,
   mcpServers,
   setMcpServers,
   mcpDiscoveredTools,
@@ -618,6 +688,8 @@ function McpServerPanel({
   language,
   t,
 }: {
+  unityOfficialMcpEnabled: boolean;
+  onUnityOfficialMcpChange: (enabled: boolean) => void;
   mcpServers: MCPServer[];
   setMcpServers: (servers: MCPServer[]) => void;
   mcpDiscoveredTools: MCPTool[];
@@ -630,7 +702,6 @@ function McpServerPanel({
     mcpServerTitle: t.mcpServers || SETTINGS_COPY[language].mcpServerTitle,
     mcpScanTools: t.mcpScanTools || SETTINGS_COPY[language].mcpScanTools,
     mcpScanning: t.mcpScanning || SETTINGS_COPY[language].mcpScanning,
-    mcpDescription: t.mcpDescription || SETTINGS_COPY[language].mcpDescription,
     mcpNoServersConfigured: t.mcpNoServersConfigured || SETTINGS_COPY[language].mcpNoServersConfigured,
     mcpNoServersHint: t.mcpNoServersHint || SETTINGS_COPY[language].mcpNoServersHint,
     remove: t.mcpRemoveServer || SETTINGS_COPY[language].remove,
@@ -648,7 +719,6 @@ function McpServerPanel({
       t.mcpDiscoveryFailedMessage
         ? formatMcpTemplate(t.mcpDiscoveryFailedMessage, { message })
         : SETTINGS_COPY[language].mcpDiscoveryFailed(message),
-    mcpTip: t.mcpTip || SETTINGS_COPY[language].mcpTip,
     mcpTestingStatus: t.mcpTestingStatus || SETTINGS_COPY[language].mcpTestingStatus,
     mcpTestSuccess: SETTINGS_COPY[language].mcpTestSuccess,
     mcpTestEmptyTools: t.mcpTestEmptyTools || SETTINGS_COPY[language].mcpTestEmptyTools,
@@ -663,16 +733,46 @@ function McpServerPanel({
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoverMsg, setDiscoverMsg] = useState<(
     | { kind: "discovered"; type: "success"; toolCount: number; serverCount: number }
-    | { kind: "noServers" | "noTools"; type: "error" }
+    | { kind: "noServers"; type: "info" }
+    | { kind: "noTools"; type: "error" }
     | { kind: "failed"; type: "error"; message: string }
   ) | null>(null);
+  const workspaces = useAppStore((state) => state.workspaces);
+  const sidebarWorkspace = useAppStore((state) => state.selectedWorkspace || state.currentWorkspace);
+  const [requestedWorkspace, setRequestedWorkspace] = useState("");
+  const workspace = workspaces.find((entry) => entry.path === requestedWorkspace)?.path
+    || workspaces.find((entry) => entry.path === sidebarWorkspace)?.path
+    || (workspaces.length === 1 ? workspaces[0].path : "");
+  const [unityOfficialScan, setUnityOfficialScan] = useState<UnityOfficialScan | null>(null);
+  const unityScanController = useRef<AbortController | null>(null);
+  const [cliStatus, setCliStatus] = useState<UnityCliUpdateStatus | null>(null);
+  const [cliActivity, setCliActivity] = useState<"checking" | "updating" | null>(null);
+  const [cliNotice, setCliNotice] = useState<UnityCliUpdateNotice | null>(null);
+  const cliRequest = useRef(0);
+  const scanWorkspace = useRef(workspace);
+  scanWorkspace.current = workspace;
   const [testStateByServer, setTestStateByServer] = useState<Record<string, McpTestUiState>>({});
   // Form state for adding a new server
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("http://localhost:8080/mcp");
-  const enabledMcpServerCount = mcpServers.filter((server) => server.enabled !== false).length;
-  const tipSeparator = language === "zh" ? "：" : ": ";
-  const tipEnd = language === "zh" ? "。" : ".";
+  const [addServerOpen, setAddServerOpen] = useState(false);
+  const addServerTrigger = useRef<HTMLButtonElement>(null);
+  const addServerForm = useRef<HTMLFormElement>(null);
+  const newServerNameInput = useRef<HTMLInputElement>(null);
+  const duplicateServerName = mcpServers.some(server => server.name === newName.trim());
+  const hasEnabledHttp = mcpServers.some((server) => server.type === "http" && server.enabled !== false);
+  const showDiscoverMsg = discoverMsg && (discoverMsg.kind === "noServers" ? !hasEnabledHttp && !unityOfficialMcpEnabled : hasEnabledHttp);
+  const officialScan = unityOfficialMcpEnabled && unityOfficialScan?.workspace === workspace ? unityOfficialScan : null;
+  const discoveredTools = officialScan?.phase === "success" ? [...officialScan.tools, ...mcpDiscoveredTools] : mcpDiscoveredTools;
+  const canUpdateCli = cliStatus?.updateAvailable && cliStatus.latestVersion && !cliStatus.packageManagerCommand;
+  const cliStatusText = cliActivity === "checking" ? copy.unityCliChecking
+    : cliActivity === "updating" ? copy.unityCliUpdating
+    : cliNotice?.kind === "updated" ? copy.unityCliUpdated(cliNotice.version)
+    : cliNotice?.kind === "error" ? cliNotice.action === "check" ? copy.unityCliCheckFailed(cliNotice.message)
+      : cliNotice.message === "UNITY_CLI_UPDATE_STALE" ? copy.unityCliUpdateStale : copy.unityCliUpdateFailed(cliNotice.message)
+    : cliStatus?.updateAvailable && cliStatus.latestVersion ? copy.unityCliAvailable(cliStatus.currentVersion, cliStatus.latestVersion)
+    : cliStatus?.latestVersion ? copy.unityCliLatest(cliStatus.currentVersion)
+    : cliStatus ? copy.unityCliUnchecked(cliStatus.currentVersion) : "";
 
   const getDiscoverMsgText = () => {
     if (!discoverMsg) return "";
@@ -702,6 +802,33 @@ function McpServerPanel({
   }, [discoverMsg]);
 
   useEffect(() => {
+    setUnityOfficialScan(null);
+    return () => unityScanController.current?.abort();
+  }, [workspace, unityOfficialMcpEnabled]);
+
+  const handleCheckCli = useCallback(async () => {
+    const request = ++cliRequest.current;
+    setCliActivity("checking");
+    setCliNotice(null);
+    setCliStatus(null);
+    try {
+      const status = await checkUnityCliUpdate();
+      if (cliRequest.current === request) setCliStatus(status);
+    } catch (error) {
+      if (cliRequest.current === request) setCliNotice({ kind: "error", action: "check",
+        message: (error instanceof Error ? error.message : String(error)).slice(0, 320) });
+    } finally {
+      if (cliRequest.current === request) setCliActivity(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (unityOfficialMcpEnabled) void handleCheckCli();
+    else setCliActivity(null);
+    return () => { cliRequest.current += 1; };
+  }, [unityOfficialMcpEnabled, handleCheckCli]);
+
+  useEffect(() => {
     const activeNames = new Set(mcpServers.map((server) => server.name));
     setTestStateByServer((prev) => {
       const next = Object.fromEntries(
@@ -711,36 +838,118 @@ function McpServerPanel({
     });
   }, [mcpServers]);
 
-  const handleDiscover = async () => {
-    setIsDiscovering(true);
-    setDiscoverMsg(null);
+  const closeAddServer = useCallback((restoreFocus: boolean) => {
+    setAddServerOpen(false);
+    setNewName("");
+    setNewUrl("http://localhost:8080/mcp");
+    if (restoreFocus) addServerTrigger.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!addServerOpen) return;
+    newServerNameInput.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeAddServer(true);
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !addServerForm.current?.contains(event.target)
+        && !addServerTrigger.current?.contains(event.target)) closeAddServer(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [addServerOpen, closeAddServer]);
+
+  const scanHttpMcp = async () => {
     try {
-      const { tools, toolServerMap } = await discoverAllMcpTools(mcpServers, { forceRefresh: true });
+      const { tools, toolServerMap, serverStatuses } = await discoverAllMcpTools(mcpServers, { forceRefresh: true });
+      if (useAppStore.getState().mcpServers !== mcpServers) return;
       setMcpDiscoveredTools(tools, toolServerMap);
-      setMcpToolServerMap(toolServerMap);
       if (tools.length > 0) {
-        setDiscoverMsg({ kind: "discovered", type: "success", toolCount: tools.length, serverCount: enabledMcpServerCount });
-      } else if (enabledMcpServerCount === 0) {
-        setDiscoverMsg({ kind: "noServers", type: "error" });
+        setDiscoverMsg({ kind: "discovered", type: "success", toolCount: tools.length,
+          serverCount: serverStatuses.filter(server => server.toolCount > 0).length });
       } else {
         setDiscoverMsg({ kind: "noTools", type: "error" });
       }
     } catch (err) {
       setDiscoverMsg({ kind: "failed", type: "error", message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const scanOfficialMcp = async () => {
+    const controller = new AbortController();
+    unityScanController.current = controller;
+    setUnityOfficialScan({ workspace, phase: "testing" });
+    try {
+      const { tools } = await scanWorkspaceUnityOfficialMcp(workspace, controller.signal);
+      if (!controller.signal.aborted) setUnityOfficialScan({ workspace, phase: "success", tools });
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      const [code, detail] = (error instanceof Error ? error.message : String(error)).split(": ", 2);
+      const message = {
+        UNITY_OFFICIAL_MCP_WORKSPACE_REQUIRED: copy.unityOfficialMcpWorkspaceRequired,
+        UNITY_OFFICIAL_MCP_PROJECT_MISMATCH: copy.unityOfficialMcpProjectMismatch,
+        UNITY_OFFICIAL_MCP_EDITOR_UNAVAILABLE: copy.unityOfficialMcpEditorUnavailable,
+        UNITY_CLI_UNAVAILABLE: copy.unityOfficialMcpCliUnavailable,
+        UNITY_OFFICIAL_MCP_CLI_TOO_OLD: detail && copy.unityOfficialMcpCliTooOld(detail),
+      }[code] || copy.unityOfficialMcpScanFailed(/^[A-Z0-9_]+$/.test(code) ? code : "MCP_UNAVAILABLE");
+      setUnityOfficialScan({ workspace, phase: "error", message });
+      console.warn("[MCP] Unity Official MCP scan failed", { code });
+    } finally {
+      if (unityScanController.current === controller) unityScanController.current = null;
+    }
+  };
+
+  const handleUpdateCli = async () => {
+    if (!canUpdateCli || cliActivity || isDiscovering) return;
+    const request = ++cliRequest.current;
+    setCliActivity("updating");
+    setCliNotice(null);
+    try {
+      const updated = await applyUnityCliUpdate(cliStatus);
+      if (cliRequest.current !== request) return;
+      setCliStatus(updated);
+      if (updated.packageManagerCommand) return;
+      setCliNotice({ kind: "updated", version: updated.currentVersion });
+      if (workspace && scanWorkspace.current === workspace) await scanOfficialMcp();
+    } catch (error) {
+      if (cliRequest.current === request) setCliNotice({ kind: "error", action: "update",
+        message: (error instanceof Error ? error.message : String(error)).slice(0, 320) });
+    } finally {
+      if (cliRequest.current === request) setCliActivity(null);
+    }
+  };
+
+  const handleDiscover = async () => {
+    if (!hasEnabledHttp && !unityOfficialMcpEnabled) {
+      setDiscoverMsg({ kind: "noServers", type: "info" });
+      return;
+    }
+    setIsDiscovering(true);
+    setDiscoverMsg(null);
+    try {
+      await Promise.all([
+        hasEnabledHttp && scanHttpMcp(),
+        unityOfficialMcpEnabled && scanOfficialMcp(),
+      ]);
     } finally {
       setIsDiscovering(false);
     }
   };
 
-  const handleAddServer = () => {
+  const handleAddServer = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
     const name = newName.trim();
     const url = newUrl.trim();
-    if (!name || !url) return;
-    // Prevent duplicate names
-    if (mcpServers.some(s => s.name === name)) return;
+    if (!name || !url || duplicateServerName) return;
     setMcpServers([...mcpServers, { name, type: "http", url, enabled: true }]);
-    setNewName("");
-    setNewUrl("http://localhost:8080/mcp");
+    closeAddServer(true);
   };
 
   const handleToggleServer = (name: string, enabled: boolean) => {
@@ -787,20 +996,129 @@ function McpServerPanel({
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="relative flex items-center justify-between gap-3">
         <h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{copy.mcpServerTitle}</h3>
-        <button
-          onClick={handleDiscover}
-          disabled={isDiscovering}
-          className="px-3 py-1.5 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] hover:text-white border border-[#27272a] rounded-md transition-colors shrink-0 disabled:opacity-50"
-        >
-          {isDiscovering ? copy.mcpScanning : copy.mcpScanTools}
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            onClick={handleDiscover}
+            disabled={isDiscovering || cliActivity === "updating"}
+            className="h-8 px-3 text-[12px] font-medium bg-[var(--surface-2)] text-[var(--surface-text)] hover:bg-[var(--surface-1)] border border-[var(--surface-border)] rounded-md transition-colors disabled:opacity-50"
+          >
+            {isDiscovering ? copy.mcpScanning : copy.mcpScanTools}
+          </button>
+          <button
+            ref={addServerTrigger}
+            type="button"
+            aria-label={copy.addServer}
+            aria-haspopup="dialog"
+            aria-expanded={addServerOpen}
+            aria-controls={addServerOpen ? "mcp-add-server" : undefined}
+            title={copy.addServer}
+            onClick={() => addServerOpen ? closeAddServer(true) : setAddServerOpen(true)}
+            className={`flex size-8 items-center justify-center rounded-md border border-[var(--surface-border)] bg-[var(--surface-2)] text-[var(--surface-text)] transition-colors hover:bg-[var(--surface-1)] focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${addServerOpen ? "theme-subtle-border theme-subtle-bg" : ""}`}
+          >
+            <IconPlus className="size-4" aria-hidden="true" />
+          </button>
+        </div>
+        {addServerOpen && (
+          <form
+            ref={addServerForm}
+            id="mcp-add-server"
+            role="dialog"
+            aria-labelledby="mcp-add-server-title"
+            onSubmit={handleAddServer}
+            className="absolute right-0 top-full z-20 mt-2 w-full max-w-[21rem] space-y-3 rounded-xl border border-[var(--surface-border)] bg-[var(--surface-1)] p-4 text-[var(--surface-text)] shadow-xl"
+          >
+            <h4 id="mcp-add-server-title" className="text-[13px] font-semibold text-[var(--surface-text-strong)]">{copy.addServer}</h4>
+            <label className="block space-y-1 text-[12px]">
+              <span>{copy.mcpServerName}</span>
+              <input ref={newServerNameInput} value={newName} onChange={(event) => setNewName(event.target.value)}
+                placeholder={copy.serverNamePlaceholder} aria-invalid={duplicateServerName || undefined}
+                className={mcpServerFieldClass} />
+            </label>
+            <label className="block space-y-1 text-[12px]">
+              <span>{copy.mcpServerAddress}</span>
+              <input type="url" value={newUrl} onChange={(event) => setNewUrl(event.target.value)}
+                placeholder="http://localhost:8080/mcp" className={`${mcpServerFieldClass} font-mono`} />
+            </label>
+            {duplicateServerName && <p role="status" className="text-[11px] text-[#f48771]">{copy.mcpDuplicateServer}</p>}
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => closeAddServer(true)}
+                className="rounded-md px-3 py-1.5 text-[12px] hover:bg-[var(--surface-2)]">{copy.cancel}</button>
+              <button type="submit" disabled={!newName.trim() || !newUrl.trim() || duplicateServerName}
+                className="rounded-md theme-bg theme-bg-hover px-3 py-1.5 text-[12px] font-semibold text-white disabled:opacity-40">{copy.add}</button>
+            </div>
+          </form>
+        )}
       </div>
 
       <p className="text-[11.5px] text-[#71717a] leading-relaxed">
         {copy.mcpDescription}
       </p>
+
+      <div className="bg-[#000000] border border-[#27272a] rounded-lg p-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-[13px] font-bold text-[#e4e4e7]">{copy.unityOfficialMcp}</div>
+            <p className="mt-1 text-[11px] text-[#71717a]">{copy.unityOfficialMcpDetail}</p>
+          </div>
+          <ToggleSwitch
+            aria-label={copy.unityOfficialMcp}
+            checked={unityOfficialMcpEnabled}
+            disabled={cliActivity === "updating"}
+            onCheckedChange={onUnityOfficialMcpChange}
+          />
+        </div>
+        {unityOfficialMcpEnabled && (workspaces.length > 0 ? (
+          <div className="space-y-1">
+            <label htmlFor="unity-official-mcp-workspace" className="block text-[12px] text-[#a1a1aa]">{copy.unityOfficialMcpWorkspace}</label>
+            <select
+              id="unity-official-mcp-workspace"
+              className={settingsSelectClass}
+              title={workspace}
+              value={workspace}
+              disabled={cliActivity === "updating"}
+              onChange={(event) => setRequestedWorkspace(event.target.value)}
+            >
+              <option value="" disabled>{copy.unityOfficialMcpSelectWorkspace}</option>
+              {workspaces.map((entry) => <option key={entry.path} value={entry.path}>{entry.name} · {entry.path}</option>)}
+            </select>
+          </div>
+        ) : <p className="text-[11px] text-[#a1a1aa]">{copy.unityOfficialMcpNoWorkspaces}</p>)}
+        {officialScan && (
+          <p role="status" data-testid="unity-official-mcp-scan-status" className={`text-[11px] ${officialScan.phase === "success"
+            ? "text-[#86d9a3]" : officialScan.phase === "error" ? "text-[#f48771]" : "text-[#a1a1aa]"}`}>
+            {officialScan.phase === "success" ? copy.mcpTestSuccess(officialScan.tools.length)
+              : officialScan.phase === "error" ? officialScan.message : copy.unityOfficialMcpScanning}
+          </p>
+        )}
+        {unityOfficialMcpEnabled && (
+          <div className="space-y-2 border-t border-[#27272a] pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p role="status" data-testid="unity-cli-update-status" className={`text-[11px] ${cliNotice?.kind === "error" ? "text-[#f48771]" : "text-[#a1a1aa]"}`}>
+                {cliStatusText}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={handleCheckCli} disabled={!!cliActivity}
+                  className="rounded-md border border-[#27272a] bg-[#18181b] px-3 py-1.5 text-[12px] text-[#e4e4e7] disabled:opacity-50">
+                  {copy.unityCliCheckUpdate}
+                </button>
+                {canUpdateCli && (
+                  <button type="button" onClick={handleUpdateCli} disabled={!!cliActivity || isDiscovering}
+                    className="rounded-md theme-bg theme-bg-hover px-3 py-1.5 text-[12px] font-bold text-white disabled:opacity-50">
+                    {copy.unityCliUpdate}
+                  </button>
+                )}
+              </div>
+            </div>
+            {cliStatus?.packageManagerCommand && (cliStatus.updateAvailable || !cliStatus.latestVersion) && (
+              <p className="text-[11px] text-[#a1a1aa]">{copy.unityCliManagedUpdate}{" "}
+                <code className="text-[#e4e4e7]">{cliStatus.packageManagerCommand}</code>
+              </p>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* ── Server list ────────────────────────────────────── */}
       <div className="space-y-2">
@@ -875,66 +1193,37 @@ function McpServerPanel({
         )}
       </div>
 
-      {/* ── Add server form ────────────────────────────────── */}
-      <div className="bg-[#000000] border border-[#27272a] rounded-lg p-4 space-y-3">
-        <p className="text-[12px] font-bold text-[#a1a1aa]">{copy.addServer}</p>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            placeholder={copy.serverNamePlaceholder}
-            className="w-32 bg-[#09090b] border border-[#27272a] rounded-md p-2 text-[13px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]"
-          />
-          <input
-            type="text"
-            value={newUrl}
-            onChange={(e) => setNewUrl(e.target.value)}
-            placeholder="http://localhost:8080/mcp"
-            className="flex-1 bg-[#09090b] border border-[#27272a] rounded-md p-2 text-[13px] text-white focus:outline-none theme-ring font-mono placeholder:text-[#3f3f46]"
-          />
-          <button
-            onClick={handleAddServer}
-            disabled={!newName.trim() || !newUrl.trim()}
-            className="px-3 py-2 text-[12px] font-bold theme-bg theme-bg-hover text-white rounded-md transition-colors shrink-0 disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            {copy.add}
-          </button>
-        </div>
-      </div>
-
       {/* ── Discovery result ───────────────────────────────── */}
-      {discoverMsg && (
-        <p className={`text-[12px] ${discoverMsg.type === 'error' ? 'text-[#f48771]' : 'text-[#86d9a3]'}`}>
+      {showDiscoverMsg && (
+        <p role="status" className={`text-[12px] ${discoverMsg.type === "error"
+          ? "text-[#f48771]" : discoverMsg.type === "success" ? "text-[#86d9a3]" : "text-[#a1a1aa]"}`}>
           {getDiscoverMsgText()}
         </p>
       )}
 
       {/* ── Discovered tools ───────────────────────────────── */}
-      {mcpDiscoveredTools.length > 0 && (
+      {discoveredTools.length > 0 && (
         <div className="space-y-2">
-          <p className="text-[12px] font-bold text-[#a1a1aa] uppercase tracking-wider">{copy.discoveredTools} ({mcpDiscoveredTools.length})</p>
+          <p className="text-[12px] font-bold text-[#a1a1aa] uppercase tracking-wider">{copy.discoveredTools} ({discoveredTools.length})</p>
           <div className="bg-[#000000] border border-[#27272a] rounded-lg divide-y divide-[#18181b] max-h-[200px] overflow-y-auto">
-            {mcpDiscoveredTools.map((tool) => (
-              <div key={tool.name} className="px-4 py-2.5">
-                <div className="flex items-center gap-2">
-                  <span className="text-[12px] font-bold text-[#e4e4e7] font-mono">{tool.name}</span>
+            {discoveredTools.map((tool) => {
+              const origin = getMcpToolOrigin(tool);
+              const serverName = origin?.connector === "unity_official" ? copy.unityOfficialMcp : origin?.serverName;
+              return (
+                <div key={`${origin?.serverUrl || ""}:${origin?.serverName || ""}:${tool.name}`} className="px-4 py-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[12px] font-bold text-[#e4e4e7] font-mono">{tool.name}</span>
+                    {serverName && <span className="text-[11px] text-[#71717a]">{serverName}</span>}
+                  </div>
+                  {tool.description && (
+                    <p className="text-[11px] text-[#71717a] mt-0.5 line-clamp-2">{tool.description}</p>
+                  )}
                 </div>
-                {tool.description && (
-                  <p className="text-[11px] text-[#71717a] mt-0.5 line-clamp-2">{tool.description}</p>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
-
-      {/* ── Tip ────────────────────────────────────────────── */}
-      <div className="p-3 bg-[#000000] border border-[#27272a] rounded-md">
-        <p className="text-[11px] text-[#71717a] leading-relaxed">
-          <span className="text-[#a1a1aa]">{copy.tipLabel}</span>{tipSeparator}{copy.mcpTip} <span className="font-mono text-[#a1a1aa]">http://localhost:8080/mcp</span>{tipEnd}
-        </p>
-      </div>
     </div>
   );
 }
@@ -1676,6 +1965,7 @@ export default function SettingsModal({
   const [isFetchingCloudModels, setIsFetchingCloudModels] = useState(false);
   const [isTestingCloudConnection, setIsTestingCloudConnection] = useState(false);
   const [cloudModelInputMode, setCloudModelInputMode] = useState<"select" | "manual">("manual");
+  const effectiveThemeMode = useEffectiveThemeMode();
   const [cloudFetchMsg, setCloudFetchMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [cloudProbeMsg, setCloudProbeMsg] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
   const [cloudConnectionStatus, setCloudConnectionStatus] = useState<{
@@ -3275,7 +3565,7 @@ export default function SettingsModal({
             {settingsTab === 'general' && (
               <div className="space-y-5">
                 <div className="flex items-center justify-between"><h3 className="text-[13px] font-bold text-[#a1a1aa] uppercase tracking-wider">{t.general}</h3></div>
-                <ManagedProjectRulesSettings language={language} themeMode={config.themeMode || "dark"} busy={isModelRuntimeLocked} />
+                <ManagedProjectRulesSettings language={language} themeMode={effectiveThemeMode} busy={isModelRuntimeLocked} />
                 <div className={settingsSectionRowClass}>
                   <div>
                     <label className="block text-[13px] font-bold text-[#e4e4e7]">{copy.displayLanguage}</label>
@@ -3322,88 +3612,13 @@ export default function SettingsModal({
                   </div>
                 </div>
 
-                {/* THEME COLOR PICKER */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.themeColor}</label>
-                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.themeDesc}</p>
-                  </div>
-                  <div className={`${settingsControlColumnClass} flex flex-wrap gap-3 lg:justify-end`}>
-                    {Object.entries(THEMES).map(([key, theme]) => (
-                      <button
-                        key={key}
-                        onClick={() => setConfig({ ...config, theme: key })}
-                        aria-label={theme.name}
-                        title={theme.name}
-                        className={`h-7 w-12 rounded-full cursor-pointer ${
-                          config.theme === key
-                            ? 'scale-105 ring-2 ring-[#f4f4f5] ring-offset-2 ring-offset-[#09090b] shadow-lg'
-                            : ''
-                        }`}
-                        style={{ backgroundColor: theme.accent }}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                {/* THEME MODE TOGGLE */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.themeMode}</label>
-                  </div>
-                  <div className={`${settingsControlColumnClass} flex flex-wrap items-center gap-2 lg:justify-end`}>
-                    <button
-                      onClick={() => setConfig({ ...config, themeMode: "dark" })}
-                      aria-pressed={config.themeMode === "dark"}
-                      className={settingsOptionButtonClass(config.themeMode === "dark", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
-                    >
-                      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
-                      {t.themeModeDark}
-                    </button>
-                    <button
-                      onClick={() => setConfig({ ...config, themeMode: "black" })}
-                      aria-pressed={config.themeMode === "black"}
-                      className={settingsOptionButtonClass(config.themeMode === "black", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
-                    >
-                      <span className="h-3.5 w-3.5 rounded-full border border-current bg-black shadow-[inset_0_0_0_2px_rgba(255,255,255,0.08)]" />
-                      {t.themeModeBlack}
-                    </button>
-                    <button
-                      onClick={() => setConfig({ ...config, themeMode: "light" })}
-                      aria-pressed={config.themeMode === "light"}
-                      className={settingsOptionButtonClass(config.themeMode === "light", "flex items-center gap-2 rounded-md px-4 py-2 text-[12px] font-bold")}
-                    >
-                      <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
-                      {t.themeModeLight}
-                    </button>
-                  </div>
-                </div>
-
-                {/* CHAT FONT SIZE */}
-                <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
-                  <div>
-                    <label className="block text-[13px] font-bold text-[#e4e4e7]">{t.chatFontSize}</label>
-                    <p className="mt-1.5 text-[12px] leading-relaxed text-[#a1a1aa]">{t.chatFontSizeDesc}</p>
-                  </div>
-                  <div className={settingsControlColumnClass}>
-                    <div className="mb-3 flex items-center justify-end">
-                      <span className="text-[12px] font-mono theme-subtle-bg px-2 py-0.5 rounded border theme-subtle-border">{config.chatFontSize ?? 13} px</span>
-                    </div>
-                    <input
-                      data-testid="chat-font-size-slider"
-                      type="range" min={10} max={20} step={1}
-                      value={config.chatFontSize ?? 13}
-                      onChange={(e) => setConfig({ ...config, chatFontSize: parseInt(e.target.value) })}
-                      className="w-full theme-slider cursor-pointer"
-                    />
-                    <div className="relative mt-1 h-4 text-[11px] text-[#3f3f46] font-mono">
-                      <span className="absolute left-0">10</span>
-                      <span className="absolute -translate-x-1/2" style={{ left: "30%" }}>13</span>
-                      <span className="absolute -translate-x-1/2" style={{ left: "60%" }}>16</span>
-                      <span className="absolute right-0">20</span>
-                    </div>
-                  </div>
-                </div>
+                {/* APPEARANCE & THEME PRESETS */}
+                <AppearanceThemeSettings
+                  config={config}
+                  setConfig={setConfig}
+                  language={language === "en" ? "en" : "zh"}
+                  t={t}
+                />
 
                 {/* SESSION RECORDING */}
                 <div className={`${settingsSectionRowClass} border-t border-[#27272a] pt-5`}>
@@ -3614,6 +3829,16 @@ export default function SettingsModal({
                     </span>
                   </summary>
                   <div className="mt-4 space-y-4">
+                    {config.local.provider === "OMLX" && (
+                      <label className="flex items-center justify-between gap-3 text-[13px] theme-text">
+                        {config.language === "en" ? "Combine intent and first response (experimental)" : "合并意图识别与首轮回复（实验）"}
+                        <ToggleSwitch
+                          checked={config.experimentalOmlxFirstResponse === true}
+                          disabled={!canChangeCurrentModel}
+                          onCheckedChange={(checked) => setConfig({ ...config, experimentalOmlxFirstResponse: checked })}
+                        />
+                      </label>
+                    )}
                     <div>
                       <label className="mb-2 block text-[13px] font-bold text-[#e4e4e7]">{copy.toolProtocol}</label>
                       <p className="mb-2 text-[11.5px] text-[#71717a]">
@@ -3683,6 +3908,8 @@ export default function SettingsModal({
 
             {/* MCP SERVER SETTINGS */}
             {settingsTab === 'mcp' && <McpServerPanel
+              unityOfficialMcpEnabled={config.unityOfficialMcpEnabled === true}
+              onUnityOfficialMcpChange={enabled => setConfig({ unityOfficialMcpEnabled: enabled })}
               mcpServers={mcpServers}
               setMcpServers={setMcpServers}
               mcpDiscoveredTools={mcpDiscoveredTools}
