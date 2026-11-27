@@ -17,13 +17,13 @@ import {
 } from "../../lib/turnIntake";
 import { buildLoadSkillToolDefinition } from "../../lib/agentSkills";
 import { filterToCoreAndUnlockedTools } from "../../lib/toolSearch";
-import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES, RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { normalizeKnowledgeReferences, renderKnowledgeContextAnchor } from "../../lib/knowledgeReferences";
 import { containsProviderTextEnvelopePrompt } from "./executionProviderContext";
 import { buildRuntimeV2TextEnvelopeCatalog } from "./executionProviderTools";
 import { renderPlanSkillContext } from "./planSkillContext";
-import { unityMcpObservationTools, UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
+import { workspaceEditorObservationTools } from "../../lib/workspaceMcp";
 import { SUBMIT_WORK_PLAN_TOOL, SUBMIT_WORK_PLAN_TOOL_NAME } from "./planSubmissionToolSchema";
 
 export { SUBMIT_WORK_PLAN_TOOL, SUBMIT_WORK_PLAN_TOOL_NAME };
@@ -50,7 +50,7 @@ export const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "tool_search",
   "knowledge_search",
   "knowledge_get_excerpt",
-  ...UNITY_MCP_OBSERVATION_NAMES,
+  ...RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
 ]);
 
 const GLOBAL_PLAN_READ_TOOL_NAMES = new Set([
@@ -80,7 +80,7 @@ export function planModelToolCandidates(
   });
   return [
     ...baseTools,
-    ...(context.workspaceMcpSnapshot?.planObservationsAllowed ? unityMcpObservationTools(context.workspaceMcpSnapshot) : []),
+    ...(context.workspaceMcpSnapshot?.planObservationsAllowed ? workspaceEditorObservationTools(context.workspaceMcpSnapshot) : []),
     ...(loadSkill ? [loadSkill] : []),
   ];
 }
@@ -93,7 +93,7 @@ export function planModelTools(context: RuntimeV2SubmissionContext): ToolDefinit
   );
   return filterToCoreAndUnlockedTools([...planModelToolCandidates(context), ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL] : []), SUBMIT_WORK_PLAN_TOOL], {
     sessionKey: context.runSessionKey,
-    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...UNITY_MCP_OBSERVATION_NAMES,
+    alwaysInclude: [SUBMIT_WORK_PLAN_TOOL_NAME, ...RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
       ...(context.knowledgeContext?.references.length ? ["knowledge_search", "knowledge_get_excerpt"] : []),
       ...(canAskPlanQuestions ? [PLAN_QUESTION_TOOL.function.name] : [])],
   });
@@ -116,7 +116,7 @@ function planCollaborationTool(name: "spawn_subagent" | "wait_subagents"):
       description: [
         "Create one bounded read-only planning child for independent investigation, review, or validation design.",
         "Each child accepts at most 6 narrow workspace-relative paths in required_paths and allowed_paths (never '.' or '*'); split larger module reviews across multiple spawn_subagent calls.",
-        "The parent must continue unrelated discovery and later join the child before submitting the WorkPlan.",
+        "Continue unrelated discovery. Wait for an optional child only when a specific plan decision depends on its result. A child explicitly required by the user must be joined before submitting the WorkPlan.",
         "Planning children cannot modify or stage workspace files.",
       ].join(" "),
       parameters: {
@@ -155,6 +155,7 @@ export function selectPlanModelTools(input: {
   readonly submissionStage: boolean;
   readonly submissionRepairPending?: boolean;
   readonly collaborationAllowed: boolean;
+  readonly spawnAllowed?: boolean;
   readonly collaborationRequired?: boolean;
   readonly collaborationRequirementMet?: boolean;
   readonly remainingSubagentCapacity: number;
@@ -174,6 +175,7 @@ export function selectPlanModelTools(input: {
   const tools = [...(input.baseTools || PLAN_MODEL_TOOLS)];
   if (
     input.collaborationAllowed &&
+    input.spawnAllowed !== false &&
     input.remainingSubagentCapacity > 0 &&
     PLAN_SPAWN_SUBAGENT_TOOL
   ) {

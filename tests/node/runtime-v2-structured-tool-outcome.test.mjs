@@ -140,6 +140,10 @@ test("a Unity process exit cannot stand in for a fresh, nonempty test verdict", 
   const managed = { command: "unity test . --mode PlayMode --filter BreakoutTests" };
   const authority = { useProjectEditor: true, expectedTestCases: 1 };
   assert.equal(outcome("run_command", result({}), managed, authority).status, "succeeded");
+  assert.equal(outcome("run_command", result({}), managed, { ...authority, expectedTestCaseNames: ["BreakoutTests.SceneLoads"] }).status, "succeeded");
+  assert.equal(outcome("run_command", result({}), managed, { ...authority, expectedTestCaseNames: ["BreakoutTests.OtherCase"] }).status, "failed");
+  assert.equal(outcome("run_command", { ...process, unityTestReports: [{ status: "verified", passed: 1 }] }, managed,
+    { ...authority, expectedTestCaseNames: ["BreakoutTests.SceneLoads"] }).status, "failed", "a count-only report cannot replace exact discovered cases");
   assert.equal(outcome("run_command", result({}), managed).status, "failed", "old batch approval cannot adopt live results");
   assert.equal(outcome("run_command", { ...process, unityTestReports: [{ status: "verified", passed: 1 }] }, managed, authority).status, "succeeded");
   assert.equal(outcome("run_command", { ...process, unityTestReports: [{ status: "verified", passed: 0 }] }, managed, authority).status, "failed");

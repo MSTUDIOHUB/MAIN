@@ -12,6 +12,7 @@ import {
 import type { MainModeKey } from "../lib/mainModes";
 import { resolveRuntimeV2VisibleRunnerKind } from "../lib/runtimeEngineSelection";
 import { hasExplicitSkillInvocation } from "../lib/agentSkills";
+import { isEditorDiagnosticRepairRequest } from "../lib/runIntent";
 import type {
   CommandDirective,
   LegacyWorkflowMode,
@@ -1776,11 +1777,12 @@ export async function runSubmitAsyncWorkflowRun<
   const bareChat = runnerKind === "chat" && requiredCapabilities?.length === 0 && !explicitSkill &&
     !input.currentImages.length && !input.shouldExecuteOnceFromReplyOption;
   const scopedCodeRead = runnerKind === "workspace_read" && requiredCapabilities !== undefined;
-  const includeProjectBaseline = runnerKind !== "chat" && !reusePlanContext && !scopedCodeRead;
-  // Typed submissions load external integration only when requested. Legacy
-  // recovery and explicitly approved plans retain their frozen capability path.
+  const gameViewRequest = /\bgame\s*view\b|\bunity\b.{0,24}(?:screenshot|capture)|(?:Unity|编辑器).{0,16}(?:截图|画面)/i.test(input.text);
+  const includeProjectBaseline = runnerKind !== "chat" && !reusePlanContext && (!scopedCodeRead || gameViewRequest);
+  // Console repair already requires Editor diagnostics for completion, even
+  // when semantic preflight classifies the repair as workspace editing.
   const includeMcp = runnerKind !== "chat" && !!(approvedPlanContinuation || !requiredCapabilities ||
-    requiredCapabilities.includes("external_interaction") ||
+    requiredCapabilities.includes("external_interaction") || isEditorDiagnosticRepairRequest(input.text) ||
     (requiredCapabilities.includes("workspace_read") &&
       /\b(?:unity|tuanjie|editor)\s+(?:editor|console|scene|hierarchy)|(?:Unity|团结)?编辑器.{0,10}(?:控制台|场景|层级)|Unity\s*控制台/i.test(input.text)));
   // A restored Turn's immutable objective wins over a missing or looser

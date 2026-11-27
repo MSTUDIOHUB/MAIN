@@ -47,7 +47,9 @@ import {
 import { isChatAttachmentPath } from "./attachments";
 import { invoke } from "@tauri-apps/api/core";
 import { isMcpTool, executeMcpTool, getMcpServerUrl, getMcpToolOrigin } from "./mcpClient";
-import { executeUnityMcpObservation, normalizeMcpWorkspace } from "./workspaceMcp";
+import { executeUnityMcpObservation, normalizeMcpWorkspace, workspaceUnityCliConsoleBinding, workspaceUnityOfficialConsoleBinding } from "./workspaceMcp";
+import { executeUnityOfficialMcp, executeUnityOfficialMcpConsole } from "./unityOfficialMcp";
+import { UNITY_CLI_CONSOLE_TOOL, UNITY_OFFICIAL_MCP_CONSOLE_TOOL } from "./runtime-v2/workspaceReadPolicy";
 import { isBuiltInToolName, type ToolCatalog } from "./toolCatalog";
 import {
   classifyBuiltInTool,
@@ -238,6 +240,8 @@ export interface ToolExecutionOptions {
   writeFileTarget?: import("./workspaceMutationPreflight").WorkspaceWriteFileTargetFact;
   unitySceneAuthority?: { signal: AbortSignal; lifecycleDeadlineAt?: number };
   unityConsoleRepairScope?: true;
+  unityConsoleSignal?: AbortSignal;
+  isUnityOfficialMcpEnabled?: () => boolean;
   networkRead?: import("./networkRead").NetworkReadPolicy;
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
@@ -322,6 +326,13 @@ export async function executeTool(
       }
       const binding = options.workspaceMcpSnapshot?.unityBindings?.[resolution.entry.serverUrl];
       const origin = resolution.entry.mcpTool && getMcpToolOrigin(resolution.entry.mcpTool);
+      if (origin?.connector === "unity_official") {
+        const official = options.workspaceMcpSnapshot?.unityOfficialMcp;
+        if (!official || official.workspace !== normalizeMcpWorkspace(workspace)) throw new Error("UNITY_OFFICIAL_MCP_SCOPE_MISMATCH");
+        if (options.isUnityOfficialMcpEnabled?.() === false) throw new Error("UNITY_OFFICIAL_MCP_DISABLED");
+        return executeUnityOfficialMcp(official, origin.remoteName, args,
+          options.unityConsoleSignal ?? new AbortController().signal);
+      }
       if (origin?.connector === "unity" && (!binding || options.workspaceMcpSnapshot?.workspace !== normalizeMcpWorkspace(workspace))) {
         throw new Error("MCP_UNITY_OBSERVATION_SCOPE_MISMATCH");
       }
@@ -361,6 +372,21 @@ export async function executeTool(
 
   if (executionName === "unity_mcp_scene" || executionName === "unity_mcp_console") {
     return executeUnityMcpObservation({ snapshot: options.workspaceMcpSnapshot, workspace, name: executionName, args, repairScope: options.unityConsoleRepairScope });
+  }
+  if (executionName === UNITY_OFFICIAL_MCP_CONSOLE_TOOL) {
+    const binding = workspaceUnityOfficialConsoleBinding(options.workspaceMcpSnapshot);
+    if (!binding || binding.workspace !== normalizeMcpWorkspace(workspace) || Object.keys(args).length) {
+      throw new Error("UNITY_OFFICIAL_MCP_SCOPE_MISMATCH");
+    }
+    if (options.isUnityOfficialMcpEnabled?.() === false) throw new Error("UNITY_OFFICIAL_MCP_DISABLED");
+    return executeUnityOfficialMcpConsole(binding, options.unityConsoleSignal ?? new AbortController().signal);
+  }
+  if (executionName === UNITY_CLI_CONSOLE_TOOL) {
+    const binding = workspaceUnityCliConsoleBinding(options.workspaceMcpSnapshot, workspace, args);
+    if (!binding) throw new Error("UNITY_CONSOLE_SCOPE_MISMATCH");
+    return JSON.stringify(await runUnityEditorOperation(UNITY_CLI_CONSOLE_TOOL, {
+      workspace, editorVersion: binding.editorVersion, expectedPid: binding.editorPid,
+    }, options.unityConsoleSignal ?? new AbortController().signal, Date.now() + 12_000));
   }
 
   // Runtime-owned Skill loading must win over the legacy process-wide MCP

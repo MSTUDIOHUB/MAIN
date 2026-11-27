@@ -72,6 +72,7 @@ export interface AppConfig {
   promptLanguageStrategy: PromptLanguageStrategy;
   toolPermissionPolicy: ToolPermissionPolicy;
   mcpRouting: McpRoutingConfig;
+  unityOfficialMcpEnabled: boolean;
   instructionsEnabled: boolean;
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";

@@ -1,12 +1,13 @@
 import { normalizeValidationWorkspaceCwd, unityValidationInvocations } from "../validationContract";
 import type { TurnAggregateV1 } from "./aggregate";
 import { approvedRuntimeV2PlanContinuation } from "./planContinuationBaseline";
-import { runtimeV2EditorDiagnosticScope, isRuntimeV2EditorDiagnosticRepair } from "./editorConsoleEvidence";
+import { freshRuntimeV2PipelineConsoleSample, runtimeV2EditorDiagnosticScope, isRuntimeV2EditorDiagnosticRepair, sameRuntimeV2ConsoleEditor, type RuntimeV2PipelineConsoleSample } from "./editorConsoleEvidence";
 import { runtimeV2DirectExecuteMutationTargets, runtimeV2ValidationBoundaryMatchesCurrent, runtimeV2WorkspaceChangeReceipts } from "./validationReceipt";
 import { extractExactReadFileWindow } from "../readFileWindow";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 
 export const UNITY_COMPILE_PROJECT_TOOL = "unity_compile_project";
+export const UNITY_BASELINE_CHECK_KIND = "csharp_baseline";
 export type UnityEditorCheckKind = "csharp" | "shader_import";
 
 export interface UnityCompilationResult {
@@ -28,6 +29,53 @@ export interface UnityCompilationResult {
     readonly code: string;
     readonly message: string;
   }[];
+  readonly postCompileConsole?: RuntimeV2PipelineConsoleSample;
+  readonly playMode?: {
+    readonly status: "discovered" | "unavailable";
+    readonly suites: readonly { readonly filter: string; readonly cases: readonly string[] }[];
+  };
+}
+
+function latestExplicitRecheck(state: TurnAggregateV1): number {
+  const requested = new Set<string>();
+  let resumed = -1;
+  for (const event of state.events) {
+    if (!("run" in event) || event.run.runId !== state.run?.identity.runId) continue;
+    if (event.type === "run.decision_recorded" && event.choice === "recheck") requested.add(event.requestId);
+    if (event.type === "run.resumed" && requested.delete(event.requestId)) resumed = event.sequence;
+  }
+  return resumed;
+}
+
+export function runtimeV2UnityBaselineReceipt(state: TurnAggregateV1, scope: NonNullable<ReturnType<typeof runtimeV2EditorDiagnosticScope>>) {
+  if (!scope.editorPid || !state.run) return;
+  const runId = state.run.identity.runId;
+  const recheckedAfter = latestExplicitRecheck(state);
+  const commands = new Map<string, number>();
+  for (const event of state.events) {
+    if (event.type !== "command.scheduled" || event.run.runId !== runId) continue;
+    const { payload } = event.command;
+    if (event.command.kind === "execute_tool" && payload.toolName === UNITY_COMPILE_PROJECT_TOOL &&
+        payload.runtimeOwnedUnityBaselineCompile === true && payload.editorCheckKind === UNITY_BASELINE_CHECK_KIND &&
+        payload.editorPid === scope.editorPid && payload.editorVersion === scope.editorVersion && typeof payload.consoleSequence === "number") {
+      commands.set(event.command.idempotencyKey, payload.consoleSequence);
+    }
+  }
+  for (const event of [...state.events].reverse()) {
+    if ((event.type !== "tool.completed" && event.type !== "command.completed") || event.run.runId !== runId) continue;
+    const consoleSequence = commands.get(event.idempotencyKey);
+    if (consoleSequence === undefined || consoleSequence >= event.sequence) continue;
+    try {
+      const result = event.type === "tool.completed" && event.modelContent ? JSON.parse(event.modelContent) as UnityCompilationResult | null : null;
+      if (result && (result.status === "passed" || result.status === "failed") && result.kind === "csharp" &&
+          result.editor === "connected" && result.projectRoot === "." && result.editorPid === scope.editorPid &&
+          result.editorVersion === scope.editorVersion) return { sequence: event.sequence, consoleSequence, result };
+      if (result?.status === "unavailable" && event.sequence > recheckedAfter) return { sequence: event.sequence, consoleSequence, result };
+    } catch { /* An interrupted or malformed result cannot prove current diagnostics. */ }
+    return event.sequence > recheckedAfter
+      ? { sequence: event.sequence, consoleSequence, result: { status: "unavailable", kind: "csharp" } as UnityCompilationResult }
+      : undefined;
+  }
 }
 
 export interface ApprovedPlanExecutionRepair {
@@ -64,7 +112,7 @@ export function unityShaderImportTarget(path: string, workspace: string): string
   return relative && /^(?:Assets|Packages)\/.*\.(?:shader|hlsl|cginc|compute)$/i.test(relative) ? relative : null;
 }
 
-function referencedShaderInclude(owner: string, include: string): string | null {
+export function referencedShaderInclude(owner: string, include: string): string | null {
   if (/^(?:\/|[a-z]:)|[\\\u0000-\u001f]/i.test(include)) return null;
   const segments = /^(?:Assets|Packages)\//.test(include) ? [] : owner.split("/").slice(0, -1);
   for (const part of include.split("/")) {
@@ -180,7 +228,13 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
     }
   }
   if (sequence < 0) return null;
-  const diagnosticTargets = runtimeV2EditorDiagnosticScope(aggregate)?.diagnostics.flatMap(item => item.kind === kind && item.path ? [item.path] : []) || [];
+  const consoleScope = runtimeV2EditorDiagnosticScope(aggregate);
+  if (consoleScope?.editorPid && receipt && (receipt.result.status === "passed" || receipt.result.status === "failed") &&
+      (receipt.result.editorPid !== consoleScope.editorPid || receipt.result.editorVersion !== consoleScope.editorVersion)) receipt = undefined;
+  if (consoleScope?.editorPid && receipt && (receipt.result.status === "unavailable" || receipt.result.status === "deferred_closed") &&
+      aggregate.events.some(event => event.type === "tool.completed" && event.sequence > receipt!.sequence &&
+        event.run.runId === run.identity.runId && event.editorConsole === consoleScope)) receipt = undefined;
+  const diagnosticTargets = consoleScope?.diagnostics.flatMap(item => item.kind === kind && item.path ? [item.path] : []) || [];
   targets = [...new Set([...targets, ...diagnosticTargets])];
   if (consoleRepair && kind === "shader_import") {
     for (const evidence of [...aggregate.evidence].reverse()) {
@@ -229,23 +283,61 @@ export function nextUnityEditorCheck(aggregate: TurnAggregateV1 | null) {
   return deriveUnityEditorChecks(aggregate).find(check => check && !check.receipt) ?? null;
 }
 
+/** An initial real compiler failure anchors a repair even when the selected
+ * Pipeline connector cannot enumerate current Console row identities. */
+export function runtimeV2PipelineCompilerBaseline(state: TurnAggregateV1) {
+  const scope = runtimeV2EditorDiagnosticScope(state);
+  const sample = freshRuntimeV2PipelineConsoleSample(scope?.pipeline?.live);
+  if (!scope || !scope.editorPid || !sample?.compilationFailed || !sample.errors) return;
+  const baseline = state.events.find(event => event.type === "tool.completed" && event.editorConsole === scope);
+  if (!baseline) return;
+  const firstWrite = runtimeV2WorkspaceChangeReceipts(state).find(event => event.sequence > baseline.sequence)?.sequence;
+  if (firstWrite === undefined) return;
+  const checked = runtimeV2UnityBaselineReceipt(state, scope);
+  if (checked && checked.consoleSequence >= baseline.sequence && checked.sequence < firstWrite) {
+    if (checked.result.status === "failed") return { scope, sample };
+    if (checked.result.status === "passed") return;
+  }
+  const hintedPaths = new Set(scope.retainedDiagnostics?.flatMap(item => item.kind === "csharp" && item.path ? [item.path] : []));
+  if (!hintedPaths.size) return;
+  const reads = new Set(state.events.flatMap(event =>
+    event.sequence > baseline.sequence && event.sequence < firstWrite && event.type === "command.scheduled" &&
+    event.command.run.runId === state.run?.identity.runId && event.command.kind === "execute_tool" && event.command.payload.toolName === "read_file"
+      ? [event.command.idempotencyKey] : []));
+  const source = state.events.find(event => {
+    if (event.sequence <= baseline.sequence || event.sequence >= firstWrite || event.type !== "tool.completed" ||
+        event.run.runId !== state.run?.identity.runId || event.status !== "succeeded" || !event.modelContent ||
+        !reads.has(event.idempotencyKey)) return false;
+    const source = extractExactReadFileWindow(event.modelContent);
+    const path = source && normalizeValidationWorkspaceCwd(source.metadata.path, state.turn.workspaceKey);
+    const version = source?.metadata.contentVersion?.replace(/^sha256-/, "");
+    return !!path && hintedPaths.has(path) && /^[a-f0-9]{64}$/.test(version || "") && event.evidence.some(item =>
+      item.kind === "source" && normalizeValidationWorkspaceCwd(item.target, state.turn.workspaceKey) === path &&
+      item.version?.replace(/^sha256-/, "") === version);
+  });
+  return source ? { scope, sample } : undefined;
+}
+
 /** The original Console diagnostics and the final file revisions must both
  * be covered by successful Editor-owned checks for each diagnostic kind. */
 export function verifiedUnityConsoleRepair(state: TurnAggregateV1) {
   const scope = runtimeV2EditorDiagnosticScope(state);
   const mutationTargets = runtimeV2DirectExecuteMutationTargets(state);
-  if (!scope?.complete || !scope.diagnostics.length || !mutationTargets.length ||
+  const baseline = scope?.pipeline && runtimeV2PipelineCompilerBaseline(state);
+  if (!scope || (!baseline && (!scope.complete || !scope.diagnostics.length)) || !mutationTargets.length ||
       scope.diagnostics.some(item => item.kind !== "runtime" && !item.path)) return null;
   const workspace = state.turn.workspaceKey;
   const checks = deriveUnityEditorChecks(state).filter(check => check !== null);
   const requiresBehavioralValidation = scope.diagnostics.some(item => item.kind === "runtime") ||
     mutationTargets.some(path => !unityCompilationTarget(path, workspace) && !unityShaderImportTarget(path, workspace));
-  if (scope.diagnostics.some(item => item.kind !== "runtime" && !checks.some(check => check.kind === item.kind))) return null;
+  if ((baseline && !checks.some(check => check.kind === "csharp")) ||
+      scope.diagnostics.some(item => item.kind !== "runtime" && !checks.some(check => check.kind === item.kind))) return null;
   const results = checks.flatMap(check => {
     const receipt = check.receipt;
     if (!receipt || receipt.result.status !== "passed" || (receipt.result.errorCount ?? 0) > 0 || receipt.result.editorVersion !== scope.editorVersion ||
         (receipt.result.editor !== "connected" && (check.kind !== "csharp" || receipt.result.editor !== "closed")) ||
         (receipt.result.editorInstanceId && receipt.result.editorInstanceId !== scope.instanceId) ||
+        (receipt.result.editor === "connected" && scope.editorPid !== undefined && receipt.result.editorPid !== scope.editorPid) ||
         (receipt.result.editor === "connected" && !receipt.result.editorInstanceId && !(Number(receipt.result.editorPid) > 0))) return [];
     const writesCovered = mutationTargets.flatMap(target => {
       const path = (check.kind === "csharp" ? unityCompilationTarget : unityShaderImportTarget)(target, workspace);
@@ -260,6 +352,22 @@ export function verifiedUnityConsoleRepair(state: TurnAggregateV1) {
   });
   const nativeInstances = new Set(results.flatMap(item => item.result.editorPid ? [item.result.editorPid] : []));
   if ((!checks.length && !requiresBehavioralValidation) || results.length !== checks.length || nativeInstances.size > 1) return null;
+  if (baseline) {
+    const compiler = results.find(item => item.result.kind === "csharp");
+    if (compiler?.result.editor !== "connected" || compiler.result.editorPid !== scope.editorPid) return null;
+    const lastCheck = Math.max(...results.map(result => result.sequence));
+    const writes = runtimeV2WorkspaceChangeReceipts(state);
+    const lastWrite = writes[writes.length - 1]?.sequence ?? -1;
+    const after = Math.max(lastCheck, lastWrite);
+    const newer = [...state.events].reverse().find(event => event.sequence > after && event.type === "tool.completed" &&
+      event.run.runId === state.run?.identity.runId && event.status === "succeeded" && event.editorConsole?.pipeline);
+    const later = newer?.type === "tool.completed" && newer.editorConsole && sameRuntimeV2ConsoleEditor(scope, newer.editorConsole)
+      ? newer.editorConsole.pipeline?.live : undefined;
+    const checked = newer ? later : results.find(result => result.sequence === after)?.result.postCompileConsole;
+    const final = freshRuntimeV2PipelineConsoleSample(checked);
+    if (!final || final.compilationFailed || final.errors !== 0 || final.sampledAt <= baseline.sample.sampledAt) return null;
+    if (newer && final.sampledAt < (state.events.find(event => event.sequence === after)?.at ?? Infinity)) return null;
+  }
   return { receipts: results, requiresBehavioralValidation };
 }
 

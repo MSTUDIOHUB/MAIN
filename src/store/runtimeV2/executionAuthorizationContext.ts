@@ -16,6 +16,8 @@ import {
   type ToolCatalogEntry,
 } from "../../lib/toolCatalog";
 import type { RuntimeV2Command } from "../../lib/runtime-v2";
+import { isRuntimeV2EditorDiagnosticRepair } from "../../lib/runtime-v2/editorConsoleEvidence";
+import { UNITY_OFFICIAL_MCP_CONSOLE_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import {
   deriveRuntimeV2ProviderEffectFacts,
@@ -28,7 +30,8 @@ import {
 import { runtimeV2ProviderActionWindowFor } from "./executionProviderActionWindow";
 import { runtimeV2ToolDefinitions } from "./executionToolDefinitions";
 import { builtInToolRequiresWorkspace } from "../../lib/workspaceToolScope";
-import { boundUnityMcpObservation, type WorkspaceMcpSnapshot } from "../../lib/workspaceMcp";
+import { boundWorkspaceEditorObservation, type WorkspaceMcpSnapshot } from "../../lib/workspaceMcp";
+import { runtimeV2WorkspaceMcpSnapshot } from "./executionUnityOfficialMcp";
 import {
   buildRuntimeV2TextEnvelopeCatalog,
   selectRuntimeV2ProviderToolDefinitions,
@@ -71,7 +74,7 @@ function resolvedRuntimeV2CatalogEntry(
 
 export function runtimeV2BoundEditorObservation(input: RuntimeV2ExecutionPortsInput, name: string, args: Readonly<Record<string, unknown>>) {
   const entry = resolvedRuntimeV2CatalogEntry(authorizationFor(input), name);
-  return entry ? boundUnityMcpObservation(input.context.workspaceMcpSnapshot, input.context.runWorkspace, entry, args) : null;
+  return entry ? boundWorkspaceEditorObservation(runtimeV2WorkspaceMcpSnapshot(input), input.context.runWorkspace, entry, args) : null;
 }
 
 export function runtimeV2CatalogToolSource(
@@ -89,7 +92,7 @@ export function runtimeV2ToolRiskForCall(
 ): ToolRiskLevel | null {
   const entry = resolvedRuntimeV2CatalogEntry(authorization, name);
   if (!entry || entry.source === "skill") return null;
-  if (boundUnityMcpObservation(context.workspaceMcpSnapshot, context.workspace ?? undefined, entry, args)) return "external_read";
+  if (boundWorkspaceEditorObservation(context.workspaceMcpSnapshot, context.workspace ?? undefined, entry, args)) return "external_read";
   return getToolRiskLevelForCall(
     entry.exposedName,
     args,
@@ -308,9 +311,15 @@ export function authorizationFor(
 ): RuntimeV2ExecutionAuthorization {
   if (!input.live.authorization) {
     const chat = isChatContext(input);
+    const editorSnapshot = chat ? null : runtimeV2WorkspaceMcpSnapshot(input);
+    const runtimes = input.context.projectBaselineContext?.facts?.runtimes ?? [];
+    const unityGameViewSupported = !!input.context.runWorkspace && !chat && (
+      editorSnapshot?.unityGameViewSupported === true ||
+      (runtimes.some(fact => fact.name === "unity" && fact.version?.startsWith("6000.")) &&
+        !runtimes.some(fact => fact.name === "tuanjie")));
     const state = { ...input.get(), ...(chat
-      ? { mcpServers: [], mcpDiscoveredTools: [], mcpToolServerMap: {}, unityBindings: {} }
-      : input.context.workspaceMcpSnapshot || {}) };
+      ? { mcpServers: [], mcpDiscoveredTools: [], mcpToolServerMap: {}, unityBindings: {}, unityCliConsole: undefined }
+      : editorSnapshot || {}), unityGameViewSupported };
     input.live.authorization = createRuntimeV2ExecutionAuthorization(
       { ...state, webSearchEnabled: readOnlyNetworkPolicy(input).enabled },
       input.context.skillCatalog,
@@ -330,7 +339,7 @@ export function runtimeV2ToolCapabilityRestriction(
     risk: runtimeV2ToolRiskForCall(authorization, name, args, {
       workspace: input.context.runWorkspace,
       approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths,
-      workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
+      workspaceMcpSnapshot: runtimeV2WorkspaceMcpSnapshot(input),
     }),
     editorObservation: !!runtimeV2BoundEditorObservation(input, name, args),
     source: runtimeV2CatalogToolSource(authorization, name),
@@ -343,7 +352,7 @@ export function runtimeV2ToolApprovalCapability(
   const authorization = authorizationFor(input);
   return runtimeV2ForbiddenToolCapability({
     restrictions: runtimeV2ApprovalRequiredCapabilities(input), toolName: name,
-    risk: runtimeV2ToolRiskForCall(authorization, name, args, { workspace: input.context.runWorkspace, approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths, workspaceMcpSnapshot: input.context.workspaceMcpSnapshot }),
+    risk: runtimeV2ToolRiskForCall(authorization, name, args, { workspace: input.context.runWorkspace, approvedLocalFileReadPaths: input.get()?.approvedLocalFileReadPaths, workspaceMcpSnapshot: runtimeV2WorkspaceMcpSnapshot(input) }),
     editorObservation: !!runtimeV2BoundEditorObservation(input, name, args),
     source: runtimeV2CatalogToolSource(authorization, name),
   });
@@ -352,7 +361,16 @@ export function runtimeV2ToolApprovalCapability(
 export function filterRuntimeV2CapabilityRestrictedTools(
   input: RuntimeV2ExecutionPortsInput, tools: readonly ToolDefinition[],
 ): ToolDefinition[] {
-  return tools.filter((tool) => !runtimeV2ToolCapabilityRestriction(input, tool.function.name));
+  return tools.filter((tool) => runtimeV2ToolVisibleToProvider(input, tool.function.name));
+}
+
+export function runtimeV2ToolVisibleToProvider(input: RuntimeV2ExecutionPortsInput, name: string): boolean {
+  if (runtimeV2ToolCapabilityRestriction(input, name)) return false;
+  const origin = resolvedRuntimeV2CatalogEntry(authorizationFor(input), name)?.mcpTool?._mainMcpOrigin;
+  // Repair uses the Console adapter that yields bound, typed Editor evidence.
+  return origin?.connector !== "unity_official" || origin.remoteName !== "console" ||
+    !isRuntimeV2EditorDiagnosticRepair(aggregateForCurrentTurn(input)) ||
+    !runtimeV2BoundEditorObservation(input, UNITY_OFFICIAL_MCP_CONSOLE_TOOL, {});
 }
 
 export function providerToolDefinitionsForCommand(

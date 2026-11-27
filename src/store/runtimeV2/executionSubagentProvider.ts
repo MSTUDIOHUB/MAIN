@@ -165,7 +165,8 @@ export async function requestRuntimeV2ChildStep(input: {
               agentKind: "subagent",
               subagentId: input.job.id,
               parentRunId: input.job.parentRunId,
-              ...(input.job.proactiveKey ? { optionalOverlap: true as const } : {}),
+              ...(input.job.proactiveKey && !input.ports.live.childTelemetry.get(input.job.id)?.dependencyRequired
+                ? { optionalOverlap: true as const } : {}),
               signal: requestController.signal,
               onDebugEvent: (event, data) => {
                 if (event === "model_lane_admission") memoryWait = data.decision === "queued" &&

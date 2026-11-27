@@ -706,6 +706,23 @@ test("a typed source inspection passes code mentions as paths and skips optional
   assert.match(harness.state.agentMessages.at(-1).content, /path: Assets\/Timer\.cs/);
 });
 
+test("typed Console repair requests admit Editor tools when preflight only names workspace capabilities", async () => {
+  for (const request of ["修复console窗口的错误", "Fix the Console errors"]) {
+    const admissions = [];
+    const harness = createHarness({ input: {
+      text: request, effectiveRunIntent: "execute", runtimeRunIntent: "execute",
+      semanticIntent: { objective: request, workType: "implement", answerFormat: "answer",
+        requiredCapabilities: ["workspace_read", "workspace_write"], forbiddenCapabilities: [], approvalRequiredCapabilities: [] },
+      refreshWorkspaceAdmission: async (workspace, prompt, options) => {
+        admissions.push({ workspace, prompt, options });
+        return { instructions: null, baseline: null };
+      },
+    } });
+    await runSubmitAsyncWorkflowRun(harness.input);
+    assert.deepEqual(admissions, [{ workspace: "/tmp/workspace", prompt: request, options: undefined }]);
+  }
+});
+
 test("a natural repair includes its exact prior investigation and omits the duplicate transcript", async () => {
   const { createRuntimeV2Checkpoint, replayRuntimeV2Events } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtime-v2/index.ts"));
   const { providerHistory } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/runtimeV2/executionProviderHistory.ts"));

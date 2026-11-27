@@ -105,6 +105,7 @@ export async function runSubmitRuntimeV2Plan(
       if (recoveredReads) {
         await replayPendingPlanReadBatch(recoveredReads, {
           context: input.context, ledger, run: identity.run, messages, evidence, evidenceContents,
+          isUnityOfficialMcpEnabled: () => input.get().config.unityOfficialMcpEnabled === true,
           ...(executablePlanSelected ? { reuseRetainedRead: { historicalReads: bootstrap.historicalReads } } : {}),
           logStoreEvent: input.logStoreEvent,
         });
@@ -521,6 +522,7 @@ export async function runSubmitRuntimeV2Plan(
           continue;
         }
         await executeReadOnlyPlanTool({ context: input.context, ledger, run: identity.run, call, messages, evidence, evidenceContents, parallelReadCount,
+          isUnityOfficialMcpEnabled: () => input.get().config.unityOfficialMcpEnabled === true,
           advertisedToolNames: response.advertisedToolNames,
           ...(executablePlanSelected ? { reuseRetainedRead: { historicalReads: bootstrap.historicalReads } } : {}), logStoreEvent: input.logStoreEvent });
       }

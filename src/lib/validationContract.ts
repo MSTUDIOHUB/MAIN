@@ -308,6 +308,7 @@ function splitShellSegments(value: string): SplitShellResult {
     }
     if (char === "|") {
       if (next !== "|") {
+        push("start");
         return { segments, rejectionReason: "pipeline_exit_status_ambiguous" };
       }
       push("or");
@@ -546,6 +547,15 @@ export function createValidationCommandSpec(
 export function commandContainsServiceProcess(command: string): boolean {
   const split = splitShellSegments(String(command || ""));
   return split.segments.some((segment) => looksLikeServiceSegment(segment.command));
+}
+
+/** Inspect the executable of a shell segment without matching its arguments. */
+export function commandContainsShellExecutable(command: string, executable: string): boolean {
+  const split = splitShellSegments(command);
+  return split.segments.some(({ command: segment }) => {
+    const program = stripShellDecorators(segment).split(/\s+/, 1)[0];
+    return program?.slice(program.lastIndexOf("/") + 1) === executable;
+  });
 }
 
 export function validationPrimitiveClass(spec: ValidationPrimitiveSpec): ValidationPrimitiveClass {

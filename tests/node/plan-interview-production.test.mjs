@@ -573,15 +573,15 @@ test("Plan tool discovery reports current access, preserves unlocks and never su
   assert.deepEqual(first.newlyUnlocked, ["get_project_skeleton"]);
   assert.deepEqual(repeated.newlyUnlocked, []);
   assert.deepEqual(repeated.alreadyAvailable, ["get_project_skeleton"]);
-  assert.deepEqual(child.alreadyAvailable, ["spawn_subagent"]);
-  assert.deepEqual(child.unlockedTools, [], "the already-advertised child schema is not duplicated in the transcript");
-  assert.deepEqual(child.matchedAdvertised, ["spawn_subagent"], "wait_subagents remains hidden when no child is active");
+  assert.deepEqual(child.alreadyAvailable, []);
+  assert.deepEqual(child.unlockedTools, [], "discovery cannot unlock a collaboration tool without its live preconditions");
+  assert.deepEqual(child.matchedAdvertised, []);
   assert.equal(empty.matchedCount, 0);
   assert.doesNotMatch(empty.hint, /run_command|query='all'/);
   assert.match(h.calls[3][0].map(message => message.content).join("\n"), /non_novel_evidence/);
   assert.deepEqual(h.logs.filter(item => item.event === "runtime_v2_plan_tool_discovery_completed").map(item => [
     item.data.outcome, item.data.matchedAdvertisedCount, item.data.newlyUnlockedCount,
-  ]), [["unlocked", 0, 1], ["already_available", 1, 0], ["already_available", 1, 0], ["no_match", 0, 0]]);
+  ]), [["unlocked", 0, 1], ["already_available", 1, 0], ["no_match", 0, 0], ["no_match", 0, 0]]);
   assert.ok(h.calls[4][4].some(tool => tool.function.name === "read_file"));
   assert.ok(h.calls[4][4].some(tool => tool.function.name === "submit_runtime_v2_work_plan"));
 });

@@ -121,8 +121,8 @@ export function runtimeV2ModelSelectedSubagentCandidate(
       "explore, review, and validate subagents must remain read-only.",
     );
   }
-  if (proactiveKey && (sourceToolCallId || writeJob || !/^[a-f0-9]{64}$/.test(proactiveKey))) {
-    throw new Error("Runtime-owned delegation requires a scoped read-only candidate and its own dispatch identity.");
+  if (proactiveKey && (!sourceToolCallId || writeJob || !/^[a-f0-9]{64}$/.test(proactiveKey))) {
+    throw new Error("Optional delegation requires a scoped read-only proposal and a provider tool call.");
   }
   const explicitlyAllowedScope = commaSeparatedPaths(args.allowed_paths);
   const requiredScope = commaSeparatedPaths(args.required_paths);

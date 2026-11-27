@@ -86,11 +86,13 @@ export type RuntimeV2ProviderActionWindow =
   | "closed_recovery";
 
 export interface RuntimeV2LiveExecutionState {
+  unityGameViewCapture?: import("./executionUnityGameView").RuntimeV2UnityGameViewCapture;
+  unityGameViewImageRejected?: true;
   latestProviderRequestRejectedIdentities?: ReadonlySet<string>;
   readonly messages: AgentMessage[];
   readonly childRuns: Map<string, Promise<RuntimeV2ChildResult>>;
   readonly childAbortControllers: Map<string, AbortController>;
-  readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null }>;
+  readonly childTelemetry: Map<string, { firstTokenAt: number | null; closedAt: number | null; dependencyRequired?: true }>;
   /** Exclusive path ownership held by active implement children. The child
    * stages against these paths; parent and sibling writes are rejected until
    * join commits or discards the transaction. */
@@ -129,8 +131,8 @@ export interface RuntimeV2LiveExecutionState {
     readonly content: string;
     readonly field: "reasoning_content" | "reasoning";
   } | null;
-  /** Confirmed decoding preference for this approved action scope only. */
-  approvedActionReasoningScope?: string;
+  /** Request-adapter decoding preference for this action scope only. */
+  actionReasoningScope?: string;
   /** Process-local truth used only if persisting the mutation completion
    * itself fails. The normal completion event remains the durable authority. */
   hasExecutedMutationEffect: boolean;
@@ -140,6 +142,7 @@ export interface RuntimeV2LiveExecutionState {
    * reason to renegotiate an already proven wire format. */
   readonly provenStructuredToolTransports: Set<RuntimeV2TransportVariant>;
   authorization: RuntimeV2ExecutionAuthorization | null;
+  workspaceMcpOverride?: import("../../lib/workspaceMcp").WorkspaceMcpSnapshot;
   /** A user-denied exact permission request is a lifecycle boundary, not a
    * provider/tool error. The owning runner consumes this fact into one
    * canonical blocked terminal without exposing transport diagnostics. */

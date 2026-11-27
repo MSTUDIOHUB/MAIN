@@ -11,6 +11,7 @@ import type { ApprovedWorkPlanContinuationReference } from "../lib/runtime-v2/co
 import type { RuntimeV2PlanAuthority } from "../lib/runtime-v2/workPlan";
 import { normalizeKnowledgeReferences } from "../lib/knowledgeReferences";
 import { retireRemovedFeatures } from "../lib/retiredFeatureMigration";
+import { createTerminalCredentialProjection } from "../lib/terminalCredentialHistory";
 import { resolveSessionModeAffinity, normalizeSessionModeAffinity, buildStandardSessionDefaultTitle, type SessionModeAffinity, type SessionModeAffinityLike } from "../lib/mainModes";
 import { captureNetworkRead, DEFAULT_WEB_SEARCH_PROVIDER, normalizeWebSearchProvider, type WebSearchProvider } from "../lib/networkRead";
 import { createRuntimeV2ExecutionBlockerView, resolveRuntimeV2ExecutionBlocker, resolveRuntimeV2StructuredUserChoice } from "./runtimeV2/executionBlocker";
@@ -75,7 +76,7 @@ import { inspectGlobalSkillPackage, promoteLegacySkillPackage } from "../lib/ipc
 import { globalSkillPackageId, migrateLegacySkillRegistrations, upsertGlobalSkillRegistration } from "../lib/globalSkillPackages";
 import { applyGithubSkillPackageCandidate, type GithubSkillUpdateCandidate, type GithubSkillUpdateResult } from "../lib/githubSkillUpdates";
 import { normalizeGithubSkillSource } from "../lib/githubSkillSource";
-import { bindWorkspaceUnityMcpView, resolveWorkspaceMcpView } from "../lib/workspaceMcp";
+import { bindWorkspaceUnityCliConsole, bindWorkspaceUnityMcpView, bindWorkspaceUnityOfficialMcp, resolveWorkspaceMcpView } from "../lib/workspaceMcp";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
@@ -705,19 +706,17 @@ export const translations = {
     mcpServers: "MCP Servers",
     mcpScanTools: "Scan Tools",
     mcpScanning: "Scanning...",
-    mcpDescription: "Configure MCP (Model Context Protocol) servers so MAIN can connect to external tools or engines. HTTP transport is supported.",
-    mcpNoServersConfigured: "No MCP servers configured",
-    mcpNoServersHint: "Use Add Server below to connect an external engine",
+    mcpNoServersConfigured: "No HTTP MCP servers",
+    mcpNoServersHint: "Use the plus button to add a server",
     mcpRemoveServer: "Remove",
-    mcpAddServer: "Add Server",
+    mcpAddServer: "Add HTTP MCP Server",
     mcpServerNamePlaceholder: "Name (for example unityMCP)",
     mcpAdd: "Add",
     mcpDiscoveredTools: "Discovered Tools",
-    mcpDiscoveredMessage: "Discovered {toolCount} tool(s) from {serverCount} server(s)",
-    mcpNoServers: "No MCP servers configured",
-    mcpNoTools: "No tools found. Check whether the servers are online.",
-    mcpDiscoveryFailedMessage: "Discovery failed: {message}",
-    mcpTip: "Start the MCP server and make sure it is listening on the configured port, then click Scan Tools. Discovered tools become available to the AI automatically. Unity MCP defaults to",
+    mcpDiscoveredMessage: "Discovered {toolCount} tool(s) from {serverCount} HTTP MCP server(s)",
+    mcpNoServers: "Enable an MCP service before scanning.",
+    mcpNoTools: "No HTTP MCP tools found. Check whether the enabled servers are online.",
+    mcpDiscoveryFailedMessage: "HTTP MCP scan failed ({message})",
     instructionsHooks: "Instructions & Hooks",
     about: "About",
     currentVersion: "Current Version",
@@ -809,19 +808,17 @@ export const translations = {
     mcpServers: "MCP 服务器",
     mcpScanTools: "扫描工具",
     mcpScanning: "扫描中...",
-    mcpDescription: "配置 MCP (Model Context Protocol) 服务器，让 MAIN 可以连接外部工具或引擎。支持 HTTP 传输协议。",
-    mcpNoServersConfigured: "暂无 MCP 服务器配置",
-    mcpNoServersHint: "点击下方「添加服务器」连接外部引擎",
+    mcpNoServersConfigured: "暂无 HTTP MCP 服务器",
+    mcpNoServersHint: "点击右上角的＋添加服务器",
     mcpRemoveServer: "移除",
-    mcpAddServer: "添加服务器",
+    mcpAddServer: "添加 HTTP MCP 服务器",
     mcpServerNamePlaceholder: "名称 (如 unityMCP)",
     mcpAdd: "添加",
     mcpDiscoveredTools: "已发现的工具",
-    mcpDiscoveredMessage: "已发现 {toolCount} 个工具（来自 {serverCount} 个服务器）",
-    mcpNoServers: "尚未配置 MCP 服务器",
-    mcpNoTools: "未发现任何工具，请检查服务器是否在线",
-    mcpDiscoveryFailedMessage: "发现失败：{message}",
-    mcpTip: "MCP 服务器需先启动并监听指定端口，然后点击「扫描工具」发现可用工具。发现后的工具会在对话中自动供 AI 调用。Unity MCP 服务器默认地址为",
+    mcpDiscoveredMessage: "从 {serverCount} 个 HTTP MCP 服务器发现 {toolCount} 个工具",
+    mcpNoServers: "请先启用要扫描的 MCP 服务。",
+    mcpNoTools: "HTTP MCP 未发现工具。请检查已启用的服务器是否在线。",
+    mcpDiscoveryFailedMessage: "HTTP MCP 扫描失败（{message}）",
     instructionsHooks: "指令与 Hooks",
     about: "关于",
     currentVersion: "当前版本",
@@ -3617,6 +3614,7 @@ export function normalizeSessionRuntimeSnapshot(
     workspacePath?: string | null;
     expectedSessionKey?: string | null;
     expectedSessionEpoch?: string | null;
+    language?: "zh" | "en";
     /** True only while hydrating a persisted snapshot after process loss. */
     coldRestore?: boolean;
   },
@@ -3880,7 +3878,7 @@ export function normalizeSessionRuntimeSnapshot(
       executionCheckpoint.owner.sessionKey === restoredLifecycleSessionKey &&
       executionCheckpoint.aggregate.run?.identity.runId === restoredHarnessRunMarker?.runId &&
       !executionCheckpoint.aggregate.run?.blocker?.decision
-    ? createRuntimeV2ExecutionBlockerView(executionCheckpoint.aggregate, "zh", Math.max(0, ...rawTaskFlow.map(block => block.id)) + 1)
+    ? createRuntimeV2ExecutionBlockerView(executionCheckpoint.aggregate, options?.language ?? "zh", Math.max(0, ...rawTaskFlow.map(block => block.id)) + 1)
     : null;
   if (executionChoice) {
     const { request } = executionChoice;
@@ -3896,7 +3894,7 @@ export function normalizeSessionRuntimeSnapshot(
       (block.choiceRequest.parentRunId ?? null) === (request.parentRunId ?? null));
     if (persistedIndex >= 0) {
       rawTaskFlow = rawTaskFlow.map((block, index) => index === persistedIndex && block.type === "agent"
-        ? { ...block, options: executionChoice.block.options, choiceRequest: request }
+        ? { ...block, content: executionChoice.block.content, options: executionChoice.block.options, choiceRequest: request }
         : block);
     } else {
       rawTaskFlow = [...rawTaskFlow, executionChoice.block];
@@ -6229,10 +6227,13 @@ function getClosedSessionPanelPatch(): Partial<AppState> {
 function getSessionRuntimeUiPatch(
   runtime: SessionRuntimeState,
   options: { resetPanels?: boolean; requireTranscript?: boolean } = {},
+  projectHistory = createTerminalCredentialProjection(runtime),
 ): Partial<AppState> {
   const normalizedRuntime = {
     ...runtime,
-    taskFlow: archiveConsumedReplyOptionsFromTaskFlow(runtime.taskFlow || []),
+    taskFlow: projectHistory(archiveConsumedReplyOptionsFromTaskFlow(runtime.taskFlow || [])),
+    conversationTurns: projectHistory(runtime.conversationTurns),
+    agentMessages: projectHistory(runtime.agentMessages),
   };
   return options.resetPanels
     ? { ...normalizedRuntime, ...getClosedSessionPanelPatch() }
@@ -6264,6 +6265,7 @@ export function buildRestoredSessionRuntimePatch(input: {
     workspacePath: input.workspacePath ?? input.fallbackState.currentWorkspace,
     expectedSessionKey: input.expectedSessionKey,
     expectedSessionEpoch: input.expectedSessionEpoch,
+    language: input.fallbackState.config?.language === "en" ? "en" : "zh",
   });
   if (!normalized) return {};
   let taskFlow = normalized.taskFlow || [];
@@ -6325,7 +6327,7 @@ export function buildRestoredSessionRuntimePatch(input: {
   });
   return getSessionRuntimeUiPatch(runtime, {
     resetPanels: input.resetPanels === true,
-  });
+  }, createTerminalCredentialProjection(mergedSnapshot));
 }
 
 function hasSessionRuntimeTranscript(runtime: Partial<SessionRuntimeState> | null | undefined): boolean {
@@ -16537,16 +16539,36 @@ export const useAppStore = create<AppState>()(
         const baseline = snapshot.baseline || (refreshedMetadata?.anchors.length ? refreshedMetadata : null);
         const editorVersion = baseline?.facts.runtimes.find(fact => fact.name === "unity")?.version;
         const mcpView = freezeMcp();
-        const mcpSnapshot = await Promise.race([
+        const boundMcp = await Promise.race([
           bindWorkspaceUnityMcpView(mcpView, editorVersion),
           new Promise<null>(resolve => setTimeout(() => resolve(null), 800)),
         ]) || await bindWorkspaceUnityMcpView(mcpView, undefined);
+        const officialVersion = editorVersion?.startsWith("6000.") &&
+          !baseline?.facts.runtimes.some(fact => fact.name === "tuanjie") ? editorVersion : undefined;
+        let officialMcpView = boundMcp;
+        if (officialVersion) {
+          if (get().config.unityOfficialMcpEnabled) {
+            try {
+              const official = await bindWorkspaceUnityOfficialMcp(boundMcp, officialVersion, AbortSignal.timeout(10_000));
+              if (get().config.unityOfficialMcpEnabled) officialMcpView = official;
+            } catch (error) {
+              logStoreEvent("workspace_unity_official_mcp_unavailable", { workspace, reason: String(error) });
+            }
+          } else {
+            officialMcpView = Object.freeze({ ...boundMcp, unityOfficialMcpOfferVersion: officialVersion });
+          }
+        }
+        const mcpSnapshot = await bindWorkspaceUnityCliConsole(officialVersion
+          ? Object.freeze({ ...officialMcpView, unityGameViewSupported: true })
+          : officialMcpView, editorVersion);
         logStoreEvent("workspace_mcp_admitted", {
           workspace,
           configured: mcpView.mcpServers.length,
           discovered: mcpView.mcpDiscoveredTools.length,
           admitted: mcpSnapshot.mcpDiscoveredTools.length,
           boundEditors: Object.keys(mcpSnapshot.unityBindings || {}).length,
+          unityOfficialMcp: !!mcpSnapshot.unityOfficialMcp,
+          unityCliConsole: !!mcpSnapshot.unityCliConsole,
         });
         return {
           instructions: snapshot.instructions,
@@ -16833,6 +16855,7 @@ export const useAppStore = create<AppState>()(
           appIconVariant: normalizeAppIconVariant((persistedConfig as any).appIconVariant),
           toolPermissionPolicy: normalizeToolPermissionPolicy((persistedConfig as any).toolPermissionPolicy),
           mcpRouting: normalizeMcpRoutingConfig((persistedConfig as any).mcpRouting),
+          unityOfficialMcpEnabled: persistedConfig.unityOfficialMcpEnabled === true,
           sessionRecordingEnabled: (persistedConfig as any).sessionRecordingEnabled ?? current.config.sessionRecordingEnabled,
           debugRecordFullTurnProcess: (persistedConfig as any).debugRecordFullTurnProcess === true,
           experimentalOmlxFirstResponse: persistedConfig.experimentalOmlxFirstResponse === true,

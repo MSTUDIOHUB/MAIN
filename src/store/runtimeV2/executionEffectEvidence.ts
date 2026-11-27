@@ -8,7 +8,7 @@ import { normalizeMcpWorkspace } from "../../lib/workspaceMcp";
 import { normalizeValidationWorkspaceCwd } from "../../lib/validationContract";
 import type { RuntimeV2ToolEffectKind } from "../../lib/runtime-v2";
 import { deriveRuntimeV2WorkspaceNetChanges } from "../../lib/runtime-v2/validationReceipt";
-import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES, isRuntimeV2ReadOnlyToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL, RUNTIME_V2_SOURCE_READ_TOOL_NAMES, isRuntimeV2ReadOnlyToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   authorizationFor,
   isRuntimeV2ObservationRisk,
@@ -84,6 +84,9 @@ export function runtimeV2ToolEvidenceProjection(input: {
   readonly effectKind?: RuntimeV2ToolEffectKind;
   readonly operationName?: string;
 } {
+  if (input.toolName === ENABLE_UNITY_OFFICIAL_MCP_TOOL && input.result?.enabled === true) {
+    return { targets: [{ target: input.target }], kind: "tool", effectKind: "external_operation", operationName: input.toolName };
+  }
   const authorization = authorizationFor(input.ports);
   const tool = authorization.toolCatalog.lookup(input.toolName);
   const builtIn = tool.status === "resolved" && tool.entry.source === "built_in";

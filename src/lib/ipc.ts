@@ -10,6 +10,7 @@ import type { GithubSkillSource } from "./githubSkillSource";
 import type { WebSearchProvider } from "./networkRead";
 import { serializeRuntimeV2CheckpointMap } from "./runtime-v2/checkpoint";
 import { mergeRuntimeV2CheckpointMaps } from "./runtime-v2/checkpointMerge";
+import { redactTerminalCredentials } from "./terminalCredentials";
 import {
   createProjectSessionMutationCoordinator,
   isProjectSessionAdmissionProjectionOwned,
@@ -1261,6 +1262,10 @@ export function compareAndSwapSessionSnapshot(input: {
   return invoke<ProjectSessionSnapshotRecord>("compare_and_swap_session_snapshot", { input });
 }
 
+export function finalizeTerminalCredentialHistoryCleanup(): Promise<boolean> {
+  return invoke("finalize_terminal_credential_history_cleanup");
+}
+
 export interface LegacySessionFile {
   workspace: string;
   sessionId: string;
@@ -1702,7 +1707,7 @@ export function runHookCommand(
 }
 
 export async function runUnityEditorOperation(
-  command: "unity_create_scene" | "unity_compile_project" | "unity_probe_editor" | "unity_test_project",
+  command: "unity_create_scene" | "unity_compile_project" | "unity_probe_editor" | "unity_cli_console" | "unity_official_mcp" | "unity_test_project" | "capture_unity_game_view",
   args: Record<string, unknown>,
   signal: AbortSignal,
   deadlineAt: number,
@@ -1720,6 +1725,10 @@ export async function runUnityEditorOperation(
   }
 }
 
+export function inspectUnityAssemblies(workspace: string, sourcePaths: readonly string[]): Promise<unknown> {
+  return invoke("unity_inspect_assemblies", { workspace, sourcePaths });
+}
+
 export function runCommand(
   command: string,
   input?: string,
@@ -1735,7 +1744,12 @@ export function runCommand(
     workspace,
     permissionApproval,
     workingDirectory,
-  });
+  }).then(output => ({
+    ...output,
+    command: redactTerminalCredentials(output.command),
+    stdout: redactTerminalCredentials(output.stdout),
+    stderr: redactTerminalCredentials(output.stderr),
+  }));
 }
 
 export function browserEvaluate(

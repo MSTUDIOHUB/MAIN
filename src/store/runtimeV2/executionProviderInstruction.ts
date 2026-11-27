@@ -161,10 +161,13 @@ export function providerModeInstruction(
       ? `Previous child work did not complete (${failedSubagents.join("; ")}). Continue the objective directly; child failure is never a blocker.`
       : "",
     activeSubagents.length > 0
-      ? `Child work is active (${activeSubagents.join("; ")}). Do not reread files already assigned to active children; continue independent non-overlapping parent work and call wait_subagents only when a child result or staged mutation becomes a dependency.`
+      ? `Child work is active (${activeSubagents.join("; ")}). Continue independent parent work. Use wait_subagents only for a result or staged mutation required by your next action. Name the child handle and describe that blocked action in dependency.`
       : "",
     allSubagentsSettled
       ? "All spawned subagents have finished and settled; no active subagents remain. Do NOT call wait_subagents again; continue directly from the delivered results or conclude."
+      : "",
+    toolSurface.hasSpawnSubagent && Array.isArray(command.payload.delegationHints) && command.payload.delegationHints.length
+      ? `Independent work candidates backed by the Run ledger: ${JSON.stringify(command.payload.delegationHints.slice(0, 4))}. Use primaryEvidence references for the child and name the path you can work on in parent_work.`
       : "",
     toolSurface.hasSpawnSubagent && remainingSubagentCapacity > 0
       ? (() => {
@@ -179,7 +182,7 @@ export function providerModeInstruction(
             command.payload.collaborationPreferred === true
               ? serializedLane
                 ? "The user prefers collaboration. The current lane runs requests sequentially rather than concurrently. Continue the parent task directly while parallel capacity is unavailable."
-                : `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, with ${freeSlots} currently free for parallel work alongside the parent. Take the initiative to delegate an evidence-backed independent result when its benefit justifies coordination. Keep each child objective within the user's requested deliverable and depth, and continue non-dependent parent work in parallel. Delegation is not a mandatory lifecycle stage. For a simple or linear task, proceed directly. If all parallel slots are occupied, continue parent work until a slot opens or a result is needed.`
+                : `The user prefers collaboration. There are ${freeSlots} free child request slots. Propose a distinct, actionable deliverable only. Provide primary required_paths, success_criteria, evidence_refs (ledger IDs or exact evidence paths), and concrete independent parent_work. Keep known versions, a single diagnostic chain, and already delivered findings in the parent. Continue directly when the work is sequential or capacity is busy.`
               : serializedLane
                 ? "Delegation is optional. The current lane runs requests sequentially rather than concurrently. Continue the parent task directly while parallel capacity is unavailable."
                 : "Delegation is optional.",

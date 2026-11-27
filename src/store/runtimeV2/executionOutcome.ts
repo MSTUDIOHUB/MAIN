@@ -17,6 +17,7 @@ import { deriveUnityCompilation, unresolvedUnityEditorCheck, unityCompilationMes
 import { deriveRuntimeV2ExecutionContract } from "../../lib/runtime-v2/executionContract";
 import { runtimeV2PendingGuidance } from "../../lib/runtime-v2/guidance";
 import { runtimeV2DeliveredWorkspacePaths } from "../../lib/runtime-v2/validationReceipt";
+import { executionRecoveryOptions } from "./executionBlocker";
 
 export function runtimeV2ExecuteTerminalDecision(input: {
   aggregate: ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"];
@@ -117,7 +118,7 @@ export async function recoverRuntimeV2Validation(
     reasonCode: "recovery_stalled",
     evidenceSequence: recovery.evidenceSequence,
     message: recovery.pauseMessage,
-    options: ["recheck", "stop"],
+    ...executionRecoveryOptions(input.aggregate),
   });
   return true;
 }

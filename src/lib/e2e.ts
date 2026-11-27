@@ -8749,8 +8749,8 @@ function seedRealOmlxPlanFlowScenario() {
     useAppStore.setState((state) => ({ config: {
       ...state.config, local: { ...state.config.local, toolProtocol },
     } }));
-  bridge.setRealMcpFixture = async (url: string, allowFixtureEditorChecks = false) => {
-    const servers = [{ name: "fixture", type: "http" as const, url, enabled: true }];
+  bridge.setRealMcpFixture = async (url: string, allowFixtureEditorChecks = false, enabled = true) => {
+    const servers = [{ name: "fixture", type: "http" as const, url, enabled }];
     useAppStore.getState().setMcpServers(servers);
     const { discoverAllMcpTools } = await import("./mcpClient");
     const discovered = await discoverAllMcpTools(servers, { forceRefresh: true });

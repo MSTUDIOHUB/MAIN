@@ -27,6 +27,7 @@ import {
 import { runtimeV2ParentOverlapDiagnostics } from "./executionSubagentOverlap";
 import { directExecuteScopeForSubagent } from "./executionSubagentStaging";
 import type { RuntimeV2ChildResult } from "./executionTypes";
+import { promoteModelLaneSubagentDependency } from "../../lib/modelLaneCoordinator";
 
 function fallbackScheduleScopeKey(command: Parameters<NonNullable<SchedulerPort["prepareSchedule"]>>[0]["command"]): string {
   const args = command.payload.arguments && typeof command.payload.arguments === "object" && !Array.isArray(command.payload.arguments)
@@ -38,14 +39,28 @@ function fallbackScheduleScopeKey(command: Parameters<NonNullable<SchedulerPort[
 }
 
 export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput): SchedulerPort {
+  const rejectOptional = (command: Parameters<SchedulerPort["execute"]>[0]["command"], reason: string): never => {
+    const code = "subagent_optional_proposal_rejected";
+    const detail = "Continue the parent task directly. An optional child needs independent work on both sides, current primary evidence, a specific deliverable, and spare capacity.";
+    closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED [code=${code}] [reason=${reason}]: ${detail}`);
+    input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
+      turnId: command.run.turnId, runId: command.run.runId, reason, reasonCode: code,
+    });
+    throw attachFailureReasonCode(new Error(detail), code);
+  };
   return {
     async prepareSchedule({ command }) {
       if (command.kind !== "schedule_subagents") return null;
+      if (command.payload.proactiveKey && !command.payload.toolCallId) return null;
+      if (typeof command.payload.optionalDelegationRejected === "string") rejectOptional(command, command.payload.optionalDelegationRejected);
       assertRuntimeV2SubagentScheduleRunway(input, command);
       const existingJobs = (aggregateForCurrentTurn(input)?.subagents || []).filter((job) =>
         job.parentRunId === command.run.runId
       );
       const requestCapacity = runtimeV2SubagentCapacityFromCommand(command);
+      if (command.payload.proactiveKey && existingJobs.filter(job => job.status === "queued" || job.status === "running").length >= requestCapacity) {
+        rejectOptional(command, "slots_in_use");
+      }
       if (requestCapacity <= 0) {
         const detail = "The current provider lane does not admit child requests. Continue the parent task directly.";
         closeCollaborationToolCall(input, command, `SUBAGENT_SCHEDULE_REJECTED [code=subagent_capacity_unavailable]: ${detail}`);
@@ -123,6 +138,23 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
         const jobs = runSubagents.filter((job) =>
           (job.status === "queued" || job.status === "running") && runtimeV2JobMatchesSchedule(job, command)
         );
+        if (command.payload.proactiveKey && !command.payload.toolCallId) {
+          // Reconcile jobs created by the retired automatic scheduler without
+          // reopening a provider stream or creating another child identity.
+          return jobs.flatMap((job): RuntimeV2EventDraft[] => {
+            input.live.childAbortControllers.get(job.id)?.abort("automatic_delegation_retired");
+            input.live.childRuns.delete(job.id);
+            input.logStoreEvent("runtime_v2_subagent_schedule_rejected", {
+              turnId: command.run.turnId, runId: command.run.runId, jobId: job.id, reason: "automatic_delegation_retired",
+            });
+            return [
+              ...(job.status === "running" && job.closedAt === null
+                ? [{ type: "subagent.telemetry" as const, run: command.run, telemetry: { jobId: job.id, phase: "closed" as const, at: input.now() } }]
+                : []),
+              { type: "subagent.completed", run: command.run, jobId: job.id, status: "canceled", summary: "自动派发的旧子任务已结束。", evidence: [] },
+            ];
+          });
+        }
         if (jobs.length === 0) {
           closeCollaborationToolCall(
             input,
@@ -172,6 +204,14 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
         return events;
       }
       if (command.kind === "join_subagents") {
+        if (command.payload.optionalJoinRejected === true) {
+          const detail = "Specify the optional child handle and the parent action that needs its deliverable. Continue independent work until then.";
+          closeCollaborationToolCall(input, command, `SUBAGENT_WAIT_REJECTED [code=subagent_optional_dependency_required]: ${detail}`);
+          input.logStoreEvent("runtime_v2_subagent_reference_rejected", {
+            turnId: command.run.turnId, runId: command.run.runId, reason: "optional_dependency_required",
+          });
+          return [];
+        }
         const runSubagentIds = new Set(runSubagents.map((job) => job.id));
         const jobIds = Array.isArray(command.payload.jobIds)
           ? command.payload.jobIds.map((value) => String(value || "")).filter((jobId) => !!jobId && runSubagentIds.has(jobId))
@@ -197,6 +237,14 @@ export function createRuntimeV2SchedulerPort(input: RuntimeV2ExecutionPortsInput
           return [];
         }
         if (jobIds.length > 0) {
+          if (hasToolCallId) {
+            for (const job of runSubagents) {
+              if (!job.proactiveKey || !jobIds.includes(job.id)) continue;
+              const telemetry = input.live.childTelemetry.get(job.id);
+              if (telemetry) telemetry.dependencyRequired = true;
+              promoteModelLaneSubagentDependency(job.parentRunId, job.id);
+            }
+          }
           if (automaticJoinReason) {
             input.logStoreEvent("runtime_v2_subagent_auto_join", {
               turnId: command.run.turnId, runId: command.run.runId, jobIds, reason: automaticJoinReason,

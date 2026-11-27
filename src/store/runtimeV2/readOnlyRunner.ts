@@ -225,6 +225,7 @@ export async function runSubmitRuntimeV2ReadOnly(
     input.logStoreEvent(`runtime_v2_${strategy === "chat" ? "chat" : "workspace_read"}_${existing ? "resumed" : "admitted"}`, { turnId: identity.turn.turnId, runId: identity.run.runId, strategy });
     const result = await runRuntimeV2ReadOnlyLoop({
       ports, turn: identity.turn, run: identity.run, objective: turn.userPrompt,
+      subagentRequirement: input.context.turnInputContextSignals?.subagentRequirement,
       capabilityRestrictions: input.context.capabilityRestrictions,
       approvalRequiredCapabilities: input.context.approvalRequiredCapabilities,
       // New code investigations choose a concrete source tool in the first
@@ -239,6 +240,7 @@ export async function runSubmitRuntimeV2ReadOnly(
         !!buildLoadSkillToolDefinition(input.context.skillCatalog),
       signal: input.context.abortCtrl.signal,
       isExternalCancellationPending: () => getPendingSessionCancellation(identity.turn.sessionKey)?.turnId === identity.turn.turnId,
+      logEvent: input.logStoreEvent,
       now, deadlineMs: input.deadlineMs,
       initial: existing ? { aggregate: existing.aggregate, revision: existing.revision } : undefined,
       blocked: () => live.permissionRejection,

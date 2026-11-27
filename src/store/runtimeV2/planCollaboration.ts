@@ -94,11 +94,17 @@ export function createRuntimeV2PlanCollaboration(input: {
         !event.report
       ) continue;
       const job = aggregate.subagents.find((entry) => entry.id === event.jobId);
+      const proposed = job?.proactiveKey && job.sourceToolCallId;
+      const delivery = aggregate.events.find(item => item.type === "subagent.handoff_delivered" && item.jobId === event.jobId);
+      const deliveredIds = delivery?.type === "subagent.handoff_delivered" ? new Set(delivery.evidenceIds) : null;
+      if (proposed && !deliveredIds?.size) continue;
+      const evidence = proposed ? event.evidence.filter(item => deliveredIds?.has(item.id)) : event.evidence;
+      const findings = proposed ? event.report.findings.filter(finding => finding.evidenceIds.some(id => deliveredIds?.has(id))) : event.report.findings;
       const evidenceIds = [...new Set(
-        event.evidence.map((evidence) => evidence.id),
+        evidence.map(item => item.id),
       )];
-      const findingContext = event.report.findings.map((finding) =>
-        `Finding: ${finding.statement} (evidence: ${finding.evidenceIds.join(", ")})`
+      const findingContext = findings.map((finding) =>
+        `Finding: ${finding.statement} (evidence: ${finding.evidenceIds.filter(id => !proposed || deliveredIds?.has(id)).join(", ")})`
       ).join("\n");
       upsertRuntimeV2ContextAnchor(live, {
         key: `child:${event.jobId}`,
@@ -106,26 +112,26 @@ export function createRuntimeV2PlanCollaboration(input: {
           `Scope: ${job?.scopeKey || "recovered planning child"} (${job?.allowedPaths.join(", ") || "bounded read scope"})`,
           "Status: completed",
           `Evidence ids: ${evidenceIds.join(", ") || "none"}`,
-          `Report: ${event.report.summary}`,
+          ...(proposed ? [] : [`Report: ${event.report.summary}`]),
           findingContext,
           "When relying on a child fact, explicitly cite its exact evidence id in the next structured action or final answer.",
         ].filter(Boolean).join("\n"),
       });
       const citedStatements = new Map<string, string[]>();
-      for (const finding of event.report.findings) {
+      for (const finding of findings) {
         for (const evidenceId of finding.evidenceIds) {
           const statements = citedStatements.get(evidenceId) || [];
           statements.push(finding.statement);
           citedStatements.set(evidenceId, statements);
         }
       }
-      for (const evidence of event.evidence) {
-        const statements = citedStatements.get(evidence.id);
+      for (const item of evidence) {
+        const statements = citedStatements.get(item.id);
         if (!statements?.length) continue;
-        if (!input.evidence.some((entry) => entry.id === evidence.id)) {
+        if (!input.evidence.some((entry) => entry.id === item.id)) {
           input.evidence.push({
-            id: evidence.id,
-            target: evidence.target,
+            id: item.id,
+            target: item.target,
             // A child observation is bounded advisory evidence. Only the
             // parent Plan reader may establish source-version authority for
             // modify/delete targets.
@@ -133,9 +139,9 @@ export function createRuntimeV2PlanCollaboration(input: {
             statement: [...new Set(statements)].join(" "),
           });
         }
-        if (!input.evidenceContents.has(evidence.id)) {
-          input.evidenceContents.set(evidence.id, [
-            `Child report: ${event.report.summary}`,
+        if (!input.evidenceContents.has(item.id)) {
+          input.evidenceContents.set(item.id, [
+            ...(proposed ? [] : [`Child report: ${event.report.summary}`]),
             ...[...new Set(statements)].map((statement) =>
               `Finding: ${statement}`
             ),
@@ -188,7 +194,7 @@ export function createRuntimeV2PlanCollaboration(input: {
           ...(failureReasonCode ? { failureReasonCode } : {}),
         });
       }
-      if (!command.payload.proactiveKey) await input.ledger.recordSoftSignal(input.run, "repeated_action");
+      if (!command.payload.proactiveKey && !command.payload.optionalDelegationRejected) await input.ledger.recordSoftSignal(input.run, "repeated_action");
       input.logStoreEvent("runtime_v2_plan_collaboration_failed", {
         turnId: input.run.turnId,
         runId: input.run.runId,
@@ -288,8 +294,7 @@ export function createRuntimeV2PlanCollaboration(input: {
       if (!aggregate || input.runner.context.abortCtrl.signal.aborted ||
           aggregate.pendingToolCalls.length || aggregate.scheduledCommands.length) return false;
       const command = decideNextCommands(aggregate, collaboration.current().decision)[0];
-      if (!command || (command.kind !== "join_subagents" &&
-        !(command.kind === "schedule_subagents" && typeof command.payload.proactiveKey === "string"))) return false;
+      if (command?.kind !== "join_subagents") return false;
       await executeSchedulerCommand(command);
       return true;
     },
@@ -299,7 +304,7 @@ export function createRuntimeV2PlanCollaboration(input: {
       const joined = await collaboration.joinActive("plan_submission_requires_joined_children", true);
       return { joined, resubmit: !joined || jobs.some(job => !job.proactiveKey) };
     },
-    async joinActive(reason, cancelUnusedProactive = false) {
+    async joinActive(reason, cancelUnusedProactive = true) {
       const jobs = activeChildJobs(input.ledger, input.run);
       if (jobs.length === 0) return true;
       const command = await input.ledger.schedule(

@@ -1,6 +1,7 @@
 import type { TurnAggregateV1 } from "./aggregate";
 import { unresolvedUnityEditorCheck, verifiedUnityConsoleRepair } from "./unityCompilation";
 import { isRuntimeV2EditorDiagnosticRepair } from "./editorConsoleEvidence";
+import { runtimeV2UnityPlayModeCovered } from "./unityPlayMode";
 import type {
   RuntimeV2AcceptanceEvidenceRequirementSlot,
 } from "./contracts";
@@ -276,6 +277,7 @@ export function runtimeV2DirectExecuteReadyForConclusion(state: TurnAggregateV1)
   const editorRepair = isRuntimeV2EditorDiagnosticRepair(state);
   const editor = editorRepair ? verifiedUnityConsoleRepair(state) : null;
   if (editorRepair && !editor) return false;
+  if (editor && !runtimeV2UnityPlayModeCovered(state)) return false;
   if (editor && !editor.requiresBehavioralValidation && !requirements.some(item => item === "behavioral" || item === "interaction") &&
       !deriveRuntimeV2ExecutionContract(state)) return true;
   const validPasses = currentDirectExecuteValidationPasses(state).filter(event => !editor?.requiresBehavioralValidation ||

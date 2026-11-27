@@ -43,10 +43,22 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   analyzeValidationCommand,
   createValidationCommandSpec,
+  commandContainsShellExecutable,
   evaluateValidationSpec,
   isAcceptanceCapableValidationSpec,
   validationPrimitiveClass,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/validationContract.ts"));
+
+test("Editor shell inspection identifies process listings and waits without reading arguments as commands", () => {
+  for (const command of ["sleep 8", "cd Assets && /bin/sleep 15 && stat Tests.csproj", "echo starting; command sleep 20"]) {
+    assert.equal(commandContainsShellExecutable(command, "sleep"), true, command);
+  }
+  for (const command of ["grep 'sleep 15' Editor.log", "printf 'done; sleep 8'", "unity command console get"]) {
+    assert.equal(commandContainsShellExecutable(command, "sleep"), false, command);
+  }
+  assert.equal(commandContainsShellExecutable("ps aux | grep Unity", "ps"), true);
+  assert.equal(commandContainsShellExecutable("grep 'ps aux' README.md", "ps"), false);
+});
 
 test("validation command and receipt identity preserve quoted source bytes", () => {
   const command = "python3 -c 'if True:\n    assert \"a  b\" == \"a  b\"'";

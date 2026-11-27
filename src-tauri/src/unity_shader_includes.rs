@@ -49,7 +49,7 @@ fn package_matches(root: &Path, package: &str, version: &str) -> bool {
         && metadata.get("version").and_then(Value::as_str) == Some(version)
 }
 
-fn installed_package(project: &Path, package: &str, lock: &Value) -> Option<PathBuf> {
+pub(crate) fn installed_package(project: &Path, package: &str, lock: &Value) -> Option<PathBuf> {
     let entry = lock.get("dependencies")?.get(package)?;
     let version = entry.get("version")?.as_str()?;
     if !version

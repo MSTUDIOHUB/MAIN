@@ -1,6 +1,8 @@
 import { buildCommentaryLanguageAnchor, shouldPublishPublicCommentary } from "../../lib/languageContract";
 import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
+import { runtimeV2CanAdvertiseSubagentSpawn } from "../../lib/runtime-v2/collaborationDecision";
+import { createTerminalCredentialProjection, projectTerminalCredentialModelMessages } from "../../lib/terminalCredentialHistory";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
@@ -14,6 +16,7 @@ import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from 
 import { boundReadOnlyHistory } from "./readOnlyHistory";
 import { projectPlanSkillGuidance } from "./planSkillGuidance";
 import { isStreamOutputLimited } from "../../lib/streaming";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   normalizeProviderResponseV1,
   runtimeV2CheckpointWriteFailureReason,
@@ -120,6 +123,7 @@ export async function requestPlanModel(input: {
     submissionStage,
     submissionRepairPending: input.submissionRepairPending,
     collaborationAllowed,
+    spawnAllowed: runtimeV2CanAdvertiseSubagentSpawn(input.collaboration),
     collaborationRequired,
     collaborationRequirementMet,
     remainingSubagentCapacity,
@@ -214,9 +218,16 @@ export async function requestPlanModel(input: {
     if (input.validationRepair) {
       appendRuntimeV2GuidanceHistory(planRequestMessages, input.ledger.snapshot(), input.run, command.idempotencyKey);
     }
+    const delegationHints = input.collaboration.delegationHints;
+    if (!collaborationRequired && advertisedToolNames.includes("spawn_subagent") && Array.isArray(delegationHints) && delegationHints.length) {
+      planRequestMessages.push({ role: "system", content:
+        `Independent planning work backed by the Run ledger: ${JSON.stringify(delegationHints.slice(0, 4))}. Propose an actionable success_criteria with required_paths and matching evidence_refs. Name the independent parent_work you can do now. Only wait for a result needed by a specific plan decision and describe that action in dependency.` });
+    }
+    const projectHistory = createTerminalCredentialProjection({ events: input.ledger.snapshot()?.events, agentMessages: planRequestMessages });
+    const safeRequestMessages = projectTerminalCredentialModelMessages(planRequestMessages, projectHistory);
     const unboundedRequestMessages = textEnvelope
-      ? planTextEnvelopeTranscript(planRequestMessages, planTools, input.context.phaseLanguage)
-      : planRequestMessages;
+      ? planTextEnvelopeTranscript(safeRequestMessages, planTools, input.context.phaseLanguage)
+      : safeRequestMessages;
     const maxOutputTokens = input.compactRecovery
       ? Math.min(budget?.outputBudget ?? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS, PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS)
       : budget?.outputBudget ?? (submissionStage ? PLAN_SYNTHESIS_RECOVERY_MAX_TOKENS : undefined);
@@ -264,7 +275,7 @@ export async function requestPlanModel(input: {
       repairReasoningDisabled,
       offeredToolCount: offeredTools.length,
       offeredToolNames: offeredTools.map((tool) => tool.function.name),
-      editorObservationTools: offeredTools.map(tool => tool.function.name).filter(name => name.startsWith("unity_mcp_")),
+      editorObservationTools: offeredTools.map(tool => tool.function.name).filter(name => RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(name)),
       projectBaselineFingerprint: input.context.projectBaselineContext?.fingerprints.overall || null,
       catalogToolNames: advertisedToolNames,
       promptMessageCount: requestMessages.length,

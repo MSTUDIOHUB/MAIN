@@ -19,6 +19,7 @@ import PlanDocumentCard from "./PlanDocumentCard";
 import { continuePlanDraft } from "../store/planDraftContinuation";
 import { resolvePlanDocumentFromAggregate, resolvePlanDraftFromAggregate, resolveSessionPlanDocument } from "../lib/planDocumentRecords";
 import { samePlanDocumentRef } from "../lib/planDocuments";
+import { createTerminalCredentialProjection } from "../lib/terminalCredentialHistory";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EQuickReplyHandler, getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
@@ -1359,9 +1360,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     );
   };
   const handleSavePlanDocument = async (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => {
+    const content = createTerminalCredentialProjection(useAppStore.getState())(document.content);
     const e2eSaveHandler = getE2ESavePlanDocumentHandler();
     if (e2eSaveHandler) {
-      return e2eSaveHandler(document);
+      return e2eSaveHandler({ ...document, content });
     }
 
     const suggestedName = sanitizeSuggestedFileName(document.suggestedFileName || document.title || "plan");
@@ -1372,7 +1374,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       ],
     });
     if (!filePath) return false;
-    await exportTextFile(filePath, document.content);
+    await exportTextFile(filePath, content);
     const globalChatSessionKey =
       !currentWorkspace.trim()
         ? resolveGlobalChatSessionKey(currentSessionId)

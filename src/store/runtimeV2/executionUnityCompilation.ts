@@ -1,13 +1,64 @@
 import { runUnityEditorOperation } from "../../lib/ipc";
+import { executeTool } from "../../lib/toolExecutor";
 import { deriveRuntimeV2PlanExecutionFrontier, type RuntimeV2Command, type RuntimeV2EventDraft } from "../../lib/runtime-v2";
-import { deriveUnityCompilation, deriveUnityShaderImport, unityCheckTargetInProject, unityCompilationMessage, unityCompilationTarget, unityShaderImportTarget, UNITY_COMPILE_PROJECT_TOOL, type UnityCompilationResult } from "../../lib/runtime-v2/unityCompilation";
+import { deriveUnityCompilation, deriveUnityShaderImport, runtimeV2PipelineCompilerBaseline, unityCheckTargetInProject, unityCompilationMessage, unityCompilationTarget, unityShaderImportTarget, UNITY_COMPILE_PROJECT_TOOL, type UnityCompilationResult } from "../../lib/runtime-v2/unityCompilation";
+import { freshRuntimeV2PipelineConsoleSample, runtimeV2EditorConsoleEvidence, runtimeV2EditorDiagnosticScope, sameRuntimeV2ConsoleEditor, type RuntimeV2EditorConsoleEvidence } from "../../lib/runtime-v2/editorConsoleEvidence";
+import { UNITY_CLI_CONSOLE_TOOL, UNITY_OFFICIAL_MCP_CONSOLE_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { workspaceUnityCliConsoleBinding, workspaceUnityOfficialConsoleBinding } from "../../lib/workspaceMcp";
 import { aggregateForCurrentTurn } from "./executionAggregate";
+import { authorizeToolForCurrentTurn } from "./executionAuthorization";
 import { authorizationFor, runtimeV2ToolApprovalCapability, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
+import { parseResultRecord } from "./executionEvidence";
 import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
 import { observeBoundUnityMcpDiagnostics } from "./executionUnityMcpDiagnostics";
+import { runtimeV2WorkspaceMcpSnapshot } from "./executionUnityOfficialMcp";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
 
-const UNITY_COMPILE_TIMEOUT_MS = 145_000;
+export const UNITY_COMPILE_TIMEOUT_MS = 145_000;
+
+export async function confirmRuntimeV2BoundUnityConsole(
+  ports: RuntimeV2ExecutionPortsInput,
+  workspace: string,
+  scope: RuntimeV2EditorConsoleEvidence,
+  startedAt: number,
+  deadlineAt: number,
+  signal: AbortSignal,
+  retryStaleSample = false,
+) {
+  const snapshot = runtimeV2WorkspaceMcpSnapshot(ports);
+  const official = ports.get().config.unityOfficialMcpEnabled && workspaceUnityOfficialConsoleBinding(snapshot);
+  const cli = workspaceUnityCliConsoleBinding(snapshot, workspace, {});
+  const candidates = [
+    { toolName: UNITY_OFFICIAL_MCP_CONSOLE_TOOL, binding: official },
+    { toolName: UNITY_CLI_CONSOLE_TOOL, binding: cli },
+  ];
+  const remainingMs = Math.min(7_000, deadlineAt - Date.now());
+  if (remainingMs <= 0) return;
+  const probeSignal = AbortSignal.any([signal, AbortSignal.timeout(remainingMs)]);
+  for (const { toolName, binding } of candidates) {
+    if (probeSignal.aborted) return;
+    if (!binding || !sameRuntimeV2ConsoleEditor(scope, binding) || runtimeV2ToolApprovalCapability(ports, toolName, {})) continue;
+    try {
+      if (!(await authorizeToolForCurrentTurn(ports, toolName, {})).allowed) continue;
+      const probe = async () => {
+        const output = await executeTool(toolName, {}, workspace, ports.context.runSessionKey, {
+          toolCatalog: authorizationFor(ports).toolCatalog,
+          workspaceMcpSnapshot: snapshot,
+          unityConsoleSignal: probeSignal,
+          isUnityOfficialMcpEnabled: () => ports.get().config.unityOfficialMcpEnabled === true,
+        });
+        probeSignal.throwIfAborted();
+        const evidence = runtimeV2EditorConsoleEvidence({ workspace, binding, args: {}, result: parseResultRecord(output) });
+        return freshRuntimeV2PipelineConsoleSample(evidence?.pipeline?.live);
+      };
+      let sample = await probe();
+      if (sample && sample.sampledAt < startedAt && retryStaleSample && !probeSignal.aborted) sample = await probe();
+      if (sample && sample.sampledAt >= startedAt) return sample;
+    } catch {
+      signal.throwIfAborted();
+    }
+  }
+}
 
 export async function executeUnityCompilation(
   ports: RuntimeV2ExecutionPortsInput, command: RuntimeV2Command, signal: AbortSignal,
@@ -25,6 +76,11 @@ export async function executeUnityCompilation(
     throw new Error("UNITY_COMPILE_AUTHORITY_INVALID");
   }
   const authorization = authorizationFor(ports);
+  const consoleScope = runtimeV2EditorDiagnosticScope(aggregate);
+  const consoleBinding = consoleScope?.editorPid ? {
+    editorPid: consoleScope.editorPid, editorVersion: consoleScope.editorVersion,
+  } : undefined;
+  const pipeline = runtimeV2PipelineCompilerBaseline(aggregate);
   const args = { command: shader ? "unity command script eval" : "unity recompile" };
   const nativeAllowed = authorization.capabilityRegistry.tools.run_command?.enabled &&
     !authorization.policy.disabledRiskLevels.includes("shell") &&
@@ -51,7 +107,8 @@ export async function executeUnityCompilation(
     activity: { run: command.run, commandKey: command.idempotencyKey, signal, toolName: UNITY_COMPILE_PROJECT_TOOL,
       target: boundary.targets[0] },
     task: async (): Promise<UnityCompilationResult> => {
-      const deadlineAt = Math.min(Date.now() + UNITY_COMPILE_TIMEOUT_MS, ports.lifecycleDeadlineAt ?? Infinity);
+      const startedAt = Date.now();
+      const deadlineAt = Math.min(startedAt + UNITY_COMPILE_TIMEOUT_MS, ports.lifecycleDeadlineAt ?? Infinity);
       if (shader && !boundary.importTargets) return { status: "unavailable", kind,
         message: "UNITY_SHADER_INCLUDE_OWNER_UNVERIFIED: read the exact dependent Shader source before verifying these changes." };
       let nativeResult: UnityCompilationResult = {
@@ -65,6 +122,7 @@ export async function executeUnityCompilation(
           const output = await runUnityEditorOperation(UNITY_COMPILE_PROJECT_TOOL, {
             workspace, deferClosed, checkKind: kind, targets: boundary.targets, expectedVersions: boundary.expectedVersions,
             ...(shader ? { shaderImportTargets: boundary.importTargets } : {}),
+            ...(consoleBinding ? { consoleBinding } : {}),
           }, signal, deadlineAt) as UnityCompilationResult | null;
           if (output && (!output.kind || output.kind === kind) &&
               ["passed", "failed", "unavailable", "not_unity_project", "deferred_closed", "project_fragment"].includes(output.status)) {
@@ -78,14 +136,30 @@ export async function executeUnityCompilation(
               : !shader && output.editor === "closed";
             const verifiesIncludes = !shader || boundary.importTargets?.length === boundary.targets.length ||
               boundary.importTargets?.every(path => output.importedPaths?.includes(path));
-            if (output.status !== "passed" || (verifiedTargets && verifiedEditor && verifiesIncludes)) nativeResult = output;
+            const matchesBinding = !consoleBinding || output.editor === "connected" &&
+              output.editorPid === consoleBinding.editorPid && output.editorVersion === consoleBinding.editorVersion &&
+              (output.projectRoot ?? ".") === ".";
+            if (output.status === "passed" || consoleBinding && output.status === "failed") {
+              if (verifiedTargets && verifiedEditor && matchesBinding && (output.status === "failed" || verifiesIncludes)) {
+                nativeResult = output;
+              } else if (consoleBinding) {
+                nativeResult = { status: "unavailable", message: "UNITY_EDITOR_INSTANCE_CHANGED: the Editor result did not match the Console binding and checked source versions." };
+              }
+            } else {
+              nativeResult = output;
+            }
           }
         } catch (error) {
           signal.throwIfAborted();
           nativeResult = { status: "unavailable", message: String(error instanceof Error ? error.message : error).slice(0, 1_200) };
         }
       }
+      if (pipeline && nativeResult.status === "passed") {
+        const postCompileConsole = await confirmRuntimeV2BoundUnityConsole(ports, workspace, pipeline.scope, startedAt, deadlineAt, signal);
+        if (postCompileConsole) nativeResult = { ...nativeResult, postCompileConsole };
+      }
       if (nativeResult.status !== "unavailable" ||
+          consoleBinding ||
           boundary.targets.some(path => !unityCheckTargetInProject(path)) ||
           nativeResult.projectRoot && nativeResult.projectRoot !== ".") return nativeResult;
       try {

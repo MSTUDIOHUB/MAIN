@@ -1,3 +1,5 @@
+import { redactTerminalCredentials } from "./terminalCredentials";
+
 /**
  * Convert raw PTY bytes into stable model-readable text. This intentionally
  * preserves status/warning lines while removing terminal-only control data.
@@ -21,8 +23,8 @@ export function sanitizePtyOutput(rawText: string): string {
     return [...parts].reverse().find((part) => part.trim().length > 0) ?? parts[parts.length - 1] ?? "";
   });
 
-  return collapsedLines
+  return redactTerminalCredentials(collapsedLines
     .join("\n")
     .replace(/\n{4,}/g, "\n\n\n")
-    .trimEnd();
+    .trimEnd());
 }

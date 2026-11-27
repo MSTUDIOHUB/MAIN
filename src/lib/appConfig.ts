@@ -39,6 +39,7 @@ export function createDefaultAppConfig(): AppConfig {
     promptLanguageStrategy: "english_core_localized_output",
     toolPermissionPolicy: createDefaultToolPermissionPolicy(),
     mcpRouting: createDefaultMcpRoutingConfig(),
+    unityOfficialMcpEnabled: false,
     instructionsEnabled: true,
     hooksEnabled: true,
     activeProfile: "local",

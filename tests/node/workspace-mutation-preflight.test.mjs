@@ -77,6 +77,47 @@ const quoteCorruptedSnakePython = validSnakePython
   .replace('"""Snake game', '""""Snake game')
   .replace("return self.body[-1]", 'return self.body[-1]"');
 
+test("Unity preflight rejects new predefined script references in post-images", async () => {
+  const target = "Assets/Rendering/RenderingTests.asmdef";
+  const oldContent = '{"name":"RenderingTests","references":["Assembly-CSharp"]}';
+  const newContent = '{"name":"RenderingTests","references":["Assembly-CSharp","Assembly-CSharp-Editor"]}';
+  const args = { path: target, search_text: oldContent, replace_text: newContent };
+  const readFile = async () => oldContent;
+  for (const mutation of [
+    { toolName: "replace_in_file", args },
+    { toolName: "write_file", args: { path: target, content: newContent } },
+    { toolName: "apply_patch", args: { patch: `*** Begin Patch\n*** Update File: ${target}\n@@\n-${oldContent}\n+${newContent}\n*** End Patch` } },
+  ]) {
+    const result = await preflightWorkspaceMutation({ ...mutation, readFile, unityProject: true, language: "en" });
+    assert.equal(result.ok, false, result.message);
+    assert.equal(result.reason, "unity_predefined_assembly_reference");
+    assert.equal(result.recoveryKind, "mutation_rejected");
+    assert.match(result.message, /"Assembly-CSharp-Editor".*declared name or GUID/);
+    assert.doesNotMatch(result.message, /"Assembly-CSharp"/);
+  }
+  const created = await preflightWorkspaceMutation({
+    toolName: "write_file", args: { path: target, content: `\uFEFF${newContent}` }, unityProject: true,
+    readFile: async () => { throw new Error("file does not exist"); },
+    probeFileAvailability: async () => "absent",
+  });
+  assert.equal(created.reason, "unity_predefined_assembly_reference");
+});
+
+test("Unity assembly preflight permits incremental repair and respects project scope", async () => {
+  const target = "Packages/com.example.rendering/Renderer.asmdef";
+  const oldContent = '{"name":"Renderer","references":["Assembly-CSharp"]}';
+  const newContent = '{"name":"Renderer","references":["Rendering.Core","GUID:b74b0d167c501b345aee3d7f42533e76"]}';
+  const check = (path, content, unityProject) => preflightWorkspaceMutation({
+    toolName: "write_file", args: { path, content }, readFile: async () => oldContent, unityProject,
+  });
+  assert.equal((await check(target, newContent, true)).ok, true);
+  assert.equal((await check(target, oldContent.replace('"Renderer"', '"Renderer.New"'), true)).ok, true);
+  const invalid = oldContent.replace("Assembly-CSharp", "Assembly-CSharp-firstpass");
+  assert.equal((await check(target, invalid, false)).ok, true);
+  assert.equal((await check(`tools/${target}`, invalid, true)).ok, true);
+  assert.equal((await check(target, oldContent.replace("Assembly-CSharp", "Assembly-CSharp.Example"), true)).ok, true);
+});
+
 test("replace_in_file preflight blocks mismatched search_text before review", async () => {
   const result = await preflightWorkspaceMutation({
     toolName: "replace_in_file",

@@ -11,6 +11,8 @@ import {
   type RecoveryReadLease,
 } from "./executeRecoveryTools";
 import { recordWorkspaceFileCheckpoint } from "./workspaceCheckpoints";
+import { introducedUnityPredefinedReferences } from "./unityAssemblyReferences";
+import { normalizeValidationWorkspaceCwd } from "./validationContract";
 
 export type WorkspaceMutationPreflightReason =
   | "not_applicable"
@@ -25,6 +27,7 @@ export type WorkspaceMutationPreflightReason =
   | "outside_workspace"
   | "invalid_patch"
   | "public_contract_break"
+  | "unity_predefined_assembly_reference"
   | "syntax_error";
 
 /** Current filesystem facts for one write_file preparation. This is produced
@@ -70,6 +73,8 @@ export interface WorkspaceMutationPreflightInput {
    * preview read or write is attempted. The executor still performs its
    * canonical filesystem authorization afterward. */
   workspaceRoot?: string;
+  /** Confirmed by the caller from this workspace's project metadata. */
+  unityProject?: boolean;
   readFile: (path: string) => Promise<string>;
   /** Runtime v2 delivers source through an authorized read_file receipt. */
   includeRecoverySource?: boolean;
@@ -332,6 +337,8 @@ function buildMessage(input: {
         return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Correct the patch from the active source observation; reread only for a changed version or a genuinely missing range.`;
       case "public_contract_break":
         return `MUTATION_PREFLIGHT_BLOCKED: The proposed change removes a module export that still has a workspace import (${input.detail || "public contract would be broken"}). No file was changed; preserve the export or update its callers in the same coherent repair.`;
+      case "unity_predefined_assembly_reference":
+        return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} would add a reference to Unity's predefined script assembly ${input.detail}. Find the owning named assembly for the required types and use its declared name or GUID. No file was changed.`;
       case "syntax_error":
         return `MUTATION_PREFLIGHT_BLOCKED: The proposed content for ${input.path} has a parser-confirmed syntax error (${input.detail || "invalid syntax"}). No file was changed; correct the edit from the active source observation.`;
     }
@@ -360,6 +367,8 @@ function buildMessage(input: {
       return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。请依据当前源码观察修正 patch；只有版本变化或确实缺少范围时才重新读取。`;
     case "public_contract_break":
       return `MUTATION_PREFLIGHT_BLOCKED: 拟议修改删除了仍被工作区导入的模块导出（${input.detail || "会破坏公共契约"}）。文件尚未修改；请保留该导出，或在同一完整修复中同步更新调用方。`;
+    case "unity_predefined_assembly_reference":
+      return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 将新增对 Unity 预定义脚本程序集 ${input.detail} 的引用。请查明所需类型所在的命名程序集，并使用其声明名称或 GUID。文件尚未修改。`;
     case "syntax_error":
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.path} 的拟写入内容存在解析器确认的语法错误（${input.detail || "语法无效"}）。文件尚未修改；请依据当前源码观察修正编辑。`;
   }
@@ -463,7 +472,7 @@ function blocked(input: {
   };
 }
 
-async function blockedSyntaxResult(
+async function blockedPostImageResult(
   input: WorkspaceMutationPreflightInput,
   path: string,
   content: string,
@@ -471,6 +480,20 @@ async function blockedSyntaxResult(
   previousContent?: string,
   patchPaths?: Readonly<Record<string, boolean>>,
 ): Promise<WorkspaceMutationPreflightResult | null> {
+  if (input.unityProject && /\.asmdef$/i.test(path)) {
+    const relative = normalizeValidationWorkspaceCwd(path, input.workspaceRoot);
+    if (relative && /^(?:Assets|Packages)\//i.test(relative)) {
+      const introduced = introducedUnityPredefinedReferences(previousContent, content);
+      if (introduced.length) return blocked({
+        reason: "unity_predefined_assembly_reference",
+        toolName: input.toolName,
+        path,
+        language,
+        detail: introduced.map(name => JSON.stringify(name)).join(", "),
+        recoveryKind: "mutation_rejected",
+      });
+    }
+  }
   if (!input.checkSyntax) return null;
   const checked = await input.checkSyntax(path, content, input.workspaceRoot, patchPaths);
   if (!checked.applicable || !checked.hasErrors) return null;
@@ -648,7 +671,7 @@ export async function preflightWorkspaceMutation(
     const patchPaths = Object.fromEntries(preview.changes.map(change => [change.path, change.kind !== "delete"]));
     for (const change of preview.changes) {
       if (change.kind === "delete") continue;
-      const syntaxFailure = await blockedSyntaxResult(
+      const postImageFailure = await blockedPostImageResult(
         input,
         change.path,
         change.newContent,
@@ -656,7 +679,7 @@ export async function preflightWorkspaceMutation(
         change.kind === "update" ? change.oldContent : undefined,
         patchPaths,
       );
-      if (syntaxFailure) return syntaxFailure;
+      if (postImageFailure) return postImageFailure;
     }
     const publicContractFailure = await blockedPublicContractResult(
       input,
@@ -707,16 +730,16 @@ export async function preflightWorkspaceMutation(
       if (current === content) {
         return blocked({ reason: "identical_content", toolName, path, language });
       }
-      const syntaxFailure = await blockedSyntaxResult(input, path, content, language, current);
-      if (syntaxFailure) return syntaxFailure;
+      const postImageFailure = await blockedPostImageResult(input, path, content, language, current);
+      if (postImageFailure) return postImageFailure;
       recordWorkspaceFileCheckpoint({
         sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
         existedBefore: true, previousContent: current, toolName,
       });
       return { ok: true, writeFileTarget: { path, exists: true, content: current }, postImages: [{ path, content }] };
     }
-    const syntaxFailure = await blockedSyntaxResult(input, path, content, language);
-    if (syntaxFailure) return syntaxFailure;
+    const postImageFailure = await blockedPostImageResult(input, path, content, language);
+    if (postImageFailure) return postImageFailure;
     recordWorkspaceFileCheckpoint({
       sessionKey: input.sessionKey, workspace: input.workspaceRoot, path,
       existedBefore: false, previousContent: null, toolName,
@@ -815,14 +838,14 @@ export async function preflightWorkspaceMutation(
     });
   }
 
-  const syntaxFailure = await blockedSyntaxResult(
+  const postImageFailure = await blockedPostImageResult(
     input,
     path,
     updated,
     language,
     current,
   );
-  if (syntaxFailure) return syntaxFailure;
+  if (postImageFailure) return postImageFailure;
   recordWorkspaceFileCheckpoint({
     sessionKey: input.sessionKey,
     workspace: input.workspaceRoot,

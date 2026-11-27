@@ -19,6 +19,7 @@ import { inferMutationRecoveryRange, preflightWorkspaceMutation, type WorkspaceW
 import { parseApplyPatch } from "../../lib/applyPatchTool";
 import { sha256Hex } from "../../lib/sha256";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
+import { isWorkspaceUnityProject } from "../../lib/unityAssemblyReferences";
 import {
   executeRuntimeV2ToolWithDeadline,
   type RuntimeV2ToolDeadlineBoundary,
@@ -112,6 +113,7 @@ export async function prepareRuntimeV2Mutation(input: {
     language: input.ports.context.phaseLanguage,
     sessionKey: input.ports.context.runSessionKey,
     workspaceRoot: workspace,
+    unityProject: isWorkspaceUnityProject(input.ports.context.projectBaselineContext, workspace),
     includeRecoverySource: false,
     readFile: async (path) => {
       const current = String(await executeRuntimeV2ToolWithDeadline({

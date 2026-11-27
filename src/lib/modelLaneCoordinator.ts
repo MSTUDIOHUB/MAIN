@@ -671,6 +671,19 @@ async function drainLane(state: ModelLaneState): Promise<void> {
         if (index < 0) continue;
         if (waiter.entry.optionalOverlap && state.queue.some((item) => !item.entry.optionalOverlap)) continue;
         if (!allowed) {
+          const reason = state.lastQueueReason;
+          if (waiter.entry.optionalOverlap && (reason === "memory_reserve" || reason === "memory_probe_unavailable" || reason === "lane_full")) {
+            state.queue.splice(index, 1);
+            if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+            waiter.entry.onDebugEvent?.("model_lane_admission", {
+              laneKey: state.laneKey, decision: "skipped", queueReason: reason,
+              waitMs: nowReader() - waiter.queuedAt, activeRequests: state.active.length,
+              limit: laneLimit(state), agentKind: waiter.entry.agentKind, subagentId: waiter.entry.subagentId || null,
+              parentRunId: waiter.entry.parentRunId || null,
+            });
+            waiter.reject(new ModelLaneResourceInterruption(reason === "lane_full" ? "provider_capacity" : "memory", reason));
+            continue;
+          }
           if (!waiter.queueLogged || waiter.queueReason !== state.lastQueueReason) {
             waiter.queueLogged = true;
             waiter.queueReason = state.lastQueueReason;
@@ -737,6 +750,18 @@ async function drainLane(state: ModelLaneState): Promise<void> {
     } while (state.drainRequested);
   } finally {
     state.draining = false;
+  }
+}
+
+/** A parent waiting on an explicit result can release its model slot while
+ * that same Run's already-admitted child finishes a multi-request task. */
+export function promoteModelLaneSubagentDependency(parentRunId: string, subagentId: string): void {
+  for (const state of lanes.values()) {
+    const entries = [...state.active, ...state.queue.map(waiter => waiter.entry)];
+    const entry = entries.find(candidate => candidate.parentRunId === parentRunId && candidate.subagentId === subagentId);
+    if (!entry?.optionalOverlap) continue;
+    delete entry.optionalOverlap;
+    void drainLane(state);
   }
 }
 
@@ -835,6 +860,10 @@ export async function acquireModelLane(input: {
     waiter.onAbort = () => {
       const index = state.queue.indexOf(waiter);
       if (index >= 0) state.queue.splice(index, 1);
+      if (index >= 0 && entry.optionalOverlap) entry.onDebugEvent?.("model_lane_admission", {
+        laneKey, decision: "canceled", queueReason: waiter.queueReason || null, waitMs: nowReader() - waiter.queuedAt,
+        agentKind: entry.agentKind, subagentId: entry.subagentId || null, parentRunId: entry.parentRunId || null,
+      });
       reject(abortError());
       void drainLane(state);
     };
@@ -852,9 +881,12 @@ export async function acquireModelLane(input: {
       waitMs: nowReader() - waiter.queuedAt,
       requestTokenBudget,
       overlapping: state.active.length > 1,
+      overlapsParent: entry.agentKind === "subagent" && state.active.some(activeEntry => activeEntry.agentKind === "parent" &&
+        (!entry.parentRunId || entry.parentRunId === activeEntry.parentRunId)),
       queueReason: waiter.queueLogged ? waiter.queueReason || "admission_pending" : null,
       agentKind: input.agentKind,
       subagentId: input.subagentId || null,
+      parentRunId: entry.parentRunId || null,
       liveRequests: state.active.map((activeEntry) => ({
         requestId: activeEntry.id,
         agentKind: activeEntry.agentKind,

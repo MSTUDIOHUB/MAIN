@@ -1267,7 +1267,7 @@ test("a child provider request hard-stops when the transport ignores abort", asy
   assert.equal(released, 1);
 });
 
-for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strategy} commits and starts a scoped job without a provider spawn call`, async () => {
+for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strategy} requires a provider proposal for independently evidenced work`, async () => {
   const revision = strategy === "revision";
   const direct = strategy === "execute";
   const owner = {
@@ -1280,22 +1280,32 @@ for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strate
   };
   const runtime = loadTsWithMocks("src/lib/runtime-v2/index.ts", new Map());
   const { deriveProactiveCollaboration } = loadTsWithMocks("src/store/runtimeV2/proactiveSubagents.ts", new Map());
+  const { ensureVersionedReadFileResultForModel } = loadTsWithMocks("src/lib/readFileWindow.ts", new Map());
   let state = null;
   const apply = (draft) => {
     const sequence = state?.nextSequence ?? 0;
     state = runtime.transition(state, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
       sequence, eventId: `event-${sequence}`, at: sequence + 1, ...draft });
   };
-  apply({ type: "turn.admitted", turn: owner, strategy: direct ? "execute" : "plan", objective: "Build a new scene and verify it",
+  apply({ type: "turn.admitted", turn: owner, strategy: direct ? "execute" : "plan", objective: direct ? "修复console窗口里的报错" : "Build a new scene and verify it",
+    ...(direct ? { completionRequirement: { kind: "workspace_change", editorDiagnostics: true } } : {}),
     constraints: [], acceptanceCriteria: ["Run behavior checks"], ...(revision ? {} : { acceptanceEvidenceRequirements: ["behavioral"] }) });
   apply({ type: "run.started", run, phase: direct ? "observing" : "planning" });
   const target = revision ? "Assets/Scripts/Breakout/Ball.cs" : "Packages/manifest.json";
   const versionPath = "ProjectSettings/ProjectVersion.txt";
   const lockPath = "Packages/packages-lock.json";
-  const reads = revision ? [target] : direct ? ["Assets/Scripts/Breakout/Ball.cs"] : [target, "Assets/Scenes/Existing.unity"];
-  const delegated = direct ? [lockPath, versionPath] : [target];
+  const reads = revision ? [target] : direct ? ["Assets/Scripts/Breakout/Ball.cs", target, lockPath, versionPath] : [target, "Assets/Scenes/Existing.unity"];
+  const delegated = [target];
+  const receipt = (toolName, path, id, version, modelContent) => {
+    apply({ type: "command.scheduled", run, command: { idempotencyKey: id, run, kind: "execute_tool", phase: state.phase,
+      payload: { toolName, arguments: { path } } } });
+    apply({ type: "tool.completed", run, idempotencyKey: id, status: "succeeded", modelContent,
+      evidence: [{ id: `${id}-evidence`, kind: "source", target: path, version }] });
+  };
   for (const [index, path] of reads.entries()) {
-    apply({ type: "observation.recorded", run, evidence: { id: `E${index + 1}`, kind: "source", target: path, version: `v${index + 1}` } });
+    const version = `sha256-${String(index + 1).repeat(64)}`;
+    receipt("read_file", path, `read-${index}`, version,
+      ensureVersionedReadFileResultForModel(path, `// ${index}`, version));
   }
   const baseline = revision ? null : { kind: "project_baseline_context", workspace: { canonicalPath: "/fixture" },
     anchors: direct ? [
@@ -1310,9 +1320,10 @@ for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strate
     ...(revision ? { revisionTargetPaths: [target, "Assets/Scripts/Breakout/Missing.cs"] } : {}) };
   assert.equal(deriveProactiveCollaboration({ ...facts, preference: "unspecified" }), undefined);
   assert.deepEqual(deriveProactiveCollaboration({ ...facts, requestMode: "serialized" }), { reason: "no_parallel_capacity" });
-  assert.deepEqual(deriveProactiveCollaboration({ ...facts, revisionTargetPaths: [], state: { ...state, evidence: state.evidence.slice(0, direct ? 0 : 1) } }), { reason: "no_independent_scope" });
+  const noReadReceipts = { ...state, events: state.events.filter(event => event.type !== "tool.completed") };
+  assert.deepEqual(deriveProactiveCollaboration({ ...facts, state: noReadReceipts }), { reason: "no_independent_scope" });
   if (direct) assert.deepEqual(deriveProactiveCollaboration({ ...facts, baseline: { ...baseline, workspace: { canonicalPath: "/foreign" } } }), { reason: "no_independent_scope" });
-  if (revision) assert.deepEqual(deriveProactiveCollaboration({ ...facts, state: { ...state, evidence: [] } }), { reason: "no_independent_scope" });
+  if (revision) assert.deepEqual(deriveProactiveCollaboration({ ...facts, revisionTargetPaths: [] }), { reason: "no_independent_scope" });
   assert.deepEqual(deriveProactiveCollaboration({ ...facts, lifecycleDeadlineAt: 1000 }), { reason: "insufficient_runway" });
   for (const key of ["capabilityRestrictions", "approvalRequiredCapabilities"]) {
     const restricted = { ...state, objective: { ...state.objective, [key]: ["workspace_read"] } };
@@ -1321,12 +1332,29 @@ for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strate
   assert.equal(deriveProactiveCollaboration({ ...facts, state: { ...state, run: { ...state.run, status: "completed" } } }), undefined);
   const decision = { subagentPreference: "preferred", subagentCapacity: 1, subagentRequestMode: "parallel",
     proactiveCollaboration: deriveProactiveCollaboration(facts) };
+  const [request] = runtime.decideNextCommands(state, decision);
+  assert.equal(request.kind, "request_model", "eligible evidence does not dispatch a child automatically");
+  if (direct) {
+    for (const [index, result] of ["Tests.csproj matches", ""].entries()) {
+      receipt("grep_search", versionPath, `query-${index}`, `sha256-${String(index + 5).repeat(64)}`, result);
+      assert.deepEqual(deriveProactiveCollaboration({ ...facts, state }), { reason: "no_independent_scope" });
+    }
+    return;
+  }
+  const hint = decision.proactiveCollaboration.candidate;
+  assert.deepEqual(request.payload.delegationHints[0].primaryEvidence.map(item => item.path), delegated);
+  apply({ type: "command.scheduled", run, command: request });
+  apply({ type: "provider.responded", run, idempotencyKey: request.idempotencyKey,
+    result: { visibleText: "", diagnostics: [], toolCalls: [{ id: "provider-spawn", name: "spawn_subagent", arguments: {
+      task_kind: hint.taskKind, objective: hint.objective, required_paths: target, evidence_refs: hint.primaryEvidence[0].id,
+      success_criteria: "Return the verified entry point or compatibility concern with exact evidence.", parent_work: "Continue drafting the remaining change and acceptance checks.",
+    } }] } });
   const [command] = runtime.decideNextCommands(state, decision);
   assert.equal(command.kind, "schedule_subagents");
-  assert.equal(command.payload.toolCallId, undefined);
-  assert.equal(command.payload.arguments.allowed_paths, delegated.join("\n"));
+  assert.equal(command.payload.toolCallId, "provider-spawn");
+  assert.equal(command.payload.arguments.required_paths, delegated.join("\n"));
   assert.equal(command.payload.arguments.task_kind, revision ? "review" : "explore");
-  assert.equal(command.payload.arguments.access_mode, "read");
+  assert.equal(command.payload.proactiveKey, hint.proactiveKey);
 
   const started = [];
   const { createRuntimeV2SchedulerPort } = loadTsWithMocks("src/store/runtimeV2/executionSchedulerPort.ts", new Map([
@@ -1347,7 +1375,7 @@ for (const strategy of ["plan", "revision", "execute"]) test(`preferred ${strate
   events.forEach(apply);
   assert.deepEqual(started, ["child"]);
   assert.deepEqual(state.subagents[0].allowedPaths, delegated);
-  assert.equal(state.subagents[0].sourceToolCallId, undefined);
+  assert.equal(state.subagents[0].sourceToolCallId, "provider-spawn");
   assert.equal(state.subagents[0].proactiveKey, command.payload.proactiveKey);
   const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: state, revision: state.nextSequence, updatedAt: state.updatedAt });
   const persisted = JSON.parse(JSON.stringify(runtime.serializeRuntimeV2CheckpointMap({ [owner.turnId]: checkpoint })));
@@ -1368,6 +1396,7 @@ test("preferred Execute and Analyze fill only available slots with distinct requ
   const runtime = loadTsWithMocks("src/lib/runtime-v2/index.ts", new Map());
   const { deriveProactiveCollaboration } = loadTsWithMocks("src/store/runtimeV2/proactiveSubagents.ts", new Map());
   const { ensureVersionedReadFileResultForModel } = loadTsWithMocks("src/lib/readFileWindow.ts", new Map());
+  const { sha256Hex } = loadTsWithMocks("src/lib/sha256.ts", new Map());
   const owner = { workspaceKey: "/fixture", sessionKey: "session", sessionEpoch: "epoch", clientSubmissionId: "submit", turnId: "turn" };
   const run = { sessionKey: owner.sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId, runId: "run", parentRunId: null, attemptId: "attempt" };
   const files = [
@@ -1400,8 +1429,8 @@ test("preferred Execute and Analyze fill only available slots with distinct requ
       assert.equal(command.payload.toolCallId, file);
       apply({ type: "command.scheduled", run, command });
       apply({ type: "tool.completed", run, idempotencyKey: command.idempotencyKey, status: "succeeded",
-        modelContent: ensureVersionedReadFileResultForModel(path, source, `version:${file}`),
-        evidence: [{ id: `source:${file}`, target: path, kind: "source", version: `version:${file}` }] });
+        modelContent: ensureVersionedReadFileResultForModel(path, source, `sha256-${sha256Hex(source)}`),
+        evidence: [{ id: `source:${file}`, target: path, kind: "source", version: `sha256-${sha256Hex(source)}` }] });
     }
     const policy = { preference: "preferred", requestMode: "parallel", workspace: owner.workspaceKey, now: 100 };
     assert.deepEqual(deriveProactiveCollaboration({ ...policy, state, capacity: 0 }), { reason: "no_parallel_capacity" });
@@ -1417,12 +1446,28 @@ test("preferred Execute and Analyze fill only available slots with distinct requ
     for (const capacity of [1, 2, 3]) {
       const collaboration = deriveProactiveCollaboration({ ...policy, state, capacity });
       assert.ok(collaboration?.candidate);
+      const candidate = collaboration.candidate;
       const decision = { subagentPreference: "preferred", subagentRequestMode: "parallel", subagentCapacity: capacity, proactiveCollaboration: collaboration };
+      const nextRequest = runtime.decideNextCommands(state, decision)[0];
+      assert.equal(nextRequest.kind, "request_model");
+      apply({ type: "command.scheduled", run, command: nextRequest });
+      const spawnId = `spawn-${capacity}`;
+      const args = {
+        task_kind: candidate.taskKind, objective: "Verify the independent component's behavior against its own implementation.",
+        required_paths: candidate.primaryEvidence.map(item => item.path).join(","),
+        evidence_refs: candidate.primaryEvidence.map(item => item.id).join(","),
+        success_criteria: "Return a concrete issue or confirmed behavior with an exact source reference.",
+        parent_work: `Review ${candidate.parentPaths[0]} directly.`,
+      };
+      apply({ type: "provider.responded", run, idempotencyKey: nextRequest.idempotencyKey,
+        result: { visibleText: "", diagnostics: [], toolCalls: [{ id: spawnId, name: "spawn_subagent", arguments: args }] } });
       const command = runtime.decideNextCommands(state, decision)[0];
       assert.equal(command.kind, "schedule_subagents");
+      assert.equal(command.payload.toolCallId, spawnId);
+      assert.equal(command.payload.proactiveKey, candidate.proactiveKey);
       assert.equal(command.payload.maxActiveSubagents, capacity);
       apply({ type: "command.scheduled", run, command });
-      const { jobs } = runtime.scheduleRuntimeV2Subagents({ parentRun: run, candidates: [collaboration.candidate],
+      const { jobs } = runtime.scheduleRuntimeV2Subagents({ parentRun: run, candidates: [{ ...candidate, sourceToolCallId: spawnId }],
         existingJobs: state.subagents, maxActiveJobs: capacity, requestedAt: state.updatedAt, nextId: () => `child-${capacity}` });
       sourceJobIds.push(jobs[0].id);
       apply({ type: "subagents.scheduled", run, jobs, maxActiveSubagents: capacity });
@@ -1445,6 +1490,162 @@ test("preferred Execute and Analyze fill only available slots with distinct requ
     const reopened = { ...state, subagents: state.subagents.map(job => ({ ...job, status: "completed" })) };
     assert.deepEqual(deriveProactiveCollaboration({ ...policy, state: reopened, capacity: 3 }), { reason: "no_independent_scope" });
   }
+});
+
+test("Unity compiler collaboration needs disjoint transitive assembly evidence and exact source versions", async () => {
+  const runtime = loadTsWithMocks("src/lib/runtime-v2/index.ts", new Map());
+  const { deriveProactiveCollaboration } = loadTsWithMocks("src/store/runtimeV2/proactiveSubagents.ts", new Map());
+  const { ensureVersionedReadFileResultForModel } = loadTsWithMocks("src/lib/readFileWindow.ts", new Map());
+  const { sha256Hex } = loadTsWithMocks("src/lib/sha256.ts", new Map());
+  const owner = { workspaceKey: "/fixture", sessionKey: "session", sessionEpoch: "epoch", clientSubmissionId: "submit", turnId: "compiler-turn" };
+  const run = { sessionKey: owner.sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId, runId: "compiler-run", parentRunId: null, attemptId: "attempt" };
+  const binding = { editorPid: 42, editorVersion: "6000.6.5f1" };
+  const hash = text => `sha256-${sha256Hex(text)}`;
+  const files = ["Movement", "Lighting", "Audio"].map((name, index) => ({
+    name, path: `Assets/${name}/Logic.cs`, asmdef: `Assets/${name}/${name}.asmdef`, content: `class ${name} {}`, message: `The name 'Member${index}' does not exist.`,
+  }));
+  const policy = { preference: "preferred", requestMode: "parallel", workspace: owner.workspaceKey, capacity: 2, now: 100 };
+  let state = null;
+  const apply = draft => {
+    const sequence = state?.nextSequence ?? 0;
+    state = runtime.transition(state, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence, eventId: `compiler-${sequence}`, at: sequence + 1, ...draft });
+  };
+  const observe = (toolName, path, facts) => {
+    const idempotencyKey = `${toolName}-${state.nextSequence}`;
+    apply({ type: "command.scheduled", run, command: { idempotencyKey, run, phase: state.phase, kind: "execute_tool",
+      payload: { toolName, arguments: { path } } } });
+    apply({ type: "tool.completed", run, idempotencyKey, status: "succeeded", evidence: [], ...facts });
+  };
+  const settle = (command, data) => {
+    apply({ type: "command.scheduled", run, command });
+    apply({ type: "tool.completed", run, idempotencyKey: command.idempotencyKey, status: "succeeded", modelContent: JSON.stringify(data), evidence: [] });
+  };
+  const read = (path, content) => observe("read_file", path, { modelContent: ensureVersionedReadFileResultForModel(path, content, hash(content)),
+    evidence: [{ id: `read:${path}`, target: path, version: hash(content), kind: "source" }] });
+  const derive = () => deriveProactiveCollaboration({ ...policy, state });
+  const skip = { reason: "no_independent_scope" };
+
+  apply({ type: "turn.admitted", turn: owner, strategy: "execute", objective: "Repair the editor diagnostics.", constraints: [], acceptanceCriteria: [],
+    completionRequirement: { kind: "workspace_change", editorDiagnostics: true } });
+  apply({ type: "run.started", run, phase: "observing" });
+  observe("unity_official_mcp_console", "Console", { editorConsole: {
+    ...binding, instanceId: "editor-binding", complete: false, diagnostics: [], retainedDiagnostics: [],
+    pipeline: { retainedWindowComplete: false, live: { ageMs: 10, sampledAt: 100, compiling: false, compilationFailed: true, errors: files.length, warnings: 0 } },
+  } });
+  const baseline = runtime.decideNextCommands(state, { checkUnityCompilation: true })[0];
+  assert.equal(baseline.payload.runtimeOwnedUnityBaselineCompile, true);
+  const compiler = { ...binding, kind: "csharp", status: "failed", projectRoot: ".", editor: "connected", targets: [], errorCount: files.length,
+    diagnostics: files.map(({ path, message }) => ({ file: path, line: 2, column: 1, code: "CS0103", message })) };
+  settle(baseline, compiler);
+  const inspection = runtime.decideNextCommands(state, { checkUnityCompilation: true })[0];
+  assert.equal(inspection.payload.runtimeOwnedUnityAssemblyDiagnosis, true);
+  assert.deepEqual(inspection.payload.sourcePaths, files.map(file => file.path).sort());
+  for (const { path, content } of files) read(path, content);
+  assert.deepEqual(derive(), skip, "versioned reads alone do not prove assembly separation");
+
+  const report = { complete: true, sources: files.map(({ name, path, asmdef, content }) => ({ path, sourceVersion: hash(content),
+    assembly: { name, path: asmdef, version: hash(asmdef), predefined: false, references: [], dependencyClosure: [{ path: asmdef, version: hash(asmdef) }] } })) };
+  const beforeReport = state;
+  settle(inspection, report);
+  const independentlyProved = state;
+  const available = derive();
+  assert.deepEqual([available.candidate, ...available.alternatives].map(branch => branch.primaryEvidence[0].path), [files[1].path, files[2].path]);
+  assert.deepEqual(available.candidate.allowedPaths, [files[1].path, files[1].asmdef].sort());
+  assert.ok(available.candidate.parentPaths.includes(files[0].path));
+  const collaboration = () => ({ subagentPreference: "preferred", subagentRequestMode: "parallel",
+    subagentCapacity: 2, proactiveCollaboration: derive() });
+  const request = runtime.decideNextCommands(state, collaboration())[0];
+  assert.equal(request.kind, "request_model");
+  assert.equal(request.payload.delegationHints.length, 2, "the parent gets choices and still owns dispatch proposals");
+
+  const started = [];
+  const { createRuntimeV2SchedulerPort } = loadTsWithMocks("src/store/runtimeV2/executionSchedulerPort.ts", new Map([
+    ["./executionAggregate", { aggregateForCurrentTurn: () => state }],
+    ["./executionSubagentRunner", { startRuntimeV2Child(_ports, job) {
+      assert.ok(state.subagents.some(entry => entry.id === job.id));
+      started.push(job.id);
+      return new Promise(() => {});
+    } }],
+  ]));
+  const live = { messages: [], childRuns: new Map(), childTelemetry: new Map() };
+  let child = 0;
+  const scheduler = createRuntimeV2SchedulerPort({ live, nextId: () => `compiler-child-${++child}`, now: () => 100, logStoreEvent() {} });
+  const { signal } = new AbortController();
+  apply({ type: "command.scheduled", run, command: request });
+  const proposals = [available.candidate, ...available.alternatives].map((branch, index) => ({ id: `proposal-${index}`,
+    name: "spawn_subagent", arguments: { task_kind: branch.taskKind, objective: branch.objective,
+      allowed_paths: branch.allowedPaths.join(","), required_paths: branch.primaryEvidence.map(item => item.path).join(","),
+      evidence_refs: branch.primaryEvidence.map(item => item.id).join(","),
+      success_criteria: "Report the cause with exact source evidence.", parent_work: `Investigate ${branch.parentPaths[0]}.` },
+  }));
+  apply({ type: "provider.responded", run, idempotencyKey: request.idempotencyKey,
+    result: { visibleText: "", diagnostics: [], toolCalls: proposals } });
+  for (const proposal of proposals) {
+    const [command] = runtime.decideNextCommands(state, collaboration());
+    assert.equal(command.kind, "schedule_subagents");
+    assert.equal(command.payload.toolCallId, proposal.id);
+    apply({ type: "command.scheduled", run, command });
+    const events = await runtime.executeRuntimeV2SchedulerLifecycle({ command, scheduler, signal,
+      getScheduledSubagents: () => state.subagents, commitPrepared: async draft => apply(draft) });
+    events.forEach(apply);
+  }
+  assert.equal(started.length, 2);
+  const [parentWhileChildrenRun] = runtime.decideNextCommands(state, collaboration());
+  assert.equal(parentWhileChildrenRun.kind, "request_model");
+  assert.equal(parentWhileChildrenRun.payload.activeSubagents.length, 2);
+
+  const shared = { path: "Assets/Common/Common.asmdef", version: hash("common") };
+  state = beforeReport;
+  const connectedReport = { ...report, sources: report.sources.map((source, index) => index === 2 ? source :
+    { ...source, assembly: { ...source.assembly, dependencyClosure: [...source.assembly.dependencyClosure, shared] } }) };
+  settle(inspection, connectedReport);
+  assert.deepEqual(derive().candidate.primaryEvidence.map(item => item.path), [files[2].path]);
+
+  for (const incomplete of [
+    { ...report, complete: false },
+    { ...report, sources: report.sources.slice(0, 1) },
+    { ...report, sources: report.sources.map((source, index) => index ? source : { ...source, sourceVersion: hash("stale") }) },
+  ]) {
+    state = beforeReport;
+    settle(inspection, incomplete);
+    assert.deepEqual(derive(), skip);
+  }
+  state = independentlyProved;
+  read(files[2].path, `${files[2].content}\n// newer bytes`);
+  assert.deepEqual(derive(), skip, "a new version without a current ownership proof keeps compiler faults together");
+});
+
+test("restore cancels an old automatic queued job without opening a provider request", async () => {
+  const runtime = loadTsWithMocks("src/lib/runtime-v2/index.ts", new Map());
+  const owner = { workspaceKey: "/fixture", sessionKey: "session", sessionEpoch: "epoch", clientSubmissionId: "submit", turnId: "turn" };
+  const run = { sessionKey: owner.sessionKey, sessionEpoch: owner.sessionEpoch, turnId: owner.turnId, runId: "run", parentRunId: null, attemptId: "attempt" };
+  let state = null;
+  const apply = (draft) => {
+    const sequence = state?.nextSequence ?? 0;
+    state = runtime.transition(state, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence, eventId: `retired-event-${sequence}`, at: sequence + 1, ...draft });
+  };
+  apply({ type: "turn.admitted", turn: owner, strategy: "execute", objective: "Repair Console errors", constraints: [], acceptanceCriteria: [] });
+  apply({ type: "run.started", run, phase: "observing" });
+  const proactiveKey = "a".repeat(64);
+  const command = { idempotencyKey: "old-schedule", run, kind: "schedule_subagents", phase: "observing", payload: { proactiveKey } };
+  apply({ type: "command.scheduled", run, command });
+  const { jobs } = runtime.scheduleRuntimeV2Subagents({ parentRun: run, maxActiveJobs: 1, requestedAt: 2, nextId: () => "old-job",
+    candidates: [{ scopeKey: "proactive:explore:old-scope", proactiveKey, taskKind: "explore", accessMode: "read",
+      objective: "Confirm known package versions", allowedPaths: ["Packages/manifest.json"] }] });
+  apply({ type: "subagents.scheduled", run, maxActiveSubagents: 1, jobs });
+  apply({ type: "command.completed", run, idempotencyKey: command.idempotencyKey, status: "succeeded" });
+  const { createRuntimeV2SchedulerPort } = loadTsWithMocks("src/store/runtimeV2/executionSchedulerPort.ts", new Map([
+    ["./executionSubagentRunner", { startRuntimeV2Child() { assert.fail("legacy automatic job must not start"); } }],
+  ]));
+  const live = { messages: [], childRuns: new Map(), childAbortControllers: new Map() };
+  const scheduler = createRuntimeV2SchedulerPort({ live, now: () => 7, logStoreEvent() {} });
+  await runtime.restoreRuntimeV2ProactiveSchedules({ state, scheduler, signal: new AbortController().signal, commit: async draft => apply(draft) });
+  assert.equal(state.subagents[0].status, "canceled");
+  assert.equal(state.events.filter(event => event.type === "subagent.telemetry").length, 0);
+  assert.equal(runtime.deriveRuntimeV2SubagentConcurrency(state.subagents).peakInFlight, 0);
+  assert.equal(runtime.runtimeV2ProactiveSchedulesToRestore(state).length, 0);
 });
 
 test("resolveSubagentCapacityPolicy scales up to 7 subagents on high memory and responds to configSlice override clearing", async () => {

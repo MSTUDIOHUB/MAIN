@@ -185,6 +185,7 @@ export async function runPlanDocumentInterview({ input, ledger, turn, run, objec
         continue;
       }
       await executeReadOnlyPlanTool({ context: input.context, ledger, run, call, messages, evidence, evidenceContents,
+        isUnityOfficialMcpEnabled: () => input.get().config.unityOfficialMcpEnabled === true,
         advertisedToolNames: response.advertisedToolNames,
         logStoreEvent: input.logStoreEvent, parallelReadCount: runtimeV2ParallelReadCount(response.toolCalls) });
     }

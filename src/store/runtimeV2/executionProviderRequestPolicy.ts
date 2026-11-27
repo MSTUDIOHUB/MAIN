@@ -13,6 +13,7 @@ import {
 } from "../../lib/runtime-v2";
 import type {
   RuntimeV2ExecutionPortsInput,
+  RuntimeV2LiveExecutionState,
   RuntimeV2ProviderActionWindow,
 } from "./executionTypes";
 
@@ -23,8 +24,53 @@ export const RUNTIME_V2_EXECUTION_VALIDATION_MAX_OUTPUT_TOKENS = 4_096;
 export const RUNTIME_V2_EXECUTION_CONCLUSION_MAX_OUTPUT_TOKENS = 4_096;
 export const RUNTIME_V2_EXECUTION_REASONING_ONLY_CHAR_LIMIT = 32_000;
 export const RUNTIME_V2_EXECUTION_REASONING_ONLY_TIMEOUT_MS = 60_000;
+
+export function runtimeV2ProviderWireShape(result: StreamResult, protocolContent: string, reasoningFallbackApplied: boolean) {
+  return {
+    finishReason: result.finishReason || null, clientStopReason: result.clientStopReason || null,
+    rawContentChars: result.content.length,
+    actionableContentChars: result.actionableContent?.length || 0,
+    semanticContentChars: result.semanticContent?.length || 0,
+    reasoningChars: result.reasoningContent?.length || 0,
+    mirrorKind: result.streamDiagnostics?.mirrorKind || null,
+    nativeToolCalls: result.toolCalls.length,
+    envelopeOpenMarkers: protocolContent.match(/<runtime-v2-tools>/g)?.length || 0,
+    envelopeCloseMarkers: protocolContent.match(/<\/runtime-v2-tools>/g)?.length || 0,
+    protocolViolation: result.protocolViolation || null,
+    reasoningFallbackApplied,
+    inputTokens: result.usage?.inputTokens ?? null,
+    outputTokens: result.usage?.outputTokens ?? null,
+    cachedInputTokens: result.usage?.cachedInputTokens ?? null,
+    uncachedInputTokens: result.usage?.cachedInputTokens === undefined ? null : result.usage.inputTokens - result.usage.cachedInputTokens,
+    firstSemanticVisibleElapsedMs: result.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
+    firstToolElapsedMs: result.streamDiagnostics?.firstToolElapsedMs ?? null,
+  };
+}
 export const RUNTIME_V2_EXECUTION_ACTIONLESS_CHAR_LIMIT = 16_000;
 export const RUNTIME_V2_EXECUTION_REQUIRED_ACTIONLESS_CHAR_LIMIT = 12_000;
+
+export function beginRuntimeV2ActionReasoningScope(input: {
+  live: RuntimeV2LiveExecutionState;
+  run: RuntimeV2Command["run"];
+  mode: string;
+  approvalKey?: string;
+  compilerKey?: string;
+  settings: StreamSettings;
+  textEnvelope: boolean;
+  eligible: boolean;
+}) {
+  const { live, run, mode, approvalKey, compilerKey, settings, eligible, textEnvelope } = input;
+  const boundary = approvalKey ? ["approved-plan", approvalKey, mode] : compilerKey ? ["compiler", compilerKey] : undefined;
+  const reasoningActionScope = boundary && eligible && settings.reasoningRequest === "auto" &&
+    (mode === "execute" || mode === "validate") ? JSON.stringify([
+      run.runId, run.attemptId, boundary, settings.provider, settings.baseUrl, settings.model, settings.toolProtocol, textEnvelope,
+    ]) : undefined;
+  const reuseReasoningFallback = !!reasoningActionScope && live.actionReasoningScope === reasoningActionScope;
+  // Only the compiler's observed verdict can retain a direct Execute's
+  // decoding preference across equivalent results or rejected actions.
+  if (!compilerKey || !reuseReasoningFallback) delete live.actionReasoningScope;
+  return { reasoningActionScope, reuseReasoningFallback };
+}
 
 export function runtimeV2CurrentToolSurfaceInstruction(
   tools: readonly ToolDefinition[],

@@ -723,8 +723,14 @@ test("approved execution dispatches independent validation prep and committed-co
   })));
   let state = approvedAggregate(plan);
   state = applyEvent(state, "phase.changed", { run, phase: "acting", reason: "implementation" });
-  state = applyEvent(state, "observation.recorded", {
-    run, evidence: { id: "toolchain", kind: "source", target: "pyproject.toml", version: "manifest-v1" },
+  const { ensureVersionedReadFileResultForModel } = loadTs("src/lib/readFileWindow.ts");
+  const target = "pyproject.toml";
+  const version = `sha256-${"a".repeat(64)}`;
+  state = applyEvent(state, "command.scheduled", { run, command: { idempotencyKey: "manifest-read", run,
+    kind: "execute_tool", phase: state.phase, payload: { toolName: "read_file", arguments: { path: target } } } });
+  state = applyEvent(state, "tool.completed", { run, idempotencyKey: "manifest-read", status: "succeeded",
+    evidence: [{ id: "toolchain", kind: "source", target, version }],
+    modelContent: ensureVersionedReadFileResultForModel(target, "[tool.pytest]", version),
   });
   const facts = { preference: "preferred", capacity: 2, requestMode: "parallel", workspace: "/fixture", now: 100,
     baseline: { kind: "project_baseline_context", workspace: { canonicalPath: "/fixture" },
@@ -734,18 +740,29 @@ test("approved execution dispatches independent validation prep and committed-co
   assert.deepEqual(validationPrep.allowedPaths, ["pyproject.toml"]);
   const { runtimeV2ChildTools } = loadTs("src/store/runtimeV2/executionSubagentPolicy.ts");
   assert.equal(runtimeV2ChildTools(validationPrep).some(tool => tool.function.name === "run_command"), false);
-  const command = runtime.decideNextCommands(state, {
+  const decision = {
     subagentPreference: "preferred", subagentRequestMode: "parallel", subagentCapacity: 2,
     proactiveCollaboration: { candidate: validationPrep },
-  })[0];
+  };
+  const request = runtime.decideNextCommands(state, decision)[0];
+  assert.equal(request.kind, "request_model");
+  state = applyEvent(state, "command.scheduled", { run, command: request });
+  state = applyEvent(state, "provider.responded", { run, idempotencyKey: request.idempotencyKey,
+    result: { visibleText: "", diagnostics: [], toolCalls: [{ id: "prepare-validation", name: "spawn_subagent", arguments: {
+      task_kind: "validate", objective: "Identify prerequisites for the approved tests.", required_paths: target,
+      evidence_refs: "toolchain", success_criteria: "Return any unmet prerequisites with exact evidence.",
+      parent_work: "Implement game.py.",
+    } }] } });
+  const command = runtime.decideNextCommands(state, decision)[0];
+  assert.equal(command.payload.toolCallId, "prepare-validation");
   state = applyEvent(state, "command.scheduled", { run, command });
   const { jobs } = runtime.scheduleRuntimeV2Subagents({
-    parentRun: run, candidates: [validationPrep], maxActiveJobs: 2, requestedAt: 100, nextId: () => "prerequisites",
+    parentRun: run, candidates: [{ ...validationPrep, sourceToolCallId: "prepare-validation" }], maxActiveJobs: 2, requestedAt: 100, nextId: () => "prerequisites",
   });
   state = applyEvent(state, "subagents.scheduled", { run, maxActiveSubagents: 2, jobs });
   state = applyEvent(state, "command.completed", { run, idempotencyKey: command.idempotencyKey, status: "succeeded" });
 
-  state = commitMutation(state, "write-game", "game.py");
+  state = commitMutation(state, "write-game", "game.py", `sha256-${"b".repeat(64)}`);
   const codeReview = deriveProactiveCollaboration({ ...facts, state }).candidate;
   assert.equal(codeReview.taskKind, "review");
   assert.deepEqual(codeReview.allowedPaths, ["game.py"]);

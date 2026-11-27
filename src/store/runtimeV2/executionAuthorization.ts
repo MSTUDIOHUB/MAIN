@@ -25,6 +25,7 @@ import {
   type RuntimeV2Command,
 } from "../../lib/runtime-v2";
 import {
+  ENABLE_UNITY_OFFICIAL_MCP_TOOL,
   isRuntimeV2ReadOnlyToolName,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
@@ -35,6 +36,7 @@ import {
   activeRuntimeV2SubagentJobWriteConflict,
 } from "./executionSubagentWriteScope";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import { runtimeV2WorkspaceMcpSnapshot } from "./executionUnityOfficialMcp";
 import { finiteValidationCommandRejection } from "./executionValidationCommand";
 import { validateRuntimeV2MutationLease } from "./correctiveMutationPolicy";
 import { runtimeV2MutationLeaseRejectionReason } from "./executionMutationRejection";
@@ -112,7 +114,7 @@ export function validateToolAgainstPhaseAndPlan(input: {
     input.args,
     {
       workspace: input.ports.context.runWorkspace,
-      workspaceMcpSnapshot: input.ports.context.workspaceMcpSnapshot,
+      workspaceMcpSnapshot: runtimeV2WorkspaceMcpSnapshot(input.ports),
       approvedLocalFileReadPaths:
         input.ports.get()?.approvedLocalFileReadPaths,
     },
@@ -387,7 +389,7 @@ export async function authorizeToolForCurrentTurn(
         args,
         {
           workspace: input.context.runWorkspace,
-          workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
+          workspaceMcpSnapshot: runtimeV2WorkspaceMcpSnapshot(input),
           approvedLocalFileReadPaths: state.approvedLocalFileReadPaths,
         },
       );
@@ -403,7 +405,11 @@ export async function authorizeToolForCurrentTurn(
       allowExternalLocalRead: false,
     };
   }
-  const approvalRequiredCapability = runtimeV2ToolApprovalCapability(input, exposedName, args);
+  if (exposedName === ENABLE_UNITY_OFFICIAL_MCP_TOOL && Object.keys(args).length) {
+    return { allowed: false, reason: "The Unity Official MCP setting takes no arguments.", allowExternalLocalRead: false };
+  }
+  const approvalRequiredCapability = exposedName === ENABLE_UNITY_OFFICIAL_MCP_TOOL
+    ? "external_interaction" : runtimeV2ToolApprovalCapability(input, exposedName, args);
   const manualReview = approvalRequiredCapability ? {
     allowed: false as const,
     reason: "This Turn requires separate human approval for this action.",

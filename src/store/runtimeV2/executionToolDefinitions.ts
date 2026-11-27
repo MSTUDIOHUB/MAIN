@@ -1,5 +1,5 @@
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../../lib/toolSchemas";
-import { unityMcpObservationTools, UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
+import { workspaceEditorObservationTools } from "../../lib/workspaceMcp";
 import { UNITY_CREATE_SCENE_TOOL } from "../../lib/workspaceMutationTools";
 import {
   buildLoadSkillToolDefinition,
@@ -7,12 +7,15 @@ import {
   type SkillCatalogSnapshot,
 } from "../../lib/agentSkills";
 import {
+  ENABLE_UNITY_OFFICIAL_MCP_TOOL,
+  RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
   RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES,
 } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
 } from "./executionContract";
 import { RESOLVE_RUNTIME_V2_REVIEW_FINDING_TOOL_NAME } from "../../lib/runtime-v2";
+import { UNITY_GAME_VIEW_DEFINITION } from "./executionUnityGameView";
 
 const RESOLVE_REVIEW_FINDING_TOOL: ToolDefinition = {
   type: "function",
@@ -91,7 +94,17 @@ const RUNTIME_V2_CORE_TOOL_NAMES = new Set([
   "load_skill",
   "tool_search",
   UNITY_CREATE_SCENE_TOOL,
+  ENABLE_UNITY_OFFICIAL_MCP_TOOL,
 ]);
+
+const ENABLE_UNITY_OFFICIAL_MCP_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: ENABLE_UNITY_OFFICIAL_MCP_TOOL,
+    description: "Request the user's approval to turn on Unity Official MCP in System Settings and discover its tools for this Unity 6 workspace. Use when the task needs an official Unity MCP capability.",
+    parameters: { type: "object", properties: {}, required: [] },
+  },
+};
 
 const UNITY_SCENE_DEFINITION: ToolDefinition = {
   type: "function",
@@ -119,14 +132,16 @@ export function runtimeV2ToolDefinitions(
   const loadSkillDefinition = buildLoadSkillToolDefinition(skillCatalog);
   const builtIns = [
     ...TOOL_DEFINITIONS,
-    ...unityMcpObservationTools(state),
+    ...workspaceEditorObservationTools(state),
+    ...(state?.unityGameViewSupported ? [UNITY_GAME_VIEW_DEFINITION] : []),
+    ...(state?.unityOfficialMcpOfferVersion && !state.config?.unityOfficialMcpEnabled ? [ENABLE_UNITY_OFFICIAL_MCP_DEFINITION] : []),
     UNITY_SCENE_DEFINITION,
     RECORD_RUNTIME_V2_EXECUTION_CONTRACT_TOOL,
     RESOLVE_REVIEW_FINDING_TOOL,
     ...(loadSkillDefinition ? [loadSkillDefinition] : []),
   ].filter((definition) => {
     const name = definition.function.name;
-    return RUNTIME_V2_CORE_TOOL_NAMES.has(name) || UNITY_MCP_OBSERVATION_NAMES.has(name) ||
+    return RUNTIME_V2_CORE_TOOL_NAMES.has(name) || RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(name) ||
       (!!knowledgeContext?.references.length && knowledgeContext.state !== "stale" && knowledgeContext.state !== "error" && ["knowledge_search", "knowledge_get_excerpt"].includes(name)) ||
       (includeNetwork && RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(name));
   }).map((definition) => {

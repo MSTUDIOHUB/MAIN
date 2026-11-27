@@ -4,14 +4,13 @@ import { getFileMetadata } from "../../lib/ipc";
 import { beginCapsuleToolActivity } from "../../lib/capsuleLiveActivity";
 import { classifyWorkspaceReadFailure, describeWorkspaceToolFailure } from "../../lib/workspaceToolFailure";
 import { runtimeV2BuiltinCapabilityRestriction, runtimeV2KnowledgeMayFetch } from "./executionCapabilityRestrictions";
-import { UNITY_MCP_OBSERVATION_NAMES } from "../../lib/workspaceMcp";
 import { normalizeTurnApprovalCapabilities, normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { normalizeNetworkRead } from "../../lib/networkRead";
 import { boundKnowledgeToolResult, normalizeKnowledgeReferences } from "../../lib/knowledgeReferences";
 import { buildToolCatalog } from "../../lib/toolCatalog";
 import { TOOL_SEARCH_TOOL_NAME } from "../../lib/toolSearch";
 import { readOnlyEvidenceVersion, webEvidenceVersions } from "../../lib/runtime-v2/readOnlyProgress";
-import { RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { RUNTIME_V2_EDITOR_READ_TOOL_NAMES, RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { getToolTarget } from "../../lib/toolTarget";
 import { executeTool } from "../../lib/toolExecutor";
 import { isAbsoluteWorkspacePath, workspacePathsReferToSameFile } from "../../lib/workspacePaths";
@@ -135,6 +134,7 @@ async function replayRetainedPlanFile(input: {
 
 export async function executeReadOnlyPlanTool(input: {
   readonly context: RuntimeV2SubmissionContext;
+  readonly isUnityOfficialMcpEnabled?: () => boolean;
   readonly ledger: PlanLedger;
   readonly run: RuntimeV2RunIdentity;
   readonly call: RuntimeV2NormalizedProviderResult["toolCalls"][number];
@@ -156,7 +156,7 @@ export async function executeReadOnlyPlanTool(input: {
   const restriction = runtimeV2BuiltinCapabilityRestriction(restrictions, input.call.name);
   const review = runtimeV2BuiltinCapabilityRestriction(approvalRequirements, input.call.name);
   if (restriction || review ||
-    (UNITY_MCP_OBSERVATION_NAMES.has(input.call.name) && !input.context.workspaceMcpSnapshot?.planObservationsAllowed) ||
+    (RUNTIME_V2_EDITOR_READ_TOOL_NAMES.has(input.call.name) && !input.context.workspaceMcpSnapshot?.planObservationsAllowed) ||
     (knowledgeTool && (!knowledgeReferences?.length || ["stale", "error"].includes(input.ledger.snapshot()?.knowledgeContext?.state || ""))) ||
     (!PLAN_READ_ONLY_TOOL_NAMES.has(input.call.name) && !(networkTool && networkRead.enabled))) {
     const content = restriction ? `TURN_CAPABILITY_RESTRICTED: ${restriction}` : review
@@ -224,6 +224,8 @@ export async function executeReadOnlyPlanTool(input: {
       {
         skillCatalog: input.context.skillCatalog,
         workspaceMcpSnapshot: input.context.workspaceMcpSnapshot,
+        unityConsoleSignal: input.context.abortCtrl?.signal,
+        isUnityOfficialMcpEnabled: input.isUnityOfficialMcpEnabled,
         ...(knowledgeTool ? { knowledgeReferences: knowledgeReferences || [] } : {}),
         ...(networkTool || knowledgeTool ? { networkRead } : {}),
         ...(input.call.name === "knowledge_search" ? {

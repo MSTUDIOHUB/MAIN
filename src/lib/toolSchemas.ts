@@ -516,7 +516,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           },
           objective: { type: "string", description: "子智能体要独立完成的明确目标" },
           delegation_reason: { type: "string", description: "可选：为什么该任务值得独立委派；省略时由运行时补充中性原因" },
-          success_criteria: { type: "string", description: "可选：可判定的成功标准；省略时要求返回与目标相关的实质性工具证据" },
+          evidence_refs: { type: "string", description: "可选协作提案必填。填写主要目标对应的确切证据 ID，或从回执看到的精确工作区文件路径。多个引用以逗号或换行分隔。" },
+          parent_work: { type: "string", description: "可选协作提案必填。说明子任务运行期间父线程会同时推进的独立工作，并引用已知的父线程目标路径。" },
+          success_criteria: { type: "string", description: "可选协作提案必填。描述可判定的具体交付标准，并指明需要引用的证据。" },
           name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
           role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
           scope: { type: "string", description: "可选的职责边界说明；不能替代 objective 和 success_criteria" },
@@ -549,12 +551,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "wait_subagents",
-      description: "等待并汇合当前父回合创建的一个或全部子智能体。省略 subagent_ids 时等待本回合全部子智能体；返回摘要、证据、阻塞原因和剩余工作。",
+      description: "汇合当前父回合的子智能体。涉及可选子任务时，填写需要的子任务 ID，并说明父线程的哪项后续动作依赖这份交付。",
       parameters: {
         type: "object",
         properties: {
           subagent_ids: { type: "string", description: "可选，逗号分隔的子智能体 ID；省略则等待全部" },
           collaboration_task_ids: { type: "string", description: "可选，逗号分隔的一次性任务 ID；可与 subagent_ids 二选一" },
+          dependency: { type: "string", description: "等待可选子任务必填。描述依赖其交付的具体父线程动作。" },
         },
         required: [],
       },

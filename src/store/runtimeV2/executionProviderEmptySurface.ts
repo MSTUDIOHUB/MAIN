@@ -79,10 +79,12 @@ export async function requestRuntimeV2ProviderWithEmptySurface(input: {
       },
     });
   } catch (error) {
+    input.signal.throwIfAborted();
     if (isRuntimeV2LifecycleDeadlineError(error)) throw error;
     if (isRuntimeV2ProviderProtocolError(error)) throw error;
     throw runtimeV2ProviderAttemptFailure(error);
   }
+  input.signal.throwIfAborted();
   const surfaceRejection = rejectRuntimeV2UnexpectedProviderTool({
     ports: input.ports,
     command: input.command,

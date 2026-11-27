@@ -24,7 +24,7 @@ export const TOOL_SEARCH_DEFINITION: ToolDefinition = {
   function: {
     name: TOOL_SEARCH_TOOL_NAME,
     description:
-      "按关键词按需搜索并解锁扩展工具（如 git、AST/符号引用、文档/表格分析、浏览器验证 browser_evaluate、桌面控制 computer_use、子智能体 spawn_subagent 及 MCP 外部工具）。调用后匹配的工具会在当前会话中解锁并可直接调用。",
+      "按关键词按需搜索并解锁扩展工具（如 git、AST/符号引用、文档/表格分析、浏览器验证 browser_evaluate、桌面控制 computer_use 及 MCP 外部工具）。调用后匹配的工具会在当前会话中解锁并可直接调用。",
     parameters: {
       type: "object",
       properties: {

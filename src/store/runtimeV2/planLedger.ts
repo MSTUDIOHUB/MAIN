@@ -89,6 +89,12 @@ export class PlanLedger {
     this.revision = result.checkpoint.revision;
     this.aggregate = result.checkpoint.aggregate;
     const committed = this.aggregate.events.find(candidate => candidate.eventId === event.eventId) || event;
+    if (result.disposition === "committed" && committed.type === "subagent.handoff_applied") {
+      this.logEvent?.("runtime_v2_subagent_handoff_adopted", {
+        turnId: committed.run.turnId, runId: committed.run.runId, jobId: committed.jobId,
+        evidenceCount: committed.evidenceIds.length, source: committed.source,
+      });
+    }
     if (committed.type === "work_plan.sealed") {
       await this.appendSealedPlanHandoffs(committed);
     }

@@ -727,6 +727,7 @@ export function boundRuntimeV2ProviderConversation(
     readonly contextLimit: number;
     readonly reservedOutputTokens: number;
     readonly inputBudget?: number;
+    readonly preferWorkset?: boolean;
   },
   effects?: RuntimeV2ProviderEffectFacts,
 ): AgentMessage[] {
@@ -734,7 +735,7 @@ export function boundRuntimeV2ProviderConversation(
   const inputBudget = options.inputBudget ?? computeContextBudgets(
     options.contextLimit, options.reservedOutputTokens,
   ).inputBudget;
-  if (estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
+  if (!options.preferWorkset && estimateMessagesTokens(messages as TrimMessage[]) <= inputBudget) return [...messages];
   const decision = buildRuntimeV2DecisionView(messages, effects);
   const guidance = activeRuntimeV2SkillGuidanceWindows(decision);
   const priorityToolCallIds = new Set(guidance.map((window) => window.callId));

@@ -1,5 +1,6 @@
 import { shareSessionStartupMigration, mergeCommittedStartupSessions } from "./lib/retiredFeatureMigration";
 import { ensureRetiredFeatureMigration, importLocalStartupSession } from "./lib/retiredFeatureMigrationIpc";
+import { createTerminalCredentialProjection } from "./lib/terminalCredentialHistory";
 import { resolveSessionModeAffinity, type SessionModeAffinityLike, type SessionModeAffinity } from "./lib/mainModes";
 import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import { open } from '@tauri-apps/plugin-dialog';
@@ -1154,6 +1155,7 @@ export default function App() {
           messages: record.messages?.length ? record.messages : record.runtimeSnapshot?.taskFlow || [],
         };
         const saved = await importLocalStartupSession(workspace, snapshot);
+        if (!saved) continue;
         // Adopt each durable revision so a later failure can retry from the
         // remaining browser records without re-saving an earlier owner.
         useAppStore.setState(latest => ({
@@ -2324,28 +2326,31 @@ export default function App() {
 
     if (target?.messages?.length) {
       if (!canPublishRestore("legacy_messages")) return;
-      syncTaskIdCounterFromBlocks(target.messages);
+      const projectHistory = createTerminalCredentialProjection(target);
+      const messages = projectHistory(target.messages as TaskBlock[]);
+      const storedTitle = projectHistory(String(target.title || ""));
+      syncTaskIdCounterFromBlocks(messages);
       const turnId = `loaded-${id}-${Date.now()}`;
       const restoredMainMode = resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode");
       const restoredTitle = normalizeConversationDisplayTitle(
-        target.title || "",
+        storedTitle,
         48,
         useAppStore.getState().config.language === "en" ? "New task" : "新的任务",
       );
       useAppStore.setState({
-        taskFlow: target.messages,
+        taskFlow: messages,
         selectedMainModeKey: restoredMainMode,
         selectedDiffTaskId: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         conversationTurns: [{
           id: turnId,
-          userPrompt: target.title || '',
+          userPrompt: storedTitle,
           title: restoredTitle,
           mode: scopeKey === GLOBAL_CHAT_KEY ? 'chat' as const : 'edit' as const,
           status: 'done' as const,
           summary: restoredTitle,
-          blockIds: target.messages.map((m: any) => m.id),
+          blockIds: messages.map(message => message.id),
           collapsed: true,
           createdAt: Date.now(),
         }],

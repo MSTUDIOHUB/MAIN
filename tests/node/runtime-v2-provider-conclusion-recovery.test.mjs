@@ -398,6 +398,29 @@ test("visible required-action recovery preserves settings for an adapter without
   });
 });
 
+test("ordinary compiler repair reuses its decoding fallback until the compiler findings change", async () => {
+  const unity = loadTs("src/lib/runtime-v2/unityRepairLoop.ts");
+  const originalDecision = unity.runtimeV2UnityCompilerDecision;
+  const tool = { type: "function", function: { name: "read_file", description: "read", parameters: { type: "object", properties: {} } } };
+  let compiler = { key: "first-verified-finding", repeated: false };
+  unity.runtimeV2UnityCompilerDecision = () => compiler;
+  try {
+    await withStreamFixture("omlx", (attempt) => attempt === 1 ? truncatedStream() : completedStream(), async (fixture, calls) => {
+      const input = { live: fixture.live, ports: fixture, command: command("execute"), tools: [tool], textEnvelope: false, toolChoice: null, signal: new AbortController().signal };
+      await request.requestRuntimeV2ProviderOnce(input);
+      compiler = { ...compiler, repeated: true };
+      await request.requestRuntimeV2ProviderOnce(input);
+      compiler = { key: "new-verified-finding", repeated: false };
+      await request.requestRuntimeV2ProviderOnce(input);
+      assert.deepEqual(calls.map(call => call.settings.reasoningRequest), ["auto", "off", "off", "auto"]);
+      assert.ok(calls[2].messages.some(message => message.content.includes("reported the same findings")));
+      assert.ok(calls.every(call => call.tools.some(({ function: definition }) => definition.name === "read_file")), "decoding recovery leaves the ordinary tools available");
+    });
+  } finally {
+    unity.runtimeV2UnityCompilerDecision = originalDecision;
+  }
+});
+
 function executeReplyAggregate(result, phase = "observing") {
   const turn = { workspaceKey: "/fixture", sessionKey: "session", sessionEpoch: "epoch", clientSubmissionId: "submission", turnId: "turn" };
   const run = { sessionKey: "session", sessionEpoch: "epoch", turnId: "turn", runId: "run", parentRunId: null, attemptId: "attempt" };

@@ -10,7 +10,8 @@ import { checkCarriedWorkPlanTargets } from "./approvedPlanContinuation";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { deriveUnityCompilation, unityCompilationMessage, unityCompilationTarget, type ApprovedPlanExecutionRepair } from "../../lib/runtime-v2/unityCompilation";
 import { projectEditorPlayModeFilter, unityCommandArguments } from "../../lib/unityValidation";
-import { unityValidationInvocations } from "../../lib/validationContract";
+import { commandContainsShellExecutable, unityValidationInvocations } from "../../lib/validationContract";
+import { isRuntimeV2EditorDiagnosticRepair } from "../../lib/runtime-v2/editorConsoleEvidence";
 import { readFileWindow } from "../../lib/ipc";
 
 export async function projectValidationManifestDriftReceipt(input: {
@@ -75,14 +76,33 @@ export function runtimeV2ToolPreExecutionReceipt(input: {
   const interrupted = interruptedRuntimeV2ShellBatchReceipt(input);
   if (interrupted) return interrupted;
   const restriction = runtimeV2ToolCapabilityRestriction(ports, toolName, args);
-  if (!restriction) return null;
-  const content = `TURN_CAPABILITY_RESTRICTED: ${restriction}`;
+  if (restriction) {
+    const content = `TURN_CAPABILITY_RESTRICTED: ${restriction}`;
+    recordToolResultHistory({ ports, command, toolName, target, status: "blocked", content });
+    const receipt = toolCompletionFor(ports, command, toolName, args, target, content,
+      "blocked", "not_authorized", undefined, undefined, "turn_capability_restricted");
+    return receipt.type === "validation.completed"
+      ? { ...receipt, evidence: [], failureKind: "not_executed", failureReasonCode: "turn_capability_restricted" }
+      : receipt;
+  }
+  const shell = toolName === "run_command" && typeof args.command === "string" ? args.command : "";
+  if (!shell) return null;
+  const inspectProcesses = commandContainsShellExecutable(shell, "ps");
+  const wait = commandContainsShellExecutable(shell, "sleep");
+  if (!inspectProcesses && !wait) return null;
+  const aggregate = aggregateForCurrentTurn(ports);
+  if (!isRuntimeV2EditorDiagnosticRepair(aggregate)) return null;
+  const compile = wait ? deriveUnityCompilation(aggregate)?.receipt?.result : undefined;
+  const reason = compile?.status === "failed" ? "unity_compilation_already_failed" : "unity_editor_status_requires_bound_probe";
+  const content = compile?.status === "failed"
+    ? `The bound Editor already returned a compilation failure. Inspect the reported source and assembly definitions using workspace tools, then correct the cause before rechecking.\n${unityCompilationMessage(compile)}`
+    : "Use the bound Unity Console reader for this workspace's Editor connection and compilation state. The runtime performs bounded checks when the Editor is busy.";
   recordToolResultHistory({ ports, command, toolName, target, status: "blocked", content });
+  ports.logStoreEvent("runtime_v2_tool_execution_blocked", { turnId: command.run.turnId,
+    runId: command.run.runId, commandKind: command.kind, toolName, reasonCode: reason });
   const receipt = toolCompletionFor(ports, command, toolName, args, target, content,
-    "blocked", "not_authorized", undefined, undefined, "turn_capability_restricted");
-  return receipt.type === "validation.completed"
-    ? { ...receipt, evidence: [], failureKind: "not_executed", failureReasonCode: "turn_capability_restricted" }
-    : receipt;
+    "blocked", "not_executed", undefined, undefined, reason);
+  return receipt.type === "validation.completed" ? { ...receipt, evidence: [] } : receipt;
 }
 
 /** Automatic preparation requires a real project scope and cannot exercise a

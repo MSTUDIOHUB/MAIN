@@ -248,6 +248,17 @@ test("proactive review tracks mutation hashes and dispatches only high-risk cros
   });
   assert.deepEqual(afterRepeat, { reason: "no_independent_scope" });
 
+  for (const [index, content] of ["Tests.csproj matched", ""].entries()) {
+    const key = `search-after-review-${index}`;
+    const target = "Assets/MFramework/Pool/ObjectPoolManager.cs";
+    state = ev(state, "command.scheduled", { run, command: { idempotencyKey: key, kind: "execute_tool", run,
+      phase: "validating", payload: { toolName: "grep_search", arguments: { path: target, query: "Tests.csproj" } } } });
+    state = ev(state, "tool.completed", { run, idempotencyKey: key, status: "succeeded", modelContent: content,
+      evidence: [{ id: key, kind: "source", target, version: `sha256-${String(index + 4).repeat(64)}` }] });
+    assert.deepEqual(deriveProactiveCollaboration({ state, preference: "preferred", capacity: 3, requestMode: "parallel",
+      workspace: turn.workspaceKey, language: "zh", now: 82 + index }), { reason: "no_independent_scope" });
+  }
+
   // After a NEW mutation hash on ObjectPoolManager.cs, review scopeKey refreshes!
   state = ev(state, "command.scheduled", {
     run, command: { idempotencyKey: "mut-mgr-v2", kind: "execute_tool", run, phase: "validating", payload: { toolName: "replace_in_file", arguments: { path: "Assets/MFramework/Pool/ObjectPoolManager.cs" } } },

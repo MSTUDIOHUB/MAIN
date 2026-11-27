@@ -18,10 +18,14 @@ export const RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES = new Set([
   "web_fetch",
 ]);
 
-const EDITOR_READ_TOOLS = ["unity_mcp_scene", "unity_mcp_console"] as const;
-export type RuntimeV2EditorReadToolName = typeof EDITOR_READ_TOOLS[number];
+export const UNITY_MCP_CONSOLE_TOOL = "unity_mcp_console";
+export const UNITY_CLI_CONSOLE_TOOL = "unity_cli_console";
+export const UNITY_OFFICIAL_MCP_CONSOLE_TOOL = "unity_official_mcp_console";
+export const UNITY_GAME_VIEW_TOOL = "capture_unity_game_view";
+export const ENABLE_UNITY_OFFICIAL_MCP_TOOL = "enable_unity_official_mcp";
+export const UNITY_CONSOLE_TOOL_NAMES: ReadonlySet<string> = new Set([UNITY_OFFICIAL_MCP_CONSOLE_TOOL, UNITY_MCP_CONSOLE_TOOL, UNITY_CLI_CONSOLE_TOOL]);
 /** Live Editor observations have no file-version authority or source replay. */
-export const RUNTIME_V2_EDITOR_READ_TOOL_NAMES: ReadonlySet<string> = new Set(EDITOR_READ_TOOLS);
+export const RUNTIME_V2_EDITOR_READ_TOOL_NAMES: ReadonlySet<string> = new Set(["unity_mcp_scene", UNITY_GAME_VIEW_TOOL, ...UNITY_CONSOLE_TOOL_NAMES]);
 
 /** Reads immutable Turn guidance, not workspace source. Keeping this separate
  * prevents a Skill body from satisfying source-version or mutation leases. */

@@ -3,6 +3,8 @@ import {
   capturePlanExecutionRunProvenance,
 } from "../../lib/planExecutionProvenance";
 import { buildToolPermissionActionRequest } from "../../lib/pendingToolReview";
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { getToolPresentationLabel } from "../../lib/toolPresentation";
 import { reduceRunTransition } from "../../lib/runTransitionReducer";
 import type { ToolReviewDecision } from "../../lib/toolReviewDecision";
 import {
@@ -132,7 +134,9 @@ export async function requestRuntimeV2ToolPermission(input: {
     turnId: input.command.run.turnId,
     runId: input.command.run.runId,
     parentRunId: input.command.run.parentRunId,
-    title: String(turn?.title || turn?.userPrompt || input.toolName),
+    title: input.toolName === ENABLE_UNITY_OFFICIAL_MCP_TOOL
+      ? getToolPresentationLabel(input.toolName, input.ports.context.phaseLanguage)
+      : String(turn?.title || turn?.userPrompt || input.toolName),
     taskId,
     toolCall: permissionToolCall,
     ...(planExecution ? { planExecution } : {}),

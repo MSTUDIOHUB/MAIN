@@ -1297,6 +1297,280 @@ test("an admitted exact command requires its own executed result", () => {
   assert.equal(commandOnlyOutcome(state)?.resultKind, "success");
 });
 
+test("Pipeline history does not authorize diagnostic targets or replace a fresh same-Editor repair verdict", () => {
+  const { runtimeV2EditorConsoleEvidence, runtimeV2EditorDiagnosticScope } = loadTs("src/lib/runtime-v2/editorConsoleEvidence.ts");
+  const { verifiedUnityConsoleRepair } = loadTs("src/lib/runtime-v2/unityCompilation.ts");
+  const { ensureVersionedReadFileResultForModel } = loadTs("src/lib/readFileWindow.ts");
+  const { runtimeV2ToolPreExecutionReceipt } = loadTs("src/store/runtimeV2/executionToolGateReceipt.ts");
+  const path = "Assets/Tests/BreakoutTests.cs";
+  const asmdef = "Assets/Tests/Tests.asmdef";
+  const binding = { instanceId: "unity-official-mcp:21", editorPid: 21, editorVersion: "6000.6.5f1" };
+  const initialSampleAt = Date.parse("2026-11-27T07:01:01.000Z");
+  const initial = runtimeV2EditorConsoleEvidence({ workspace: baseTurn.workspaceKey, binding, args: {}, result: {
+    success: true, data: {
+      items: Array.from({ length: 10 }, (_, idx) => ({ type: "Error", message: `${path}(${idx + 1},5): error CS0246: Missing type.` })),
+      total: 10, cursor: 0, truncated: false,
+      consoleEvidence: { rowSource: "retained", retainedErrors: 10, retainedWarnings: 0, retainedWindowComplete: true },
+      groundTruth: { ageMs: 60, sampledUtc: new Date(initialSampleAt).toISOString(), consoleErrors: 2, consoleWarnings: 0, compiling: false, compilationFailed: true },
+    },
+  } });
+  assert.deepEqual(initial.diagnostics, []);
+  assert.equal(initial.retainedDiagnostics.length, 10);
+  assert.equal(initial.pipeline.live.errors, 2);
+  assert.equal(initial.complete, false);
+  const console = (state, evidence) => operationReceipt(state, "unity_official_mcp_console", {
+    name: "unity_official_mcp_console", arguments: {}, effectKind: "observation", evidence: [], editorConsole: evidence,
+  });
+  let state = console(executeAggregate("observing", [null], { kind: "workspace_change", editorDiagnostics: true }), initial);
+  assert.deepEqual(runtimeV2EditorDiagnosticScope(state).diagnostics, []);
+  const hash = char => `sha256-${char.repeat(64)}`;
+  const read = (previous, char) => operationReceipt(previous, path, { name: "read_file", arguments: { path },
+    modelContent: ensureVersionedReadFileResultForModel(path, "class BreakoutTests {}", hash(char)),
+    evidence: [{ id: `exact-tests-source-${char}`, kind: "source", target: path, version: hash(char) }],
+  });
+  const source = read(state, "a");
+  const write = (previous, char) => operationReceipt(previous, asmdef, {
+    name: "write_file", arguments: { path: asmdef, content: "fixed references" }, effectKind: "workspace_change",
+    evidence: [{ id: `asmdef-${char}`, kind: "mutation", target: asmdef, version: hash(char) }],
+  });
+  const check = (previous, char, change) => {
+    const command = runtime.decideNextCommands(previous, { checkUnityCompilation: true })[0];
+    assert.equal(command.payload.target, asmdef, "retained paths cannot widen the compiler check");
+    previous = schedule(previous, command);
+    return runtime.transition(previous, event(previous, "tool.completed", { run: baseRun, idempotencyKey: command.idempotencyKey,
+      status: change.status === "failed" ? "failed" : "succeeded", evidence: [], modelContent: JSON.stringify({
+        status: "passed", projectRoot: ".", editor: "connected", editorPid: binding.editorPid, editorVersion: binding.editorVersion,
+        kind: "csharp", targets: [{ path: asmdef, version: hash(char) }], ...change,
+      }),
+    }));
+  };
+  const compiled = write(source, "b");
+  const closed = { ...initial.pipeline.live, errors: 0, compilationFailed: false, sampledAt: initialSampleAt + 5_000 };
+  assert.equal(verifiedUnityConsoleRepair(check(compiled, "b", {})), null);
+  assert.equal(verifiedUnityConsoleRepair(check(compiled, "b", { postCompileConsole: { ...closed, ageMs: 2_001 } })), null);
+  assert.equal(verifiedUnityConsoleRepair(check(compiled, "b", { postCompileConsole: closed, editorPid: 23 })), null);
+  assert.equal(verifiedUnityConsoleRepair(check(compiled, "c", { postCompileConsole: closed })), null);
+  assert.equal(verifiedUnityConsoleRepair(check(write(state, "b"), "b", { postCompileConsole: closed })), null);
+  const search = operationReceipt(state, path, { name: "grep_search", arguments: { pattern: "BreakoutTests" },
+    modelContent: ensureVersionedReadFileResultForModel(path, "class BreakoutTests {}", hash("a")),
+    evidence: [{ id: "grep-hit", kind: "source", target: path, version: hash("a") }],
+  });
+  assert.equal(verifiedUnityConsoleRepair(check(write(search, "b"), "b", { postCompileConsole: closed })), null);
+  const failed = check(compiled, "b", { status: "failed", postCompileConsole: closed });
+  assert.equal(verifiedUnityConsoleRepair(failed), null);
+  const shellGate = (aggregate, commandLine) => {
+    const checkpoint = runtime.createRuntimeV2Checkpoint({ revision: aggregate.nextSequence, aggregate, updatedAt: aggregate.updatedAt });
+    const args = { command: commandLine };
+    return runtimeV2ToolPreExecutionReceipt({
+      ports: { get: () => ({ runtimeV2Checkpoints: { [baseTurn.turnId]: checkpoint } }),
+        context: { turnId: baseTurn.turnId, runWorkspace: baseTurn.workspaceKey }, live: { messages: [] }, logStoreEvent() {} },
+      command: { run: baseRun, kind: "execute_tool", phase: "acting", idempotencyKey: "unity-state-check",
+        payload: { toolName: "run_command", arguments: args } }, toolName: "run_command", args, target: commandLine,
+    });
+  };
+  assert.equal(shellGate(state, "ps aux | grep Unity")?.failureReasonCode, "unity_editor_status_requires_bound_probe");
+  assert.equal(shellGate(failed, "sleep 15 && stat Tests.csproj")?.failureReasonCode, "unity_compilation_already_failed");
+  assert.equal(shellGate(failed, "unity --version"), null);
+  const verified = check(compiled, "b", { postCompileConsole: closed });
+  assert.equal(verifiedUnityConsoleRepair(runtime.replayRuntimeV2Events(verified.events))?.receipts.length, 1);
+  const restarted = console(verified, { ...initial, instanceId: "unity-cli:23", editorPid: 23,
+    pipeline: { ...initial.pipeline, live: closed } });
+  assert.equal(verifiedUnityConsoleRepair(restarted), null);
+  assert.equal(runtimeV2EditorDiagnosticScope(restarted).editorPid, 23);
+  assert.equal(runtime.decideNextCommands(restarted, { checkUnityCompilation: true })[0]?.payload.toolName, "unity_compile_project");
+  const newFailure = console(restarted, { ...initial, instanceId: "unity-cli:23", editorPid: 23,
+    pipeline: { ...initial.pipeline, live: { ...initial.pipeline.live, sampledAt: closed.sampledAt + 1_000 } } });
+  const corrected = write(read(newFailure, "d"), "e");
+  assert.equal(verifiedUnityConsoleRepair(check(corrected, "e", { postCompileConsole: closed })), null);
+  const correctedCheck = check(corrected, "e", { editorPid: 23, postCompileConsole: { ...closed, sampledAt: closed.sampledAt + 2_000 } });
+  assert.equal(verifiedUnityConsoleRepair(correctedCheck)?.receipts.length, 1);
+  const later = console(check(compiled, "b", {}), { ...initial, instanceId: "unity-cli:21",
+    pipeline: { ...initial.pipeline, live: closed } });
+  assert.equal(verifiedUnityConsoleRepair(later)?.receipts.length, 1);
+
+  const { runtimeV2UnityPlayModeBindingForCommand, runtimeV2UnityPlayModeUnavailable } = loadTs("src/lib/runtime-v2/unityPlayMode.ts");
+  const filter = "Example.Acceptance.ArenaFixture";
+  const cases = [`${filter}.Spawn`, `${filter}.Reset`];
+  const discovery = { status: "discovered", suites: [{ filter, cases }] };
+  const validate = current => runtime.transition(current, event(current, "phase.changed", {
+    run: baseRun, phase: "validating", reason: "mutation_committed",
+  }));
+  const testing = validate(check(compiled, "b", { postCompileConsole: closed, playMode: discovery }));
+  const checkCase = runtime.decideNextCommands(runtime.replayRuntimeV2Events(testing.events))[0];
+  assert.equal(checkCase.kind, "execute_validation");
+  assert.equal(checkCase.payload.arguments.command, `unity test . --mode PlayMode --filter ${filter}`);
+  assert.deepEqual(checkCase.payload.validationAuthority.expectedTestCaseNames, cases);
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(testing), false);
+  assert.equal(runtimeV2UnityPlayModeBindingForCommand(testing, checkCase), undefined, "requires a scheduled check");
+  const checking = schedule(testing, checkCase);
+  assert.deepEqual(runtimeV2UnityPlayModeBindingForCommand(checking, checkCase)?.expectedVersions, { [asmdef]: hash("b") });
+  const authority = checkCase.payload.validationAuthority;
+  const settleTest = (passed, failure = {}) => runtime.transition(checking, event(checking, "validation.completed", {
+    run: baseRun, idempotencyKey: checkCase.idempotencyKey, passed, authority,
+    ...runtime.deriveRuntimeV2ValidationBoundary(checking, authority.targetPaths),
+    evidence: [{ id: "Editor runner verdict", kind: "validation", target: checkCase.payload.arguments.command, version: "verified" }],
+    presentation: { toolName: "run_command", target: checkCase.payload.arguments.command }, ...failure,
+  }));
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(settleTest(false)), false);
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(settleTest(true)), false, "tests alone cannot replace the fresh post-test Console");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(settleTest(true, { postPlayModeConsole: { ...closed, errors: 1 } })), false);
+  const settled = settleTest(true, { postPlayModeConsole: closed });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(runtime.replayRuntimeV2Events(settled.events)), true);
+  const restartedAfterTests = console(settled, { ...initial, instanceId: "unity-cli:23", editorPid: 23,
+    pipeline: { ...initial.pipeline, live: { ...closed, sampledAt: closed.sampledAt + 1_000 } } });
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(restartedAfterTests), false, "a different Editor cannot reuse the original test receipt");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(check(write(settled, "d"), "d", {
+    postCompileConsole: closed, playMode: discovery,
+  })), false, "the old test pass cannot verify newly compiled bytes");
+  const unavailable = settleTest(false, { failureKind: "not_executed", evidence: [] });
+  const blockedAt = runtimeV2UnityPlayModeUnavailable(unavailable)?.sequence;
+  assert.ok(blockedAt && blockedAt < unavailable.events.at(-1).sequence);
+  const requestId = "retry-playmode";
+  const paused = runtime.transition(unavailable, event(unavailable, "run.paused", { run: baseRun, blocker: {
+    requestId, reasonCode: "unity_editor_verification_pending", evidenceSequence: blockedAt, options: ["recheck", "stop"], message: "Verify tests again",
+  } }));
+  const choice = runtime.transition(paused, event(paused, "run.decision_recorded", { run: baseRun, requestId, choice: "recheck" }));
+  const resumed = runtime.transition(choice, event(choice, "run.resumed", { run: baseRun, requestId }));
+  assert.equal(runtime.decideNextCommands(resumed, { checkUnityCompilation: true })[0].payload.target, asmdef, "recheck refreshes the compilation and test discovery");
+  assert.equal(runtime.runtimeV2DirectExecuteReadyForConclusion(check(compiled, "b", { postCompileConsole: closed, playMode: {
+    status: "discovered", suites: [],
+  } })), true, "compile-only remains valid when the Editor identifies no applicable PlayMode tests");
+});
+
+test("Unity repair observes the current compiler, diagnoses assembly references and verifies the newest edit", () => {
+  const { runtimeV2UnityCompilerDecision, runtimeV2UnityRepairContext, runtimeV2UnityRepairPayloadForCommand } = loadTs("src/lib/runtime-v2/unityRepairLoop.ts");
+  const { verifiedUnityConsoleRepair } = loadTs("src/lib/runtime-v2/unityCompilation.ts");
+  const { runtimeV2EvidenceVersion } = loadTs("src/lib/runtime-v2/evidenceVersion.ts");
+  const binding = { instanceId: "unity-official-mcp:21", editorVersion: "6000.6.5f1", editorPid: 21 };
+  const path = "Assets/Scripts/Paddle.cs";
+  const historical = "Assets/Tests/History.cs";
+  const nextPath = "Assets/Tests/BreakoutTests.cs";
+  const asmdef = "Assets/Scripts/Breakout.asmdef";
+  const hash = value => `sha256-${value.repeat(64)}`;
+  const sample = { ageMs: 10, sampledAt: 1000, compiling: false, compilationFailed: true, errors: 2, warnings: 0 };
+  const observe = (previous, owner, live = sample) => operationReceipt(previous, "Console", {
+    name: "unity_official_mcp_console", arguments: {}, effectKind: "observation", evidence: [],
+    editorConsole: { ...owner, complete: false, diagnostics: [],
+      retainedDiagnostics: [{ kind: "csharp", path: historical, code: "CS0246" }],
+      pipeline: { retainedWindowComplete: false, live } },
+  });
+  const command = previous => runtime.decideNextCommands(previous, { checkUnityCompilation: true })[0];
+  const settle = (previous, dispatched, result, status = "succeeded") => {
+    const queued = schedule(previous, dispatched);
+    return runtime.transition(queued, event(queued, "tool.completed", { run: baseRun, idempotencyKey: dispatched.idempotencyKey,
+      status, evidence: [], modelContent: JSON.stringify(result) }));
+  };
+  const compilerResult = (targets, diagnostics = [], extra = {}) => ({ kind: "csharp", projectRoot: ".", editor: "connected",
+    editorPid: 21, editorVersion: binding.editorVersion, status: diagnostics.length ? "failed" : "passed", targets, diagnostics, ...extra });
+  const diagnostic = (file, code) => ({ file, code, line: 2, column: 19, message: "Assembly reference unavailable." });
+  const write = (previous, version) => operationReceipt(previous, asmdef, { name: "replace_in_file", arguments: { path: asmdef },
+    effectKind: "workspace_change", evidence: [{ id: `edit-${version}`, kind: "mutation", target: asmdef, version: hash(version) }] });
+
+  let state = observe(executeAggregate("observing", [null], { kind: "workspace_change", editorDiagnostics: true }), binding);
+  const baseline = command(state);
+  assert.equal(baseline.payload.runtimeOwnedUnityBaselineCompile, true);
+  assert.deepEqual(baseline.payload.sourcePaths, [historical]);
+  assert.equal(runtimeV2UnityRepairPayloadForCommand(state, baseline), undefined, "must be durably scheduled before executing");
+  assert.equal(runtimeV2UnityRepairPayloadForCommand(schedule(state, baseline), baseline).editorPid, binding.editorPid);
+  assert.equal(runtimeV2UnityRepairPayloadForCommand(schedule(state, baseline), { ...baseline,
+    payload: { ...baseline.payload, sourcePaths: [path] } }), undefined, "cannot mutate a queued command's exact scope");
+  state = settle(state, baseline, compilerResult([{ path: historical, version: hash("a") }], [diagnostic(path, "CS0234")]));
+  const originalDecision = runtimeV2UnityCompilerDecision(state);
+  assert.ok(originalDecision?.key);
+  assert.equal(originalDecision.repeated, false);
+  assert.equal(verifiedUnityConsoleRepair(state), null, "a baseline diagnosis does not verify a repair");
+  const assembly = command(state);
+  assert.equal(assembly.payload.toolName, "unity_inspect_assemblies");
+  assert.deepEqual(assembly.payload.sourcePaths, [path], "the live compiler, not its retained Console hint, selects the scope");
+  const report = { complete: true, sources: [{ path, assembly: { name: "Breakout", path: asmdef, predefined: false,
+    references: [{ reference: "UnityEngine.InputSystem", status: "missing", candidate: { name: "Unity.InputSystem" } }] } }] };
+  state = settle(state, assembly, report);
+  assert.deepEqual(runtimeV2UnityRepairContext(runtime.replayRuntimeV2Events(state.events)).assemblyReport.report, report);
+  state = observe(state, binding, { ...sample, sampledAt: 2000 });
+  assert.equal(command(state), undefined, "an unchanged sample cannot repeat either operation");
+
+  for (const pattern of ["**/InputSystem.dll", "Packages/com.unity.inputsystem/**"]) {
+    state = providerResult(state, { toolCalls: [{ id: `glob-${pattern}`, name: "glob_search", arguments: { pattern } }] });
+    state = executePendingTool(state, { type: "tool.completed", status: "succeeded", effectKind: "observation",
+      evidence: [{ id: `empty-${pattern}`, kind: "source", target: pattern, version: runtimeV2EvidenceVersion([]) }],
+      presentation: { toolName: "glob_search", target: pattern }, modelContent: "TOOL_RESULT_EMPTY" });
+  }
+  assert.ok(runtime.deriveRuntimeV2ProviderRecoveryPressure(state)?.occurrence >= 2, "empty searches cannot renew the recovery lease");
+  assert.equal(command(state), undefined);
+
+  state = write(state, "b");
+  const firstCheck = command(state);
+  assert.equal(firstCheck.payload.runtimeOwnedUnityCompile, true);
+  assert.equal(runtimeV2UnityRepairContext(state).assemblyReport, undefined, "a new mutation invalidates previous diagnosis");
+  const sameFault = settle(state, firstCheck, compilerResult([{ path: asmdef, version: hash("b") }], [
+    { ...diagnostic(path, "CS0234"), line: 5, column: 12 },
+  ]), "failed");
+  assert.deepEqual(runtimeV2UnityCompilerDecision(runtime.replayRuntimeV2Events(sameFault.events)), {
+    key: originalDecision.key, repeated: true,
+  }, "moving the source line or rechecking newer bytes does not change the actual failed finding");
+  let repeatedDiscovery = settle(sameFault, command(sameFault), report);
+  for (const [pattern, line] of [["first declaration query", 5], ["equivalent declaration query", 5], ["new candidate query", 12]]) {
+    repeatedDiscovery = providerResult(repeatedDiscovery, { toolCalls: [{ id: pattern, name: "grep_search", arguments: { query: pattern } }] });
+    repeatedDiscovery = executePendingTool(repeatedDiscovery, { type: "tool.completed", status: "succeeded", effectKind: "observation",
+      evidence: [{ id: pattern, kind: "source", target: pattern, version: runtimeV2EvidenceVersion([{ path, line }]) }],
+      presentation: { toolName: "grep_search", target: pattern }, modelContent: `query: ${pattern}\n${path}:${line}` });
+  }
+  assert.ok(runtime.deriveRuntimeV2ProviderRecoveryPressure(repeatedDiscovery)?.occurrence >= 2,
+    "equivalent searches and further uninspected candidates do not renew progress");
+  const unavailable = settle(state, firstCheck, { status: "unavailable", kind: "csharp" }, "failed");
+  assert.equal(command(unavailable), undefined, "interruption keeps the committed edit pending verification");
+  assert.equal(runtimeV2UnityRepairContext(unavailable).diagnostic, undefined, "interruption is not a compiler diagnostic");
+  const pending = { requestId: "verify-committed-edit", reasonCode: "unity_editor_verification_pending",
+    evidenceSequence: unavailable.events.at(-1).sequence, message: "Editor not ready.", options: ["recheck", "stop"] };
+  const paused = runtime.transition(unavailable, event(unavailable, "run.paused", { run: baseRun, blocker: pending }));
+  const recorded = runtime.transition(paused, event(paused, "run.decision_recorded", { run: baseRun,
+    requestId: pending.requestId, choice: "recheck" }));
+  const resumed = runtime.transition(recorded, event(recorded, "run.resumed", { run: baseRun, requestId: pending.requestId }));
+  assert.equal(command(resumed).payload.mutationSequence, firstCheck.payload.mutationSequence, "resume verifies the existing edit without applying it twice");
+  const newerEditor = observe(unavailable, { ...binding, instanceId: "unity-cli:23", editorPid: 23 });
+  assert.equal(command(newerEditor).payload.mutationSequence, firstCheck.payload.mutationSequence,
+    "a verified replacement Editor reopens the pending compile at the same edit");
+  const stopped = runtime.transition(paused, event(paused, "run.decision_recorded", { run: baseRun,
+    requestId: pending.requestId, choice: "stop" }));
+  assert.equal(runtime.tryTransition(stopped, event(stopped, "run.resumed", { run: baseRun, requestId: pending.requestId })).disposition, "rejected");
+  assert.equal(command(stopped), undefined, "manual stop cannot schedule a retry");
+  state = settle(state, firstCheck, compilerResult([{ path: asmdef, version: hash("b") }], [diagnostic(nextPath, "CS0246")]), "failed");
+  assert.notEqual(runtimeV2UnityCompilerDecision(state).key, originalDecision.key);
+  assert.equal(runtimeV2UnityCompilerDecision(state).repeated, false);
+  assert.equal(verifiedUnityConsoleRepair(state), null);
+  assert.deepEqual(command(state).payload.sourcePaths, [nextPath], "the new compiler errors drive the next diagnosis");
+  state = settle(state, command(state), { complete: false, sources: [] });
+  state = write(state, "c");
+  state = settle(state, command(state), compilerResult([{ path: asmdef, version: hash("c") }], [], {
+    postCompileConsole: { ...sample, sampledAt: 3000, errors: 0, compilationFailed: false },
+  }));
+  assert.equal(command(state), undefined);
+  assert.equal(verifiedUnityConsoleRepair(runtime.replayRuntimeV2Events(state.events))?.receipts.length, 1);
+
+  let interrupted = observe(executeAggregate("observing", [null], { kind: "workspace_change", editorDiagnostics: true }), binding);
+  interrupted = settle(interrupted, command(interrupted), { status: "unavailable", kind: "csharp" }, "failed");
+  assert.equal(command(interrupted), undefined, "an unavailable result does not loop automatically");
+  const recheck = "unity-baseline-recheck";
+  interrupted = runtime.transition(interrupted, event(interrupted, "run.paused", { run: baseRun,
+    blocker: { requestId: recheck, reasonCode: "recovery_stalled", evidenceSequence: interrupted.events.at(-1).sequence,
+      message: "Check the Editor connection.", options: ["recheck", "stop"] } }));
+  assert.equal(command(interrupted), undefined);
+  interrupted = runtime.transition(interrupted, event(interrupted, "run.decision_recorded", { run: baseRun, requestId: recheck, choice: "recheck" }));
+  interrupted = runtime.transition(interrupted, event(interrupted, "run.resumed", { run: baseRun, requestId: recheck }));
+  assert.equal(command(interrupted).payload.runtimeOwnedUnityBaselineCompile, true);
+  const reconnected = observe(interrupted, { ...binding, instanceId: "unity-cli:23", editorPid: 23 });
+  assert.equal(command(reconnected).payload.editorPid, 23, "a new bound Editor opens a new diagnostic boundary");
+
+  const toolOnly = write(executeAggregate("observing", [null], { kind: "workspace_change" }), "d");
+  const toolCheck = command(toolOnly);
+  const afterWrongVersion = settle(toolOnly, toolCheck,
+    compilerResult([{ path: asmdef, version: hash("e") }], [diagnostic(path, "CS0234")]), "failed");
+  assert.equal(command(afterWrongVersion), undefined, "a failed result for other file bytes cannot trigger inspection");
+  const afterNativeFailure = settle(toolOnly, toolCheck,
+    compilerResult([{ path: asmdef, version: hash("d") }], [diagnostic(path, "CS0234")]), "failed");
+  assert.deepEqual(command(afterNativeFailure).payload.sourcePaths, [path], "an exact post-write compiler result needs no Console prerequisite");
+});
+
 test("Console repairs need verified C# and Shader results for the original targets and final versions", () => {
   const { runtimeV2EditorConsoleEvidence } = loadTs("src/lib/runtime-v2/editorConsoleEvidence.ts");
   const { verifiedUnityConsoleRepair } = loadTs("src/lib/runtime-v2/unityCompilation.ts");
@@ -1372,12 +1646,20 @@ test("ordinary Execute delegates two separate versioned diagnostic branches whil
   for (const path of [first, second]) {
     const collaboration = deriveProactiveCollaboration({ ...policy, state });
     assert.ok(collaboration?.candidate, `${path}: ${JSON.stringify(collaboration)}`);
-    assert.deepEqual(collaboration.candidate.allowedPaths, [path]);
+    const candidate = collaboration.candidate;
+    assert.deepEqual(candidate.allowedPaths, [path]);
+    const spawnId = `propose-${path}`;
+    state = providerResult(state, { toolCalls: [{ id: spawnId, name: "spawn_subagent", arguments: {
+      task_kind: "review", objective: "Trace this shader's exact diagnostic and suggest a minimal fix.",
+      required_paths: path, evidence_refs: candidate.primaryEvidence[0].id,
+      success_criteria: "Return a cause and exact source evidence.", parent_work: `Fix the C# error in ${script}.`,
+    } }] });
     const command = runtime.decideNextCommands(state, { subagentPreference: "preferred", subagentCapacity: 2,
       subagentRequestMode: "parallel", proactiveCollaboration: collaboration })[0];
     assert.equal(command.kind, "schedule_subagents");
+    assert.equal(command.payload.toolCallId, spawnId);
     state = schedule(state, command);
-    const { jobs } = runtime.scheduleRuntimeV2Subagents({ parentRun: baseRun, candidates: [collaboration.candidate],
+    const { jobs } = runtime.scheduleRuntimeV2Subagents({ parentRun: baseRun, candidates: [{ ...candidate, sourceToolCallId: spawnId }],
       existingJobs: state.subagents, maxActiveJobs: 2, requestedAt: state.updatedAt, nextId: () => path });
     state = runtime.transition(state, event(state, "subagents.scheduled", { run: baseRun, jobs, maxActiveSubagents: 2 }));
     state = runtime.transition(state, event(state, "command.completed", { run: baseRun, idempotencyKey: command.idempotencyKey, status: "succeeded" }));
@@ -1386,6 +1668,37 @@ test("ordinary Execute delegates two separate versioned diagnostic branches whil
   const next = runtime.decideNextCommands(state, { subagentPreference: "preferred", subagentCapacity: 2, subagentRequestMode: "parallel" })[0];
   assert.equal(next.kind, "request_model");
   assert.equal(next.payload.activeSubagents.length, 2);
+  const tryWait = (args) => runtime.decideNextCommands(providerResult(state, { toolCalls: [{
+    id: `wait-${++eventCounter}`, name: "wait_subagents", arguments: args,
+  }] }))[0];
+  const handle = state.subagents[0].scopeKey;
+  assert.equal(tryWait({ subagent_ids: handle }).payload.optionalJoinRejected, true);
+  assert.deepEqual(tryWait({ subagent_ids: handle, dependency: "The affected Shader include must be identified before editing it." }).payload.jobIds, [first]);
+  const { recordRuntimeV2JoinedChildAnchor } = loadTs("src/store/runtimeV2/executionSubagentJoin.ts");
+  const live = { messages: [] };
+  const used = [];
+  for (const original of state.subagents) {
+    const job = { ...original, status: "completed" };
+    for (const phase of ["request_opened", "first_token", "closed"]) {
+      state = runtime.transition(state, event(state, "subagent.telemetry", { run: baseRun, telemetry: { jobId: job.id, phase, at: state.updatedAt + 1 } }));
+    }
+    const cited = { id: `child-proof-${used.length}`, kind: "subagent", target: job.allowedPaths[0], version: `sha256-${"b".repeat(64)}` };
+    const uncited = { ...cited, id: `auxiliary-child-proof-${used.length}` };
+    const evidence = [cited, uncited];
+    const summary = `Found the independent shader cause (${cited.id}).`;
+    const report = runtime.compileRuntimeV2SubagentTextReport({ summary, evidence });
+    const handoff = recordRuntimeV2JoinedChildAnchor(live, { job, status: "completed", evidence, inheritedEvidence: [], report, summary });
+    assert.deepEqual(handoff.evidenceIds, [cited.id]);
+    assert.equal(handoff.delivered, true);
+    assert.doesNotMatch(live.messages.at(-1).content, /auxiliary-child-proof/);
+    state = runtime.transition(state, event(state, "subagent.completed", { run: baseRun, jobId: job.id, status: "completed", evidence, report, summary }));
+    state = runtime.transition(state, event(state, "subagent.handoff_delivered", { run: baseRun, jobId: job.id, contextEntryId: handoff.contextEntryId, evidenceIds: handoff.evidenceIds }));
+    used.push(cited.id);
+  }
+  state = providerResult(state, { visibleText: `I will apply the two independent shader diagnoses (${used.join(", ")}) and verify both imports.` });
+  const sourceEvent = state.events.at(-1);
+  const applied = runtime.runtimeV2SubagentHandoffApplicationDrafts({ state, sourceEvent });
+  assert.deepEqual(applied.flatMap(item => item.evidenceIds), used);
 });
 
 test("a runtime-only Console repair needs a corresponding Editor test after the scene change", () => {

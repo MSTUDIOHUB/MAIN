@@ -258,18 +258,19 @@ function collaborationSurfaceFixture(mode, payload = {}, options = {}) {
   return selected.map((tool) => tool.function.name);
 }
 
-test("admitted collaboration keeps a stable tool surface without prompt keywords", () => {
+test("optional collaboration advertises only tools actionable in this request", () => {
   for (const mode of ["execute", "validate", "analyze"]) {
-    const selected = collaborationSurfaceFixture(mode);
-    assert.ok(selected.includes("spawn_subagent"), `${mode} must retain the admitted child capability`);
-    assert.ok(selected.includes("wait_subagents"), `${mode} stabilizes wait_subagents in the workspace tool schema for KV cache stability`);
+    const hint = { primaryEvidence: [{ id: "E1", path: "src/branch.ts" }] };
+    const selected = collaborationSurfaceFixture(mode, { delegationHints: [hint] });
+    assert.ok(selected.includes("spawn_subagent"), `${mode} exposes the evidenced proposal`);
+    assert.ok(!selected.includes("wait_subagents"), `${mode} has no task to join`);
     assert.ok(!selected.includes("browser_evaluate"), "ordinary extensions still require discovery");
     assert.ok(selected.includes("read_file"));
     assert.equal(selected.includes("write_file"), mode !== "analyze", "analysis remains read-only");
   }
 });
 
-test("compact collaboration tools keep stable workspace schema while retaining forbidden, conclude, and no-workspace boundaries", () => {
+test("compact collaboration tools honor eligible scope, active children, and workspace boundaries", () => {
   for (const mode of ["execute", "validate", "analyze"]) {
     const baseline = collaborationSurfaceFixture(mode);
     const forbidden = collaborationSurfaceFixture(mode, { collaborationAllowed: false });
@@ -279,18 +280,12 @@ test("compact collaboration tools keep stable workspace schema while retaining f
     assert.ok(!omitted.includes("spawn_subagent"), `${mode} does not inject spawn_subagent when collaborationAllowed is omitted`);
     assert.ok(!omitted.includes("wait_subagents"), `${mode} does not inject wait_subagents when collaborationAllowed is omitted`);
 
-    for (const [payload, options] of [
-      [{ remainingSubagentCapacity: 0 }, {}],
-      [{}, { deadlineAt: 120_000 }],
-      [{ remainingSubagentCapacity: 0, activeSubagents: [{ id: "active-child" }] }, {}],
-    ]) {
-      const stabilized = collaborationSurfaceFixture(mode, payload, options);
-      assert.deepEqual(
-        stabilized,
-        baseline,
-        `${mode} keeps identical tool definitions across capacity, active-child, and runway transitions: ${JSON.stringify({ payload, options })}`,
-      );
-    }
+    assert.ok(!baseline.includes("spawn_subagent"));
+    assert.ok(!baseline.includes("wait_subagents"));
+    assert.deepEqual(collaborationSurfaceFixture(mode, { collaborationPreferred: false, collaborationRequiresProposal: true }), baseline,
+      "allowed optional collaboration still needs a proposal scope");
+    assert.deepEqual(collaborationSurfaceFixture(mode, { activeSubagents: [{ id: "active-child" }] }).filter(name => /subagent/.test(name)), ["wait_subagents"]);
+    assert.deepEqual(collaborationSurfaceFixture(mode, { collaborationRequired: true }).filter(name => /subagent/.test(name)), ["spawn_subagent"]);
   }
   for (const [mode, options] of [
     ["chat", { workspace: "" }],
@@ -1901,6 +1896,7 @@ test("one cached replay preserves source then closes covered ranges on that sour
     logStoreEvent() {},
   });
   const completion = await port.execute({
+    signal: new AbortController().signal,
     command: {
       idempotencyKey: "read-toolbar-command",
       kind: "execute_tool",
@@ -1969,6 +1965,7 @@ test("a thrown tool error is visible to both the model and structured presentati
   });
 
   const completion = await port.execute({
+    signal: new AbortController().signal,
     command: {
       idempotencyKey: "missing-read-command",
       kind: "execute_tool",
@@ -6938,15 +6935,12 @@ test("preferred collaboration keeps the user's deliverable authoritative instead
     hasWaitSubagents: false,
   });
 
-  assert.match(prompt, /explicitly prefers collaboration/i);
-  assert.match(prompt, /current child-request capacity is 2/i);
-  assert.match(prompt, /2 currently free for parallel work alongside the parent/i);
-  assert.match(prompt, /requested deliverable and depth/i);
-  assert.match(prompt, /independent result.*benefit/i);
+  assert.match(prompt, /2 free child request slots/i);
+  assert.match(prompt, /distinct, actionable deliverable only/i);
+  assert.match(prompt, /required_paths, success_criteria, evidence_refs.*independent parent_work/i);
   assert.doesNotMatch(prompt, /prioritize issuing|up to 2 spawn_subagent calls|as many/i);
-  assert.match(prompt, /continue non-dependent parent work in parallel/i);
-  assert.match(prompt, /not a mandatory lifecycle stage/i);
-  assert.match(prompt, /simple or linear task, proceed directly/i);
+  assert.match(prompt, /keep known versions, a single diagnostic chain, and already delivered findings in the parent/i);
+  assert.match(prompt, /continue directly when the work is sequential or capacity is busy/i);
 });
 
 test("a single available child slot runs in parallel with the parent", () => {
@@ -6954,12 +6948,12 @@ test("a single available child slot runs in parallel with the parent", () => {
     collaborationRequestMode: "parallel" } };
   const surface = { hasReadFile: true, hasMutation: true, hasSpawnSubagent: true, hasWaitSubagents: true };
   const available = providerRequest.providerModeInstruction(command, "", surface);
-  assert.match(available, /1 currently free for parallel work alongside the parent/i);
+  assert.match(available, /1 free child request slots/i);
   assert.doesNotMatch(available, /sequentially rather than concurrently/i);
   const occupied = providerRequest.providerModeInstruction({ payload: { ...command.payload,
     activeSubagents: [{ id: "source-review", objective: "Check an independent component" }],
   } }, "", surface);
-  assert.match(occupied, /0 currently free for parallel work alongside the parent/i);
+  assert.match(occupied, /0 free child request slots/i);
 });
 
 test("execution prompt stops asking for the same source after versioned evidence exists", () => {
@@ -9002,6 +8996,10 @@ test("decision view keeps only the current non-source frontier", () => {
   }];
 
   const view = providerHistory.buildRuntimeV2DecisionView(messages);
+  const spacious = { contextLimit: 32_768, reservedOutputTokens: 4_096 };
+  assert.deepEqual(providerHistory.boundRuntimeV2ProviderConversation(messages, spacious), messages);
+  assert.deepEqual(providerHistory.boundRuntimeV2ProviderConversation(messages, { ...spacious, preferWorkset: true }), view,
+    "recovery can select the same exact semantic workset when the full transcript fits");
   assert.equal(
     messages.some((message) =>
       message.role === "tool" &&
@@ -11605,7 +11603,8 @@ test("providerModeInstruction gates collaboration hints on live activeSubagents,
     hasWaitSubagents: true,
   });
   assert.match(activeInstruction, /Reviewer A \(review-a\) \[paths: src\/a\.ts, src\/b\.ts\]: Inspect module A/);
-  assert.match(activeInstruction, /Do not reread files already assigned to active children/i);
+  assert.match(activeInstruction, /continue independent parent work/i);
+  assert.match(activeInstruction, /name the child handle and describe that blocked action in dependency/i);
   assert.match(activeInstruction, /Child-request capacity is currently 0/i);
   assert.doesNotMatch(activeInstruction, /explicitly prefers collaboration/i);
   assert.doesNotMatch(activeInstruction, /All spawned subagents have finished/i);
@@ -11627,7 +11626,7 @@ test("providerModeInstruction gates collaboration hints on live activeSubagents,
   assert.doesNotMatch(settledInstruction, /Child work is active/i, "stabilized wait_subagents schema alone must not claim child work is active");
   assert.match(settledInstruction, /All spawned subagents have finished and settled; no active subagents remain/i);
   assert.match(settledInstruction, /Do NOT call wait_subagents again/i);
-  assert.match(settledInstruction, /explicitly prefers collaboration; current child-request capacity is 2/i);
+  assert.match(settledInstruction, /2 free child request slots/i);
 });
 
 test("executionSchedulerPort logs rejected spawns in catch, returns empty on wait with no active children, and writes batch-settled anchor on finalJoin", async () => {

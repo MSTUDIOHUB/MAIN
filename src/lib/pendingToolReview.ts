@@ -1,4 +1,6 @@
 import type { TaskBlock } from "./taskTypes";
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL } from "./runtime-v2/workspaceReadPolicy";
+import { getToolTarget } from "./toolTarget";
 import {
   ACTION_REQUEST_SCHEMA_VERSION,
   createActionRequestId,
@@ -179,6 +181,7 @@ export function getPendingToolReviewArgumentDisclosure(
 
 export function derivePendingReviewTarget(toolName: string, args: Record<string, unknown>, localFileReadPath?: string): string {
   if (localFileReadPath && localFileReadPath.trim()) return summarizePendingReviewText(localFileReadPath);
+  if (toolName === ENABLE_UNITY_OFFICIAL_MCP_TOOL) return getToolTarget(toolName, args);
   if (toolName === "apply_patch") {
     return summarizePendingPatchTarget(String(args.patch || "")) || "workspace patch";
   }

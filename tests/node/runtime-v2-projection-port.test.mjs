@@ -1112,7 +1112,7 @@ test("V2 projection logs distinguish a stale Store owner from publication", asyn
 
 test("V2 canceled final projection preserves the canonical abort-complete-turn order", async () => {
   const harness = createHarness();
-  await harness.port.publish({
+  const publication = {
     aggregate: aggregate({
       phase: "completed",
       run: {
@@ -1142,7 +1142,9 @@ test("V2 canceled final projection preserves the canonical abort-complete-turn o
       kind: "final",
       dedupeKey: "turn-a:final:canceled:user_canceled",
     },
-  });
+  };
+  await harness.port.publish(publication);
+  await harness.port.publish(publication);
 
   const state = harness.getState();
   assert.deepEqual(
@@ -1167,6 +1169,10 @@ test("V2 canceled final projection preserves the canonical abort-complete-turn o
   assert.equal(state.agentMessages[0].role, "assistant");
   assert.equal(state.agentMessages[0].runtimeTurnId, "turn-a");
   assert.match(state.agentMessages[0].content, /已取消/);
+  assert.equal(harness.logs.filter((entry) => entry.event === "runtime_v2_projection_published").length, 1);
+  assert.equal(harness.logs.at(-1)?.event, "runtime_v2_projection_skipped");
+  assert.equal(harness.logs.at(-1)?.data?.storeDisposition, "deduped");
+  assert.equal(state.taskFlow.filter((block) => block.visibility === "assistant_final").length, 1);
   assert.equal(harness.logs.at(-1)?.data?.audience, "final");
   assert.equal(harness.logs.at(-1)?.data?.resultKind, "canceled");
   assert.equal(harness.logs.at(-1)?.data?.finalProjectionId, "final-canceled");

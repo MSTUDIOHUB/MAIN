@@ -1,5 +1,7 @@
 import { runtimeV2ProviderOmittedKnowledgeCanReplay } from "./providerReadReceipts";
 import { runtimeV2BoundEditorObservation } from "./executionAuthorizationContext";
+import { UNITY_GAME_VIEW_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
+import { runtimeV2UnityGameViewMessage } from "./executionUnityGameView";
 import { isReadOnlyContext, readOnlyNetworkPolicy } from "./readOnlyPolicy";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { normalizePreparedWorkspaceRead } from "./preparedReadOnlyResponse";
@@ -70,6 +72,7 @@ export function createRuntimeV2ProviderPort(
   let preparedWorkspaceRead = input.context.preparedWorkspaceRead;
   return {
     async request({ command, signal }) {
+      signal.throwIfAborted();
       input.logStoreEvent("runtime_v2_provider_request_timing", {
         turnId: command.run.turnId,
         runId: command.run.runId,
@@ -192,6 +195,7 @@ export function createRuntimeV2ProviderPort(
               });
             },
           });
+          signal.throwIfAborted();
           let result = {
             ...providerResult,
             toolCalls: normalizeRuntimeV2ProviderToolCalls(
@@ -310,6 +314,10 @@ export function createRuntimeV2ProviderPort(
             ),
           );
           for (const rejected of providerEffectFacts.rejectedActionIdentities) completedIdentities.delete(rejected);
+          if (schedulingCalls.some(call => call.name === UNITY_GAME_VIEW_TOOL) &&
+              !runtimeV2UnityGameViewMessage(aggregateForCurrentTurn(input), command.run, input.live.unityGameViewCapture)) {
+            completedIdentities.delete(runtimeV2ProviderToolCallIdentity({ name: UNITY_GAME_VIEW_TOOL, arguments: {} }));
+          }
           for (const call of schedulingCalls) {
             if (
               !coveredReadReceipts.has(
@@ -467,7 +475,7 @@ export function createRuntimeV2ProviderPort(
             () => input.nextId("provider-tool-call"),
           );
           if (!signal.aborted && scopedCalls.length > 0 && reasoningActionScope) {
-            input.live.approvedActionReasoningScope = reasoningActionScope;
+            input.live.actionReasoningScope = reasoningActionScope;
           }
           const parallelReadCount =
             runtimeV2ParallelReadCount(scopedCalls);
@@ -505,6 +513,7 @@ export function createRuntimeV2ProviderPort(
           }
           const classified = classifyAndRecordRuntimeV2ProviderAttemptError({
             error,
+            signal,
             textEnvelope: attempt.textEnvelope,
             attemptVariant: attempt.variant,
             command,
@@ -520,6 +529,7 @@ export function createRuntimeV2ProviderPort(
           }
         }
       }
+      signal.throwIfAborted();
       if (isRuntimeV2LifecycleDeadlineError(lastError)) throw lastError;
       if (isRuntimeV2ProviderProtocolError(lastError)) throw lastError;
       throw runtimeV2ProviderAttemptFailure(lastError);

@@ -344,8 +344,8 @@ function hasFinalProjectionBlock(
   return taskFlow.some((block) =>
     block.turnId === turnId &&
     block.type === "agent" &&
-    block.content === projection.markdown &&
-    block.visibility === "assistant_final",
+    block.visibility === "assistant_final" &&
+    (block.runtimeProjectionKey === projection.dedupeKey || block.content === projection.markdown),
   );
 }
 
@@ -364,6 +364,7 @@ export function createRuntimeV2ProjectionPort(
       if (!run) return;
       const harnessOwner = input.get()?.harnessRunMarker as HarnessRunMarker | null;
       let projectedChildLifecycle = false;
+      let projectedFinal = false;
       let storeDisposition:
         | "owner_mismatch"
         | "projected"
@@ -500,12 +501,21 @@ export function createRuntimeV2ProjectionPort(
             projection,
             input.language,
           );
+          const alreadyVisible = hasFinalProjectionBlock(taskFlow, run.turnId, visibleProjection);
+          const runCompleted = runtimeEvents.some((event: MainThreadEvent) =>
+            event.type === "run.completed" && event.threadId === run.sessionKey &&
+            event.turnId === run.turnId && event.runId === run.runId,
+          );
+          const turnCompleted = runtimeEvents.some((event: MainThreadEvent) =>
+            event.type === "turn.completed" && event.threadId === run.sessionKey && event.turnId === run.turnId,
+          );
+          if (alreadyVisible && runCompleted && turnCompleted) {
+            storeDisposition = "deduped";
+            return { runtimeEvents, taskFlow, conversationTurns };
+          }
+          projectedFinal = true;
           runtimeEvents = closeRuntimeV2CapsuleEvents(runtimeEvents, aggregate, timestampMs);
-          if (!hasFinalProjectionBlock(
-            taskFlow,
-            run.turnId,
-            visibleProjection,
-          )) {
+          if (!alreadyVisible) {
             const block: TaskBlock = {
               id: input.nextTaskId(),
               turnId: run.turnId,
@@ -514,6 +524,7 @@ export function createRuntimeV2ProjectionPort(
               streaming: false,
               hiddenProcess: false,
               visibility: "assistant_final",
+              runtimeProjectionKey: visibleProjection.dedupeKey,
             };
             taskFlow = [...taskFlow, block];
             conversationTurns = conversationTurns.map((turn: any) =>
@@ -583,12 +594,7 @@ export function createRuntimeV2ProjectionPort(
               message: visibleProjection.markdown,
             }));
           }
-          if (!runtimeEvents.some((event: MainThreadEvent) =>
-            event.type === "run.completed" &&
-            event.threadId === run.sessionKey &&
-            event.turnId === run.turnId &&
-            event.runId === run.runId,
-          )) {
+          if (!runCompleted) {
             runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
               type: "run.completed",
               threadId: run.sessionKey,
@@ -600,10 +606,7 @@ export function createRuntimeV2ProjectionPort(
               summary: visibleProjection.markdown,
             }));
           }
-          if (!runtimeEvents.some((event: MainThreadEvent) =>
-            event.type === "turn.completed" &&
-            event.threadId === run.sessionKey && event.turnId === run.turnId,
-          )) {
+          if (!turnCompleted) {
             runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
               type: "turn.completed",
               threadId: run.sessionKey,
@@ -681,7 +684,7 @@ export function createRuntimeV2ProjectionPort(
         ? projectedState.taskFlow as TaskBlock[]
         : [];
       input.logStoreEvent(
-        accepted
+        accepted && (audience !== "final" || projectedFinal)
           ? "runtime_v2_projection_published"
           : "runtime_v2_projection_skipped",
         {

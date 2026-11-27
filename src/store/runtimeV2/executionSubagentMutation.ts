@@ -6,6 +6,7 @@ import { getToolTarget } from "../../lib/toolTarget";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
 import { preflightWorkspaceMutation, type WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
 import { sha256Hex } from "../../lib/sha256";
+import { isWorkspaceUnityProject } from "../../lib/unityAssemblyReferences";
 import type {
   RuntimeV2Command,
   RuntimeV2EvidenceReference,
@@ -56,11 +57,13 @@ async function mutationPreflight(input: {
   readonly args: Record<string, unknown>;
   readonly baseVersions: Record<string, string | null>;
 }): Promise<{ readonly ok: boolean; readonly message: string; readonly writeFileTarget?: WorkspaceWriteFileTargetFact }> {
+  const workspace = input.ports.context.runWorkspace || "";
   const preflight = await preflightWorkspaceMutation({
     toolName: input.toolName,
     args: input.args,
     language: input.ports.context.phaseLanguage,
-    workspaceRoot: input.ports.context.runWorkspace || "",
+    workspaceRoot: workspace,
+    unityProject: isWorkspaceUnityProject(input.ports.context.projectBaselineContext, workspace),
     readFile: async (path) => {
       const content = await readRawSubagentWorkspaceFile(input.ports, path);
       input.baseVersions[normalizedRuntimeV2SubagentPath(path)] =
@@ -72,7 +75,7 @@ async function mutationPreflight(input: {
     findReferences: (symbol) => findSymbolReferences({
       symbol,
       maxResults: 80,
-    }, input.ports.context.runWorkspace || ""),
+    }, workspace),
   });
   if (input.toolName === "write_file" && preflight.writeFileTarget?.exists) {
     return { ok: false, message: "CHILD_MUTATION_REJECTED: a create transaction cannot overwrite an existing target." };

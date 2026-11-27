@@ -13,6 +13,7 @@ import { isRuntimeV2ValidationAttempt } from "../../lib/runtime-v2/validationAtt
 import { isRuntimeV2UnexecutedToolReceipt } from "../../lib/runtime-v2/toolReceipt";
 import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import { runtimeV2WorkspaceChangeReceipts } from "../../lib/runtime-v2/validationReceipt";
+import { UNITY_GAME_VIEW_TOOL } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { MUTATION_SOURCE_CHANGED_REASON } from "./executionMutationRejection";
 
 export interface RuntimeV2ProviderEffectFacts {
@@ -193,6 +194,12 @@ export function deriveRuntimeV2ProviderEffectFacts(
       }
     }
     if (event.type === "run.resumed") {
+      const lastCapture = [...(aggregate?.events || [])].reverse().find(receipt =>
+        receipt.sequence < event.sequence && receipt.type === "tool.completed" &&
+        commandsByIdempotencyKey.get(receipt.idempotencyKey)?.payload.toolName === UNITY_GAME_VIEW_TOOL);
+      if (lastCapture?.type === "tool.completed" && lastCapture.failureReasonCode === "unity_game_view_unavailable") {
+        rejectedActionIdentities.delete(runtimeV2ProviderToolCallIdentity({ name: UNITY_GAME_VIEW_TOOL, arguments: {} }));
+      }
       const paused = aggregate?.events.find(item => item.type === "run.paused" && item.blocker.requestId === event.requestId);
       if (paused?.type === "run.paused" && paused.blocker.actionIdentity) {
         const identity = paused.blocker.actionIdentity;

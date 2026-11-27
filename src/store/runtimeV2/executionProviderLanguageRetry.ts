@@ -26,6 +26,7 @@ import {
 } from "./executionProviderRequestPolicy";
 import { runtimeV2TranscriptSkillGuidanceWindows } from "./executionProviderSkillTranscript";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
+import type { VisualTransportRequestBinding } from "../../lib/visualContext";
 
 export function createRuntimeV2WireCallbacks(input: {
   lane: { markFirstToken: () => void };
@@ -184,6 +185,7 @@ export async function retryRuntimeV2ProviderLanguageMismatch(input: {
   actionOnlyCharLimit?: number;
   activity: ReturnType<typeof beginCapsuleModelActivity>;
   rebuildRetryMessages: (retryHistoryStart: number) => any[];
+  visualTransportBinding?: VisualTransportRequestBinding;
   wireCallbacks: (
     attempt: "initial" | "reasoning_retry" | "language_retry",
   ) => Parameters<typeof streamChatCompletion>[2];
@@ -247,6 +249,7 @@ export async function retryRuntimeV2ProviderLanguageMismatch(input: {
       input.maxOutputTokens,
       {
         ...(input.effectiveToolChoice ? { toolChoice: input.effectiveToolChoice } : {}),
+        ...(input.visualTransportBinding ? { visualTransportBinding: input.visualTransportBinding } : {}),
         timeoutMs: input.timeoutMs,
         contextOwnership: "caller",
         reasoningOnlyCharLimit: input.reasoningOnlyCharLimit,

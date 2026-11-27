@@ -3227,16 +3227,18 @@ async function attachRealOmlxFailureDiagnostics(
   }
 }
 
-async function expectRealWorkspaceTerminal(page: Page, testInfo: TestInfo, label: string, approveTools = false): Promise<any> {
+async function expectRealWorkspaceTerminal(page: Page, testInfo: TestInfo, label: string,
+  approveTools: boolean | ((tool: { toolName: string; target: string }) => boolean) = false, timeout = 120_000): Promise<any> {
   let snapshot: any;
   try {
     await expect.poll(async () => {
       snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
-      if (approveTools && snapshot.activeActionRequest?.kind === "tool_permission") {
+      if (snapshot.activeActionRequest?.kind === "tool_permission" &&
+          (typeof approveTools === "function" ? approveTools(snapshot.activeActionRequest) : approveTools)) {
         await page.evaluate(() => (window as any).__CODELY_E2E__.approvePendingTool());
       }
       return !!snapshot.runtimeV2?.terminalOutcome && !snapshot.isGenerating;
-    }, { timeout: 120_000, intervals: [500] }).toBe(true);
+    }, { timeout, intervals: [500] }).toBe(true);
   } finally {
     snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot());
     await fs.writeFile(testInfo.outputPath(`${label}.json`), JSON.stringify(snapshot, null, 2));
@@ -5076,9 +5078,9 @@ test(`real OMLX starts semantic collaboration after runtime admission with ${sub
   }, { timeout: 60_000 }).toBe(true);
 });
 
-test(`real OMLX ordinary Execute starts a proactive read-only subagent with ${subagentModel}`, async ({ page }, testInfo) => {
+test(`real OMLX single-chain Execute keeps known version facts in the parent with ${subagentModel}`, async ({ page }, testInfo) => {
   test.skip(realOmlxFixture !== "csv");
-  test.skip(!!process.env.REAL_OMLX_WORKSPACE, "Proactive collaboration regression uses its own disposable project.");
+  test.skip(!!process.env.REAL_OMLX_WORKSPACE, "Single-chain collaboration regression uses its own disposable project.");
   test.setTimeout(150_000);
   const workspace = (page as any).__realOmlxWorkspace as string;
   const editorVersionPath = "ProjectSettings/ProjectVersion.txt";
@@ -5101,26 +5103,14 @@ test(`real OMLX ordinary Execute starts a proactive read-only subagent with ${su
   try {
     await expect.poll(async () => {
       runtime = (await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot())).runtimeV2;
-      const jobs = runtime?.events.flatMap((event: any) => event.jobs || []) || [];
-      const proactive = jobs.find((job: any) => job.scopeKey?.startsWith("proactive:"));
-      return !!(proactive && runtime.subagents.some((job: any) => job.id === proactive.id && job.firstTokenAt))
-        || !!runtime?.terminalOutcome;
+      return !!runtime?.terminalOutcome;
     }, { timeout: 100_000, intervals: [500] }).toBe(true);
     expect(runtime.strategy).toBe("execute");
     expect(runtime.workPlan).toBeNull();
-    const proactive = runtime.events.flatMap((event: any) => event.jobs || [])
-      .find((job: any) => job.scopeKey?.startsWith("proactive:"));
-    expect(proactive).toMatchObject({ accessMode: "read", allowedPaths: expect.arrayContaining([editorVersionPath, lockPath]) });
-    expect(runtime.subagents.find((job: any) => job.id === proactive.id)?.firstTokenAt).toBeGreaterThan(0);
-    const scheduled = runtime.events.find((event: any) => event.jobs?.some((job: any) => job.id === proactive.id));
-    const completed = runtime.events.find((event: any) => event.type === "subagent.completed" && event.jobId === proactive.id);
-    const parentReadsBeforeSchedule = runtime.commands.filter((command: any) => command.sequence < scheduled.sequence &&
-      command.toolName === "read_file" && command.status === "succeeded").map((command: any) => command.target);
-    expect(parentReadsBeforeSchedule).toContain("src/hooks/useCsvParser.ts");
-    expect(parentReadsBeforeSchedule).not.toContain(editorVersionPath);
-    expect(parentReadsBeforeSchedule).not.toContain(lockPath);
-    expect(runtime.events.some((event: any) => event.type === "command.scheduled" && event.commandKind === "request_model" &&
-      event.sequence > scheduled.sequence && (!completed || event.sequence < completed.sequence))).toBe(true);
+    expect(runtime.subagents).toEqual([]);
+    const parentReads = runtime.commands.filter((command: any) => command.toolName === "read_file" &&
+      command.status === "succeeded").map((command: any) => command.target);
+    expect(parentReads).toContain("src/hooks/useCsvParser.ts");
   } finally {
     await fs.writeFile(testInfo.outputPath("proactive-execute-v2.json"), JSON.stringify(runtime || {}, null, 2));
     await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
@@ -5667,6 +5657,151 @@ for (const model of models) {
     const answer = snapshot.runtimeV2.projections.find((item: any) => item.audience === "final")?.markdown || "";
     for (const version of ["1.10.4", "2022.3.62t16", "14.2.0-t1"]) expect(answer).toContain(version);
     expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(before);
+  });
+
+  for (const [connector, env, observation, nativeOperation] of [
+    ["Unity Official MCP", "REAL_OMLX_UNITY_OFFICIAL_MCP", "unity_official_mcp_console", "unity_official_mcp"],
+    ["Unity CLI", "REAL_OMLX_UNITY_CLI_CONSOLE", "unity_cli_console", "unity_cli_console"],
+  ] as const) test(`real OMLX reads TestCli Console through ${connector} with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env[env] !== "1", "Requires the explicitly selected TestCli project with an open Editor.");
+    expect(process.env.REAL_OMLX_WORKSPACE).toBeTruthy();
+    expect(realOmlxFixture).toBe("unity");
+    test.setTimeout(180_000);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.getByRole("button", { name: /^(系统设置|设置|System Settings|Settings)$/ }).click();
+    await page.getByTestId("settings-tab-mcp").click();
+    const official = page.getByRole("switch", { name: /^(Unity 官方 MCP|Unity Official MCP)$/ });
+    await expect(official).not.toBeChecked();
+    if (nativeOperation === "unity_official_mcp") {
+      await official.click();
+      await expect(official).toBeChecked();
+    }
+    await page.getByTestId("settings-close").click();
+    const submitted = await page.evaluate(async () => {
+      const host = window as any;
+      const bridge = host.__CODELY_E2E__;
+      const invoke = host.__TAURI_INTERNALS__.invoke;
+      host.__TAURI_INTERNALS__.invoke = (command: string, args: unknown) => {
+        if (command === "unity_cli_console" || command === "unity_official_mcp") {
+          (host.__MAIN_E2E_CONSOLE_INVOCATIONS ??= []).push({ command, args });
+          return host.__MAIN_E2E_NATIVE_TOOL(command, args);
+        }
+        // This fixture checks the Console route in a real project.
+        if (["write_file", "write_file_atomic", "write_file_create_new", "replace_in_file", "delete_workspace_path", "run_command"].includes(command)) {
+          throw new Error(`CONSOLE_ROUTE_FIXTURE_UNEXPECTED_EFFECT: ${command}`);
+        }
+        return invoke(command, args);
+      };
+      const discovered = await bridge.setRealMcpFixture("http://localhost:8080/mcp", false, false);
+      bridge.setPreferSubagents?.(true);
+      return { discovered, accepted: await bridge.sendDirectEditMessage("修复console窗口的错误") };
+    });
+    expect(submitted).toEqual({ discovered: 0, accepted: true });
+    const firstToolRequest = () => ((page as any).__realOmlxProviderWire as any[]).find(request => request.tools.length > 0);
+    await expect.poll(() => !!firstToolRequest(), { timeout: 90_000 }).toBe(true);
+    const firstRuntime = firstToolRequest();
+    expect(firstRuntime?.tools).toContain(observation);
+    expect(firstRuntime?.tools).not.toContain("unity_mcp_console");
+    if (nativeOperation === "unity_official_mcp") expect(firstRuntime?.tools).not.toContain("unity_cli_console");
+    await expect.poll(() => page.evaluate(() =>
+      (window as any).__CODELY_E2E__.getSnapshot().runtimeV2?.events.some(
+        (event: any) => event.type === "tool.completed" && event.editorConsole?.editorPid > 0,
+      ) ?? false,
+    ), { timeout: 90_000 }).toBe(true);
+    await page.evaluate(() => (window as any).__CODELY_E2E__.stopGeneration());
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, observation);
+    expect(snapshot.runtimeV2.strategy).toBe("execute");
+    expect(realWorkspaceToolSucceeded(snapshot, observation)).toBe(true);
+    const console = snapshot.runtimeV2.events.find((event: any) => event.editorConsole?.editorPid);
+    expect(console?.editorConsole.retainedDiagnostics ?? console?.editorConsole.diagnostics).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        path: "Assets/Tests/BreakoutTests.cs", code: "CS0246",
+      })]),
+    );
+    if (nativeOperation === "unity_official_mcp") {
+      const invocations = await page.evaluate(() => (window as any).__MAIN_E2E_CONSOLE_INVOCATIONS);
+      expect(invocations).toEqual(expect.arrayContaining([expect.objectContaining({
+        command: "unity_official_mcp",
+        args: expect.objectContaining({
+          expectedPid: console.editorConsole.editorPid,
+          call: { name: "console", arguments: { command: "get", args: { tail: 100, level: "warn" } } },
+        }),
+      })]));
+    }
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("canceled");
+  });
+
+  test(`real OMLX repairs the isolated TestCli Console through official MCP with ${model}`, async ({ page }, testInfo) => {
+    test.skip(process.env.REAL_OMLX_TESTCLI_REPAIR !== "1", "Requires an isolated TestCli copy with its own running Editor.");
+    test.setTimeout(780_000);
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const editorPid = Number(process.env.REAL_OMLX_TESTCLI_EDITOR_PID);
+    expect(process.env.REAL_OMLX_WORKSPACE).toBeTruthy();
+    expect(realOmlxFixture).toBe("unity");
+    expect(editorPid).toBeGreaterThan(0);
+    expect((await fs.readFile(path.join(workspace, ".main-unity-disposable"), "utf8")).trim()).toBe("isolated test workspace");
+    const testsPath = path.join(workspace, "Assets/Tests/BreakoutTests.cs");
+    const caseNames = (source: string) => [...source.matchAll(/\[(?:UnityTest|Test)\]\s*(?:public\s+)?[\w.<>]+\s+(\w+)\s*\(/g)].map(match => match[1]);
+    const originalCases = caseNames(await fs.readFile(testsPath, "utf8"));
+    expect(originalCases.length).toBeGreaterThan(0);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await page.getByRole("button", { name: /^(系统设置|设置|System Settings|Settings)$/ }).click();
+    await page.getByTestId("settings-tab-mcp").click();
+    const official = page.getByRole("switch", { name: /^(Unity 官方 MCP|Unity Official MCP)$/ });
+    if (!(await official.isChecked())) await official.click();
+    await page.getByTestId("settings-close").click();
+    expect(await page.evaluate(async () => {
+      const host = window as any;
+      const bridge = host.__CODELY_E2E__;
+      const invoke = host.__TAURI_INTERNALS__.invoke;
+      host.__TAURI_INTERNALS__.invoke = (command: string, args: unknown) => {
+        if (["unity_official_mcp", "unity_cli_console", "unity_compile_project", "unity_inspect_assemblies", "unity_test_project"].includes(command)) {
+          (host.__MAIN_E2E_CONSOLE_INVOCATIONS ??= []).push({ command, args });
+          return host.__MAIN_E2E_NATIVE_TOOL(command, args);
+        }
+        return invoke(command, args);
+      };
+      await bridge.setRealMcpFixture("http://localhost:8080/mcp", false, false);
+      bridge.setPreferSubagents?.(true);
+      return bridge.sendDirectEditMessage("修复console窗口的错误");
+    })).toBe(true);
+    const snapshot = await expectRealWorkspaceTerminal(page, testInfo, "testcli-official-repair", tool => tool.toolName === "run_command" &&
+      /^unity test \. --mode PlayMode --filter [A-Za-z_][A-Za-z0-9_.+]*$/.test(tool.target), 600_000);
+    expect(snapshot.runtimeV2.strategy).toBe("execute");
+    expect(snapshot.runtimeV2.terminalOutcome.resultKind).toBe("success");
+    expect(realWorkspaceToolSucceeded(snapshot, "unity_official_mcp_console")).toBe(true);
+    expect(realWorkspaceToolSucceeded(snapshot, "unity_compile_project")).toBe(true);
+    const observations = snapshot.runtimeV2.events.map((event: any) => event.editorConsole).filter(Boolean);
+    expect(observations[0]).toMatchObject({ editorPid, pipeline: { live: { compilationFailed: true } } });
+    const ledger = await page.evaluate(() => (window as any).__CODELY_E2E__.readOnlySnapshot().aggregate);
+    const baseline = ledger.events.find((event: any) => event.type === "command.scheduled" && event.command.payload.runtimeOwnedUnityBaselineCompile === true);
+    const firstWrite = ledger.events.find((event: any) => event.type === "tool.completed" && event.status === "succeeded" && event.effectKind === "workspace_change");
+    expect(baseline?.sequence).toBeLessThan(firstWrite?.sequence);
+    const inspection = ledger.events.find((event: any) => event.type === "tool.completed" && event.presentation?.toolName === "unity_inspect_assemblies");
+    expect(inspection?.status).toBe("succeeded");
+    expect(inspection.sequence).toBeLessThan(firstWrite.sequence);
+    const compileChecks = ledger.events.filter((event: any) => event.type === "tool.completed" &&
+      event.presentation?.toolName === "unity_compile_project" && event.modelContent).map((event: any) => JSON.parse(event.modelContent));
+    const passing = compileChecks.findLast((result: any) => result.status === "passed");
+    expect(passing).toMatchObject({ editorPid });
+    expect(passing?.postCompileConsole ?? observations.at(-1)?.pipeline?.live).toMatchObject({
+      errors: 0, compiling: false, compilationFailed: false,
+    });
+    expect(ledger.subagents).toHaveLength(0);
+    expect(caseNames(await fs.readFile(testsPath, "utf8"))).toEqual(expect.arrayContaining(originalCases));
+    const playMode = ledger.events.filter((event: any) => event.type === "validation.completed" && event.passed &&
+      event.authority?.useProjectEditor === true && Array.isArray(event.authority.expectedTestCaseNames));
+    expect(playMode.length).toBeGreaterThan(0);
+    const final = ledger.events.find((event: any) => event.type === "run.completed");
+    expect(playMode.every((event: any) => event.run.runId === final?.run.runId &&
+      event.mutationBoundarySequence >= firstWrite.sequence && event.sequence < final?.sequence)).toBe(true);
+    expect(playMode.at(-1)?.postPlayModeConsole).toMatchObject({ errors: 0, compiling: false, compilationFailed: false });
+    const playModeCases = playMode.flatMap((event: any) => event.authority.expectedTestCaseNames)
+      .map((name: string) => name.split('(')[0]?.split('.').at(-1));
+    expect(playModeCases).toEqual(expect.arrayContaining(originalCases));
+    const attempts = await page.evaluate(() => (window as any).__MAIN_E2E_CONSOLE_INVOCATIONS);
+    expect(attempts.some((item: any) => item.command === "unity_test_project" && item.args.consoleBinding?.editorPid === editorPid)).toBe(true);
+    await fs.writeFile(testInfo.outputPath("testcli-playmode.json"), JSON.stringify(playMode, null, 2));
   });
 
   for (const [request, strategy] of [

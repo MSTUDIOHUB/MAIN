@@ -62,7 +62,10 @@ test("Unity observations require the exact project and version and select it bef
     const view = snapshot({ manualServers: [configured], manualTools: found.tools, manualToolServerMap: found.toolServerMap });
     assert.deepEqual((await mcp.bindWorkspaceUnityMcpView(view, "6000.0.1f1")).mcpDiscoveredTools, []);
     const bound = await mcp.bindWorkspaceUnityMcpView(view, instance.unity_version);
-    assert.deepEqual(mcp.unityMcpObservationTools(bound).map(tool => tool.function.name), ["unity_mcp_scene", "unity_mcp_console"]);
+    assert.deepEqual(mcp.workspaceEditorObservationTools(bound).map(tool => tool.function.name), ["unity_mcp_scene", "unity_mcp_console"]);
+    let cliProbes = 0;
+    assert.equal(await mcp.bindWorkspaceUnityCliConsole(bound, instance.unity_version, async () => { cliProbes++; }), bound);
+    assert.equal(cliProbes, 0);
     assert.ok(!bound.mcpDiscoveredTools.some(tool => tool.name === "set_active_instance"));
     await assert.rejects(mcp.executeUnityMcpObservation({ snapshot: bound, workspace: "/b", name: "unity_mcp_console", args: {} }), /SCOPE_MISMATCH/);
     await assert.rejects(mcp.executeUnityMcpObservation({ snapshot: bound, workspace: "/a", name: "unity_mcp_console", args: { action: "clear" } }), /SCOPE_MISMATCH/);
@@ -95,6 +98,26 @@ test("manual MCP snapshots exclude disabled and unregistered discovery results",
   assert.deepEqual(view.mcpServers, [enabled, disabled], "configured server state remains available to the existing permission owner");
   assert.deepEqual(view.mcpDiscoveredTools.map((entry) => entry.name), ["ping"]);
   assert.deepEqual(view.mcpToolServerMap, { ping: enabled.url });
+});
+
+test("workspace Console discovery uses a verified Unity CLI when MCP is disabled", async () => {
+  const view = snapshot({ manualServers: [server("editor", false)] });
+  const editorVersion = "6000.6.5f1";
+  const seen = [];
+  const bound = await mcp.bindWorkspaceUnityCliConsole(view, editorVersion, async (workspace, version) => {
+    seen.push([workspace, version]);
+    return { editorPid: 30663, editorVersion };
+  });
+  assert.deepEqual(seen, [["/a", editorVersion]]);
+  assert.deepEqual(mcp.workspaceEditorObservationTools(bound).map(tool => tool.function.name), ["unity_cli_console"]);
+  assert.deepEqual(bound.mcpDiscoveredTools, []);
+  assert.ok(Object.isFrozen(bound.unityCliConsole));
+
+  const unavailable = await mcp.bindWorkspaceUnityCliConsole(view, editorVersion, async () => null);
+  assert.equal(unavailable, view);
+  assert.equal(await mcp.bindWorkspaceUnityCliConsole(view, editorVersion, async () => ({
+    editorPid: 30663, editorVersion: "2022.3.62t16",
+  })), view);
 });
 
 test("attached MCP provenance takes precedence over a legacy server map", () => {

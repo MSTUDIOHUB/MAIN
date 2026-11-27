@@ -545,6 +545,310 @@ test("Runtime MCP authorization consumes the admitted workspace snapshot rather 
   assert.equal(authorizationContext.authorizationFor(ports), frozen);
 });
 
+const pipelineConsole = {
+  success: true,
+  data: {
+    cursor: 0, truncated: false, total: 1,
+    consoleEvidence: { rowSource: "retained", retainedWindowComplete: true, retainedErrors: 1, retainedWarnings: 0, session: "capture", cursor: 8 },
+    groundTruth: { ageMs: 120, sampledUtc: "2026-11-27T07:01:01.000Z", compilationFailed: true, compiling: false, consoleErrors: 1, consoleWarnings: 0 },
+    items: [{ type: "Error", message: "Assets/Tests/Fixture.cs(88,10): error CS0246: Missing type." }],
+  },
+};
+
+const pipelineEvidence = {
+  complete: false,
+  diagnostics: [],
+  retainedDiagnostics: [{ kind: "csharp", path: "Assets/Tests/Fixture.cs", line: 88, code: "CS0246" }],
+  pipeline: { retainedWindowComplete: true, retainedErrors: 1, retainedWarnings: 0, session: "capture", cursor: 8,
+    live: { ageMs: 120, sampledAt: Date.parse("2026-11-27T07:01:01.000Z"), compilationFailed: true, compiling: false, errors: 1, warnings: 0 } },
+};
+
+test("Execute reads current Unity compiler errors and resolves the owning asmdef before repair", async (t) => {
+  const { runtimeV2ExecutionEditorGuidance } = loadTs("src/store/runtimeV2/executionEditorGuidance.ts");
+  const store = stateForMcp([], {}, { currentTurnExecutionConsent: { turnId: "turn-mcp", granted: true } });
+  const ports = portsFor(store);
+  const workspace = ports.context.runWorkspace;
+  const turn = { workspaceKey: workspace, sessionKey: "session-mcp", sessionEpoch: "epoch-mcp", turnId: "turn-mcp", clientSubmissionId: "unity-repair" };
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId,
+    runId: "run-unity-repair", parentRunId: null, attemptId: "attempt-unity-repair" };
+  let aggregate = null;
+  const apply = (type, fields) => {
+    const sequence = aggregate?.nextSequence ?? 0;
+    aggregate = runtime.transition(aggregate, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence, eventId: `unity-repair-${sequence}`, at: sequence + 1, type, run, ...fields });
+    store.runtimeV2Checkpoints[turn.turnId] = runtime.createRuntimeV2Checkpoint({
+      revision: aggregate.nextSequence, aggregate, updatedAt: aggregate.updatedAt,
+    });
+  };
+  apply("turn.admitted", { turn, strategy: "execute", objective: "修复console窗口的错误", constraints: [], acceptanceCriteria: [],
+    completionRequirement: { kind: "workspace_change", editorDiagnostics: true } });
+  apply("run.started", { phase: "observing" });
+  const observed = { kind: "execute_tool", phase: "observing", run, idempotencyKey: "console",
+    payload: { toolName: "unity_official_mcp_console", arguments: {} } };
+  apply("command.scheduled", { command: observed });
+  const editorPid = 30663;
+  const editorVersion = "6000.6.5f1";
+  apply("tool.completed", { idempotencyKey: observed.idempotencyKey, status: "succeeded", evidence: [], effectKind: "observation",
+    editorConsole: { ...pipelineEvidence, instanceId: `unity-official-mcp:${editorPid}`, editorPid, editorVersion } });
+  const path = "Assets/Tests/Fixture.cs";
+  const asmdef = "Assets/Tests/Fixture.asmdef";
+  const version = `sha256-${"a".repeat(64)}`;
+  const declaration = { name: "Unity.InputSystem", path: "Library/PackageCache/com.unity.inputsystem@verified/InputSystem/Unity.InputSystem.asmdef",
+    package: "com.unity.inputsystem", packageVersion: "1.20.0", version };
+  let references = [{ reference: "UnityEngine.InputSystem", status: "missing", candidate: { ...declaration, namespace: "UnityEngine.InputSystem" } }];
+  const calls = [];
+  const originalWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: { invoke: async (command, args) => {
+    calls.push({ command, args });
+    if (command === "unity_compile_project") return {
+      status: "failed", kind: "csharp", editor: "connected", projectRoot: ".", editorPid, editorVersion,
+      targets: [{ path, version }], diagnostics: [{ file: path, line: 2, column: 19, code: "CS0234", message: "InputSystem is missing" }],
+    };
+    assert.equal(command, "unity_inspect_assemblies");
+    return { complete: true, sources: [{ path, assembly: { name: "Fixture", path: asmdef, version, predefined: false, references } }] };
+  } } };
+  t.after(() => { globalThis.window = originalWindow; });
+  const port = executionToolPort.createRuntimeV2ToolPort(ports);
+  const signal = new AbortController().signal;
+  const [baseline] = runtime.decideNextCommands(aggregate, { checkUnityCompilation: true });
+  assert.ok(baseline?.payload.runtimeOwnedUnityBaselineCompile);
+  await assert.rejects(port.execute({ command: baseline, signal }), /UNITY_REPAIR_EVIDENCE_AUTHORITY_INVALID/);
+  assert.equal(calls.length, 0);
+  apply("command.scheduled", { command: baseline });
+  const baselineReceipt = await port.execute({ command: baseline, signal });
+  assert.equal(baselineReceipt.status, "succeeded");
+  assert.equal(JSON.parse(baselineReceipt.modelContent).status, "failed");
+  assert.deepEqual(baselineReceipt.evidence, []);
+  apply("tool.completed", baselineReceipt);
+  const [inspect] = runtime.decideNextCommands(aggregate, { checkUnityCompilation: true });
+  assert.ok(inspect?.payload.runtimeOwnedUnityAssemblyDiagnosis);
+  apply("command.scheduled", { command: inspect });
+  const report = await port.execute({ command: inspect, signal });
+  assert.equal(report.status, "succeeded");
+  assert.deepEqual(report.evidence, []);
+  apply("tool.completed", report);
+  assert.deepEqual(runtime.decideNextCommands(aggregate, { checkUnityCompilation: true }), []);
+  assert.deepEqual(calls.map(({ command, args }) => [command, args.workspace, args.targets ?? args.sourcePaths]), [
+    ["unity_compile_project", workspace, [path]], ["unity_inspect_assemblies", workspace, [path]],
+  ]);
+  assert.deepEqual(calls[0].args.consoleBinding, { editorPid, editorVersion });
+  const guide = runtimeV2ExecutionEditorGuidance(aggregate, new Set()).instruction;
+  assert.match(guide, /Fixture\.asmdef.*UnityEngine\.InputSystem.*Unity\.InputSystem/);
+  assert.match(guide, /Preserve the verified C# namespace "UnityEngine\.InputSystem" in source imports/);
+  assert.match(guide, /CS0234/);
+  assert.equal(runtime.runtimeV2CommandTaskReadyForConclusion(aggregate), false);
+
+  // The first compile checks a C# file. The immutable inspection receipt,
+  // rather than the extension of the compile target, proves the invalid edge.
+  const predefinedReport = JSON.parse(report.modelContent);
+  predefinedReport.sources[0].assembly.references = [
+    { reference: "Assembly-CSharp", status: "predefined" },
+  ];
+  const withPredefinedEdge = runtime.replayRuntimeV2Events(aggregate.events.map(event =>
+    event.type === "tool.completed" && event.idempotencyKey === report.idempotencyKey
+      ? { ...event, modelContent: JSON.stringify(predefinedReport) }
+      : event));
+  assert.deepEqual(JSON.parse(baselineReceipt.modelContent).targets.map(target => target.path), [path]);
+  const predefinedGuide = runtimeV2ExecutionEditorGuidance(withPredefinedEdge, new Set()).instruction;
+  assert.match(predefinedGuide, /confirms an unsupported reference from a named assembly/);
+  assert.ok(predefinedGuide.includes(`"${path}" belongs to "${asmdef}" ("Fixture"), which references the predefined script assembly "Assembly-CSharp"`));
+  assert.match(predefinedGuide, /Locate the actual source declarations.*owning \.asmdef or \.asmref/);
+  assert.doesNotMatch(guide, /confirms an unsupported reference from a named assembly/);
+
+  const write = { ...observed, idempotencyKey: "repair-reference", payload: { toolName: "replace_in_file", arguments: { path: asmdef } } };
+  apply("command.scheduled", { command: write });
+  apply("tool.completed", { idempotencyKey: write.idempotencyKey, status: "succeeded", effectKind: "workspace_change",
+    evidence: [{ id: "changed-reference", kind: "mutation", target: asmdef, version }] });
+  const [verify] = runtime.decideNextCommands(aggregate, { checkUnityCompilation: true });
+  assert.ok(verify?.payload.runtimeOwnedUnityCompile);
+  apply("command.scheduled", { command: verify });
+  apply("tool.completed", { idempotencyKey: verify.idempotencyKey, status: "failed", evidence: [], modelContent: JSON.stringify({
+    status: "failed", kind: "csharp", editor: "connected", projectRoot: ".", editorPid, editorVersion, targets: [{ path: asmdef, version }],
+    diagnostics: [{ file: path, line: 2, column: 13, code: "CS0234", message: "InputSystem does not exist in the namespace Unity" }],
+  }) });
+  const [inspectAfter] = runtime.decideNextCommands(aggregate, { checkUnityCompilation: true });
+  assert.ok(inspectAfter?.payload.runtimeOwnedUnityAssemblyDiagnosis);
+  references = [{ reference: declaration.name, status: "resolved", resolved: declaration }];
+  apply("command.scheduled", { command: inspectAfter });
+  const reportAfter = await port.execute({ command: inspectAfter, signal });
+  apply("tool.completed", reportAfter);
+  const newGuide = runtimeV2ExecutionEditorGuidance(aggregate, new Set()).instruction;
+  assert.match(newGuide, /Preserve the verified C# namespace "UnityEngine\.InputSystem" in source imports/);
+  assert.match(newGuide, /InputSystem does not exist in the namespace Unity/);
+  assert.doesNotMatch(newGuide, /has missing reference/);
+  const changedPackage = JSON.parse(reportAfter.modelContent);
+  changedPackage.sources[0].assembly.references[0].resolved.version = `sha256-${"b".repeat(64)}`;
+  const stale = runtime.replayRuntimeV2Events(aggregate.events.map(event => event.idempotencyKey === reportAfter.idempotencyKey &&
+    event.type === "tool.completed" ? { ...event, modelContent: JSON.stringify(changedPackage) } : event));
+  assert.doesNotMatch(runtimeV2ExecutionEditorGuidance(stale, new Set()).instruction, /Preserve the verified C# namespace/);
+});
+
+test("Unity mutation preparation rejects a newly introduced predefined assembly before review", async (t) => {
+  const { prepareRuntimeV2Mutation } = loadTs("src/store/runtimeV2/executionMutationPreflight.ts");
+  const ports = portsFor(stateForMcp([], {}));
+  const workspace = ports.context.runWorkspace;
+  const target = "Assets/Physics/Interactions.asmdef";
+  const run = { sessionKey: "session-mcp", sessionEpoch: "epoch-mcp", turnId: "turn-mcp",
+    runId: "run-assembly-edit", parentRunId: null, attemptId: "attempt-assembly-edit" };
+  ports.context.projectBaselineContext = { kind: "project_baseline_context", workspace: { canonicalPath: workspace },
+    facts: { runtimes: [{ name: "unity", version: "6000.6.5f1", provenance: { path: "ProjectSettings/ProjectVersion.txt" } }] } };
+  const invokeCalls = [];
+  const before = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: { invoke: async (name, args) => {
+    invokeCalls.push({ name, args });
+    assert.equal(name, "read_file");
+    return '{"name":"Interactions","references":[]}';
+  } } };
+  t.after(() => { globalThis.window = before; });
+  const args = { path: target, content: '{"name":"Interactions","references":["Assembly-CSharp"]}' };
+  const prepared = await prepareRuntimeV2Mutation({ ports, command: { kind: "execute_tool", phase: "acting", run,
+    idempotencyKey: "write-assembly", payload: { toolName: "write_file", arguments: args } },
+  toolName: "write_file", args, target, failureContextTarget: target, toolExecutionOptions: {} });
+  assert.equal(prepared.allowed, false);
+  assert.equal(prepared.completion.failureKind, "mutation_rejected");
+  assert.equal(prepared.completion.failureReasonCode, "mutation_preflight_unity_predefined_assembly_reference");
+  assert.match(prepared.completion.presentation.message, /Assembly-CSharp/);
+  assert.deepEqual(invokeCalls, [{ name: "read_file", args: { path: target, workspace } }]);
+});
+
+test("Execute advertises the CLI Console with MCP disabled and records the bound evidence", async (t) => {
+  const { bindWorkspaceUnityCliConsole, resolveWorkspaceMcpView } = loadTs("src/lib/workspaceMcp.ts");
+  const state = stateForMcp([], {}, { currentTurnExecutionConsent: { turnId: "turn-mcp", granted: true } });
+  state.mcpServers[0].enabled = false;
+  const ports = portsFor(state);
+  const workspace = ports.context.runWorkspace;
+  const editorVersion = "6000.6.5f1";
+  const editorPid = 30663;
+  ports.context.workspaceMcpSnapshot = await bindWorkspaceUnityCliConsole(resolveWorkspaceMcpView({
+    workspace, manualServers: state.mcpServers, manualTools: [], manualToolServerMap: {},
+  }), editorVersion, async () => ({ editorPid, editorVersion }));
+  const surface = authorizationContext.providerToolDefinitionsForCommand(ports, {
+    kind: "request_model", payload: { mode: "execute" },
+  }).map(tool => tool.function.name);
+  assert.ok(surface.includes("unity_cli_console"));
+  assert.ok(!surface.includes("unity_mcp_console"));
+
+  const originalWindow = globalThis.window;
+  const calls = [];
+  globalThis.window = { __TAURI_INTERNALS__: { invoke: async (command, args) => {
+    calls.push({ command, args });
+    return pipelineConsole;
+  } } };
+  t.after(() => { globalThis.window = originalWindow; });
+  const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+  const run = { sessionKey: "session-mcp", sessionEpoch: "epoch-mcp", turnId: "turn-mcp",
+    runId: "run-cli-console", parentRunId: null, attemptId: "attempt-cli-console" };
+  const completion = await toolPort.execute({
+    command: { kind: "execute_tool", phase: "observing", run, idempotencyKey: "console",
+      payload: { toolName: "unity_cli_console", toolCallId: "read-console", arguments: {} } },
+    signal: new AbortController().signal,
+  });
+  assert.equal(completion.status, "succeeded", completion.failureReasonCode);
+  assert.equal(completion.effectKind, "observation");
+  assert.deepEqual(completion.editorConsole, {
+    instanceId: "unity-cli:30663", editorVersion, editorPid, ...pipelineEvidence,
+  });
+  const options = { workspaceMcpSnapshot: ports.context.workspaceMcpSnapshot };
+  await assert.rejects(toolExecutor.executeTool("unity_cli_console", { action: "clear" }, workspace, run.sessionKey, options), /SCOPE_MISMATCH/);
+  await assert.rejects(toolExecutor.executeTool("unity_cli_console", {}, "/another-workspace", run.sessionKey, options), /SCOPE_MISMATCH/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "unity_cli_console");
+  assert.deepEqual([calls[0].args.workspace, calls[0].args.editorVersion, calls[0].args.expectedPid], [workspace, editorVersion, editorPid]);
+});
+
+test("Unity Official MCP and a manual HTTP server keep separate tool identities and Console receipts", async (t) => {
+  const { bindWorkspaceUnityCliConsole, bindWorkspaceUnityOfficialMcp, resolveWorkspaceMcpView } = loadTs("src/lib/workspaceMcp.ts");
+  const manual = mcpTool("console", "List device Console output");
+  const state = stateForMcp([manual], { console: manual._mainMcpOrigin.serverUrl });
+  state.config.unityOfficialMcpEnabled = true;
+  const ports = portsFor(state);
+  const workspace = ports.context.runWorkspace;
+  const editorVersion = "6000.6.5f1";
+  const calls = [];
+  let officialFailure = "";
+  let officialPid = 30663;
+  const originalWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: { invoke: async (command, args) => {
+    calls.push({ command, args });
+    if (command === "unity_cli_console") return { editorPid: officialPid, editorVersion };
+    if (!args.call) return { editorPid: officialPid, tools: [mcpTool("console", "Read or clear Unity Console")] };
+    if (officialFailure) return { structuredContent: { success: false, message: officialFailure } };
+    if (args.expectedPid !== officialPid) throw new Error("UNITY_OFFICIAL_MCP_EDITOR_UNAVAILABLE");
+    if (!args.consoleObservation) return { content: [{ type: "text", text: "official status" }] };
+    return { structuredContent: pipelineConsole };
+  } } };
+  t.after(() => { globalThis.window = originalWindow; });
+  const snapshot = await bindWorkspaceUnityOfficialMcp(resolveWorkspaceMcpView({
+    workspace, manualServers: state.mcpServers, manualTools: state.mcpDiscoveredTools, manualToolServerMap: state.mcpToolServerMap,
+  }), editorVersion, new AbortController().signal);
+  ports.context.workspaceMcpSnapshot = await bindWorkspaceUnityCliConsole(snapshot, editorVersion, () => assert.fail("Unneeded CLI probe"));
+  assert.equal(ports.context.workspaceMcpSnapshot, snapshot);
+  assert.deepEqual(snapshot.mcpServers.map(server => server.type), ["http", "stdio"]);
+  const catalog = authorizationContext.authorizationFor(ports).toolCatalog;
+  const official = catalog.entries.find(entry => entry.mcpTool?._mainMcpOrigin?.connector === "unity_official");
+  assert.equal(catalog.lookup("console").status, "ambiguous");
+  assert.ok(official);
+
+  const run = { sessionKey: "session-mcp", sessionEpoch: "epoch-mcp", turnId: "turn-mcp", runId: "run-official-console",
+    parentRunId: null, attemptId: "attempt-official-console" };
+  assert.equal(authorizationContext.runtimeV2ToolVisibleToProvider(ports, official.exposedName), true);
+  const repair = runtime.transition(null, {
+    schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, sequence: 0, eventId: "console-repair", at: 1,
+    type: "turn.admitted", turn: { workspaceKey: workspace, sessionKey: run.sessionKey, sessionEpoch: run.sessionEpoch,
+      clientSubmissionId: "console-repair-submission", turnId: run.turnId }, strategy: "execute", objective: "修复console窗口的错误",
+    constraints: [], acceptanceCriteria: [], completionRequirement: { kind: "workspace_change", editorDiagnostics: true },
+  });
+  state.runtimeV2Checkpoints[run.turnId] = runtime.createRuntimeV2Checkpoint({ revision: 1, aggregate: repair, updatedAt: repair.updatedAt });
+  const repairTools = authorizationContext.providerToolDefinitionsForCommand(ports, { kind: "request_model", payload: { mode: "execute" } })
+    .map(tool => tool.function.name);
+  assert.ok(repairTools.includes("unity_official_mcp_console"));
+  assert.ok(!repairTools.includes(official.exposedName), "the unbound Console alias cannot replace typed repair evidence");
+  assert.equal(authorizationContext.runtimeV2ToolVisibleToProvider(ports, official.exposedName), false);
+  state.runtimeV2Checkpoints = {};
+  const toolPort = executionToolPort.createRuntimeV2ToolPort(ports);
+  const call = {
+    command: { kind: "execute_tool", phase: "observing", run, idempotencyKey: "official-console",
+      payload: { toolName: "unity_official_mcp_console", toolCallId: "read-console", arguments: {} } },
+    signal: new AbortController().signal,
+  };
+  const completion = await toolPort.execute(call);
+  assert.equal(completion.status, "succeeded", completion.failureReasonCode);
+  assert.equal(completion.effectKind, "observation");
+  assert.deepEqual(completion.editorConsole, {
+    instanceId: "unity-official-mcp:30663", editorVersion, editorPid: 30663, ...pipelineEvidence,
+  });
+  assert.deepEqual(calls[1].args.call, { name: "console", arguments: { command: "get", args: { tail: 100, level: "warn" } } });
+  assert.deepEqual([calls[1].args.workspace, calls[1].args.editorVersion, calls[1].args.expectedPid], [workspace, editorVersion, 30663]);
+  const options = { toolCatalog: catalog, workspaceMcpSnapshot: snapshot };
+  await assert.rejects(toolExecutor.executeTool("unity_official_mcp_console", { command: "clear" }, workspace, run.sessionKey, options), /SCOPE_MISMATCH/);
+  await assert.rejects(toolExecutor.executeTool(official.exposedName, { command: "status" }, "/other", run.sessionKey, options), /SCOPE_MISMATCH/);
+  await assert.rejects(toolExecutor.executeTool(official.exposedName, { command: "status" }, workspace, run.sessionKey,
+    { ...options, isUnityOfficialMcpEnabled: () => false }), /OFFICIAL_MCP_DISABLED/);
+  assert.equal(await toolExecutor.executeTool(official.exposedName, { command: "status" }, workspace, run.sessionKey, options), "official status");
+  assert.equal(calls.length, 3);
+
+  officialPid = 30664;
+  const restarted = await toolPort.execute({ ...call, command: { ...call.command, idempotencyKey: "old-pid-console" } });
+  assert.equal(restarted.status, "failed");
+  assert.equal(calls.at(-1).command, "unity_official_mcp");
+  assert.equal(calls.at(-1).args.workspace, workspace);
+  assert.equal(calls.at(-1).args.call, undefined, "a stale invocation can only rediscover, not retry against another Editor");
+  const afterRestart = await toolPort.execute({ ...call, command: { ...call.command, idempotencyKey: "new-pid-console" } });
+  assert.equal(afterRestart.editorConsole.editorPid, officialPid);
+  assert.equal(calls.at(-1).args.expectedPid, officialPid);
+
+  officialFailure = "MCP returned an unverified Console result";
+  const failed = await toolPort.execute({ ...call, command: { ...call.command, idempotencyKey: "closed-console" } });
+  assert.equal(failed.status, "failed");
+  const surface = authorizationContext.providerToolDefinitionsForCommand(ports, {
+    kind: "request_model", payload: { mode: "execute" },
+  }).map(tool => tool.function.name);
+  assert.ok(surface.includes("unity_cli_console"));
+  assert.ok(!surface.includes("unity_official_mcp_console"));
+  assert.equal(calls.at(-1).command, "unity_cli_console");
+  assert.ok(snapshot.unityOfficialMcp);
+});
+
 test("Analyze receives the bound Editor Console result and rejects raw Unity effects", async (t) => {
   const { bindWorkspaceUnityMcpView, resolveWorkspaceMcpView } = loadTs("src/lib/workspaceMcp.ts");
   const { runRuntimeV2ReadOnlyLoop } = loadTs("src/lib/runtime-v2/readOnly.ts");

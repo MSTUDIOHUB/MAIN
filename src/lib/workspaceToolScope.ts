@@ -1,6 +1,10 @@
+import { ENABLE_UNITY_OFFICIAL_MCP_TOOL, RUNTIME_V2_EDITOR_READ_TOOL_NAMES } from "./runtime-v2/workspaceReadPolicy";
+
 /** Built-ins whose existing execution contract requires a real project root.
  * Global file reads have their own attachment/approval guards. */
 const WORKSPACE_REQUIRED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ...RUNTIME_V2_EDITOR_READ_TOOL_NAMES,
+  ENABLE_UNITY_OFFICIAL_MCP_TOOL,
   "list_directory",
   "glob_search",
   "grep_search",
