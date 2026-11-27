@@ -122,6 +122,7 @@ export function runtimeV2EmergencyTerminalReason(input: {
   readonly reasonCode: RuntimeV2EmergencyTerminalReasonCode;
   readonly resultKind: RuntimeV2EmergencyTerminalResultKind;
   readonly language: "zh" | "en";
+  readonly strategy?: "plan";
 }): string {
   const boundary = input.language === "zh"
     ? {
@@ -140,6 +141,20 @@ export function runtimeV2EmergencyTerminalReason(input: {
         checkpoint_persist_failed:
           "The runtime checkpoint could not be persisted.",
       }[input.reasonCode];
+  if (input.strategy === "plan") {
+    const planOutcome = input.language === "zh"
+      ? {
+          partial: "已保留本轮保存的计划文档，计划生成未能完整结束。",
+          error: "本轮未生成可交付的计划，已保存的调查证据仍予保留。",
+          canceled: "用户已停止本轮计划生成，此前已保存的调查证据仍予保留。",
+        }[input.resultKind]
+      : {
+          partial: "The saved plan document was retained. Plan generation did not finish.",
+          error: "This turn produced no deliverable plan. Previously saved investigation evidence remains available.",
+          canceled: "The user stopped plan generation. Previously saved investigation evidence remains available.",
+        }[input.resultKind];
+    return `${boundary} ${planOutcome}`;
+  }
   const outcome = input.language === "zh"
     ? {
         partial:
@@ -166,6 +181,7 @@ export function createRuntimeV2EmergencyTerminalEnvelope(input: {
   readonly resultKind: RuntimeV2EmergencyTerminalResultKind;
   readonly reasonCode: RuntimeV2EmergencyTerminalReasonCode;
   readonly language: "zh" | "en";
+  readonly strategy?: "plan";
   readonly at: number;
   readonly lastRevision: number;
   readonly hasMutation: boolean;
@@ -234,16 +250,10 @@ export function normalizeRuntimeV2EmergencyTerminalEnvelope(
     ? value.reason
     : "";
   if (
-    reason !== runtimeV2EmergencyTerminalReason({
-      reasonCode,
-      resultKind,
-      language: "zh",
-    }) &&
-    reason !== runtimeV2EmergencyTerminalReason({
-      reasonCode,
-      resultKind,
-      language: "en",
-    })
+    !(["zh", "en"] as const).some(language =>
+      reason === runtimeV2EmergencyTerminalReason({ reasonCode, resultKind, language }) ||
+      reason === runtimeV2EmergencyTerminalReason({ reasonCode, resultKind, language, strategy: "plan" })
+    )
   ) {
     return null;
   }

@@ -437,10 +437,11 @@ export function toolCompletionFor(
       command,
       status,
       !RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES.has(toolName) || (webEvidenceVersions(toolName, output)?.length || 0) > 0
-        ? projection.targets.map(({ target: resolvedTarget, version }) => ({
+        ? projection.targets.map(({ target: resolvedTarget, version, previousVersion }) => ({
             id: nextEvidenceId(input.live),
             kind: projection.kind,
             target: resolvedTarget,
+            ...(previousVersion === undefined ? {} : { previousVersion }),
             version: version || (projection.kind === "source"
               ? sourceVersion || runtimeV2EvidenceVersion(output)
               : projection.kind === "tool"

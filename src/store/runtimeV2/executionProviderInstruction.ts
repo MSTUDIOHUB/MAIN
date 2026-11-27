@@ -171,14 +171,17 @@ export function providerModeInstruction(
           const requestMode = typeof command.payload.collaborationRequestMode === "string"
             ? command.payload.collaborationRequestMode
             : "";
-          const serializedLane = remainingSubagentCapacity <= 1 || requestMode === "serialized";
+          // Capacity counts child requests after the lane reserves the parent.
+          // A single child slot can still run concurrently with that parent.
+          const serializedLane = requestMode === "serialized";
+          const freeSlots = Math.max(0, remainingSubagentCapacity - activeSubagents.length);
           return [
             command.payload.collaborationPreferred === true
               ? serializedLane
-                ? `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity} (${requestMode || "serialized"}, sequential model lane), so child requests run sequentially rather than concurrently. Keep each child objective and success criteria within the user's requested deliverable and depth. Prefer one focused child or direct parent execution unless bounded context isolation justifies queuing.`
-                : `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, and independent tasks may queue. Keep each child objective and success criteria within the user's requested deliverable and depth. Delegate an independent result only when its benefit justifies coordination, and continue non-dependent parent work in parallel. This preference applies at inspect, edit, or verify; it is not a mandatory lifecycle stage. For a simple or linear task, proceed directly without explaining why no child was used.`
+                ? "The user prefers collaboration. The current lane runs requests sequentially rather than concurrently. Continue the parent task directly while parallel capacity is unavailable."
+                : `The user explicitly prefers collaboration; current child-request capacity is ${remainingSubagentCapacity}, with ${freeSlots} currently free for parallel work alongside the parent. Take the initiative to delegate an evidence-backed independent result when its benefit justifies coordination. Keep each child objective within the user's requested deliverable and depth, and continue non-dependent parent work in parallel. Delegation is not a mandatory lifecycle stage. For a simple or linear task, proceed directly. If all parallel slots are occupied, continue parent work until a slot opens or a result is needed.`
               : serializedLane
-                ? `Delegation is optional. Current child-request capacity is ${remainingSubagentCapacity} (${requestMode || "serialized"}, sequential model lane), so child requests run sequentially rather than concurrently; prefer direct parent execution unless bounded context isolation justifies queuing.`
+                ? "Delegation is optional. The current lane runs requests sequentially rather than concurrently. Continue the parent task directly while parallel capacity is unavailable."
                 : "Delegation is optional.",
             "Use read-only children for parallel investigation. Use implement/write only under an approved WorkPlan ready frontier (even during initial observing) or a recorded parent execution contract: provide an explicit operation, implementation_plan, success criteria, and exact non-overlapping file targets; never grant a directory and let the child choose writes. The child stages coherent write transactions within its exclusive targets and Runtime atomically validates and commits them at join; the parent still owns cross-file integration, dependency order, and final validation. Never delegate merely because a parent action failed or because the next action is difficult.",
           ].join(" ");

@@ -1,5 +1,5 @@
-import { shareSessionStartupMigration, mergeCommittedStartupSessions, type CommittedStartupSession } from "./lib/retiredFeatureMigration";
-import { ensureRetiredFeatureMigration } from "./lib/retiredFeatureMigrationIpc";
+import { shareSessionStartupMigration, mergeCommittedStartupSessions } from "./lib/retiredFeatureMigration";
+import { ensureRetiredFeatureMigration, importLocalStartupSession } from "./lib/retiredFeatureMigrationIpc";
 import { resolveSessionModeAffinity, type SessionModeAffinityLike, type SessionModeAffinity } from "./lib/mainModes";
 import { useRef, useEffect, useCallback, useMemo, useState } from "react";
 import { open } from '@tauri-apps/plugin-dialog';
@@ -724,7 +724,7 @@ export default function App() {
   const lastSessionRuntimeSignatureRef = useRef<string>("");
   const sessionRestoreTokenRef = useRef(0);
   const autosaveSuspendedForSessionRef = useRef<string>("");
-  const sessionStartupMigrationRef = useRef<Promise<CommittedStartupSession<any>[]> | null>(null);
+  const sessionStartupMigrationRef = useRef<Promise<void> | null>(null);
   const [sessionMigrationReady, setSessionMigrationReady] = useState(false);
   const [sessionMigrationError, setSessionMigrationError] = useState<string | null>(null);
   const [sessionMigrationAttempt, setSessionMigrationAttempt] = useState(0);
@@ -1013,6 +1013,7 @@ export default function App() {
   }, []);
 
   const persistCurrentSessionInBackground = useCallback(() => {
+    if (!sessionMigrationReady) return;
     const state = useAppStore.getState();
     if (!state.currentSessionId) return;
     const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
@@ -1093,7 +1094,7 @@ export default function App() {
           error: error instanceof Error ? error.message : String(error),
         });
       });
-  }, [cacheSessionTranscript]);
+  }, [cacheSessionTranscript, sessionMigrationReady]);
 
   // ── Skills ────────────────────────────────────────────────────────────
   const skills = useAppStore((s) => s.skills);
@@ -1137,19 +1138,29 @@ export default function App() {
     setSessionMigrationError(null);
     const migration = shareSessionStartupMigration(sessionStartupMigrationRef, async () => {
       const state = useAppStore.getState();
-      const imports: CommittedStartupSession<any>[] = [];
       // Local imports and native CAS/cleanup form one shared transaction chain.
-      // StrictMode resubscription cannot race another local save against it.
-      for (const [scopeKey, sessions] of Object.entries(state.sessionsByWorkspace || {})) {
-        for (const session of sessions as any[]) {
-          const hasDetails = (Array.isArray(session.messages) && session.messages.length > 0) ||
-            (Array.isArray(session.runtimeSnapshot?.taskFlow) && session.runtimeSnapshot.taskFlow.length > 0) ||
-            (Array.isArray(session.runtimeSnapshot?.conversationTurns) && session.runtimeSnapshot.conversationTurns.length > 0);
-          if (session.recordingDisabled || session.storageStatus === "temporary" || !hasDetails) continue;
-          const { _retirementMigrationPending: _pending, ...record } = session;
-          const saved = await saveProjectSession(scopeKey, record);
-          imports.push({ workspace: scopeKey, original: session, saved: { ...record, ...saved } });
-        }
+      const pending = Object.entries(state.sessionsByWorkspace).flatMap(([workspace, sessions]) => sessions
+        .filter(session => session._retirementMigrationPending === true && !session.recordingDisabled && session.storageStatus !== "temporary")
+        .map(session => ({ workspace, session })));
+      if (pending.length > 0) {
+        // Persist normalized owner identities before writing SQLite. A restart
+        // between native commit and browser adoption must use the same epoch.
+        useAppStore.setState({ sessionsByWorkspace: state.sessionsByWorkspace });
+      }
+      for (const { workspace, session } of pending) {
+        const { _retirementMigrationPending: _pending, ...record } = session;
+        const snapshot = {
+          ...record,
+          messages: record.messages?.length ? record.messages : record.runtimeSnapshot?.taskFlow || [],
+        };
+        const saved = await importLocalStartupSession(workspace, snapshot);
+        // Adopt each durable revision so a later failure can retry from the
+        // remaining browser records without re-saving an earlier owner.
+        useAppStore.setState(latest => ({
+          sessionsByWorkspace: mergeCommittedStartupSessions(latest.sessionsByWorkspace, [{
+            workspace, original: session, saved: { ...snapshot, ...saved },
+          }]),
+        }));
       }
       await ensureRetiredFeatureMigration([...new Set([
         ...Object.keys(state.sessionsByWorkspace || {}),
@@ -1157,13 +1168,9 @@ export default function App() {
         ...(state.currentWorkspace ? [state.currentWorkspace] : []),
       ])]);
       try { window.localStorage.setItem("main.sessions.appDataMigrated.v4", "1"); } catch {}
-      return imports;
     });
-    void migration.then((imports) => {
+    void migration.then(() => {
       if (cancelled) return;
-      if (imports.length > 0) useAppStore.setState(latest => ({
-        sessionsByWorkspace: mergeCommittedStartupSessions(latest.sessionsByWorkspace, imports),
-      }));
       setSessionMigrationReady(true);
     }, (error) => {
       if (cancelled) return;
@@ -1198,7 +1205,7 @@ export default function App() {
   }, [currentWorkspace]);
 
   useEffect(() => {
-    if (!currentSessionId) return;
+    if (!sessionMigrationReady || !currentSessionId) return;
     const autosaveSessionKey = resolveSessionRuntimeKey(activeSessionScope, currentSessionId);
     if (autosaveSessionKey && autosaveSuspendedForSessionRef.current === autosaveSessionKey) {
       return;
@@ -1276,10 +1283,8 @@ export default function App() {
       return;
     }
 
-    const activeSessionHasTranscript = hasRecoverableSessionTranscript(activeSessionRecord);
-    const activeSessionHasOnlyDetailPointer =
-      hasStoredSessionDetailPointer(activeSessionRecord) && !activeSessionHasTranscript;
-    if (messages.length === 0 && conversationTurns.length === 0 && activeSessionHasOnlyDetailPointer) {
+    if (messages.length === 0 && conversationTurns.length === 0 &&
+        (hasStoredSessionDetailPointer(activeSessionRecord) || hasRecoverableSessionTranscript(activeSessionRecord))) {
       return;
     }
 
@@ -1411,6 +1416,7 @@ export default function App() {
     planStage,
     planTasks,
     rightPanelTab,
+    sessionMigrationReady,
     selectedMainModeKey,
     selectedDiffTaskId,
     showDiff,
@@ -1927,6 +1933,7 @@ export default function App() {
 
   // --- Workspace & Session Management ---
   const restoreSessionState = async (target: any, id: number, scopeKey = activeSessionScope) => {
+    if (!sessionMigrationReady) return;
     const restoreToken = ++sessionRestoreTokenRef.current;
     const expectedSessionKey = resolveSessionRuntimeKey(scopeKey, id);
     if (!expectedSessionKey) return;
@@ -3379,6 +3386,7 @@ export default function App() {
   }, [patchFeishuApprovalCard, runFeishuRemoteMessage, sendFeishuText, updateFeishuPairingConfig]);
 
   useEffect(() => {
+    if (!sessionMigrationReady) return;
     const feishuConfig = normalizeImAdaptersConfig(config.imAdapters).feishu;
     if (!feishuConfig.enabled) {
       void invoke("stop_feishu_adapter").catch(() => {});
@@ -3425,10 +3433,13 @@ export default function App() {
     config.imAdapters?.feishu?.domain,
     config.imAdapters?.feishu?.enabled,
     config.language,
+    sessionMigrationReady,
   ]);
 
   useEffect(() => {
+    if (!sessionMigrationReady) return;
     let unlisten: (() => void) | null = null;
+    let disposed = false;
     void listen<FeishuAdapterEvent>("feishu-adapter-event", (event) => {
       const payload = event.payload;
       if (payload.type === "status" || payload.type === "error") {
@@ -3455,12 +3466,14 @@ export default function App() {
         handleFeishuInboundMessage(payload);
       }
     }).then((dispose) => {
-      unlisten = dispose;
+      if (disposed) dispose();
+      else unlisten = dispose;
     });
     return () => {
+      disposed = true;
       unlisten?.();
     };
-  }, [handleFeishuCardAction, handleFeishuInboundMessage]);
+  }, [handleFeishuCardAction, handleFeishuInboundMessage, sessionMigrationReady]);
 
   const startPanelResize = useCallback((event: React.MouseEvent, panel: "sidebar" | "files" | "right") => {
     if (event.button !== 0) return;
@@ -3782,7 +3795,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!currentSessionId || taskFlow.length > 0) return;
+    if (!sessionMigrationReady || !currentSessionId || taskFlow.length > 0) return;
     const target = activeSessionRecord || (useAppStore.getState().sessionsByWorkspace[activeSessionScope] || []).find((s: any) => s.id === currentSessionId);
     if (!target) return;
     const hasTargetDetails =
@@ -3800,9 +3813,10 @@ export default function App() {
       sessionRecoveryAttemptRef.current = attemptKey;
       void restoreSessionState(target, currentSessionId, activeSessionScope);
     }
-  }, [activeSessionRecoveryKey, activeSessionScope, conversationTurns.length, currentSessionId, taskFlow.length]);
+  }, [activeSessionRecoveryKey, activeSessionScope, conversationTurns.length, currentSessionId, sessionMigrationReady, taskFlow.length]);
 
   useEffect(() => {
+    if (!sessionMigrationReady) return;
     let unlisten: (() => void | Promise<void>) | null = null;
     let disposed = false;
     const safelyDispose = (dispose: (() => void | Promise<void>) | null) => {
@@ -3878,7 +3892,7 @@ export default function App() {
       disposed = true;
       safelyDispose(unlisten);
     };
-  }, [addWorkspaceEntry, refreshSessionsForScope]);
+  }, [addWorkspaceEntry, refreshSessionsForScope, sessionMigrationReady]);
 
   if (!sessionMigrationReady) return (
     <div className="flex h-screen items-center justify-center bg-[var(--bg-primary)] p-8 text-[var(--text-primary)]">

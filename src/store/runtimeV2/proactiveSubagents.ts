@@ -15,9 +15,93 @@ import {
   type TurnAggregateV1,
 } from "../../lib/runtime-v2";
 import { deriveRuntimeV2ExecutionContract } from "./executionContract";
+import { RUNTIME_V2_SUBAGENT_MAX_SCOPE_PATHS } from "./executionSubagentCandidate";
 import { resolveApprovedRuntimeV2WorkPlanFromAggregate } from "./workPlanAdapter";
 
 type Decision = NonNullable<RuntimeV2DecisionInput["proactiveCollaboration"]>;
+
+type SourceUnit = {
+  path: string;
+  declarations: Set<string>;
+  identifiers: Set<string>;
+  references: Set<string>;
+};
+
+function connectedGroups<T>(items: Iterable<T>, related: (left: T, right: T) => boolean): T[][] {
+  const groups: T[][] = [];
+  for (const item of items) {
+    const linked = groups.filter(group => group.some(other => related(item, other)));
+    const first = linked[0];
+    if (!first) {
+      groups.push([item]);
+      continue;
+    }
+    first.push(item);
+    for (const group of linked.slice(1)) {
+      first.push(...group);
+      groups.splice(groups.indexOf(group), 1);
+    }
+  }
+  return groups;
+}
+
+function sourceIdentifiers(text: string): Set<string> {
+  // Dollar-prefixed and Unicode identifiers are valid in several supported
+  // languages. Matching whole identifiers avoids path/symbol substrings.
+  return new Set(text.match(/[$_\p{ID_Start}][$_\p{ID_Continue}]*/gu) || []);
+}
+
+function sourceReferences(text: string): Set<string> {
+  return new Set(Array.from(text.matchAll(
+    /(?:^\s*#\s*include\s*|\b(?:from|import|preload|require|extends)\s*\(?\s*)["'<]([^"'<>\n]+)["'>]/gm,
+  ), match => match[1]!.replace(/^res:\/\//, "").replace(/^\.\//, "")));
+}
+
+function independentTaskSourceGroups(state: TurnAggregateV1, versions: ReadonlyMap<string, string>, workspace: string) {
+  const runId = state.run?.identity.runId;
+  const readCommands = new Set(state.events.flatMap(event =>
+    event.type === "command.scheduled" && event.run.runId === runId && event.command.kind === "execute_tool" &&
+    event.command.payload.toolName === "read_file" ? [event.command.idempotencyKey] : [],
+  ));
+  const units = new Map<string, SourceUnit>();
+  for (const event of state.events) {
+    if (event.type !== "tool.completed" || event.run.runId !== runId || !readCommands.has(event.idempotencyKey) ||
+        event.status !== "succeeded" || event.receiptOrigin === "replayed" || !event.modelContent) continue;
+    const window = extractExactReadFileWindow(event.modelContent);
+    if (!window || window.metadata.truncated || !window.metadata.contentVersion) continue;
+    const path = normalizeValidationWorkspaceCwd(window.metadata.path, workspace);
+    const version = window.metadata.contentVersion;
+    if (!path || path === "." || versions.get(path) !== version || units.has(path) ||
+        !event.evidence.some(evidence => evidence.kind === "source" && evidence.version === version &&
+          normalizeValidationWorkspaceCwd(evidence.target, workspace) === path)) continue;
+    const declarations = new Set(Array.from(window.content.matchAll(
+      /\b(?:class(?:_name)?|interface|struct|enum|record(?:\s+(?:class|struct))?|trait|function|func)\s+(?:[A-Z][A-Z0-9_]*_API\s+)?([$_\p{ID_Start}][$_\p{ID_Continue}]*)/gu,
+    ), match => match[1]!));
+    if (!declarations.size) continue;
+    units.set(path, { path, declarations, identifiers: sourceIdentifiers(window.content), references: sourceReferences(window.content) });
+  }
+  const objectiveText = [state.objective.text, ...state.objective.acceptanceCriteria].join("\n");
+  const objectiveIdentifiers = sourceIdentifiers(objectiveText);
+  const explicitlyRequestedPaths = new Set((objectiveText.match(/(?:\.{0,1}[\\/])?(?:[\w.@+-]+[\\/])*[\w.@+-]+\.[A-Za-z][\w]*/g) || [])
+    .map(value => normalizeValidationWorkspaceCwd(value, workspace)));
+  const targets = new Set(Array.from(units.values()).filter(unit =>
+    explicitlyRequestedPaths.has(unit.path) ||
+    [...unit.declarations].some(name => objectiveIdentifiers.has(name)),
+  ).map(unit => unit.path));
+  if (!targets.size && state.strategy !== "analyze") return [];
+  const referencesUnit = (from: SourceUnit, to: SourceUnit) => {
+    const withoutExtension = to.path.replace(/\.[^.\/]+$/, "");
+    return [...to.declarations].some(name => from.identifiers.has(name)) ||
+      [...from.references].some(reference => reference === to.path || to.path.endsWith(`/${reference}`) ||
+        reference === withoutExtension || withoutExtension.endsWith(`/${reference}`) ||
+        withoutExtension.endsWith(`/${reference}/index`));
+  };
+  const groups = connectedGroups(units.values(), (left, right) => referencesUnit(left, right) || referencesUnit(right, left));
+  // A broad analysis can use independent units from its own versioned reads.
+  // An explicit scope wins over those inferred targets. One connected branch
+  // stays with the parent, including the observed dependencies of that branch.
+  return targets.size ? groups.filter(group => group.some(unit => targets.has(unit.path))) : groups;
+}
 
 /** Distinct compiler/Shader targets can be investigated in parallel. Group
  * files that share an include or explicitly reference each other's types. */
@@ -46,18 +130,7 @@ function independentDiagnosticBranches(state: TurnAggregateV1) {
     return [...a.includes].some(include => b.includes.has(include)) ||
       a.types.some(type => new RegExp(`\\b${type}\\b`).test(b.text)) || b.types.some(type => new RegExp(`\\b${type}\\b`).test(a.text));
   };
-  const groups: string[][] = [];
-  for (const path of files.keys()) {
-    const joined = groups.filter(group => group.some(other => related(path, other)));
-    if (!joined.length) groups.push([path]);
-    else {
-      joined[0]!.push(path);
-      for (const group of joined.slice(1)) {
-        joined[0]!.push(...group);
-        groups.splice(groups.indexOf(group), 1);
-      }
-    }
-  }
+  const groups = connectedGroups(files.keys(), related);
   const committed = runtimeV2DirectExecuteMutationTargets(state);
   return groups.filter(group => !committed.length || group.some(path => scopesDisjoint([path], committed)))
     .map(group => ({ group, kind: files.get(group[0]!)?.kind, versioned: group.filter(path => windows.has(path)) }));
@@ -122,7 +195,8 @@ export function deriveProactiveCollaboration(input: {
     objective: string,
   ) => {
     const allowedPaths = [...new Set(paths)].sort();
-    if (!allowedPaths.length || allowedPaths.length > 24) return;
+    if (!allowedPaths.length || allowedPaths.length > RUNTIME_V2_SUBAGENT_MAX_SCOPE_PATHS ||
+        allowedPaths.some(path => /[,\r`'"]/.test(path))) return;
     const scopeVersion = allowedPaths.map(path => [path.toLowerCase(), sourceVersions.get(path) ?? input.baseline?.anchors.find(anchor => anchor.path === path)?.contentHash ?? null]);
     const scopeKey = `proactive:${taskKind}:${sha256Hex(JSON.stringify(scopeVersion))}`;
     const proactiveKey = sha256Hex(JSON.stringify([runId, approved?.plan.digest || contract?.revision || null, scopeKey]));
@@ -150,6 +224,17 @@ export function deriveProactiveCollaboration(input: {
         : input.language === "zh" ? "C# 报错调查" : "Investigate C# diagnostics";
       add("review", name, branch.group,
         `Trace the reported ${shader ? "Shader import" : "C# compiler"} errors in ${branch.group.join(", ")}. Identify the exact cause and minimal compatible fix supported by the admitted source and project version. Return paths, symbols or includes, and the Editor check that should confirm the fix. The parent handles ${parent.group.join(", ")}.`);
+    }
+  }
+  if (input.workspace && !state.pendingToolCalls.length && (directExecute || (state.strategy === "analyze" && state.phase === "observing"))) {
+    const [parent, ...branches] = independentTaskSourceGroups(state, sourceVersions, input.workspace);
+    for (const branch of branches) {
+      const paths = branch.map(unit => unit.path);
+      const parentPaths = parent!.map(unit => unit.path);
+      if (!scopesDisjoint(parentPaths, paths)) continue;
+      add("review", input.language === "zh" ? "独立源码审查" : "Review independent source",
+        paths,
+        `Inspect the requested issue in ${paths.join(", ")}. Report exact evidence and any connection to the parent scope. The parent continues independently on ${parentPaths.join(", ")}. User's objective: ${state.objective.text}`);
     }
   }
   const baseline = input.baseline;
@@ -211,7 +296,7 @@ export function deriveProactiveCollaboration(input: {
           return depStep.targets.filter((target) => otherWrites.length === 0 || scopesDisjoint([target], otherWrites));
         }),
       )];
-      const auditTargets = [...new Set([...step.targets, ...prerequisitePaths])].slice(0, 6);
+      const auditTargets = [...new Set([...step.targets, ...prerequisitePaths])].slice(0, RUNTIME_V2_SUBAGENT_MAX_SCOPE_PATHS);
       const contractQuestion = prerequisitePaths.length > 0
         ? `Check interface compatibility, type conformance, inheritance contracts, and acceptance compliance against prerequisite files (${prerequisitePaths.join(", ")}).`
         : "Check type safety, interface conformance, and acceptance compliance.";

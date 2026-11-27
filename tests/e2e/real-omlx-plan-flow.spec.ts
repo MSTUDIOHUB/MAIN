@@ -53,6 +53,13 @@ import { createRealOmlxChatTelemetry } from "./realOmlxChatTelemetry";
 import { canonicalChatNetworkRead, expectActualWebReadProviders, expectGlobalReadOnlyChatReply, type RealOmlxWebInvocation } from "./realOmlxChatReadOnlyAssertions";
 import { verifyUnityCollector } from "./realUnityCollectorOracle";
 import { observeRuntimeTask } from "./runtimeTaskObservation";
+import {
+  classifyBenchmarkFirstResponse,
+  readBenchmarkWorkspaceFingerprint,
+  readChatCompletionUsage,
+  summarizeBenchmarkUsage,
+  summarizeMainBenchmark,
+} from "../../scripts/coding-agent-benchmark.mjs";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
@@ -1734,6 +1741,12 @@ test.beforeEach(async ({ page }, testInfo) => {
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
+    if (process.env.REAL_OMLX_CODING_BENCHMARK) {
+      return JSON.stringify({
+        command, cwd: workspace, exitCode: 126, success: false, durationMs: 0, stdout: "",
+        stderr: "The benchmark replays source files from an Assets-only archive. Shell and engine verification are unavailable in this fixture.",
+      });
+    }
     console.log(`[real-omlx-validation-command] ${JSON.stringify({
       command: command.slice(0, 1_000),
     })}`);
@@ -1837,6 +1850,7 @@ test.beforeEach(async ({ page }, testInfo) => {
   });
 
   type RealOmlxChatStream = {
+    id: string;
     reader: ReadableStreamDefaultReader<Uint8Array> | null;
     decoder: TextDecoder;
     controller: AbortController;
@@ -1849,6 +1863,17 @@ test.beforeEach(async ({ page }, testInfo) => {
   const chatStreams = new Map<string, RealOmlxChatStream>();
   const canceledBeforeOpen = new Set<string>();
   const finishStreamEvidence = async (stream: RealOmlxChatStream, complete: boolean, reason: string | null) => {
+    if (process.env.REAL_OMLX_CODING_BENCHMARK) {
+      const wire = providerWire.find(entry => entry.streamId === stream.id);
+      if (wire && wire.durationMs === undefined) {
+        wire.durationMs = Date.now() - Date.parse(wire.at);
+        wire.usage = readChatCompletionUsage(stream.capture.responseText);
+        if (wire.isFirstResponse) {
+          wire.firstResponseShape = classifyBenchmarkFirstResponse(stream.capture.responseText);
+          wire.firstResponseCompleted = complete;
+        }
+      }
+    }
     try { await stream.capture.finish(complete, reason, stream.inactivity.phase); }
     catch (error) { console.warn(`[real-omlx-stream-evidence-error] ${String(error)}`); }
   };
@@ -2001,6 +2026,15 @@ test.beforeEach(async ({ page }, testInfo) => {
     const responseOrigin = replayConfirmation ? "recorded_breakout_confirmation" : "real_omlx";
     providerWire.push({ at: new Date().toISOString(), streamId, model,
       responseOrigin,
+      ...(process.env.REAL_OMLX_CODING_BENCHMARK ? {
+        isFirstResponse: parsedBody?.max_tokens === 2048 &&
+          String((parsedBody?.messages as any[] | undefined)?.[0]?.content || "").includes("MAIN_INTENT"),
+        isLegacyPreflight: parsedBody?.max_tokens === 512 &&
+          String((parsedBody?.messages as any[] | undefined)?.[0]?.content || "")
+            .includes("Return one complete JSON object only; no prose, markdown or tools."),
+        investigationReferences: (parsedBody?.messages as any[] | undefined)?.reduce((count, message) =>
+          count + (typeof message.content === "string" ? message.content.split("[PREVIOUS INVESTIGATION]").length - 1 : 0), 0) ?? 0,
+      } : {}),
       ...(replayConfirmation ? { sourceSessionId: breakoutConfirmation.sessionId, sourceProviderSequence: breakoutConfirmation.providerSequence } : {}),
       responseFormat: responseFormat?.type, responseSchema: responseFormat?.json_schema?.name,
       toolChoice: parsedBody?.tool_choice, template: parsedBody?.chat_template_kwargs, maxTokens: parsedBody?.max_tokens,
@@ -2137,6 +2171,7 @@ test.beforeEach(async ({ page }, testInfo) => {
       : null;
     const controller = new AbortController();
     const stream: RealOmlxChatStream = {
+      id: streamId,
       reader: null,
       decoder: new TextDecoder(),
       controller,
@@ -2449,6 +2484,23 @@ test.beforeEach(async ({ page }, testInfo) => {
       if (cmd === "append_debug_log") {
         const raw = args || {};
         const message = String(raw.message || "");
+        const benchmarkEvents = (window as any).__REAL_OMLX_BENCHMARK_EVENTS__;
+        const source = String(raw.source || "");
+        if (benchmarkEvents && (source === "store.intent_first_response" ||
+          /^store\.runtime_v2_(?:(?:chat|workspace_read|execute|plan)_(?:admitted|terminal)|provider_request_(?:timing|opened)|provider_(?:wire_shape|action_rejected|transport_failed)|plan_provider_(?:request_opened|response_shape|unavailable)|plan_(?:run_summary|read_completed|submission_rejected|unhandled_failure)|tool_execution_(?:completed|blocked|failed)|tool_permission_requested|projection_published)$/.test(source))) {
+          try {
+            const payload = JSON.parse(message);
+            if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+              benchmarkEvents.push({ timestamp: String(raw.timestamp || new Date().toISOString()), event: source, payload });
+            }
+          } catch { /* Only valid structured measurements belong in the benchmark. */ }
+        }
+        if (raw.source === "store.source_investigation_continued") {
+          try {
+            const record = JSON.parse(message);
+            ((window as any).__REAL_OMLX_INVESTIGATION_LINKS__ ??= []).push(record);
+          } catch { /* Invalid debug payload does not affect the test runtime. */ }
+        }
         debugEntries.push({
           timestamp: String(raw.timestamp || ""),
           level: String(raw.level || ""),
@@ -3219,6 +3271,162 @@ test.afterEach(async ({ page }, testInfo) => {
 
 
 for (const model of models) {
+  test(`real OMLX coding benchmark with ${model}`, async ({ page }, testInfo) => {
+    const scenario = process.env.REAL_OMLX_CODING_BENCHMARK;
+    test.skip(!runRealOmlx || !scenario);
+    if (!["chat", "analyze", "repair", "plan"].includes(scenario!)) throw new Error("Invalid coding benchmark scenario");
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    const fixture = JSON.parse(await fs.readFile(path.join(workspace, "..", "manifest.json"), "utf8"));
+    expect(await fs.realpath(fixture.workspace)).toBe(workspace);
+    expect(path.basename(path.dirname(workspace))).toMatch(/^main-twinny-baseline-/);
+    expect(path.dirname(path.dirname(workspace))).toBe(await fs.realpath(os.tmpdir()));
+    expect((await readBenchmarkWorkspaceFingerprint(workspace)).sha256).toBe(fixture.sha256);
+    const baseline = await fingerprintPlanOnlyWorkspace(workspace);
+    const requestedBudget = Number(process.env.REAL_OMLX_BENCHMARK_BUDGET_MS);
+    const budgetMs = Number.isFinite(requestedBudget) && requestedBudget > 0 ? requestedBudget : undefined;
+    const benchmarkStartedAt = Date.now();
+    test.setTimeout(15 * 60_000);
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&workspaceConversation=1&model=${encodeURIComponent(model)}`);
+    await expect.poll(() => page.evaluate(() => !!(window as any).__CODELY_E2E__?.getSnapshot)).toBe(true);
+    if (scenario === "chat") {
+      await page.evaluate(() => (window as any).__CODELY_E2E__.prepareReadOnlyChat(false));
+    } else {
+      // Twinny's active editor was MFramework.cs when the request was sent.
+      await page.evaluate(file => (window as any).__CODELY_E2E__.setRealInputContext([file], []),
+        path.join(workspace, "MFramework/Core/MFramework.cs"));
+    }
+    const firstResponseExperiment = process.env.REAL_OMLX_FIRST_RESPONSE === "1";
+    if (firstResponseExperiment) {
+      await page.evaluate(async () => {
+        const { useAppStore } = await import("/src/store/useAppStore.ts");
+        useAppStore.getState().setConfig({ experimentalOmlxFirstResponse: true });
+      });
+    }
+
+    const benchmarkSnapshot = () => page.evaluate(async () => {
+      const snapshot = (window as any).__CODELY_E2E__.getSnapshot();
+      const { useAppStore } = await import("/src/store/useAppStore.ts");
+      const state = useAppStore.getState();
+      const terminal = state.runtimeEvents.findLast(event => event.type === "turn.completed" && event.turnId === snapshot.currentTurnId);
+      return {
+        ...snapshot,
+        completedTurn: terminal?.type === "turn.completed" ? terminal.resultKind || "success" : null,
+        visibleFinals: state.taskFlow.filter(block => block.turnId === snapshot.currentTurnId &&
+          block.type === "agent" && block.visibility === "assistant_final" && !block.streaming).length,
+      };
+    });
+    const submit = async (prompt: string, kind: "chat" | "analyze" | "execute" | "plan") => {
+      const previousTurn = await page.evaluate(() => (window as any).__CODELY_E2E__.getSnapshot().currentTurnId);
+      const providerWire = (page as any).__realOmlxProviderWire as Array<{
+        at: string; tools: string[]; durationMs?: number; usage?: Record<string, number> | null;
+        isFirstResponse?: boolean; firstResponseShape?: string; firstResponseCompleted?: boolean;
+        isLegacyPreflight?: boolean; investigationReferences?: number;
+      }>;
+      const wireStart = providerWire.length;
+      const input = page.getByTestId("composer-textarea");
+      if (kind !== "plan") await input.fill(prompt);
+      await page.evaluate(() => { (window as any).__REAL_OMLX_BENCHMARK_EVENTS__ = []; });
+      const submittedAt = Date.now();
+      if (kind === "plan") {
+        await page.evaluate(text => {
+          const bridge = (window as any).__CODELY_E2E__;
+          void bridge.sendCloudMessage(text);
+        }, prompt);
+      } else {
+        await page.getByTestId("composer-send-button").click();
+      }
+      let last: any;
+      try {
+        await expect.poll(async () => {
+          last = await benchmarkSnapshot();
+          const runtime = last.runtimeV2?.turnId === last.currentTurnId ? last.runtimeV2 : null;
+          return !!last.currentTurnId && last.currentTurnId !== previousTurn && !last.isGenerating &&
+            (!!last.completedTurn || !!runtime?.terminalOutcome || (kind === "plan" && !!runtime?.planReviewCommit) ||
+              (!!runtime && !!last.activeActionRequest));
+        }, { timeout: Math.max(250, Math.min(600_000, realOmlxExecutionTimeoutMs,
+          budgetMs === undefined ? Infinity : budgetMs - (Date.now() - benchmarkStartedAt))), intervals: [250, 500, 1000] }).toBe(true);
+      } finally {
+        last = await benchmarkSnapshot();
+        const run = last.runtimeV2?.turnId === last.currentTurnId ? last.runtimeV2 : null;
+        const events = await page.evaluate(() => {
+          const events = (window as any).__REAL_OMLX_BENCHMARK_EVENTS__ || [];
+          delete (window as any).__REAL_OMLX_BENCHMARK_EVENTS__;
+          return events;
+        });
+        const metrics = run?.runId ? summarizeMainBenchmark(events, { runId: run.runId, submittedAt })[0] : null;
+        const wire = providerWire.slice(wireStart);
+        const candidate = wire.find(entry => entry.isFirstResponse);
+        const observedOutcome = events.findLast((entry: any) =>
+          entry.event === "store.intent_first_response" && entry.payload.turnId === run?.turnId)?.payload.outcome;
+        const firstResponseOutcome = ["admitted", "fallback", "canceled"].includes(observedOutcome) ? observedOutcome : null;
+        const sourceInvestigationContinued = await page.evaluate((turnId) => {
+          const continuation = ((window as any).__REAL_OMLX_INVESTIGATION_LINKS__ || [])
+            .findLast((entry: any) => entry.turnId === turnId);
+          return continuation ? { sourceTurnId: continuation.sourceTurnId, fileHints: continuation.files } : null;
+        }, last.currentTurnId);
+        const finals = (run?.projections || []).filter((entry: any) => entry.audience === "final");
+        const workspaceChanged = (await fingerprintPlanOnlyWorkspace(workspace)) !== baseline;
+        const syntheticChatAnswer = kind === "chat" && !process.env.REAL_OMLX_BENCHMARK_PROMPT
+          ? String(finals[0]?.markdown || "").trim() : null;
+        const diagnostics = events.filter((entry: any) => entry.payload.runId === run?.runId &&
+          /(?:action_rejected|transport_failed|submission_rejected|unhandled_failure|provider_unavailable|execution_blocked|execution_failed|permission_requested)$/.test(entry.event))
+          .slice(-8).map((entry: any) => ({
+            event: entry.event,
+            detail: String(entry.payload.detailCode || entry.payload.reasonCode || entry.payload.reason || entry.payload.error || "").slice(0, 300),
+            tool: entry.payload.toolName ?? null,
+          }));
+        const report = {
+          requestedScenario: kind, fixtureSha256: fixture.sha256, model, firstResponseExperiment,
+          runtimeStrategy: run?.strategy || null, terminal: run?.terminalOutcome?.resultKind || last.completedTurn || null,
+          terminalReason: run?.terminalOutcome?.reason || finals[0]?.reason || null,
+          diagnostics,
+          activeRequest: last.activeActionRequest?.kind || null, planReviewReady: !!run?.planReviewCommit,
+          finalCount: run ? finals.length : last.visibleFinals, submittedAt: new Date(submittedAt).toISOString(), observedElapsedMs: Date.now() - submittedAt,
+          providerRequests: wire.length, firstProviderDispatchMs: wire[0] ? Date.parse(wire[0].at) - submittedAt : null,
+          providerWallMs: wire.length && wire.every(entry => entry.durationMs !== undefined)
+            ? wire.reduce((total, entry) => total + entry.durationMs!, 0) : null,
+          providerUsage: summarizeBenchmarkUsage(wire.map(entry => entry.usage || {})),
+          firstResponseShape: candidate?.firstResponseShape ?? null,
+          firstResponseCompleted: candidate?.firstResponseCompleted ?? null,
+          firstResponseOutcome,
+          legacyPreflightObserved: wire.some(entry => entry.isLegacyPreflight),
+          sourceInvestigationContinued,
+          firstRequestInvestigationReferences: wire.find(entry => (entry.investigationReferences ?? 0) > 0)
+            ?.investigationReferences ?? 0,
+          firstToolSchemaCount: wire.find(entry => entry.tools.length > 0)?.tools.length ?? 0,
+          exactChatAnswer: syntheticChatAnswer === null ? null : syntheticChatAnswer === "BENCH-742",
+          syntheticChatAnswerChars: syntheticChatAnswer?.length ?? null,
+          syntheticChatAnswerSample: syntheticChatAnswer?.slice(0, 120) ?? null,
+          workspaceChanged, validationAvailability: "source_only_fixture",
+          // Match evidence against the independently known compiler-facing defect.
+          audioSourceRead: (run?.evidence || []).some((entry: any) => entry.kind === "source" &&
+            String(entry.target).endsWith("MFramework/Audio/AudioManager.cs")),
+          firstAudioSourceDefectReported: (run?.projections || []).some((entry: any) => entry.audience === "final" &&
+            /AudioManager/.test(entry.markdown || "") && /ServiceBase/.test(entry.markdown || "") &&
+            /transform|Destroy/.test(entry.markdown || "")),
+          metrics,
+        };
+        await fs.writeFile(testInfo.outputPath(`coding-benchmark-${kind}.json`), JSON.stringify(report, null, 2));
+        console.log(`[coding-benchmark] ${JSON.stringify(report)}`);
+      }
+      return last;
+    };
+
+    if (scenario === "chat") {
+      await submit(process.env.REAL_OMLX_BENCHMARK_PROMPT || "请只回复 BENCH-742。", "chat");
+    } else if (scenario === "plan") {
+      await submit(process.env.REAL_OMLX_BENCHMARK_PROMPT ||
+        "检查当前代码的问题。给出可审批的修复计划，写清涉及文件与如何验证。此轮仅计划。", "plan");
+    } else {
+      const analysis = await submit(process.env.REAL_OMLX_BENCHMARK_PROMPT || "检查当前代码的问题", "analyze");
+      expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(baseline);
+      if (scenario === "repair" && (analysis.runtimeV2?.terminalOutcome?.resultKind || analysis.completedTurn) === "success") {
+        await submit("修复", "execute");
+      }
+    }
+    if (scenario !== "repair") expect(await fingerprintPlanOnlyWorkspace(workspace)).toBe(baseline);
+  });
+
   test(`deterministic production repeated mutation rejections recover through validation with ${model}`, async ({ page }, testInfo) => {
     test.skip(process.env.MAIN_DETERMINISTIC_PAUSE_E2E !== "1");
     test.setTimeout(60_000);

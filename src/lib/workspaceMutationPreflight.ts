@@ -33,6 +33,19 @@ export type WorkspaceWriteFileTargetFact =
   | { readonly path: string; readonly exists: false }
   | { readonly path: string; readonly exists: true; readonly content: string };
 
+/** Raised before committing an editor operation. The fresh source itself is
+ * delivered only through an authorized read. */
+export class WorkspaceMutationSourceMismatch extends Error {
+  constructor(
+    readonly target: string,
+    readonly requestedRange: RecoveryReadLease["requestedRange"],
+    message: string,
+  ) {
+    super(message);
+    this.name = "WorkspaceMutationSourceMismatch";
+  }
+}
+
 export interface WorkspaceMutationPreflightResult {
   ok: boolean;
   writeFileTarget?: WorkspaceWriteFileTargetFact;
@@ -58,6 +71,8 @@ export interface WorkspaceMutationPreflightInput {
    * canonical filesystem authorization afterward. */
   workspaceRoot?: string;
   readFile: (path: string) => Promise<string>;
+  /** Runtime v2 delivers source through an authorized read_file receipt. */
+  includeRecoverySource?: boolean;
   readFileMetadata?: (
     path: string,
   ) => Promise<{ sizeBytes: number; modifiedMs: number } | null>;
@@ -213,11 +228,12 @@ async function buildPatchRecoveryMismatchEvidence(input: {
   };
 }
 
-function inferReplaceMismatchRecoveryRange(
+export function inferMutationRecoveryRange(
   current: string,
   searchText: string,
 ): RecoveryReadLease["requestedRange"] {
   const lines = String(current || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
   const searchLines = String(searchText || "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
@@ -299,7 +315,7 @@ function buildMessage(input: {
       case "read_failed":
         return `MUTATION_PREFLIGHT_BLOCKED: Could not read ${input.path} before patching (${input.detail || "read failed"}). Do not ask for approval; read the correct target or report the blocker.`;
       case "search_text_mismatch":
-        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Copy the exact lines from the current source snippet below and retry:${input.detail ? `\n${input.detail}` : ""}`;
+        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. ${input.detail ? `Copy the exact lines from this source and retry:\n${input.detail}` : "Read the relevant current source before retrying."}`;
       case "search_text_ambiguous":
         return `MUTATION_PREFLIGHT_BLOCKED: search_text occurs more than once in ${input.path}. Expand it to one unique exact block from the visible source before retrying.`;
       case "empty_change":
@@ -327,7 +343,7 @@ function buildMessage(input: {
     case "read_failed":
       return `MUTATION_PREFLIGHT_BLOCKED: patch 前无法读取 ${input.path}（${input.detail || "读取失败"}）。不要请求用户审批；请读取正确目标或明确阻塞。`;
     case "search_text_mismatch":
-      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中未精确匹配。请直接复制下方当前文件中的真实代码片段修正 search_text 后重试：${input.detail ? `\n${input.detail}` : ""}`;
+      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中未精确匹配。${input.detail ? `请复制以下当前源码，修正 search_text 后重试：\n${input.detail}` : "请读取相关的最新源码后再试。"}`;
     case "search_text_ambiguous":
       return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中出现多次。请依据已显示源码将其扩展为唯一的精确文本块后重试。`;
     case "empty_change":
@@ -564,7 +580,7 @@ export async function preflightWorkspaceMutation(
       input.probeFileAvailability,
     );
     if (!preview.ok) {
-      const recoveryTarget = preview.changes[0]?.path || patchTarget;
+      const recoveryTarget = preview.sourceMismatch?.target || preview.changes[0]?.path || patchTarget;
       const recoveryKind = preview.failureKind === "source_mismatch"
         ? "source_mismatch"
         : preview.failureKind === "target_unavailable"
@@ -574,7 +590,9 @@ export async function preflightWorkspaceMutation(
         ? await buildPatchRecoveryMismatchEvidence({
             reason: "invalid_patch",
             target: recoveryTarget,
-            requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget),
+            requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget) || (preview.sourceMismatch && inferMutationRecoveryRange(
+              preview.sourceMismatch.currentContent, preview.sourceMismatch.oldText,
+            )),
             readFileMetadata: input.readFileMetadata,
           })
         : undefined;
@@ -736,7 +754,7 @@ export async function preflightWorkspaceMutation(
   if (!current.includes(searchText)) {
     const inferredRange =
       normalizeRecoveryReadRange(input.args) ||
-      inferReplaceMismatchRecoveryRange(current, searchText);
+      inferMutationRecoveryRange(current, searchText);
     const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
       reason: "search_text_mismatch",
       target: path,
@@ -753,7 +771,7 @@ export async function preflightWorkspaceMutation(
       .slice(snippetStart - 1, snippetEnd)
       .join("\n")
       .slice(0, 2400);
-    const detail = nearbyExcerpt
+    const detail = input.includeRecoverySource !== false && nearbyExcerpt
       ? `[${path}:${snippetStart}-${snippetEnd}]\n${nearbyExcerpt}`
       : undefined;
     return blocked({

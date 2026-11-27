@@ -1,5 +1,6 @@
 import { getToolTarget } from "../../lib/toolTarget";
 import { buildDurableTurnContext } from "../../lib/durableTurnContext";
+import { shouldPublishPublicCommentary } from "../../lib/languageContract";
 import type { HarnessRunMarker } from "../../lib/harnessCrashTelemetry";
 import {
   appendRuntimeEvent,
@@ -335,24 +336,23 @@ function closeRuntimeV2CapsuleEvents(
   );
 }
 
-function hasProjectionBlock(
+function hasFinalProjectionBlock(
   taskFlow: readonly TaskBlock[],
   turnId: string,
   projection: RuntimeV2Projection,
-  visibility: "assistant_update" | "assistant_final",
 ): boolean {
   return taskFlow.some((block) =>
     block.turnId === turnId &&
     block.type === "agent" &&
     block.content === projection.markdown &&
-    block.visibility === visibility,
+    block.visibility === "assistant_final",
   );
 }
 
 /**
- * Audience-specific UI projection. It accepts only a projection already
- * committed to the v2 ledger; no component/model text can write lifecycle
- * state back into the controller.
+ * Audience-specific presentation of committed runtime state. Capsule may be
+ * derived directly from a committed action or receipt. Presentation never
+ * writes lifecycle state back into the controller.
  */
 export function createRuntimeV2ProjectionPort(
   input: RuntimeV2ProjectionStoreAdapterInput,
@@ -363,6 +363,7 @@ export function createRuntimeV2ProjectionPort(
       const run = aggregate.run?.identity;
       if (!run) return;
       const harnessOwner = input.get()?.harnessRunMarker as HarnessRunMarker | null;
+      let projectedChildLifecycle = false;
       let storeDisposition:
         | "owner_mismatch"
         | "projected"
@@ -376,12 +377,14 @@ export function createRuntimeV2ProjectionPort(
           aggregate,
           timestampMs,
         );
+        const previousEvent = runtimeEvents[runtimeEvents.length - 1];
         runtimeEvents = reconcileRuntimeV2SubagentEvents(
           runtimeEvents,
           aggregate,
           state,
           input.language,
         );
+        projectedChildLifecycle = runtimeEvents[runtimeEvents.length - 1] !== previousEvent;
         let taskFlow = state.taskFlow || [];
         let conversationTurns = state.conversationTurns || [];
         // Reconcile only the bounded presentation facts committed by the
@@ -422,12 +425,23 @@ export function createRuntimeV2ProjectionPort(
             },
           }));
         } else if (audience === "chat_milestone") {
-          if (!hasProjectionBlock(
-            taskFlow,
-            run.turnId,
-            projection,
-            "assistant_update",
-          )) {
+          const milestoneLanguage = shouldPublishPublicCommentary(projection.markdown, input.language);
+          if (!milestoneLanguage.allow) {
+            storeDisposition = "suppressed_internal";
+            if (milestoneLanguage.reason === "language_mismatch") {
+              input.logStoreEvent("runtime_v2_commentary_language_suppressed", {
+                turnId: run.turnId,
+                runId: run.runId,
+                phase: aggregate.phase,
+                audience,
+                targetLanguage: input.language,
+                detectedLanguage: milestoneLanguage.detectedLanguage,
+                hanCount: milestoneLanguage.hanCount,
+                latinWords: milestoneLanguage.latinWords,
+              });
+            }
+          } else if (!taskFlow.some((block: TaskBlock) => block.type === "agent" && block.turnId === run.turnId &&
+            block.visibility === "assistant_update" && block.runtimeProjectionKey === projection.dedupeKey)) {
             const block: TaskBlock = {
               id: input.nextTaskId(),
               turnId: run.turnId,
@@ -436,6 +450,7 @@ export function createRuntimeV2ProjectionPort(
               streaming: false,
               hiddenProcess: false,
               visibility: "assistant_update",
+              runtimeProjectionKey: projection.dedupeKey,
             };
             taskFlow = [...taskFlow, block];
             conversationTurns = conversationTurns.map((turn: any) =>
@@ -486,11 +501,10 @@ export function createRuntimeV2ProjectionPort(
             input.language,
           );
           runtimeEvents = closeRuntimeV2CapsuleEvents(runtimeEvents, aggregate, timestampMs);
-          if (!hasProjectionBlock(
+          if (!hasFinalProjectionBlock(
             taskFlow,
             run.turnId,
             visibleProjection,
-            "assistant_final",
           )) {
             const block: TaskBlock = {
               id: input.nextTaskId(),
@@ -629,7 +643,9 @@ export function createRuntimeV2ProjectionPort(
                   ...marker,
                   status: "completed",
                   terminalResultKind: resultKind,
-                  closeReason: "runtime_v2_terminal",
+                  closeReason: resultKind === "canceled"
+                    ? aggregate.terminalOutcome?.reason || "runtime_v2_canceled"
+                    : "runtime_v2_terminal",
                   closedAt: timestampMs,
                   updatedAt: timestampMs,
                 }
@@ -654,6 +670,10 @@ export function createRuntimeV2ProjectionPort(
         owner: harnessOwner,
         marker: projectedState?.harnessRunMarker as HarnessRunMarker | null,
       });
+      // Capsule snapshots and internal timeline rows repeat facts recorded by
+      // their owning command. UI publication still happens above.
+      if (accepted && !projectedChildLifecycle && (audience === "capsule_live" ||
+        (audience === "timeline" && isInternalTimelineCommand(aggregate.scheduledCommands[0])))) return;
       const projectedRuntimeEvents = Array.isArray(projectedState?.runtimeEvents)
         ? projectedState.runtimeEvents as MainThreadEvent[]
         : [];
@@ -675,11 +695,6 @@ export function createRuntimeV2ProjectionPort(
           dedupeKey: projection.dedupeKey.slice(0, 240),
           dedupeKeyChars: projection.dedupeKey.length,
           markdownChars: projection.markdown.length,
-          projectionTitle: projection.markdown
-            .split("\n")[0]
-            ?.replace(/^#+\s*/, "")
-            .trim()
-            .slice(0, 240) || "",
           timelineRecordCount: projectedTaskFlow.filter((block) =>
             (block.type === "progress" || block.type === "tool") &&
             block.turnId === run.turnId &&

@@ -10,6 +10,25 @@ import type { TurnInputContextSignals } from "./turnIntake";
 import type { DurableTurnContext } from "./workflowModels";
 type SubmissionStoreState = any;
 
+/** Process-local handoff from the semantic request to the admitted Chat Run. */
+export interface RuntimeV2PreparedChatAnswer {
+  read(input: {
+    readonly signal: AbortSignal;
+    readonly onText: (delta: string) => void;
+  }): Promise<{
+    readonly visibleText: string;
+    readonly usage?: Readonly<Record<string, number>>;
+  } | null>;
+  dispose?(): void;
+}
+
+/** Native source proposals from a validated semantic request. The admitted
+ * Analyze Run still owns argument checks and authorization. */
+export interface RuntimeV2PreparedWorkspaceRead {
+  readonly toolCalls: readonly import("./streaming").StreamedToolCall[];
+  readonly usage?: Readonly<Record<string, number>>;
+}
+
 export interface SubmissionRuntimeStorePorts {
   sanitizeTaskBlocksForPersist: (blocks: TaskBlock[]) => TaskBlock[];
   sanitizeAgentMessagesForPersist: (messages: any[]) => any[];
@@ -67,6 +86,10 @@ export interface SubmissionRuntimeContext {
   capabilityRestrictions?: readonly import("./turnCapabilities").TurnCapability[];
   approvalRequiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("./turnCapabilities").TurnCapability[];
+  restoredReadOnlyStrategy?: "chat" | "analyze";
+  sourceInvestigationTurnId?: string;
+  preparedChatAnswer?: RuntimeV2PreparedChatAnswer;
+  preparedWorkspaceRead?: RuntimeV2PreparedWorkspaceRead;
   semanticWorkType?: import("./runIntent").SemanticTaskIntent["workType"];
   intentClarification?: import("./turnClarification").TurnClarification;
 

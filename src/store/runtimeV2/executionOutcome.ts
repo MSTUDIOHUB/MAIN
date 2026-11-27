@@ -4,6 +4,7 @@ import {
   countDistinctRuntimeV2EvidenceFacts,
   decideRuntimeV2TerminalOutcome,
   deriveRuntimeV2PlanExecutionCoverage,
+  deriveRuntimeV2ProviderRecoveryPressure,
   latestRuntimeV2ProviderConclusionText,
   runtimeV2DirectExecuteReadyForConclusion,
   summarizeRuntimeV2ExecuteEvidence,
@@ -12,7 +13,10 @@ import {
 } from "../../lib/runtime-v2";
 import { sanitizeAssistantDisplayContent } from "../../lib/sanitize";
 import { isWorkspaceMutationToolName } from "../../lib/workspaceMutationTools";
-import { unresolvedUnityEditorCheck, unityCompilationMessage } from "../../lib/runtime-v2/unityCompilation";
+import { deriveUnityCompilation, unresolvedUnityEditorCheck, unityCompilationMessage } from "../../lib/runtime-v2/unityCompilation";
+import { deriveRuntimeV2ExecutionContract } from "../../lib/runtime-v2/executionContract";
+import { runtimeV2PendingGuidance } from "../../lib/runtime-v2/guidance";
+import { runtimeV2DeliveredWorkspacePaths } from "../../lib/runtime-v2/validationReceipt";
 
 export function runtimeV2ExecuteTerminalDecision(input: {
   aggregate: ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"];
@@ -32,7 +36,7 @@ export function runtimeV2ExecuteTerminalDecision(input: {
   ).trim().slice(0, 24_000);
   const decision = decideRuntimeV2TerminalOutcome(aggregate, {
     canceled: signal.aborted,
-    mutationCount: evidence.mutationCount,
+    mutationCount: runtimeV2DeliveredWorkspacePaths(aggregate).length,
     passedValidationCount: evidence.passedValidationCount,
     hasAcceptanceValidation:
       runtimeV2DirectExecuteReadyForConclusion(aggregate),
@@ -54,6 +58,70 @@ export function runtimeV2ExecuteTerminalDecision(input: {
   };
 }
 
+export function runtimeV2ValidationRecoveryDecision(input: {
+  aggregate: NonNullable<ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"]>;
+  language?: "en" | "zh";
+  hasProjectValidation: boolean;
+}): { resultKind: "partial" | "blocked"; resultReason: string }
+  | { pauseMessage: string; evidenceSequence: number }
+  | null {
+  const { aggregate } = input;
+  if (aggregate.phase !== "validating" || aggregate.run?.status !== "running" ||
+      aggregate.scheduledCommands.length > 0 || aggregate.pendingToolCalls.length > 0 ||
+      runtimeV2PendingGuidance(aggregate) ||
+      aggregate.subagents.some(job => job.status === "queued" || job.status === "running")) return null;
+  const pressure = deriveRuntimeV2ProviderRecoveryPressure(aggregate);
+  if (pressure?.reason !== "non_actionable_response") return null;
+  const runId = aggregate.run.identity.runId;
+  const response = [...aggregate.events].reverse().find(event => event.type === "provider.responded" && event.run.runId === runId);
+  if (response?.type !== "provider.responded" || response.result.toolCalls.length || response.result.diagnostics.length) return null;
+  const request = [...aggregate.events].reverse().find(event => event.type === "command.scheduled" &&
+    event.command.kind === "request_model" && event.command.idempotencyKey === response.idempotencyKey);
+  if (request?.type !== "command.scheduled" || request.command.payload.mode !== "validate") return null;
+  const compilation = deriveUnityCompilation(aggregate)?.receipt;
+  const english = input.language === "en";
+  // A verified source-only workspace is a real prerequisite gap. A summary
+  // is only the signal to assess it; it cannot discharge validation.
+  if (compilation?.result.status === "project_fragment" && !input.hasProjectValidation &&
+      aggregate.strategy === "execute" && !aggregate.workPlan && !deriveRuntimeV2ExecutionContract(aggregate)) {
+    const reason = english
+      ? "Unity compilation and tests require a complete project. This workspace contains Unity source without a bound project."
+      : "当前工作区只有 Unity 源码，缺少已绑定的完整工程，无法运行 Unity 编译和测试。";
+    return { resultKind: runtimeV2DeliveredWorkspacePaths(aggregate).length > 0 ? "partial" : "blocked", resultReason: reason };
+  }
+  const previousPressure = request.command.payload.recoveryPressure as typeof pressure | undefined;
+  if (previousPressure?.reason !== "non_actionable_response" || previousPressure.stage !== "alternative" ||
+      pressure.occurrence <= previousPressure.occurrence) return null;
+  // The alternative recovery was actually offered and produced no validation
+  // action at this frontier. Pause rather than resending that same work.
+  return {
+    evidenceSequence: response.sequence,
+    pauseMessage: english
+      ? "The current changes still lack an applicable validation result. Provide a runnable project check or recheck the prerequisites."
+      : "最新改动仍缺可核验的验证结果。请提供可运行的工程验证命令，或在前置条件就绪后重新检查。",
+  };
+}
+
+export async function recoverRuntimeV2Validation(
+  controller: RuntimeV2Controller,
+  input: Parameters<typeof runtimeV2ValidationRecoveryDecision>[0],
+  nextId: (scope: string) => string,
+): Promise<boolean> {
+  const recovery = runtimeV2ValidationRecoveryDecision(input);
+  if (!recovery) return false;
+  if ("resultKind" in recovery) {
+    return controller.driveOnce(recovery);
+  }
+  await controller.pauseRun({
+    requestId: nextId("execution-choice"),
+    reasonCode: "recovery_stalled",
+    evidenceSequence: recovery.evidenceSequence,
+    message: recovery.pauseMessage,
+    options: ["recheck", "stop"],
+  });
+  return true;
+}
+
 export function truthfulRuntimeV2RecoveryStallDecision(input: {
   aggregate: NonNullable<
     ReturnType<RuntimeV2Controller["snapshot"]>["aggregate"]
@@ -67,7 +135,7 @@ export function truthfulRuntimeV2RecoveryStallDecision(input: {
   const evidence = summarizeRuntimeV2ExecuteEvidence(input.aggregate, {
     isMutationToolName: isWorkspaceMutationToolName,
   });
-  const hasMutation = evidence.mutationCount > 0;
+  const hasMutation = runtimeV2DeliveredWorkspacePaths(input.aggregate).length > 0;
   const planCoverage =
     deriveRuntimeV2PlanExecutionCoverage(input.aggregate);
   const missingTargets = planCoverage?.missingMutationTargets || [];

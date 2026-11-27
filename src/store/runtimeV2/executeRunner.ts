@@ -47,6 +47,7 @@ import {
 import {
   runtimeV2ExecuteTerminalDecision,
   runtimeV2PhaseTransitionMessage,
+  recoverRuntimeV2Validation,
 } from "./executionOutcome";
 import {
   createRuntimeV2RunnerIdentity,
@@ -237,7 +238,7 @@ export async function runSubmitRuntimeV2Execute(
           ),
         initialPhase: continuationReference ? "planning" : isProjectBaselineForWorkspace(input.context.projectBaselineContext, input.context.runWorkspace || "") || admission.capabilityRestrictions?.includes("workspace_read") || admission.approvalRequiredCapabilities?.includes("workspace_read") ? "observing" : "preparing",
       });
-      await admitExecuteSessionSourceCarryover({ state: input.get(), sessionKey: identity.turn.sessionKey, workspaceKey: identity.turn.workspaceKey, turnId: identity.turn.turnId, runId: identity.run.runId, capabilityRestrictions: admission.capabilityRestrictions, approvalRequiredCapabilities: admission.approvalRequiredCapabilities, live, signal: input.context.abortCtrl.signal, recordObservation: (evidence) => controller.recordObservation(evidence), logStoreEvent: input.logStoreEvent });
+      await admitExecuteSessionSourceCarryover({ state: input.get(), sessionKey: identity.turn.sessionKey, workspaceKey: identity.turn.workspaceKey, turnId: identity.turn.turnId, runId: identity.run.runId, sourceTurnId: input.context.sourceInvestigationTurnId, sessionEpoch: identity.turn.sessionEpoch, capabilityRestrictions: admission.capabilityRestrictions, approvalRequiredCapabilities: admission.approvalRequiredCapabilities, live, signal: input.context.abortCtrl.signal, recordObservation: (evidence) => controller.recordObservation(evidence), logStoreEvent: input.logStoreEvent });
     } else if (existing.aggregate.terminalOutcome) {
       const terminal = existing.aggregate.terminalOutcome;
       await controller.resumeTerminalProjection();
@@ -475,6 +476,12 @@ export async function runSubmitRuntimeV2Execute(
         if (controller.snapshot().aggregate?.terminalOutcome) break;
         continue;
       }
+      const projectValidators = before.phase === "validating" && !isRuntimeV2EditorDiagnosticRepair(before) &&
+        providerRecoveryPressure?.reason === "non_actionable_response" ? projectFiniteValidationCommands(input) : [];
+      if (await recoverRuntimeV2Validation(controller, {
+        aggregate: before, language: input.context.phaseLanguage,
+        hasProjectValidation: projectValidators.length > 0,
+      }, nextId)) continue;
       if (
         providerRecoveryPressure &&
         runtimeV2ProviderRecoveryStallExpired(
@@ -536,10 +543,9 @@ export async function runSubmitRuntimeV2Execute(
         input.get().config,
       );
       const subagentPreference = input.context.turnInputContextSignals.subagentPreference;
-      const projectValidators = before.phase === "validating" && !isRuntimeV2EditorDiagnosticRepair(before) && providerRecoveryPressure?.reason === "non_actionable_response"
-        ? projectFiniteValidationCommands(input).filter(option => option.capability === "test") : [];
+      const projectTestValidators = projectValidators.filter(option => option.capability === "test");
       const drove = await controller.driveOnce({
-        projectValidationRecovery: projectValidators.length === 1 ? projectValidators[0] : undefined,
+        projectValidationRecovery: projectTestValidators.length === 1 ? projectTestValidators[0] : undefined,
         subagentPreference,
         subagentCapacity: subagentPolicy.maxActiveRequests,
         subagentRequestMode: subagentPolicy.modelRequestMode,

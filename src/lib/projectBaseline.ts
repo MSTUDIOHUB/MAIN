@@ -296,13 +296,37 @@ async function discoverCandidates(io: ProjectBaselineIo, workspace: string, omis
   const rootDirectoryNames = rootHasEntries
     ? new Set(rootEntries.filter(entry => entry.kind === "directory").map(entry => String(entry.name || "").toLowerCase()))
     : null;
-  const staticAnchorMatchesRoot = (candidatePath: string): boolean => {
+  const nestedListCache = new Map<string, Awaited<ReturnType<typeof safeListWithStatus>>>();
+  const listDirCached = async (directoryPath: string) => {
+    const existing = nestedListCache.get(directoryPath);
+    if (existing) return existing;
+    const loaded = await safeListWithStatus(io, workspace, directoryPath);
+    nestedListCache.set(directoryPath, loaded);
+    return loaded;
+  };
+  const staticAnchorExists = async (candidatePath: string): Promise<boolean> => {
     if (!rootFileNames || !rootDirectoryNames) return true;
     const slash = candidatePath.indexOf("/");
     if (slash < 0) return rootFileNames.has(candidatePath.toLowerCase());
-    return rootDirectoryNames.has(candidatePath.slice(0, slash).toLowerCase());
+    const topDir = candidatePath.slice(0, slash);
+    if (!rootDirectoryNames.has(topDir.toLowerCase())) return false;
+    const parentEnd = candidatePath.lastIndexOf("/");
+    const parentDir = candidatePath.slice(0, parentEnd);
+    const fileName = candidatePath.slice(parentEnd + 1);
+    const parentListing = await listDirCached(parentDir);
+    if (!parentListing.ok) return true;
+    return parentListing.entries.some(
+      (entry) => entry.kind === "file" && String(entry.name || "").toLowerCase() === fileName.toLowerCase(),
+    );
   };
-  const candidates = metadataOnly ? [] : STATIC_ANCHORS.filter(candidate => staticAnchorMatchesRoot(candidate.path));
+  const candidates: AnchorCandidate[] = [];
+  if (!metadataOnly) {
+    for (const candidate of STATIC_ANCHORS) {
+      if (await staticAnchorExists(candidate.path)) {
+        candidates.push(candidate);
+      }
+    }
+  }
   for (const entry of rootEntries) {
     const path = joinRelative("", String(entry?.name || ""));
     if (!path || entry.kind !== "file") continue;

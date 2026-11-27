@@ -1,19 +1,22 @@
+import { buildCommentaryLanguageAnchor, shouldPublishPublicCommentary } from "../../lib/languageContract";
+import { upsertRuntimeV2ContextAnchor } from "./executionProviderHistory";
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { buildPlanDecisionJournal } from "../../lib/planDecisionJournal";
 import { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { buildCapsuleModelActivityContext } from "../../lib/capsuleModelContext";
 import type { ToolDefinition } from "../../lib/toolSchemas";
+import { TOOL_SEARCH_TOOL_NAME } from "../../lib/toolSearch";
 import { runtimeV2BuiltinCapabilityRestriction } from "./executionCapabilityRestrictions";
 import { normalizeTurnCapabilityRestrictions } from "../../lib/turnCapabilities";
 import { normalizeNetworkRead } from "../../lib/networkRead";
-import { acquireModelLane } from "../../lib/modelLaneCoordinator";
 import { deriveBudgetedStreamSettings, deriveProviderAdapterCapabilities } from "../../lib/providerLaneSettings";
 import { boundReadOnlyHistory } from "./readOnlyHistory";
 import { projectPlanSkillGuidance } from "./planSkillGuidance";
-import { isStreamOutputLimited, streamChatCompletion } from "../../lib/streaming";
+import { isStreamOutputLimited } from "../../lib/streaming";
 import {
   normalizeProviderResponseV1,
+  runtimeV2CheckpointWriteFailureReason,
   type RuntimeV2NormalizedProviderResult,
   type RuntimeV2RunIdentity,
   type WorkPlanRuntimeEvidence,
@@ -42,7 +45,6 @@ import {
   type PlanProviderTransport,
 } from "./planModelProtocol";
 import type { RuntimeV2SubmissionContext } from "./submissionContext";
-import { withRuntimeV2HardDeadline, withRuntimeV2ProgressDeadline } from "./hardDeadline";
 import { formatRuntimeV2ToolSchemaHint, normalizeRuntimeV2ProviderToolCalls, runtimeV2ProviderToolArgumentViolation } from "./executionProviderTools";
 import { PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE } from "./planCollaborationAcquisition";
 import { RUNTIME_V2_LIFECYCLE_DEADLINE_CODE, RuntimeV2LifecycleDeadlineError } from "../../lib/runtime-v2/lifecycle";
@@ -51,6 +53,7 @@ import { adaptPlanBlockingQuestions, admittedPlanQuestionPurpose, ASK_PLAN_QUEST
 import { isPlanStreamRepetition, PLAN_REPETITION_FALLBACK_FAILED, PLAN_STREAM_REPETITION_CODE } from "./planRepetitionRecovery";
 import { buildPlanToolAdmissionRejectionMessages, replaceTrailingPlanAdmissionRejectionGroup } from "./planProviderAdmission";
 import { PLAN_VALIDATION_REPAIR_FAILED } from "./planValidationRecovery";
+import { executePlanProviderStream, type PlanProviderStreamMetrics } from "./planProviderStream";
 type StoreGet = () => any;
 type RuntimeV2PlanLog = (event: string, data?: Record<string, unknown>) => void;
 const PLAN_REASONING_ONLY_TIMEOUT_MS = 60_000;
@@ -78,6 +81,7 @@ export async function requestPlanModel(input: {
   readonly explicitFallback?: boolean;
   readonly repetitionFallback?: boolean;
   readonly validationRepair?: { candidate: Record<string, unknown>; feedback: string; rejectedCommands: readonly string[] };
+  readonly validationDiscoveryFocus?: boolean;
   readonly logStoreEvent: RuntimeV2PlanLog;
   readonly customTools?: readonly ToolDefinition[];
   readonly focusedRevision?: boolean;
@@ -126,6 +130,7 @@ export async function requestPlanModel(input: {
       networkRead: normalizeNetworkRead(input.ledger.snapshot()?.networkRead),
     })).filter((tool) =>
       (!input.focusedRevision || ["read_file", "load_skill", SUBMIT_WORK_PLAN_TOOL_NAME].includes(tool.function.name)) &&
+      (!input.validationDiscoveryFocus || tool.function.name !== TOOL_SEARCH_TOOL_NAME) &&
       !runtimeV2BuiltinCapabilityRestriction(normalizeTurnCapabilityRestrictions(
         input.ledger.snapshot()?.objective.capabilityRestrictions,
       ), tool.function.name)
@@ -157,12 +162,29 @@ export async function requestPlanModel(input: {
     ...(input.explicitFallback ? { planExplicitFallback: true } : {}),
     ...(input.repetitionFallback ? { planRepetitionFallback: true } : {}),
     ...(input.validationRepair ? { planValidationOnlyRepair: true } : {}),
+    ...(input.validationDiscoveryFocus ? { planValidationDiscoveryFocus: true } : {}),
   });
-  const requestTrace = { turnId: input.run.turnId, runId: input.run.runId, commandKey: command.idempotencyKey };
-  let streamedText = "";
+  const requestTrace = {
+    sessionKey: input.run.sessionKey,
+    sessionEpoch: input.run.sessionEpoch,
+    turnId: input.run.turnId,
+    runId: input.run.runId,
+    attemptId: input.run.attemptId,
+    commandKey: command.idempotencyKey,
+  };
+  let streamMetrics: PlanProviderStreamMetrics = {
+    streamedText: "",
+    dispatchCount: 0,
+    dispatchedAt: 0,
+    firstTransportMs: null,
+    firstPromptProgressMs: null,
+    firstDecodedMs: null,
+    streamId: undefined,
+    promptProgress: undefined,
+    requestTimedOut: false,
+    lifecycleTimedOut: false,
+  };
   const requestAbort = new AbortController();
-  let requestTimedOut = false;
-  let lifecycleTimedOut = false;
   const forwardAbort = () => requestAbort.abort(input.context.abortCtrl.signal.reason);
   input.context.abortCtrl.signal.addEventListener("abort", forwardAbort, { once: true });
   if (input.context.abortCtrl.signal.aborted) forwardAbort();
@@ -186,6 +208,7 @@ export async function requestPlanModel(input: {
           compactRecovery: !!input.compactRecovery,
           transport,
           canAskPlanQuestions,
+          phaseLanguage: input.context.phaseLanguage,
         })
       : boundedPlanTranscript(input.messages);
     if (input.validationRepair) {
@@ -207,6 +230,7 @@ export async function requestPlanModel(input: {
         })
       : projectPlanSkillGuidance(unboundedRequestMessages);
     const requestMetrics = planRequestMetrics({ messages: requestMessages, tools: offeredTools, responseFormat });
+    const requestTokenBudget = Math.max(2_048, Math.ceil(requestMetrics.promptChars / 4) + (maxOutputTokens || 4_096));
     activity.setContext(buildCapsuleModelActivityContext({
       aggregate: input.ledger.snapshot(),
       messages: requestMessages,
@@ -216,7 +240,6 @@ export async function requestPlanModel(input: {
     }));
     input.logStoreEvent("runtime_v2_plan_provider_request_opened", {
       ...requestTrace,
-      sessionKey: input.run.sessionKey,
       guidanceIds: requestMessages.flatMap(message => message.runtimeGuidanceId ? [message.runtimeGuidanceId] : []),
       evidenceCount: input.ledger.snapshot()?.evidence.length || 0,
       stage: input.stage,
@@ -227,6 +250,9 @@ export async function requestPlanModel(input: {
       focusedRevision: input.focusedRevision === true,
       proactiveSkipReason: input.collaboration.proactiveSkipReason ?? null,
       collaborationAllowed,
+      activeSubagentCount: activeSubagents.length,
+      spawnAdvertised: advertisedToolNames.includes("spawn_subagent"),
+      waitAdvertised: advertisedToolNames.includes("wait_subagents"),
       remainingSubagentCapacity,
       collaborationRequired,
       collaborationRequirementMet,
@@ -242,121 +268,54 @@ export async function requestPlanModel(input: {
       projectBaselineFingerprint: input.context.projectBaselineContext?.fingerprints.overall || null,
       catalogToolNames: advertisedToolNames,
       promptMessageCount: requestMessages.length,
+      messagesBeforeBudget: unboundedRequestMessages.length,
       ...requestMetrics,
+      laneTokenBudget: requestTokenBudget,
       contextLimit: budget?.contextLimit ?? null,
       maxOutputTokens: maxOutputTokens ?? null,
       timeoutMs: requestTimeoutMs,
       reasoningOnlyTimeoutMs: reasoningOnlyTimeoutMs ?? null,
     });
-    const requestTokenBudget = Math.max(2_048, Math.ceil(requestMetrics.promptChars / 4) + (maxOutputTokens || 4_096));
-    const lifecycleTimeoutMs = Math.max(1, input.deadlineAt - Date.now());
-    const result = await withRuntimeV2HardDeadline({
-      timeoutMs: lifecycleTimeoutMs,
-      timeoutError: RUNTIME_V2_LIFECYCLE_DEADLINE_CODE,
-      onTimeout: () => {
-        lifecycleTimedOut = true;
-        requestAbort.abort("runtime_v2_plan_lifecycle_deadline");
-      },
-      task: async () => {
-        activity.acquiringLane();
-        const lane = await acquireModelLane({
-          config: input.get().config,
-          contextLimit: budget?.contextLimit,
-          requestTokenBudget,
-          agentKind: "parent",
-          parentRunId: input.run.runId,
-          signal: requestAbort.signal,
-          onDebugEvent: (event, data) => input.logStoreEvent(event, {
-            ...requestTrace,
-            ...data,
-          }),
-        });
-        if (requestAbort.signal.aborted) {
-          lane.release();
-          throw new Error(lifecycleTimedOut
-            ? "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT" : "Aborted");
-        }
-        lane.setPressureHandler((error) => requestAbort.abort(error));
-        try {
-          activity.preparing();
-          return await withRuntimeV2ProgressDeadline({
-            timeoutMs: requestTimeoutMs,
-            timeoutError: "RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT",
-            onTimeout: () => {
-              requestTimedOut = true;
-              requestAbort.abort("runtime_v2_plan_provider_request_timeout");
-            },
-            task: ({ markProgress }) => streamChatCompletion(
-              requestMessages,
-              requestSettings,
-              {
-                onToken: (token) => {
-                  lane.markFirstToken();
-                  streamedText += token;
-                },
-                onDone: () => undefined,
-                onError: () => undefined,
-                onRequestDispatched: activity.requestDispatched,
-                onLifecycle: (event) => {
-                  if (event.phase === "first_chunk") input.logStoreEvent("runtime_v2_provider_request_timing", { ...requestTrace, stage: "first_chunk", elapsedMs: event.elapsedMs });
-                  if (
-                    event.phase === "first_chunk" ||
-                    event.phase === "chunk_progress"
-                  ) {
-                    markProgress();
-                  }
-                  if (event.phase === "prompt_progress") {
-                    activity.reportPromptProgress({
-                      processedTokens: event.processedTokens,
-                      totalTokens: event.totalTokens,
-                      cachedTokens: event.cachedTokens,
-                      percent: event.percent,
-                    });
-                    markProgress();
-                  }
-                  if (event.phase === "model_progress") {
-                    lane.markFirstToken();
-                  }
-                  if (event.phase === "response_format_downgraded") {
-                    input.logStoreEvent("runtime_v2_plan_provider_response_format_downgraded", {
-                      turnId: input.run.turnId,
-                      runId: input.run.runId,
-                      requestId: command.idempotencyKey,
-                      transport,
-                      reason: event.status,
-                    });
-                  }
-                },
-              },
-              requestAbort.signal,
-              offeredTools,
-              maxOutputTokens,
-              {
-                ...(toolChoice ? { toolChoice } : {}),
-                responseFormat,
-                timeoutMs: requestTimeoutMs,
-                contextOwnership: "caller",
-                reasoningOnlyTimeoutMs,
-              },
-            ),
-          });
-        } catch (error) {
-          lane.reportFailure(error);
-          throw error;
-        } finally {
-          activity.finish();
-          lane.setPressureHandler(undefined);
-          lane.release();
+    const streamOutcome = await executePlanProviderStream({
+      config: input.get().config,
+      contextLimit: budget?.contextLimit,
+      requestTokenBudget,
+      parentRunId: input.run.runId,
+      runId: input.run.runId,
+      turnId: input.run.turnId,
+      requestId: command.idempotencyKey,
+      requestTrace,
+      deadlineAt: input.deadlineAt,
+      requestTimeoutMs,
+      requestAbort,
+      activity,
+      requestMessages,
+      requestSettings,
+      offeredTools,
+      maxOutputTokens,
+      toolChoice,
+      responseFormat,
+      reasoningOnlyTimeoutMs,
+      transport,
+      allowPublicText: !structuredResponse && !textEnvelope && !input.submissionRepairPending,
+      onPublicText: (text) => {
+        if (shouldPublishPublicCommentary(text, input.context.phaseLanguage).allow) {
+          activity.reportPublicCommentary(text);
         }
       },
+      logStoreEvent: input.logStoreEvent,
     });
+    const result = streamOutcome.result;
+    streamMetrics = streamOutcome.metrics;
     if (input.context.abortCtrl.signal.aborted) throw new Error("RUNTIME_V2_PLAN_ABORTED");
     const outputTruncated = isStreamOutputLimited(result);
     const rawVisibleText = result.clientStopReason === "reasoning_only_timeout"
       ? ""
-      : result.content || streamedText;
+      : result.content || streamMetrics.streamedText;
+    const actionableText = result.clientStopReason === "reasoning_only_timeout"
+      ? "" : result.actionableContent ?? rawVisibleText;
     const decoded = (structuredResponse || input.submissionRepairPending) && !result.toolCalls?.length
-      ? decodeExactStructuredPlanResponse(rawVisibleText)
+      ? decodeExactStructuredPlanResponse(actionableText)
       : null;
     const structuredCandidate = input.validationRepair ? applyWorkPlanValidationRepair(input.validationRepair, decoded) : decoded;
     const adaptedToolCalls = structuredCandidate
@@ -366,8 +325,31 @@ export async function requestPlanModel(input: {
             arguments: structuredCandidate,
           }]
       : structuredResponse ? [] : result.toolCalls;
+    const commentaryText = !structuredCandidate && actionableText
+      ? result.semanticContent || actionableText
+      : "";
+    const commentaryCheck = adaptedToolCalls.length > 0 && commentaryText.trim()
+      ? shouldPublishPublicCommentary(commentaryText, input.context.phaseLanguage)
+      : null;
+    const commentarySuppressed = commentaryCheck !== null && !commentaryCheck.allow && commentaryCheck.reason === "language_mismatch";
+    if (commentarySuppressed && !outputTruncated && !result.protocolViolation) {
+      input.logStoreEvent("runtime_v2_commentary_language_suppressed", {
+        ...requestTrace,
+        phase: "planning",
+        targetLanguage: input.context.phaseLanguage,
+        detectedLanguage: commentaryCheck.detectedLanguage,
+        hanCount: commentaryCheck.hanCount,
+        latinWords: commentaryCheck.latinWords,
+        toolCount: adaptedToolCalls.length,
+      });
+      upsertRuntimeV2ContextAnchor({ messages: input.messages } as any, {
+        key: "language-contract",
+        content: buildCommentaryLanguageAnchor(input.context.phaseLanguage),
+      });
+    }
     const providerNormalized = normalizeProviderResponseV1({
-      visibleText: structuredCandidate ? "" : rawVisibleText,
+      visibleText: structuredCandidate ? "" : actionableText,
+      ...(!structuredCandidate && !commentarySuppressed && actionableText && result.semanticContent ? { commentary: result.semanticContent } : {}),
       toolCalls: adaptedToolCalls,
       usage: result.usage,
       diagnostics: planProviderResponseDiagnostics({
@@ -424,8 +406,17 @@ export async function requestPlanModel(input: {
           ],
         };
     input.logStoreEvent("runtime_v2_plan_provider_response_shape", {
-      turnId: input.run.turnId,
-      runId: input.run.runId,
+      ...requestTrace,
+      streamId: streamMetrics.streamId,
+      dispatchCount: streamMetrics.dispatchCount,
+      dispatchElapsedMs: streamMetrics.dispatchedAt ? Date.now() - streamMetrics.dispatchedAt : null,
+      firstTransportMs: streamMetrics.firstTransportMs,
+      firstPromptProgressMs: streamMetrics.firstPromptProgressMs,
+      firstDecodedMs: streamMetrics.firstDecodedMs,
+      firstPublicTextMs: result.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
+      firstToolMs: result.streamDiagnostics?.firstToolElapsedMs ?? null,
+      providerUsage: result.usage,
+      promptProgress: streamMetrics.promptProgress,
       stage: input.stage,
       transport,
       finishReason: result.finishReason || null,
@@ -433,6 +424,8 @@ export async function requestPlanModel(input: {
       stopSource: result.clientStopReason ? "client_guard" : outputTruncated ? "provider" : null,
       contentChars: String(rawVisibleText || "").length,
       reasoningChars: String(result.reasoningContent || "").length,
+      publicTextChars: structuredCandidate ? 0 : result.semanticContent?.length ?? String(rawVisibleText || "").length,
+      nativeToolArgumentChars: result.toolCalls.reduce((sum, call) => sum + String(call.arguments || "").length, 0),
       nativeToolCallCount: result.toolCalls.length,
       normalizedToolCallCount: normalized.toolCalls.length,
       admittedToolCallCount: admitted.toolCalls.length,
@@ -462,7 +455,7 @@ export async function requestPlanModel(input: {
     } else {
       input.messages.push({
         role: "assistant",
-        content: structuredCandidate ? "" : rawVisibleText,
+        content: structuredCandidate ? "" : actionableText,
         ...(admitted.toolCalls.length > 0
           ? {
               tool_calls: admitted.toolCalls.map((call) => ({
@@ -484,17 +477,24 @@ export async function requestPlanModel(input: {
       ...(unexpectedToolNames.length > 0 || argumentViolation ? { rejectedAdmission: true, unexpectedToolNames } : {}),
     };
   } catch (error) {
-    activity.finish();
-    const providerRequestTimedOut = !lifecycleTimedOut && (requestTimedOut || isPlanProviderRequestTimeout(
+    const failedMetrics = (
+      error &&
+      typeof error === "object" &&
+      "planStreamMetrics" in error
+        ? (error as { planStreamMetrics?: PlanProviderStreamMetrics }).planStreamMetrics
+        : undefined
+    ) ?? streamMetrics;
+    if (runtimeV2CheckpointWriteFailureReason(error)) throw error;
+    const providerRequestTimedOut = !failedMetrics.lifecycleTimedOut && (failedMetrics.requestTimedOut || isPlanProviderRequestTimeout(
       error,
       requestAbort.signal,
       input.context.abortCtrl.signal,
     ));
     const canceled = input.context.abortCtrl.signal.aborted;
     const failureReasonCode = canceled ? undefined
-      : lifecycleTimedOut ? RUNTIME_V2_LIFECYCLE_DEADLINE_CODE
+      : failedMetrics.lifecycleTimedOut ? RUNTIME_V2_LIFECYCLE_DEADLINE_CODE
       : providerRequestTimedOut && requiredSpawn ? PLAN_REQUIRED_COLLABORATION_PROVIDER_TIMEOUT_CODE
-      : input.validationRepair ? PLAN_VALIDATION_REPAIR_FAILED
+      : input.validationRepair || input.validationDiscoveryFocus ? PLAN_VALIDATION_REPAIR_FAILED
       : isPlanStreamRepetition(error) ? PLAN_STREAM_REPETITION_CODE
       : input.repetitionFallback ? PLAN_REPETITION_FALLBACK_FAILED : undefined;
     await input.ledger.settleCommand({
@@ -505,21 +505,28 @@ export async function requestPlanModel(input: {
       ...(failureReasonCode ? { failureReasonCode } : {}),
     });
     input.logStoreEvent("runtime_v2_plan_provider_request_closed", {
-      turnId: input.run.turnId,
-      runId: input.run.runId,
+      ...requestTrace,
+      streamId: failedMetrics.streamId,
+      dispatchCount: failedMetrics.dispatchCount,
+      dispatchElapsedMs: failedMetrics.dispatchedAt ? Date.now() - failedMetrics.dispatchedAt : null,
+      firstTransportMs: failedMetrics.firstTransportMs,
+      firstPromptProgressMs: failedMetrics.firstPromptProgressMs,
+      firstDecodedMs: failedMetrics.firstDecodedMs,
+      failureReasonCode,
       stage: input.stage,
       transport,
       timeoutMs: requestTimeoutMs,
       timedOut: providerRequestTimedOut,
-      lifecycleTimedOut,
+      lifecycleTimedOut: failedMetrics.lifecycleTimedOut,
       errorName: error instanceof Error ? error.name : "",
       error: error instanceof Error ? error.message : String(error || ""),
     });
-    if (lifecycleTimedOut) throw new RuntimeV2LifecycleDeadlineError();
+    if (failedMetrics.lifecycleTimedOut) throw new RuntimeV2LifecycleDeadlineError();
     throw providerRequestTimedOut
       ? new Error("RUNTIME_V2_PLAN_PROVIDER_REQUEST_TIMEOUT")
       : error;
   } finally {
+    activity.finish();
     input.context.abortCtrl.signal.removeEventListener("abort", forwardAbort);
   }
 }

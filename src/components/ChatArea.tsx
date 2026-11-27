@@ -30,6 +30,7 @@ import { deriveTurnProgressItems } from "../lib/turnProgress";
 import { useAppStore } from "../store/useAppStore";
 import { resolveRuntimeV2PlanReviewFromAggregate } from "../store/runtimeV2/workPlanAdapter";
 import { isRuntimeV2ValidationAttempt, normalizeRuntimeV2Checkpoint } from "../lib/runtime-v2";
+import { buildInterimCommentaryHistory, trimRepeatedInterimCommentary } from "../lib/runtime-v2/interimCommentary";
 import {
   deriveTurnElapsedSeconds,
   resolveTurnRunTimeWindow,
@@ -3351,22 +3352,6 @@ export default function ChatArea({
     setActiveVisibleTurnId(visibleConversationTurns.at(-1)?.id || null);
   }, [visibleConversationTurns]);
 
-  useEffect(() => {
-    if (!isAutoScroll) return;
-
-    const el = chatContainerRef.current;
-    if (!el) return;
-
-    const rafId = window.requestAnimationFrame(() => {
-      el.scrollTo({ top: el.scrollHeight, behavior: isStreaming ? "auto" : "smooth" });
-      lastScrollTopRef.current = el.scrollTop;
-    });
-
-    return () => {
-      window.cancelAnimationFrame(rafId);
-    };
-  }, [taskFlow, isAutoScroll, isStreaming]);
-
   const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal" | "subagents" | "file") => {
     const isCurrentlyOpen =
       (tab === "plan" && showPlanPanel && rightPanelTab === "plan") ||
@@ -3803,6 +3788,7 @@ export default function ChatArea({
         !isQuestionnaireAnchor(block) &&
         !block.hiddenProcess &&
         block.visibility !== "user_progress" &&
+        block.visibility !== "assistant_update" &&
         hasRenderableAgentBlock(block)
       )?.idx ?? -1;
     // New completed turns carry an explicit semantic final. The legacy
@@ -3882,7 +3868,7 @@ export default function ChatArea({
       shouldRenderCompletedProcessArchive &&
       isFinishedTurn &&
       finalVisibleAgentIndex >= 0 &&
-      !hasSubstantiveIntermediateAgentText &&
+      substantiveIntermediateAgentBlockIds.size === publicAssistantUpdates.length &&
       !shouldKeepContinuousProcessTimeline;
     let processArchive = null;
     if (shouldArchiveCompletedProcess) {
@@ -4029,6 +4015,9 @@ export default function ChatArea({
         // Its structured tool evidence is rendered by the process timeline and
         // capsule; repeating the prose in ChatArea creates a false checkpoint.
         if (item.block?.type === "agent" && item.block.visibility === "user_progress") return null;
+        if (item.block?.type === "agent" && item.block.visibility === "assistant_update") {
+          return substantiveIntermediateAgentBlockIds.has(item.block.id) ? renderBlockItem(item) : null;
+        }
         // A completed turn's exact final assistant answer is canonical visible
         // context. Never let process-narration heuristics consume it merely
         // because it mentions the tool result that immediately preceded it.
@@ -4358,21 +4347,6 @@ export default function ChatArea({
               />
             </React.Fragment>
           )}
-          {isTurnExpanded &&
-            isActiveRunningTurn &&
-            requestStage &&
-            !blocks.some((block) => block.type === "agent" && block.isStreaming && String(block.content || "").trim().length > 0) && (
-            <div
-              data-testid="chat-area-live-model-progress"
-              className="ml-9 flex min-w-0 max-w-[calc(100%-2.25rem)] items-start gap-2 rounded-xl border border-[var(--surface-border-soft)] bg-[var(--surface-1)] px-3 py-2 text-[12px] text-[var(--surface-text)]"
-            >
-              <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 animate-pulse rounded-full bg-[var(--accent)]" />
-              <div className="min-w-0 flex-1">
-                <CapsuleActivityText line={capsuleActivityLine} language={language} />
-              </div>
-            </div>
-          )}
-
           {!isTurnExpanded ? (
             <React.Fragment key="collapsed-process-visible-messages">
               {additionalVisibleUserBlocks.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
@@ -4390,6 +4364,7 @@ export default function ChatArea({
             </React.Fragment>
           ) : shouldArchiveCompletedProcess ? (
             <>
+              {publicAssistantUpdates.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
               {questionHistoryEntries.length > 0 && (
                 <UserQuestionAnswerHistory
                   entries={questionHistoryEntries}
@@ -4444,6 +4419,23 @@ export default function ChatArea({
             if (!insertedUnanchored) nodes.push(unanchoredNode);
             return nodes;
           })()}
+
+          {isActiveRunningTurn && liveAssistantCommentary &&
+            !blocks.some((block) => block.type === "agent" && block.streaming && String(block.content || "").trim()) && (
+              <div data-testid="assistant-live-output">
+                <AgentContentBlock
+                  key={currentModelRequest?.key}
+                  block={{
+                    id: `live-output-${currentModelRequest?.key}`,
+                    turnId: turn.id,
+                    content: liveAssistantCommentary,
+                    streaming: true,
+                  }}
+                  language={language}
+                  chatFontSize={resolvedChatFontSize}
+                />
+              </div>
+          )}
 
           {shouldShowTurnChanges && (
             <TurnChangesCard
@@ -4610,6 +4602,33 @@ export default function ChatArea({
   const currentTool = runningTools[runningTools.length - 1];
   const currentModelRequest = currentActivities.find(activity => activity.kind === "model");
   const requestStage = currentModelRequest?.stage;
+  const modelRun = currentModelRequest?.run;
+  const modelCommandKey = currentModelRequest?.commandKey;
+  const commentaryPresentation = useMemo(() => {
+    if (!modelRun || !modelCommandKey) return null;
+    const events = capsuleAggregate?.events || [];
+    const request = events.find((event) => event.type === "command.scheduled" &&
+      event.command.idempotencyKey === modelCommandKey && event.command.kind === "request_model");
+    return {
+      history: buildInterimCommentaryHistory(events, modelRun, modelCommandKey),
+      concludes: request?.command.payload.mode === "conclude" || request?.command.payload.conclusionKind === "read_only",
+    };
+  }, [capsuleAggregate?.events, modelRun, modelCommandKey]);
+  const publicCommentary = commentaryPresentation?.history.publishedCurrent ? undefined : currentModelRequest?.publicCommentary;
+  const liveAssistantCommentary = publicCommentary && commentaryPresentation && !commentaryPresentation.concludes
+    ? trimRepeatedInterimCommentary(publicCommentary, commentaryPresentation.history, true)
+    : publicCommentary;
+
+  useEffect(() => {
+    if (!isAutoScroll) return;
+    const el = chatContainerRef.current;
+    if (!el) return;
+    const rafId = window.requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: isStreaming ? "auto" : "smooth" });
+      lastScrollTopRef.current = el.scrollTop;
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [taskFlow, liveAssistantCommentary, isAutoScroll, isStreaming]);
 
   const legacyTool = !rawCapsuleCheckpoint && capsuleIsRunActive && !capsuleActionKind && capsuleActivityRunId
     ? [...capsuleTurnBlocks].reverse().find(block => block.type === "tool" && block.audience !== "internal" &&
@@ -4653,11 +4672,12 @@ export default function ChatArea({
     };
     const modelContext = currentModelRequest?.kind === "model" ? currentModelRequest.context : undefined;
     const modelPromptProgress = currentModelRequest?.kind === "model" ? currentModelRequest.promptProgress : undefined;
-    const modelDetail = modelContext
-      ? formatCapsuleModelDetailWithProgress(modelContext, modelPromptProgress, language)
-      : undefined;
+    const modelDetail = formatCapsuleModelDetailWithProgress(modelContext, modelPromptProgress, language);
+    const isProcessingContext = requestStage === "waiting" && !!modelPromptProgress;
     capsuleActivityLine = {
-      title: modelStatus[requestStage][language],
+      title: isProcessingContext
+        ? (language === "zh" ? "正在处理上下文" : "Processing context")
+        : modelStatus[requestStage][language],
       ...(modelDetail ? { detail: modelDetail } : {}),
       live: true,
       waitingSince: requestStage === "waiting" ? currentModelRequest?.startedAt : undefined,

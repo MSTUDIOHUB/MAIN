@@ -134,6 +134,8 @@ export interface RuntimeV2EvidenceReference {
   readonly kind: "source" | "tool" | "mutation" | "validation" | "subagent" | "user";
   readonly target: string;
   readonly version: string | null;
+  /** Mutation baseline captured at the write boundary; 'deleted' means absent. */
+  readonly previousVersion?: string | null;
 }
 
 /** The evidence id and sequence identify the exact write covered by a validator. */

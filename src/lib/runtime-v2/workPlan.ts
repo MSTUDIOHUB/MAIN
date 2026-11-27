@@ -247,7 +247,7 @@ export function validateWorkPlanDraftV1(
   if (!normalizeText(draft.summary, 2_000)) {
     issues.push({ path: "summary", message: "Summary is required." });
   }
-  if (/<\/?tool_call\b|<function=|<parameter=/i.test(String(draft.summary || ""))) {
+  if (/<\/?(?:tool_call|function_call|tool_use|parameter|arg_key|arg_value|planMarkdown)\b|\*\/planMarkdown\*|<function=/i.test(String(draft.summary || ""))) {
     issues.push({
       path: "summary",
       message: "Plan Markdown contains provider tool-protocol markup.",

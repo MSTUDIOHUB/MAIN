@@ -1,4 +1,4 @@
-import { globSearch, readFile } from "./ipc";
+import { globSearch, listDirectory, readFile } from "./ipc";
 import {
   loadSkillCatalog,
   type SkillCatalogSnapshot,
@@ -31,6 +31,7 @@ export interface InstructionSource {
 export interface ResolvedInstructionIo {
   readFile(path: string, workspace: string): Promise<string>;
   globSearch(pattern: string, workspace: string): Promise<string[]>;
+  listDirectory?(path: string, workspace?: string): Promise<Array<{ name: string; is_dir?: boolean }>>;
 }
 
 export interface InstructionLayer {
@@ -283,7 +284,7 @@ export async function loadResolvedInstructions(
   skills: InstructionSkillLike[],
   associatedPaths: string[] = [],
   userPrompt = "",
-  io: ResolvedInstructionIo = { readFile, globSearch },
+  io: ResolvedInstructionIo = { readFile, globSearch, listDirectory },
   externalSkillSelections: readonly ExternalSkillSelection[] = [],
   externalSkillSources?: ExternalSkillSources,
 ): Promise<ResolvedInstructionSet> {
@@ -339,7 +340,42 @@ export async function loadResolvedInstructions(
     order += 1;
   };
 
+  const rootEntries = immutableWorkspace && io.listDirectory
+    ? await io.listDirectory("", immutableWorkspace).catch(() => [])
+    : [];
+  const hasRootListing = rootEntries.length > 0;
+  const rootFiles = hasRootListing
+    ? new Set(rootEntries.filter((entry) => !entry.is_dir).map((entry) => entry.name.toLowerCase()))
+    : null;
+  const rootDirs = hasRootListing
+    ? new Set(rootEntries.filter((entry) => entry.is_dir).map((entry) => entry.name.toLowerCase()))
+    : null;
+  const nestedFilesByDir = new Map<string, Set<string> | null>();
+  const nestedFileExists = async (relativePath: string): Promise<boolean> => {
+    if (!hasRootListing || !rootFiles || !rootDirs) return true;
+    const normalized = normalizePath(relativePath);
+    const slash = normalized.indexOf("/");
+    if (slash < 0) return rootFiles.has(normalized.toLowerCase());
+    const topDir = normalized.slice(0, slash);
+    const fileName = normalized.slice(slash + 1);
+    if (!rootDirs.has(topDir.toLowerCase()) || !io.listDirectory) return false;
+    if (!nestedFilesByDir.has(topDir)) {
+      try {
+        const subEntries = await io.listDirectory(topDir, immutableWorkspace);
+        nestedFilesByDir.set(
+          topDir,
+          new Set(subEntries.filter((entry) => !entry.is_dir).map((entry) => entry.name.toLowerCase())),
+        );
+      } catch {
+        nestedFilesByDir.set(topDir, null);
+      }
+    }
+    const files = nestedFilesByDir.get(topDir);
+    return files ? files.has(fileName.toLowerCase()) : true;
+  };
+
   for (const legacyPath of LEGACY_FILES) {
+    if (!(await nestedFileExists(legacyPath))) continue;
     const content = await tryRead(legacyPath, immutableWorkspace, io);
     if (!content) continue;
     pushLayer(legacyPath.split("/").pop() || legacyPath, "legacy", content, {
@@ -347,11 +383,13 @@ export async function loadResolvedInstructions(
     });
   }
 
-  const cursorRuleFiles = await tryGlob(
-    ".cursor/rules/*.md",
-    immutableWorkspace,
-    io,
-  );
+  const cursorRuleFiles = rootDirs && !rootDirs.has(".cursor")
+    ? []
+    : await tryGlob(
+        ".cursor/rules/*.md",
+        immutableWorkspace,
+        io,
+      );
   for (const rulePath of cursorRuleFiles) {
     const content = await tryRead(rulePath, immutableWorkspace, io);
     if (!content) continue;
@@ -360,16 +398,17 @@ export async function loadResolvedInstructions(
     });
   }
 
-  const agentContent = await tryRead("AGENT.md", immutableWorkspace, io);
+  const agentContent = (await nestedFileExists("AGENT.md"))
+    ? await tryRead("AGENT.md", immutableWorkspace, io)
+    : null;
   if (agentContent) {
     pushLayer("AGENT.md", "workspace_agent", agentContent, { path: "AGENT.md" });
   }
 
-  const steeringFiles = await tryGlob(
-    ".MAIN/steering/*.md",
-    immutableWorkspace,
-    io,
-  );
+  const hasMainDir = !rootDirs || rootDirs.has(".main");
+  const steeringFiles = hasMainDir
+    ? await tryGlob(".MAIN/steering/*.md", immutableWorkspace, io)
+    : [];
   for (const steeringPath of steeringFiles.sort()) {
     if (/\/README\.md$/i.test(normalizePath(steeringPath))) continue;
     const content = await tryRead(steeringPath, immutableWorkspace, io);
@@ -397,11 +436,9 @@ export async function loadResolvedInstructions(
     );
   }
 
-  const scopedRuleFiles = await tryGlob(
-    ".MAIN/rules/*.md",
-    immutableWorkspace,
-    io,
-  );
+  const scopedRuleFiles = hasMainDir
+    ? await tryGlob(".MAIN/rules/*.md", immutableWorkspace, io)
+    : [];
   const scopedRules: ScopedRule[] = [];
 
   for (const rulePath of scopedRuleFiles) {
@@ -439,11 +476,9 @@ export async function loadResolvedInstructions(
       });
     });
 
-  const templateFiles = await tryGlob(
-    ".MAIN/templates/**/*.md",
-    immutableWorkspace,
-    io,
-  );
+  const templateFiles = hasMainDir
+    ? await tryGlob(".MAIN/templates/**/*.md", immutableWorkspace, io)
+    : [];
   for (const templatePath of templateFiles) {
     // Older releases may have copied the removed mode's private template pack
     // into a user workspace. Preserve those files on disk, but never revive

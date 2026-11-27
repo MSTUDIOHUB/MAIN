@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { RuntimeV2Event, RuntimeV2EventDraft } from "../../src/lib/runtime-v2";
 
 test.describe("subagent activity and right panel", () => {
   test.beforeEach(async ({ page }) => {
@@ -57,6 +58,46 @@ test.describe("subagent activity and right panel", () => {
     await expect(page.getByTestId("subagent-detail")).not.toContainText("可用内存低于预留线");
     await expect(page.getByTestId("subagent-detail"))
       .toContainText("新证据 1 · 返回 1 · 交付 0 · 采用 0");
+  });
+
+  test("distinguishes no parallel capacity from unproven independent work", async ({ page }) => {
+    await page.goto("/?e2eScenario=subagents-panel");
+    await page.getByTestId("subagent-activity-subagent-mendel").click();
+    const setDisposition = (reason: "no_parallel_capacity" | "no_independent_scope") => page.evaluate(async (reason) => {
+      const storeUrl = performance.getEntriesByType("resource")
+        .filter(entry => new URL(entry.name).pathname === "/src/store/useAppStore.ts")
+        .at(-1)?.name ?? "/src/store/useAppStore.ts";
+      const runtime = await import("/src/lib/runtime-v2/index.ts");
+      const { useAppStore, resolveSessionRuntimeKey, resolveSessionWorkspaceKey } = await import(storeUrl) as typeof import("/src/store/useAppStore.ts");
+      const state = useAppStore.getState();
+      const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+      const sessionKey = resolveSessionRuntimeKey(workspaceKey, state.currentSessionId)!;
+      const sessionEpoch = "subagent-disposition-fixture";
+      const turnId = state.currentTurnId ?? state.conversationTurns.at(-1)?.id;
+      if (!turnId || !sessionKey || !state.sessionsByWorkspace[workspaceKey]?.length) throw new Error("Missing subagent fixture session");
+      const turn = { workspaceKey, sessionKey, sessionEpoch, turnId, clientSubmissionId: turnId };
+      const run = { sessionKey, sessionEpoch, turnId, runId: "delegation-run", parentRunId: null, attemptId: "delegation-attempt" };
+      const events: RuntimeV2EventDraft[] = [
+        { type: "turn.admitted", turn, strategy: "analyze", objective: "Review the current code.", constraints: [], acceptanceCriteria: [] },
+        { type: "run.started", run, phase: "observing" },
+        { type: "command.scheduled", run, command: { kind: "request_model", phase: "observing", run,
+          idempotencyKey: "request", payload: { mode: "analyze", proactiveSkipReason: reason } } },
+      ];
+      const last = events.reduce<ReturnType<typeof runtime.transition> | null>((previous, event, sequence) =>
+        runtime.transition(previous, { ...event, schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+          sequence, at: sequence + 1, eventId: `delegation-event-${sequence}` } as RuntimeV2Event), null)!;
+      const checkpoint = runtime.createRuntimeV2Checkpoint({ aggregate: last, revision: last.nextSequence, updatedAt: last.updatedAt });
+      useAppStore.setState({
+        sessionsByWorkspace: { ...state.sessionsByWorkspace, [workspaceKey]: state.sessionsByWorkspace[workspaceKey].map(session =>
+          session.id === state.currentSessionId ? { ...session, planLifecycleEpoch: sessionEpoch } : session) },
+        runtimeV2Checkpoints: runtime.serializeRuntimeV2CheckpointMap({ [turnId]: checkpoint }),
+      });
+    }, reason);
+    const disposition = page.getByTestId("subagent-proactive-disposition");
+    await setDisposition("no_parallel_capacity");
+    await expect(disposition).toContainText("模型通道当前无法同时运行子请求");
+    await setDisposition("no_independent_scope");
+    await expect(disposition).toContainText("当前证据尚未支持独立委派");
   });
 
   for (const theme of ["light", "dark", "black"] as const) {

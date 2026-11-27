@@ -1298,21 +1298,21 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   const semanticRequests = installReadOnlySemanticFixture(useAppStore, t);
 
   const durableClear = deferred();
-  const workspaceTree = deferred();
-  const workspaceTreeStarted = deferred();
+  const workspaceAdmission = deferred();
+  const workspaceAdmissionStarted = deferred();
   const commands = [];
   let clearInvocations = 0;
-  let workspaceTreeInvocations = 0;
+  let workspaceAdmissionInvocations = 0;
   tauriInvoke = (command, payload) => {
     commands.push(command);
     if (command === "clear_project_sessions") {
       clearInvocations += 1;
       return clearInvocations === 1 ? durableClear.promise : Promise.resolve();
     }
-    if (command === "get_project_skeleton") {
-      workspaceTreeInvocations += 1;
-      workspaceTreeStarted.resolve();
-      return workspaceTree.promise;
+    if (command === "canonicalize_workspace_path") {
+      workspaceAdmissionInvocations += 1;
+      workspaceAdmissionStarted.resolve();
+      return workspaceAdmission.promise.then(() => payload.path);
     }
     if (command === "set_workspace_root") return Promise.resolve(payload.path);
     if (command === "save_project_session") return Promise.resolve(payload.session);
@@ -1364,8 +1364,8 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   assert.equal(Object.keys(pendingState.runtimeBySessionKey).filter((key) => key.startsWith(`${workspace}:`)).length, 0);
   assert.equal(pendingState.abortController, null);
   assert.equal(pendingState.harnessRunMarker, null);
-  assert.equal(workspaceTreeInvocations, 0);
-  assert.deepEqual(commands.filter((command) => command === "get_project_skeleton"), []);
+  assert.equal(workspaceAdmissionInvocations, 0);
+  assert.deepEqual(commands.filter((command) => command === "canonicalize_workspace_path"), []);
 
   const replayCalls = [];
   const admissionCalls = [];
@@ -1409,7 +1409,7 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   await waitFor(() => admissionCalls.length >= 2, "both successful clear submissions admitted");
   assert.equal(admissionCalls.length, 2);
   assert.deepEqual(admissionCalls.map((call) => call.text), [firstText, secondText]);
-  await withTimeout(workspaceTreeStarted.promise, "success clear replay workspace tree");
+  await withTimeout(workspaceAdmissionStarted.promise, "success clear replay workspace admission");
   assert.equal(semanticRequests.length, 1, "the FIFO head is interpreted once before context loading");
   assert.equal(JSON.parse(semanticRequests[0][1].content).currentRequest, "第一条用户输入必须保留");
   const replayOptions = admissionCalls[1];
@@ -1436,14 +1436,14 @@ test("successful deferred clear replays every visible user input in strict FIFO 
   assert.equal(replayedState.taskFlow.filter((block) => block.type === "user").length, 2);
   assert.equal(replayedState.abortController, null);
   assert.equal(replayedState.harnessRunMarker, null);
-  assert.equal(workspaceTreeInvocations, 1);
+  assert.equal(workspaceAdmissionInvocations, 1);
 
   useAppStore.setState({
     sendMessage: realSendMessage,
     acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
   });
   await useAppStore.getState().clearChatHistory();
-  workspaceTree.resolve("");
+  workspaceAdmission.resolve("");
   await new Promise((resolve) => setImmediate(resolve));
 });
 
@@ -1460,19 +1460,19 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   const semanticRequests = installReadOnlySemanticFixture(useAppStore, t);
 
   const durableClear = deferred();
-  const workspaceTree = deferred();
-  const workspaceTreeStarted = deferred();
+  const workspaceAdmission = deferred();
+  const workspaceAdmissionStarted = deferred();
   let clearInvocations = 0;
-  let workspaceTreeInvocations = 0;
+  let workspaceAdmissionInvocations = 0;
   tauriInvoke = (command, payload) => {
     if (command === "clear_project_sessions") {
       clearInvocations += 1;
       return clearInvocations === 1 ? durableClear.promise : Promise.resolve();
     }
-    if (command === "get_project_skeleton") {
-      workspaceTreeInvocations += 1;
-      workspaceTreeStarted.resolve();
-      return workspaceTree.promise;
+    if (command === "canonicalize_workspace_path") {
+      workspaceAdmissionInvocations += 1;
+      workspaceAdmissionStarted.resolve();
+      return workspaceAdmission.promise.then(() => payload.path);
     }
     if (command === "set_workspace_root") return Promise.resolve(payload.path);
     if (command === "save_project_session") return Promise.resolve(payload.session);
@@ -1495,7 +1495,7 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     submissionOriginSessionKey: oldSessionKey,
   }), true);
   assert.equal(useAppStore.getState().currentSessionId, null);
-  assert.equal(workspaceTreeInvocations, 0);
+  assert.equal(workspaceAdmissionInvocations, 0);
 
   const replayCalls = [];
   const admissionResults = [];
@@ -1535,12 +1535,12 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     true,
     JSON.stringify(admissionResults[0].result),
   );
-  await withTimeout(workspaceTreeStarted.promise, "failed clear replay workspace tree");
+  await withTimeout(workspaceAdmissionStarted.promise, "failed clear replay workspace admission");
   assert.equal(semanticRequests.length, 1, "exact reactivation admits one semantic request");
   assert.equal(JSON.parse(semanticRequests[0][1].content).currentRequest, "清理失败后作为全新回合重放");
-  // The fresh replay reuses the current in-flight workspace-tree request;
+  // The fresh replay reuses the current in-flight workspace admission request;
   // strict FIFO admission must not duplicate the same workspace read.
-  assert.equal(workspaceTreeInvocations, 1);
+  assert.equal(workspaceAdmissionInvocations, 1);
   assert.equal(admissionResults.length, 1, "clear recovery creates exactly one fresh admission");
   assert.equal(replayCalls.length, 2, "one dispatch and its same-claim semantic resume");
   assert.equal(replayCalls[0][0], latestText);
@@ -1578,14 +1578,14 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
     replayedState.conversationTurns.find((turn) => turn.id !== oldTurnId).userPrompt,
     /清理失败后作为全新回合重放/,
   );
-  assert.equal(workspaceTreeInvocations, 1);
+  assert.equal(workspaceAdmissionInvocations, 1);
 
   useAppStore.setState({
     sendMessage: realSendMessage,
     acceptWorkspaceInstruction: realAcceptWorkspaceInstruction,
   });
   await useAppStore.getState().clearChatHistory();
-  workspaceTree.resolve("");
+  workspaceAdmission.resolve("");
   await new Promise((resolve) => setImmediate(resolve));
 });
 

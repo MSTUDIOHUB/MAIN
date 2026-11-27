@@ -1,5 +1,6 @@
 import { hashPlanDraftCandidate } from "../../lib/planDrafts";
 import type { RuntimeV2Event, RuntimeV2RunIdentity, TurnAggregateV1 } from "../../lib/runtime-v2";
+import { TOOL_SEARCH_TOOL_NAME } from "../../lib/toolSearch";
 import { SUBMIT_WORK_PLAN_TOOL_NAME } from "./planModelProtocol";
 import { PLAN_SUBMISSION_VALIDATION_REJECTION_CODE } from "./planSubmissionRepair";
 
@@ -58,13 +59,32 @@ function rejectedValidationCommands(
   return [...new Set(commands)];
 }
 
+interface ValidationRepairCandidate {
+  candidate: Record<string, unknown>;
+  feedback: string;
+  rejectedCommands: readonly string[];
+}
+
 type ValidationRecovery =
-  | { kind: "repair"; candidate: Record<string, unknown>; feedback: string; rejectedCommands: readonly string[] }
+  | ({ kind: "focus" | "repair"; reason?: "closed_capability_discovery" } & ValidationRepairCandidate)
   | { kind: "exhausted" };
 
-/** Try a focused validation repair when the same complete candidate stalls
- * on validation alone. The current evidence frontier and its receipts also
- * govern the decision after a restart. */
+/** Match the effective capability result, so changing the query text does not
+ * reopen the same closed observation. Undecodable and old receipts carry no fact. */
+function capabilitySearchResult(content: string | undefined): { unlocked: boolean; key: string } | null {
+  if (!content) return null;
+  try {
+    const result: unknown = JSON.parse(content);
+    if (!isRecord(result) || result.type !== "tool_search.result" || !Array.isArray(result.newlyUnlocked) ||
+      !Array.isArray(result.alreadyAvailable) || !result.alreadyAvailable.every(name => typeof name === "string")) return null;
+    return { unlocked: result.newlyUnlocked.length > 0, key: JSON.stringify([...new Set(result.alreadyAvailable)].sort()) };
+  } catch {
+    return null;
+  }
+}
+
+/** Reframe validated but fruitless capability discovery at the current
+ * evidence frontier, which is reconstructed from the ledger after a restart. */
 export function planValidationRecovery(
   aggregate: TurnAggregateV1,
   run: RuntimeV2RunIdentity,
@@ -73,18 +93,24 @@ export function planValidationRecovery(
   if (recoveryStartedSequence === undefined) return null;
   const commands = new Map<string, Extract<RuntimeV2Event, { type: "command.scheduled" }>>();
   const rejectedCandidates = new Set<string>();
-  let duplicate: Extract<ValidationRecovery, { kind: "repair" }> | null = null;
+  const seenCapabilityResults = new Set<string>();
+  let latestGap: ValidationRepairCandidate | null = null;
+  let duplicate: ValidationRepairCandidate | null = null;
+  let closedDiscovery = false;
+  let focusSettled = false;
   let repairResponded = false;
   let repairSubmission: { responseSequence: number; callId: string; hash: string } | null = null;
   for (const event of aggregate.events) {
-    if (event.sequence < recoveryStartedSequence || !("run" in event) || !sameRun(event.run, run)) continue;
+    if (!("run" in event) || !sameRun(event.run, run)) continue;
     if (event.type === "command.scheduled") {
       if (sameRun(event.command.run, run)) commands.set(event.command.idempotencyKey, event);
       continue;
     }
     if (event.type === "provider.responded") {
       repairSubmission = null;
+      if (event.sequence < recoveryStartedSequence) continue;
       const request = commands.get(event.idempotencyKey)?.command;
+      if (request?.kind === "request_model" && request.payload.planValidationDiscoveryFocus === true) focusSettled = true;
       if (request?.kind !== "request_model" || request.payload.planValidationOnlyRepair !== true) continue;
       repairResponded = true;
       const calls = event.result.toolCalls;
@@ -95,20 +121,41 @@ export function planValidationRecovery(
       }
       continue;
     }
-    if (event.type === "command.completed" && event.status === "failed" &&
-      event.failureReasonCode === PLAN_VALIDATION_REPAIR_FAILED) {
+    if (event.type === "command.completed" && event.status === "failed" && event.failureReasonCode &&
+      event.sequence >= recoveryStartedSequence) {
       const request = commands.get(event.idempotencyKey)?.command;
-      if (request?.kind === "request_model" && request.payload.planValidationOnlyRepair === true) return { kind: "exhausted" };
+      if (request?.kind === "request_model" && request.payload.planValidationDiscoveryFocus === true) focusSettled = true;
+      if (request?.kind === "request_model" && request.payload.planValidationOnlyRepair === true &&
+        event.failureReasonCode === PLAN_VALIDATION_REPAIR_FAILED) return { kind: "exhausted" };
       continue;
     }
-    if (event.type !== "tool.completed" || event.status !== "failed" || event.failureKind !== "protocol_invalid" ||
-      event.failureReasonCode !== PLAN_SUBMISSION_VALIDATION_REJECTION_CODE) continue;
+    if (event.type !== "tool.completed") continue;
     const scheduled = commands.get(event.idempotencyKey);
     if (!scheduled) continue;
     const { command } = scheduled;
+    if (latestGap && event.sequence >= recoveryStartedSequence && command.kind === "execute_tool" &&
+      command.payload.toolName === TOOL_SEARCH_TOOL_NAME && event.status === "succeeded" && event.receiptOrigin !== "replayed") {
+      const result = capabilitySearchResult(event.modelContent);
+      if (!result) continue;
+      if (result.unlocked) {
+        seenCapabilityResults.clear();
+        closedDiscovery = false;
+      } else {
+        closedDiscovery ||= seenCapabilityResults.has(result.key);
+        seenCapabilityResults.add(result.key);
+      }
+      continue;
+    }
+    if (event.status !== "failed" || event.failureKind !== "protocol_invalid" ||
+      event.failureReasonCode !== PLAN_SUBMISSION_VALIDATION_REJECTION_CODE) continue;
     if (command.kind !== "execute_tool" || command.payload.runtimeControlPlane !== true ||
       command.payload.toolName !== SUBMIT_WORK_PLAN_TOOL_NAME || typeof command.payload.toolCallId !== "string") continue;
+    latestGap = null;
     duplicate = null;
+    if (!focusSettled) {
+      seenCapabilityResults.clear();
+      closedDiscovery = false;
+    }
     const candidate = command.payload.arguments;
     if (!isRecord(candidate)) continue;
     const hash = hashPlanDraftCandidate(candidate);
@@ -118,10 +165,14 @@ export function planValidationRecovery(
     if (typeof candidate.planMarkdown !== "string" || !candidate.planMarkdown.trim() || !feedback) continue;
     const diagnostics = validationOnlyDiagnostics(feedback);
     if (!diagnostics) continue;
-    if (rejectedCandidates.has(hash)) {
-      duplicate = { kind: "repair", candidate, feedback, rejectedCommands: rejectedValidationCommands(candidate, diagnostics) };
-    }
+    latestGap = { candidate, feedback, rejectedCommands: rejectedValidationCommands(candidate, diagnostics) };
+    if (event.sequence < recoveryStartedSequence) continue;
+    if (rejectedCandidates.has(hash)) duplicate = latestGap;
     rejectedCandidates.add(hash);
   }
-  return repairResponded ? null : duplicate;
+  if (repairResponded) return null;
+  if (duplicate) return { kind: "repair", ...duplicate };
+  return closedDiscovery && latestGap
+    ? { kind: focusSettled ? "repair" : "focus", reason: "closed_capability_discovery", ...latestGap }
+    : null;
 }

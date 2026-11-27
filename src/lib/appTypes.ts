@@ -75,6 +75,7 @@ export interface AppConfig {
   instructionsEnabled: boolean;
   hooksEnabled: boolean;
   activeProfile: "local" | "cloud";
+  experimentalOmlxFirstResponse?: boolean;
   chatFontSize: number;
   sessionRecordingEnabled: boolean;
   debugRecordFullTurnProcess: boolean;

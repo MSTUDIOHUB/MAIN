@@ -40,6 +40,7 @@ import { collectPlanRevisionPathEvidence, observedPlanRevisionArtifact, scopedPl
 import { approvedPlanExecutionRepair } from "../../lib/runtime-v2/unityCompilation";
 import { recoverPendingPlanReadBatch } from "./planReadRecovery";
 import { recoverPlanSubmission } from "./planSubmissionRepair";
+import { recoverRuntimeV2PlanCheckpointBoundary, restoreRuntimeV2PlanEmergencyTerminal } from "./planCheckpointRecovery";
 import {
   resolveRuntimeV2PlanReviewFromAggregate,
 } from "./workPlanAdapter";
@@ -229,6 +230,27 @@ export async function bootstrapRuntimeV2Plan(
       : null,
     input.logStoreEvent,
   );
+  const recovery = { runner: input, ledger, run: identity.run };
+  const emergency = await restoreRuntimeV2PlanEmergencyTerminal(recovery);
+  if (emergency) return { settlement: emergency };
+  try {
+    return await prepareRuntimeV2Plan({ input, initialState, turn, identity, ledger, existing, revisionSourceReference });
+  } catch (error) {
+    const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...recovery, error, canUseReservedTerminal: true });
+    if (settlement) return { settlement };
+    throw error;
+  }
+}
+
+async function prepareRuntimeV2Plan({ input, initialState, turn, identity, ledger, existing, revisionSourceReference }: {
+  readonly input: RuntimeV2PlanRunnerInput;
+  readonly initialState: ReturnType<RuntimeV2PlanRunnerInput["get"]>;
+  readonly turn: ConversationTurn;
+  readonly identity: PlanBootstrapReady["identity"];
+  readonly ledger: PlanLedger;
+  readonly existing: ReturnType<typeof getRuntimeV2Checkpoint>;
+  readonly revisionSourceReference: ConversationTurn["approvedPlanContinuation"];
+}): Promise<PlanBootstrapResult> {
   const recoveredDraft = await recoverRuntimeV2PlanDraft(input, ledger, identity.run);
   if (recoveredDraft) return { settlement: recoveredDraft };
   if (existing?.aggregate.terminalOutcome) {

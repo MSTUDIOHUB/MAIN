@@ -1,5 +1,7 @@
 import type { DebugLogLevel } from "./debugLog";
 
+export const RUNTIME_V2_SLOW_CHECKPOINT_MS = 250;
+
 const ERROR_EVENTS = new Set([
   "runtime_v2_execute_infrastructure_failure",
   "runtime_v2_execute_infrastructure_terminal_failed",
@@ -37,8 +39,10 @@ export function resolveStoreEventLogLevel(
   if (
     WARN_SUFFIXES.some((suffix) => name.endsWith(suffix)) ||
     name === "runtime_v2_provider_language_retry" ||
+    name === "runtime_v2_projection_skipped" ||
     (name === "runtime_v2_ledger_committed" &&
-      data?.eventType === "recovery.exhausted")
+      (data?.eventType === "recovery.exhausted" ||
+        (typeof data?.elapsedMs === "number" && data.elapsedMs >= RUNTIME_V2_SLOW_CHECKPOINT_MS)))
   ) {
     return "warn";
   }

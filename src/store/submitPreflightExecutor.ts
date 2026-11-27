@@ -66,6 +66,7 @@ export async function executeSubmitBlockingPreflight<
     isOriginSessionActive: latestSnapshot.isOriginSessionActive,
     isOriginOwnerCurrent: latestSnapshot.isOriginOwnerCurrent,
   });
+  if (action.kind !== "resume") preflight?.preparedChatAnswer?.dispose?.();
 
   if (action.kind === "stale_discard") {
     input.logStoreEvent("intent_preflight_stale_discarded", {
@@ -104,6 +105,7 @@ export async function executeSubmitBlockingPreflight<
   }
 
   if (input.claimResume && !input.claimResume()) {
+    preflight?.preparedChatAnswer?.dispose?.();
     return { kind: "skip_inactive_session", phase: "intent_preflight", sessionKey: input.effect.sendOriginSessionKey || "" };
   }
   input.resumeSubmission(action.text, action.images, action.options);
@@ -179,6 +181,7 @@ export function startSubmitBlockingPreflightEffect<
     concludeWithoutExecution: input.concludeWithoutExecution,
     resumeSubmission: (text, images, options) => {
       const accepted = input.resumeSubmission(text, images, options);
+      if (!accepted) options.preparedChatAnswer?.dispose?.();
       // Reuse the dispatcher's synchronous adoption handoff before any queued
       // UI drain can mistake an asynchronous bootstrap for a stale executor.
       if (workspace && !(accepted && input.onWorkspaceResumeAccepted?.(options))) {

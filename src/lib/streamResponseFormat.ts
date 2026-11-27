@@ -34,9 +34,17 @@ export function isUnsupportedStreamResponseFormat(message: string): boolean {
 
 /** Retry without optional stream usage reporting when a server rejects stream_options. */
 export function isUnsupportedStreamUsageOption(message: string): boolean {
+  return isRejectedOptionalStreamField(message, "(?:stream_options(?:\\.include_usage)?|include_usage)", ["stream_options", "stream_options.include_usage", "include_usage"]);
+}
+
+export function isUnsupportedPromptProgressOption(message: string): boolean {
+  return isRejectedOptionalStreamField(message, "return_progress", ["return_progress"]);
+}
+
+function isRejectedOptionalStreamField(message: string, fieldPattern: string, params: readonly string[]): boolean {
   const text = String(message || "").toLowerCase();
   if (!/^http\s+(?:400|422)\b/.test(text.trim())) return false;
-  const field = "(?:[\"']?stream_options(?:\\.include_usage)?[\"']?|[\"']include_usage[\"'])(?![\\w.\\[])";
+  const field = `[\"']?${fieldPattern}[\"']?(?![\\w.\\[])`;
   const rejectsField = new RegExp(`(?:unsupported|unknown|unrecognized|extra\\s+inputs?\\s+(?:are\\s+)?not\\s+permitted)\\s*(?:for\\s+|[:=]?\\s*)?(?:(?:request\\s+)?(?:parameter|field|argument)(?:\\s+supplied)?\\s*[:=]?\\s*)?${field}`);
   const fieldRejected = new RegExp(`${field}\\s+(?:(?:parameter|field)\\s+)?(?:(?:is|are)\\s+)?(?:not supported|unsupported|unknown|unrecognized|not permitted|forbidden)\\b`);
   const cannotSupportField = new RegExp(`(?:does not|doesn't|cannot)\\s+support\\s+${field}`);
@@ -44,7 +52,12 @@ export function isUnsupportedStreamUsageOption(message: string): boolean {
   try {
     const json = JSON.parse(text.slice(text.indexOf("{")));
     const error = json.error || json;
-    return ["stream_options", "stream_options.include_usage", "include_usage"].includes(error.param) &&
-      ["unsupported_parameter", "unknown_parameter", "unrecognized_parameter", "unsupported_field", "extra_forbidden"].includes(error.code);
+    const unsupported = ["unsupported_parameter", "unknown_parameter", "unrecognized_parameter", "unsupported_field", "extra_forbidden"].includes(error.code);
+    return (params.includes(error.param) && unsupported) ||
+      (Array.isArray(json.detail) && json.detail.length > 0 && json.detail.every(
+        (issue: { type?: string; loc?: unknown[] }) =>
+          issue?.type === "extra_forbidden" &&
+          Array.isArray(issue.loc) && params.includes(String(issue.loc[issue.loc.length - 1])),
+      ));
   } catch { return false; }
 }

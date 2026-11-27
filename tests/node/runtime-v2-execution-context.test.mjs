@@ -1673,6 +1673,110 @@ test("a structured missing-source mutation failure survives restart as correctiv
   );
 });
 
+test("a changed patch source invalidates only that file's older read and replay before normal recovery", async () => {
+  const target = "src/controller.js";
+  const unaffected = "src/other.js";
+  const older = `${"// filler\n".repeat(118)}export const controlSpeed = 1;\n`;
+  const current = older.replace("controlSpeed = 1", "controlSpeed = 3");
+  const loaded = loadTs(path.join(workspaceRoot, "src/lib/readFileWindow.ts"));
+  const { sha256Hex } = loadTs(path.join(workspaceRoot, "src/lib/sha256.ts"));
+  const oldVersion = `sha256-${sha256Hex(older)}`;
+  const currentVersion = `sha256-${sha256Hex(current)}`;
+  const candidate = { id: "refresh", name: "read_file", arguments: { path: target, start_line: 118, end_line: 119 } };
+  const patch = ["*** Begin Patch", `*** Update File: ${target}`, "@@", "-export const controlSpeed = 1;", "+export const controlSpeed = 2;", "*** End Patch"].join("\n");
+  const live = executionTypes.createRuntimeV2LiveExecutionState();
+  const versionedWindow = (path, contents, args) => loaded.ensureVersionedReadFileResultForModel(
+    path, loaded.formatReadFileWindowForModel(path, contents, args), `sha256-${sha256Hex(contents)}`,
+  );
+  const oldReceipt = versionedWindow(target, older, candidate.arguments);
+  const otherReceipt = versionedWindow(unaffected, "export const other = 1;\n", {});
+  function tool(callId, name, args) {
+    return { ...command("acting"), kind: "execute_tool", idempotencyKey: callId, payload: { toolCallId: callId, toolName: name, arguments: args } };
+  }
+  function addPair(cmd, receipt) {
+    live.messages.push({ role: "assistant", content: "", tool_calls: [{ id: cmd.payload.toolCallId, type: "function", function: {
+      name: cmd.payload.toolName, arguments: JSON.stringify(cmd.payload.arguments),
+    } }] });
+    if (receipt) live.messages.push({ role: "tool", tool_call_id: cmd.payload.toolCallId, content: receipt });
+  }
+  const firstRead = tool("old-read", "read_file", candidate.arguments);
+  const replay = tool("old-replay", "read_file", candidate.arguments);
+  const unrelatedRead = tool("other-read", "read_file", { path: unaffected });
+  const rejectedPatch = tool("proposed-patch", "apply_patch", { patch });
+  addPair(firstRead, oldReceipt);
+  addPair(replay, oldReceipt);
+  addPair(unrelatedRead, otherReceipt);
+  addPair(rejectedPatch);
+  const scheduled = (command) => ({ type: "command.scheduled", command });
+  const completed = (cmd, target, version) => ({ type: "tool.completed", idempotencyKey: cmd.idempotencyKey, status: "succeeded",
+    evidence: [{ kind: "source", target, version }] });
+  const events = [scheduled(firstRead), completed(firstRead, target, oldVersion), scheduled(replay),
+    { type: "tool.completed", idempotencyKey: replay.idempotencyKey, status: "succeeded", evidence: [], receiptOrigin: "replayed" },
+    scheduled(unrelatedRead), completed(unrelatedRead, unaffected, loaded.extractReadFileWindowMetadata(otherReceipt).contentVersion), scheduled(rejectedPatch)];
+  const unresolved = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({ events: [...events, {
+    type: "tool.completed", idempotencyKey: rejectedPatch.idempotencyKey, status: "blocked", evidence: [],
+    failureKind: "protocol_invalid", failureReasonCode: "mutation_source_lease_missing", presentation: { target },
+  }] });
+  assert.ok(providerToolSurface.runtimeV2ProviderCoveredReadReceipt(candidate, live.messages, unresolved), "an evicted request lease can replay known unchanged source");
+
+  live.mutationSourceCoverageByToolCallId.set(rejectedPatch.idempotencyKey, [{
+    target, version: oldVersion, complete: false, totalLines: 119,
+    windows: [{ startLine: 119, endLine: 119, content: "export const controlSpeed = 1;\n" }],
+  }]);
+  const ports = { live, get: () => ({}), context: { turnId: "turn", runWorkspace: "/fixture", runSessionKey: "session", phaseLanguage: "en" }, now: () => 100, nextId: (scope) => scope, logStoreEvent() {} };
+  const executor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
+  const originalExecute = executor.executeTool;
+  const originalAuthorize = authorization.authorizeToolForCurrentTurn;
+  const executions = [];
+  const approvals = [];
+  executor.executeTool = async (name, args) => {
+    executions.push(name);
+    assert.equal(name, "read_file", "recovery never applies the rejected patch");
+    return args.__raw ? current : versionedWindow(args.path, current, args);
+  };
+  authorization.authorizeToolForCurrentTurn = async (_ports, name, args) => {
+    approvals.push({ name, path: args.path });
+    return { allowed: true, reason: null };
+  };
+  try {
+    const prepared = await executionMutationPreflight.prepareRuntimeV2Mutation({
+      ports, command: rejectedPatch, toolName: "apply_patch", target, failureContextTarget: target,
+      args: { patch }, toolExecutionOptions: {},
+    });
+    assert.equal(prepared.allowed, false);
+    assert.equal(prepared.completion.failureReasonCode, "mutation_source_changed");
+    assert.deepEqual(prepared.completion.evidence, []);
+    const feedback = live.messages.at(-1).content;
+    assert.match(feedback, /read_file\(\{"path":"src\/controller\.js","start_line":\d+,"end_line":119\}\)/);
+    assert.doesNotMatch(feedback, /controlSpeed = [123]/, "preflight's private raw read is not shown to the model");
+    events.push(prepared.completion);
+    const effects = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({ events });
+    assert.deepEqual([...effects.invalidatedSourceReadToolCallIds], ["old-read", "old-replay"]);
+    const patchIdentity = providerToolSurface.runtimeV2ProviderToolCallIdentity({ name: "apply_patch", arguments: { patch } });
+    assert.ok(effects.rejectedActionIdentities.has(patchIdentity), "the rejected patch stays closed until fresh source arrives");
+    assert.equal(providerToolSurface.runtimeV2ProviderCoveredReadReceipt(candidate, live.messages, effects), null);
+    assert.equal(providerToolSurface.completedRuntimeV2ProviderToolCallIdentities(live.messages, effects).has(
+      providerToolSurface.runtimeV2ProviderToolCallIdentity(candidate)), false);
+    const recoveryCommand = tool(candidate.id, candidate.name, candidate.arguments);
+    addPair(recoveryCommand);
+    const recovery = await executionToolPort.createRuntimeV2ToolPort(ports).execute({ command: recoveryCommand, signal: new AbortController().signal });
+    assert.deepEqual(approvals, [{ name: "read_file", path: target }]);
+    assert.deepEqual(executions, ["read_file", "read_file"]);
+    assert.equal(recovery.evidence[0].version, currentVersion);
+    const source = live.messages.at(-1).content;
+    assert.match(source, /controlSpeed = 3/);
+    assert.doesNotMatch(source, /controlSpeed = 1/);
+    const finalFacts = providerEffectFacts.deriveRuntimeV2ProviderEffectFacts({ events: [...events, scheduled(recoveryCommand), recovery] });
+    assert.equal(finalFacts.rejectedActionIdentities.has(patchIdentity), false, "the model may make a new proposal after a fresh source receipt, subject to normal anchor and lease checks");
+    const view = providerHistory.buildRuntimeV2DecisionView(live.messages, finalFacts);
+    assert.ok(view.some(message => String(message.content).includes("controlSpeed = 3")));
+    assert.ok(view.every(message => !String(message.content).includes("controlSpeed = 1")));
+  } finally {
+    executor.executeTool = originalExecute;
+    authorization.authorizeToolForCurrentTurn = originalAuthorize;
+  }
+});
+
 test("the durable ledger retains every rejected action until a committed mutation", () => {
   const rejectedCalls = Array.from({ length: 13 }, (_, index) => ({
     name: "replace_in_file",
@@ -6836,13 +6940,26 @@ test("preferred collaboration keeps the user's deliverable authoritative instead
 
   assert.match(prompt, /explicitly prefers collaboration/i);
   assert.match(prompt, /current child-request capacity is 2/i);
-  assert.match(prompt, /independent tasks may queue/i);
+  assert.match(prompt, /2 currently free for parallel work alongside the parent/i);
   assert.match(prompt, /requested deliverable and depth/i);
   assert.match(prompt, /independent result.*benefit/i);
   assert.doesNotMatch(prompt, /prioritize issuing|up to 2 spawn_subagent calls|as many/i);
   assert.match(prompt, /continue non-dependent parent work in parallel/i);
   assert.match(prompt, /not a mandatory lifecycle stage/i);
   assert.match(prompt, /simple or linear task, proceed directly/i);
+});
+
+test("a single available child slot runs in parallel with the parent", () => {
+  const command = { payload: { mode: "execute", collaborationPreferred: true, remainingSubagentCapacity: 1,
+    collaborationRequestMode: "parallel" } };
+  const surface = { hasReadFile: true, hasMutation: true, hasSpawnSubagent: true, hasWaitSubagents: true };
+  const available = providerRequest.providerModeInstruction(command, "", surface);
+  assert.match(available, /1 currently free for parallel work alongside the parent/i);
+  assert.doesNotMatch(available, /sequentially rather than concurrently/i);
+  const occupied = providerRequest.providerModeInstruction({ payload: { ...command.payload,
+    activeSubagents: [{ id: "source-review", objective: "Check an independent component" }],
+  } }, "", surface);
+  assert.match(occupied, /0 currently free for parallel work alongside the parent/i);
 });
 
 test("execution prompt stops asking for the same source after versioned evidence exists", () => {

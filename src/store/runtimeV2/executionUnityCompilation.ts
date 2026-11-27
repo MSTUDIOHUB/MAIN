@@ -1,6 +1,6 @@
 import { runUnityEditorOperation } from "../../lib/ipc";
 import { deriveRuntimeV2PlanExecutionFrontier, type RuntimeV2Command, type RuntimeV2EventDraft } from "../../lib/runtime-v2";
-import { deriveUnityCompilation, deriveUnityShaderImport, unityCompilationMessage, unityCompilationTarget, unityShaderImportTarget, UNITY_COMPILE_PROJECT_TOOL, type UnityCompilationResult } from "../../lib/runtime-v2/unityCompilation";
+import { deriveUnityCompilation, deriveUnityShaderImport, unityCheckTargetInProject, unityCompilationMessage, unityCompilationTarget, unityShaderImportTarget, UNITY_COMPILE_PROJECT_TOOL, type UnityCompilationResult } from "../../lib/runtime-v2/unityCompilation";
 import { aggregateForCurrentTurn } from "./executionAggregate";
 import { authorizationFor, runtimeV2ToolApprovalCapability, runtimeV2ToolCapabilityRestriction } from "./executionAuthorizationContext";
 import { executeRuntimeV2ToolWithDeadline } from "./executionToolDeadline";
@@ -30,10 +30,19 @@ export async function executeUnityCompilation(
     !authorization.policy.disabledRiskLevels.includes("shell") &&
     !runtimeV2ToolCapabilityRestriction(ports, "run_command", args) &&
     !runtimeV2ToolApprovalCapability(ports, "run_command", args);
-  // A closed Editor takes a full batch boot. Coalesce reviewed script
-  // changes until the last script boundary; connected Editors stay live.
+  // A closed Editor takes a full batch boot. Defer only for pending changes
+  // in the same project, so another project's write cannot consume this check.
+  const projectHint = (path: string) => {
+    const segments = path.split("/");
+    const assets = segments.flatMap((part, index) => /^(?:Assets|Packages)$/i.test(part) ? [index] : []);
+    return assets.length === 1 ? segments.slice(0, assets[0]).join("/") || "." : null;
+  };
+  const currentProjectHint = boundary.targets[0] ? projectHint(boundary.targets[0]) : null;
   const deferClosed = deriveRuntimeV2PlanExecutionFrontier(aggregate)?.steps.some(step =>
-    step.status !== "completed" && step.targets.some(path => resolveTarget(path, workspace))) === true;
+    step.status !== "completed" && step.targets.some(path => {
+      const target = resolveTarget(path, workspace);
+      return !!target && (shader || currentProjectHint !== null && projectHint(target) === currentProjectHint);
+    })) === true;
   let result = await executeRuntimeV2ToolWithDeadline({
     toolName: UNITY_COMPILE_PROJECT_TOOL,
     toolTimeoutMs: UNITY_COMPILE_TIMEOUT_MS + 2_000,
@@ -58,8 +67,9 @@ export async function executeUnityCompilation(
             ...(shader ? { shaderImportTargets: boundary.importTargets } : {}),
           }, signal, deadlineAt) as UnityCompilationResult | null;
           if (output && (!output.kind || output.kind === kind) &&
-              ["passed", "failed", "unavailable", "not_unity_project", "deferred_closed"].includes(output.status)) {
-            const verifiedTargets = output.targets?.length === boundary.targets.length &&
+              ["passed", "failed", "unavailable", "not_unity_project", "deferred_closed", "project_fragment"].includes(output.status)) {
+            const verifiedTargets = boundary.targets.every(path => unityCheckTargetInProject(path, output.projectRoot)) &&
+              output.targets?.length === boundary.targets.length &&
               output.targets.every((target, index) => target.path === boundary.targets[index] &&
                 (!shader && target.version === null || /^sha256-[a-f0-9]{64}$/.test(target.version || "")) &&
                 (!(target.path in boundary.expectedVersions) || boundary.expectedVersions[target.path] === target.version));
@@ -75,7 +85,9 @@ export async function executeUnityCompilation(
           nativeResult = { status: "unavailable", message: String(error instanceof Error ? error.message : error).slice(0, 1_200) };
         }
       }
-      if (nativeResult.status !== "unavailable") return nativeResult;
+      if (nativeResult.status !== "unavailable" ||
+          boundary.targets.some(path => !unityCheckTargetInProject(path)) ||
+          nativeResult.projectRoot && nativeResult.projectRoot !== ".") return nativeResult;
       try {
         return await observeBoundUnityMcpDiagnostics({
           ports, signal, deadlineAt, workspace, kind, targets: boundary.targets, expectedVersions: boundary.expectedVersions,
@@ -96,6 +108,7 @@ export async function executeUnityCompilation(
   result = { ...result, kind };
   const en = ports.context.phaseLanguage === "en";
   const silent = result.status === "not_unity_project" || result.status === "deferred_closed";
+  const projectFragment = result.status === "project_fragment";
   const success = result.status === "passed" || silent;
   const message = result.status === "passed"
     ? (shader ? (en ? "Shader import verified" : "已验证 Shader 导入") : (en ? "Compilation passed" : "编译通过"))
@@ -103,14 +116,14 @@ export async function executeUnityCompilation(
   ports.logStoreEvent("runtime_v2_unity_compilation_completed", {
     sessionKey: command.run.sessionKey, turnId: command.run.turnId, runId: command.run.runId,
     commandKey: command.idempotencyKey, mutationSequence: boundary.sequence,
-    status: result.status, checkKind: kind, editor: result.editor ?? null, editorPid: result.editorPid ?? null, editorInstanceId: result.editorInstanceId ?? null, targets: boundary.targets,
+    status: result.status, checkKind: kind, projectRoot: result.projectRoot ?? null, editor: result.editor ?? null, editorPid: result.editorPid ?? null, editorInstanceId: result.editorInstanceId ?? null, targets: boundary.targets,
     errorCount: result.errorCount ?? result.diagnostics?.length ?? 0,
   });
   return {
     type: "tool.completed", run: command.run, idempotencyKey: command.idempotencyKey,
-    status: success ? "succeeded" : "failed", evidence: [],
+    status: success ? "succeeded" : projectFragment ? "blocked" : "failed", evidence: [],
     modelContent: JSON.stringify(result),
-    ...(success ? {} : { failureKind: "execution_failed", failureReasonCode: shader
+    ...(success ? {} : projectFragment ? { failureKind: "target_invalid", failureReasonCode: "unity_project_fragment" } : { failureKind: "execution_failed", failureReasonCode: shader
       ? (result.status === "failed" ? "unity_shader_import_failed" : "unity_shader_import_unavailable")
       : (result.status === "failed" ? "unity_compilation_failed" : "unity_compilation_unavailable") }),
     ...(silent ? {} : { presentation: {

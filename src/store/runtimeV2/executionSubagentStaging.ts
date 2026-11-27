@@ -413,6 +413,7 @@ export async function commitRuntimeV2StagedBatch(input: {
         kind: "mutation",
         target,
         version,
+        previousVersion: staged.baseVersions[target] ?? "deleted",
       });
     }
     input.ports.logStoreEvent("runtime_v2_subagent_mutation_committed", {

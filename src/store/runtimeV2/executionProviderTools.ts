@@ -1,4 +1,4 @@
-import { isChatContext } from "./readOnlyPolicy";
+import { isChatContext, runtimeV2ChatToolNames } from "./readOnlyPolicy";
 import { RUNTIME_V2_KNOWLEDGE_READ_TOOL_NAMES } from "../../lib/runtime-v2/workspaceReadPolicy";
 import { type ToolDefinition } from "../../lib/toolSchemas";
 import type { ToolCapabilityRegistry } from "../../lib/toolCapabilities";
@@ -79,6 +79,10 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
   readonly correctiveValidationCommand?: string;
 }): ToolDefinition[] {
   const mode = String(input.command.payload.mode || "").trim();
+  if (mode !== "conclude" && (mode === "chat" || isChatContext(input.ports))) {
+    const names = runtimeV2ChatToolNames(input.ports);
+    return input.available.filter(definition => names.has(definition.function.name));
+  }
   const mcpRiskFor = (name: string) => {
     const capability = input.capabilityRegistry?.tools[name];
     return capability?.source === "mcp" && capability.enabled
@@ -130,13 +134,6 @@ export function selectRuntimeV2ProviderToolDefinitions(input: {
     return input.available.filter((definition) =>
       definition.function.name === "wait_subagents" &&
       collaboration.has("wait_subagents")
-    );
-  }
-  if (mode === "chat" || isChatContext(input.ports)) {
-    return input.available.filter((definition) =>
-      ["load_skill", "tool_search", "web_search", "web_fetch"].includes(
-        definition.function.name,
-      ) || knowledgeTool(definition.function.name)
     );
   }
   if (mode === "analyze") {

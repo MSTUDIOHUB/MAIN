@@ -124,9 +124,9 @@ export default function SubagentsPanel({
     return statusLabel("queued", language);
   };
   const skipReasons: Record<RuntimeV2ProactiveSkipReason, readonly [string, string]> = {
-    no_independent_scope: ["当前没有可独立委派的范围", "No independent scope is available"],
-    no_parallel_capacity: ["模型通道当前无并发容量", "The model lane has no parallel capacity"],
-    slots_in_use: ["子请求槽位已占用", "Child request slots are occupied"],
+    no_independent_scope: ["当前证据尚未支持独立委派", "Current evidence has not established an independent scope"],
+    no_parallel_capacity: ["模型通道当前无法同时运行子请求", "The model lane currently cannot run a child in parallel"],
+    slots_in_use: ["当前可用的子请求槽位均已占用", "All available child request slots are occupied"],
     workspace_read_restricted: ["当前工作区读取受限", "Workspace reads are restricted"],
     insufficient_runway: ["剩余运行时间不足", "The remaining run time is too short"],
   };

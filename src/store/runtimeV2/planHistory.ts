@@ -1,4 +1,5 @@
 import { appendRuntimeV2GuidanceHistory } from "../../lib/runtime-v2/guidance";
+import { TOOL_SEARCH_TOOL_NAME } from "../../lib/toolSearch";
 import type { AgentMessage } from "../../lib/agentMessages";
 import { runtimeV2ClarificationMessage } from "./clarificationHistory";
 import type { RuntimeV2RunIdentity, TurnAggregateV1, WorkPlanRuntimeEvidence } from "../../lib/runtime-v2";
@@ -38,6 +39,8 @@ export function restorePlanHistory(input: {
 }): void {
   const events = input.aggregate.events.filter((event) => "run" in event && event.run.runId === input.run.runId);
   const commands = events.flatMap((event) => event.type === "command.scheduled" ? [event] : []);
+  const discoveryKeys = new Set(commands.filter(({ command }) => command.payload.toolName === TOOL_SEARCH_TOOL_NAME)
+    .map(({ command }) => command.idempotencyKey));
   const skillCommands = new Map(commands.flatMap(({ command }) => {
     const { toolCallId, toolName, arguments: args } = command.payload;
     return toolName === "load_skill" && typeof toolCallId === "string" && args && typeof args === "object" && !Array.isArray(args)
@@ -71,7 +74,7 @@ export function restorePlanHistory(input: {
       if (event.result.diagnostics.length) input.messages.push({ role: "system", content: JSON.stringify({ planProviderFeedback: event.result.diagnostics }) });
     }
     const source = event.type === "observation.recorded" ? [event.evidence]
-      : event.type === "tool.completed" && event.status === "succeeded" ? event.evidence : [];
+      : event.type === "tool.completed" && event.status === "succeeded" && !discoveryKeys.has(event.idempotencyKey) ? event.evidence : [];
     for (const item of source.filter((item) => /^E\d+$/.test(item.id))) {
       const content = "modelContent" in event ? event.modelContent : undefined;
       const prior = input.evidence.find((entry) => entry.id === item.id);

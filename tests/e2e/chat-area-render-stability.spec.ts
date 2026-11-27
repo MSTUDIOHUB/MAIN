@@ -53,6 +53,7 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "plugin:event|unlisten") return null;
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "get_workspace_root") return "";
+      if (cmd === "list_all_session_snapshots" || cmd === "list_legacy_session_files") return [];
       if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return [];
       if (cmd === "get_git_status") return { isRepo: false, gitAvailable: true, clean: true };
       if (cmd === "main_update_status") return { status: "idle" };

@@ -20,6 +20,7 @@ export interface RuntimeV2ValidationBoundary {
 
 interface RuntimeV2ValidationBoundaryAggregate {
   readonly events: readonly RuntimeV2Event[];
+  readonly turn?: { readonly workspaceKey: string };
 }
 
 export function isRuntimeV2FileVersion(version: string | null): boolean {
@@ -61,6 +62,90 @@ export function latestRuntimeV2WorkspaceChange(aggregate: RuntimeV2ValidationBou
   return receipts[receipts.length - 1];
 }
 
+export interface RuntimeV2WorkspaceNetChange {
+  readonly target: string;
+  readonly beforeVersion: string | null | undefined;
+  readonly version: string | null;
+  readonly status: "created" | "modified" | "deleted" | "unchanged" | "unverified";
+}
+
+const workspaceNetChangesByLedger = new WeakMap<readonly RuntimeV2Event[], {
+  workspaceKey?: string;
+  changes: readonly RuntimeV2WorkspaceNetChange[];
+}>();
+
+function comparableMutationVersion(version: string | null | undefined): string | null | undefined {
+  if (version?.startsWith("deleted:")) return "deleted";
+  return version && /^[a-f0-9]{64}$/.test(version) ? `sha256-${version}` : version;
+}
+
+/** Keep effects and delivery separate. A restored byte version or create/delete
+ * pair still invalidates old validation, but delivers no changed path. */
+export function deriveRuntimeV2WorkspaceNetChanges(
+  aggregate: RuntimeV2ValidationBoundaryAggregate,
+  afterSequence = -1,
+): readonly RuntimeV2WorkspaceNetChange[] {
+  const workspaceKey = aggregate.turn?.workspaceKey;
+  const cached = afterSequence === -1 ? workspaceNetChangesByLedger.get(aggregate.events) : undefined;
+  if (cached && cached.workspaceKey === workspaceKey) return cached.changes;
+  const changes = new Map<string, {
+    beforeVersion: string | null | undefined;
+    version: string | null;
+    discontinuous: boolean;
+  }>();
+  const key = (target: string) => normalizeValidationWorkspaceCwd(target, workspaceKey);
+  const writes = new Set(runtimeV2WorkspaceChangeReceipts(aggregate));
+  for (const receipt of aggregate.events) {
+    if (receipt.sequence <= afterSequence) continue;
+    if (receipt.type === "tool.completed" && receipt.presentation?.toolName === "run_command") {
+      for (const observed of receipt.observedWorkspaceRemovals || []) {
+        const path = key(observed.target);
+        if (!path) continue;
+        const prior = changes.get(path);
+        if (prior && prior.beforeVersion === "deleted" && prior.version === comparableMutationVersion(observed.priorMutationVersion)) {
+          changes.set(path, { ...prior, version: "deleted" });
+        }
+      }
+    }
+    if (receipt.type !== "tool.completed" && receipt.type !== "subagent.completed" || !writes.has(receipt)) continue;
+    for (const evidence of receipt.evidence) {
+      if (evidence.kind !== "mutation") continue;
+      const path = key(evidence.target);
+      if (!path || path === ".") continue;
+      const created = receipt.type === "tool.completed" && receipt.mutationRequests?.some(
+        request => request.operation === "create" && key(request.target) === path,
+      );
+      const previous = comparableMutationVersion(evidence.previousVersion ?? (created ? "deleted" : evidence.previousVersion));
+      const version = comparableMutationVersion(evidence.version) ?? null;
+      const prior = changes.get(path);
+      changes.set(path, {
+        beforeVersion: prior ? prior.beforeVersion : previous,
+        version,
+        discontinuous: Boolean(prior?.discontinuous || prior && previous &&
+          previous !== prior.version && !(previous === "present" && prior.version !== "deleted")),
+      });
+    }
+  }
+  const net: RuntimeV2WorkspaceNetChange[] = [...changes].map(([target, { beforeVersion, version, discontinuous }]) => ({
+    target, beforeVersion, version,
+    status: discontinuous || beforeVersion === null || version === null ? "unverified"
+      : beforeVersion === version ? "unchanged"
+      : version === "deleted" ? "deleted"
+      : beforeVersion === "deleted" ? "created"
+      : "modified",
+  }));
+  if (afterSequence === -1) workspaceNetChangesByLedger.set(aggregate.events, { workspaceKey, changes: net });
+  return net;
+}
+
+export function runtimeV2DeliveredWorkspacePaths(
+  aggregate: RuntimeV2ValidationBoundaryAggregate,
+  afterSequence = -1,
+): readonly string[] {
+  return deriveRuntimeV2WorkspaceNetChanges(aggregate, afterSequence).flatMap(change =>
+    change.status === "unchanged" || change.status === "unverified" ? [] : [change.target]);
+}
+
 function uniqueTargets(targets: readonly string[]): readonly string[] {
   const unique: string[] = [];
   for (const target of targets) {
@@ -89,13 +174,7 @@ export function runtimeV2DirectExecuteCriterionIds(
 export function runtimeV2DirectExecuteMutationTargets(
   aggregate: RuntimeV2ValidationBoundaryAggregate,
 ): readonly string[] {
-  return uniqueTargets(
-    runtimeV2WorkspaceChangeReceipts(aggregate).flatMap((event) =>
-      event.evidence
-        .filter((evidence) => evidence.kind === "mutation")
-        .map((evidence) => evidence.target)
-    ),
-  );
+  return runtimeV2DeliveredWorkspacePaths(aggregate);
 }
 
 export function runtimeV2DirectExecuteAuthorityDigest(input: {

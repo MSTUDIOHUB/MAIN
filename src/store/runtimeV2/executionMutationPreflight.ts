@@ -15,7 +15,10 @@ import type {
   RuntimeV2Command,
   RuntimeV2EventDraft,
 } from "../../lib/runtime-v2";
-import { preflightWorkspaceMutation, type WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
+import { inferMutationRecoveryRange, preflightWorkspaceMutation, type WorkspaceWriteFileTargetFact } from "../../lib/workspaceMutationPreflight";
+import { parseApplyPatch } from "../../lib/applyPatchTool";
+import { sha256Hex } from "../../lib/sha256";
+import { workspacePathsReferToSameFile } from "../../lib/workspacePaths";
 import {
   executeRuntimeV2ToolWithDeadline,
   type RuntimeV2ToolDeadlineBoundary,
@@ -28,6 +31,8 @@ import {
   runtimeV2ProviderToolCallIdentity,
 } from "./providerToolSurface";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import { runtimeV2MutationLeases } from "./correctiveMutationPolicy";
+import { MUTATION_SOURCE_CHANGED_REASON, runtimeV2MutationSourceRefreshInstruction } from "./executionMutationRejection";
 
 type RuntimeV2MutationPreparation =
   | {
@@ -97,14 +102,19 @@ export async function prepareRuntimeV2Mutation(input: {
   readonly toolExecutionOptions: ToolExecutionOptions;
 }): Promise<RuntimeV2MutationPreparation> {
   const workspace = input.ports.context.runWorkspace || "";
+  const leases = input.toolName === "replace_in_file" || input.toolName === "apply_patch"
+    ? runtimeV2MutationLeases(input.ports, String(input.command.payload.toolCallId || ""))
+    : [];
+  const changedSources = new Map<string, string>();
   const preflight = await preflightWorkspaceMutation({
     toolName: input.toolName,
     args: input.args,
     language: input.ports.context.phaseLanguage,
     sessionKey: input.ports.context.runSessionKey,
     workspaceRoot: workspace,
-    readFile: async (path) => String(
-      await executeRuntimeV2ToolWithDeadline({
+    includeRecoverySource: false,
+    readFile: async (path) => {
+      const current = String(await executeRuntimeV2ToolWithDeadline({
         toolName: "read_file",
         lifecycleDeadlineAt: input.ports.lifecycleDeadlineAt,
         now: input.ports.now,
@@ -136,8 +146,14 @@ export async function prepareRuntimeV2Mutation(input: {
           input.ports.context.runSessionKey,
           input.toolExecutionOptions,
         ),
-      }),
-    ),
+      }));
+      const lease = leases.find(entry => workspacePathsReferToSameFile(entry.target, path));
+      if (lease && /^sha256-[a-f0-9]{64}$/.test(lease.version) && lease.version !== `sha256-${sha256Hex(current)}`) {
+        changedSources.set(path, current);
+        throw new Error("Source version changed before mutation preparation.");
+      }
+      return current;
+    },
     probeFileAvailability: async (path) => {
       try {
         await getFileMetadata(path, workspace);
@@ -153,45 +169,51 @@ export async function prepareRuntimeV2Mutation(input: {
       maxResults: 80,
     }, workspace),
   });
-  if (!preflight.ok) {
+  if (!preflight.ok || changedSources.size > 0) {
     const rejectedActionIdentity =
       runtimeV2ProviderToolCallIdentity({
         name: input.toolName,
         arguments: input.args,
       });
-    const mismatchRange = preflight.patchRecoveryMismatch?.requestedRange;
-    const mismatchPath =
-      preflight.patchRecoveryMismatch?.target ||
-      preflight.path ||
-      input.target;
-    const sourceMismatch = preflight.recoveryKind === "source_mismatch";
-    const mutationRejected = preflight.recoveryKind === "mutation_rejected";
-    const refreshLine = mismatchRange?.startLine
-      ? Math.floor(
-          (
-            mismatchRange.startLine +
-            (mismatchRange.endLine || mismatchRange.startLine)
-          ) / 2,
-        )
+    const staleSource = changedSources.entries().next().value;
+    const mismatchPath = staleSource?.[0] || preflight.patchRecoveryMismatch?.target || preflight.path || input.target;
+    const mismatchRange = preflight.patchRecoveryMismatch?.target === mismatchPath
+      ? preflight.patchRecoveryMismatch?.requestedRange
       : null;
-    const sourceRefreshHint =
-      (sourceMismatch || mutationRejected) &&
-        mismatchPath &&
-        refreshLine
-        ? `${mismatchPath}:${refreshLine}:1 - refresh this exact source window before retrying a smaller valid mutation`
-        : "";
-    const failureReceipt = runtimeV2MutationPreflightFailureReceipt({
-      message: preflight.message,
-      reason: preflight.reason,
-      recoveryKind: preflight.recoveryKind,
-      sourceRefreshHint,
-    });
+    const sourceMismatch = preflight.recoveryKind === "source_mismatch";
+    const requiresCurrentRead = sourceMismatch || !!staleSource;
+    let recoveryRange = mismatchRange;
+    if (staleSource && !recoveryRange) {
+      const current = staleSource[1];
+      const anchors = input.toolName === "apply_patch"
+        ? parseApplyPatch(String(input.args.patch || "")).operations
+          .filter(operation => workspacePathsReferToSameFile(operation.path, mismatchPath))
+          .flatMap(operation => operation.hunks.map(hunk => hunk.oldText))
+        : [String(input.args.search_text || "")];
+      const anchor = anchors.find(text => !current.includes(text.replace(/\n$/, ""))) || anchors[0];
+      if (anchor) recoveryRange = inferMutationRecoveryRange(current, anchor);
+    }
+    const failureReceipt = requiresCurrentRead
+      ? {
+          content: [
+            `MUTATION_SOURCE_CHANGED: ${mismatchPath}. The edit was rejected before writing.`,
+            runtimeV2MutationSourceRefreshInstruction({ target: mismatchPath, requestedRange: recoveryRange }),
+          ].join("\n"),
+          failureKind: "source_mismatch" as const,
+          failureReasonCode: MUTATION_SOURCE_CHANGED_REASON,
+        }
+      : runtimeV2MutationPreflightFailureReceipt({
+          message: preflight.message,
+          reason: preflight.reason,
+          recoveryKind: preflight.recoveryKind,
+        });
+    const receiptTarget = requiresCurrentRead ? mismatchPath : preflight.path || input.failureContextTarget;
     const content = failureReceipt.content;
     recordToolResultHistory({
       ports: input.ports,
       command: input.command,
       toolName: input.toolName,
-      target: preflight.path || input.failureContextTarget,
+      target: receiptTarget,
       status: "failed",
       content,
     });
@@ -200,12 +222,12 @@ export async function prepareRuntimeV2Mutation(input: {
       runId: input.command.run.runId,
       commandKind: input.command.kind,
       toolName: input.toolName,
-      target: preflight.path || input.target || null,
-      reason: preflight.reason || "invalid_mutation",
-      recoveryKind: preflight.recoveryKind || null,
-      mismatchTarget: preflight.patchRecoveryMismatch?.target || null,
-      mismatchStartLine: mismatchRange?.startLine || null,
-      mismatchEndLine: mismatchRange?.endLine || null,
+      target: receiptTarget || null,
+      reason: requiresCurrentRead ? MUTATION_SOURCE_CHANGED_REASON : preflight.reason || "invalid_mutation",
+      recoveryKind: requiresCurrentRead ? "source_mismatch" : preflight.recoveryKind || null,
+      mismatchTarget: requiresCurrentRead ? mismatchPath : null,
+      mismatchStartLine: recoveryRange?.startLine || null,
+      mismatchEndLine: recoveryRange?.endLine || null,
       message: preflight.message?.slice(0, 1_000) || null,
       actionIdentity: rejectedActionIdentity,
     });
@@ -216,7 +238,7 @@ export async function prepareRuntimeV2Mutation(input: {
         input.command,
         input.toolName,
         input.args,
-        preflight.path || input.failureContextTarget,
+        receiptTarget,
         content,
         "failed",
         failureReceipt.failureKind,

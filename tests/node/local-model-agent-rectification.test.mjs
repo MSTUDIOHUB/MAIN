@@ -109,6 +109,9 @@ const {
 const { preflightWorkspaceMutation } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/workspaceMutationPreflight.ts"),
 );
+const { runtimeV2MutationSourceRefreshInstruction } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/store/runtimeV2/executionMutationRejection.ts"),
+);
 const { loadSkillCatalog, loadSkillContent, resolveSkillId } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/agentSkills.ts"),
 );
@@ -234,8 +237,9 @@ test("Phase 3: workspaceCheckpoints records pre-mutation snapshots and rewinds t
   assert.equal(listWorkspaceCheckpoints(sessionKey).length, 0);
 });
 
-test("Phase 3: preflightWorkspaceMutation attaches nearby actual file snippet on search_text_mismatch", async () => {
+test("Phase 3: a replacement mismatch guides a focused read without exposing preflight source", async () => {
   const fileContent = [
+    ...Array.from({ length: 100 }, () => "// fixture header"),
     "export function calculateScore(base: number) {",
     "  const bonus = base * 2;",
     "  return bonus + 10;",
@@ -250,13 +254,24 @@ test("Phase 3: preflightWorkspaceMutation attaches nearby actual file snippet on
       replace_text: "export function calculateScore(base: number) {\n  return base;\n}",
     },
     language: "zh",
+    includeRecoverySource: false,
     readFile: async () => fileContent,
   });
 
   assert.equal(result.ok, false);
   assert.equal(result.reason, "search_text_mismatch");
-  assert.match(result.message, /请直接复制下方当前文件中的真实代码片段修正 search_text 后重试/);
-  assert.match(result.message, /const bonus = base \* 2;/);
+  assert.equal(result.recoveryKind, "source_mismatch");
+  assert.match(result.message, /读取.*源码/);
+  const mismatch = result.patchRecoveryMismatch;
+  assert.equal(mismatch?.target, "src/score.ts");
+  const guidance = runtimeV2MutationSourceRefreshInstruction(mismatch);
+  const readArguments = guidance.match(/read_file\((\{[^\n]+\})\)/)?.[1];
+  assert.ok(readArguments, "recovery should propose the ordinary read_file tool");
+  const { path: sourcePath, start_line, end_line } = JSON.parse(readArguments);
+  assert.equal(sourcePath, "src/score.ts");
+  assert.ok(start_line > 1 && start_line <= 101 && end_line >= 102);
+  assert.ok(end_line - start_line + 1 <= 80);
+  assert.doesNotMatch(`${result.message}\n${guidance}`, /const bonus = base \* 2;/);
 });
 
 test("Phase 4: parseExplicitTextToolEnvelope parses both <tool_call> JSON and legacy <tool_use> XML parameters", () => {

@@ -34,6 +34,168 @@ const SHELL_EXECUTION_TOOL_NAMES = new Set([
   "execute_command",
 ]);
 
+export interface ToolCallSchemaHint {
+  readonly properties?: Record<string, { readonly type?: string }>;
+  readonly required?: ReadonlySet<string> | readonly string[];
+}
+
+const FALLBACK_SPILLED_PARAMETER_KEYS = new Set([
+  "planMarkdown",
+  "changes",
+  "validations",
+  "questions",
+  "title",
+  "markdown",
+  "path",
+  "content",
+  "search_text",
+  "replace_text",
+  "command",
+]);
+
+function escapeNormalizationRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripTrailingParameterMarkup(value: string, key: string): string {
+  const escapedKey = escapeNormalizationRegExp(key);
+  return value
+    .replace(
+      new RegExp(
+        `(?:\\r?\\n|[ \\t])*(?:</${escapedKey}>|\\*/${escapedKey}\\*|</parameter>|</arg_value>)\\s*$`,
+        "i",
+      ),
+      "",
+    )
+    .replace(/(?:\r?\n|[ \t])*(?:<\/parameter>|<\/arg_value>)\s*$/i, "")
+    .trimEnd();
+}
+
+function parseSpilledParameterSegment(
+  key: string,
+  rawSegment: string,
+  schema?: ToolCallSchemaHint,
+): unknown {
+  const cleaned = stripTrailingParameterMarkup(rawSegment, key).trim();
+  const targetType = schema?.properties?.[key]?.type;
+  if (targetType !== "string" && (cleaned.startsWith("[") || cleaned.startsWith("{"))) {
+    try {
+      return JSON.parse(cleaned);
+    } catch {
+      // Keep raw cleaned text so downstream schema/compiler errors surface intact.
+    }
+  }
+  return cleaned;
+}
+
+function hasAssignedArgument(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+}
+
+/**
+ * Recovers tool parameters when a native/XML tool stream leaves closing-tag
+ * drift or spills subsequent parameter segments into an earlier string field.
+ */
+export function recoverSpilledXmlToolArguments(
+  toolName: string,
+  args: Record<string, unknown>,
+  schema?: ToolCallSchemaHint,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...(args || {}) };
+  const schemaProperties = schema?.properties;
+  const isKnownKey = (key: string) =>
+    schemaProperties && Object.keys(schemaProperties).length > 0
+      ? Object.prototype.hasOwnProperty.call(schemaProperties, key)
+      : FALLBACK_SPILLED_PARAMETER_KEYS.has(key);
+
+  const spilledTagPattern =
+    /<(?:parameter=|parameter\s+name=["']|arg_key>)([A-Za-z_][A-Za-z0-9_]*)(?:["']\s*>|\s*>|<\/arg_key>\s*(?:<arg_value>)?)/gi;
+
+  for (const [currentKey, rawValue] of Object.entries(next)) {
+    if (typeof rawValue !== "string" || !rawValue) continue;
+    spilledTagPattern.lastIndex = 0;
+    const matches: Array<{ key: string; start: number; end: number }> = [];
+    let match: RegExpExecArray | null;
+    while ((match = spilledTagPattern.exec(rawValue)) !== null) {
+      const candidateKey = String(match[1] || "").trim();
+      if (!candidateKey || candidateKey === currentKey || !isKnownKey(candidateKey)) continue;
+      matches.push({
+        key: candidateKey,
+        start: match.index,
+        end: match.index + match[0].length,
+      });
+    }
+    if (matches.length > 0) {
+      next[currentKey] = stripTrailingParameterMarkup(
+        rawValue.slice(0, matches[0]!.start),
+        currentKey,
+      );
+      for (let i = 0; i < matches.length; i += 1) {
+        const entry = matches[i]!;
+        const segmentEnd = matches[i + 1]?.start ?? rawValue.length;
+        if (!hasAssignedArgument(next[entry.key])) {
+          next[entry.key] = parseSpilledParameterSegment(
+            entry.key,
+            rawValue.slice(entry.end, segmentEnd),
+            schema,
+          );
+        }
+      }
+    }
+  }
+
+  const requiredKeys = schema?.required ? [...schema.required] : [];
+  for (const [currentKey, rawValue] of Object.entries(next)) {
+    if (typeof rawValue !== "string" || !rawValue) continue;
+    const escapedKey = escapeNormalizationRegExp(currentKey);
+    const tailJsonPattern = new RegExp(
+      `(?:\\r?\\n|[ \\t])*(?:</${escapedKey}>|\\*/${escapedKey}\\*)\\s*(\\[[\\s\\S]*\\]|\\{[\\s\\S]*\\})\\s*$`,
+      "i",
+    );
+    const tailMatch = rawValue.match(tailJsonPattern);
+    if (tailMatch && tailMatch[1]) {
+      try {
+        const parsed = JSON.parse(tailMatch[1]);
+        const expectedType = Array.isArray(parsed)
+          ? "array"
+          : parsed && typeof parsed === "object"
+            ? "object"
+            : null;
+        if (expectedType) {
+          const targetKey =
+            requiredKeys.find((candidateKey) =>
+              candidateKey !== currentKey &&
+              !hasAssignedArgument(next[candidateKey]) &&
+              schemaProperties?.[candidateKey]?.type === expectedType
+            ) ||
+            (toolName === "submit_runtime_v2_work_plan" &&
+              expectedType === "array" &&
+              !hasAssignedArgument(next.changes) &&
+              !hasAssignedArgument(next.changesJson)
+              ? "changes"
+              : undefined);
+          if (targetKey) {
+            next[targetKey] = parsed;
+            next[currentKey] = rawValue.slice(0, tailMatch.index).trimEnd();
+            continue;
+          }
+        }
+      } catch {
+        // Ignore non-JSON tail segments.
+      }
+    }
+    const stripped = stripTrailingParameterMarkup(rawValue, currentKey);
+    if (stripped !== rawValue) {
+      next[currentKey] = stripped;
+    }
+  }
+
+  return next;
+}
+
 function unwrapScalarString(value: string): string {
   let next = value
     .replace(/<\/?parameter[^>\n]*>/gi, "")
@@ -178,8 +340,13 @@ export function normalizeToolCallForExecution(
   toolName: string,
   args: Record<string, unknown>,
   workspace?: string | null,
+  schema?: ToolCallSchemaHint,
 ): Record<string, unknown> {
-  const executionArgs = { ...(args || {}) };
+  const executionArgs = recoverSpilledXmlToolArguments(
+    toolName,
+    args || {},
+    schema,
+  );
   if (toolName === "replace_in_file") {
     executionArgs.path ??=
       executionArgs.target ??

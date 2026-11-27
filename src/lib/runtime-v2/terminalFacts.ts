@@ -17,6 +17,7 @@ import {
 } from "./unityCompilation";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
 import {
+  runtimeV2DeliveredWorkspacePaths,
   runtimeV2ValidationBoundaryMatchesCurrent,
   runtimeV2WorkspaceChangeReceipts,
 } from "./validationReceipt";
@@ -126,11 +127,7 @@ export function deriveRuntimeV2TerminalAcceptanceFacts(
   );
 
   const deliveredFiles = uniqueOrderedPaths([
-    ...relevantMutations.flatMap((event) =>
-      event.evidence
-        .filter((ev) => ev.kind === "mutation")
-        .map((ev) => workspaceRelativeTarget(ev.target, aggregate.turn.workspaceKey)),
-    ),
+    ...runtimeV2DeliveredWorkspacePaths(aggregate, hasApprovedWorkPlan ? approvedSeq : -1),
     ...(continuation?.continuation.carriedTargets.map((item) =>
       workspaceRelativeTarget(item.target, aggregate.turn.workspaceKey),
     ) || []),
@@ -280,6 +277,10 @@ function formatUnityCheckLine(
         return zh
           ? "- Unity 编译检查：当前目录不适用 Unity 编译检查。"
           : "- Unity compilation check: Unity compilation check not applicable to this directory.";
+      case "project_fragment":
+        return zh
+          ? "- Unity 编译检查：工作区包含 Unity 源码，缺少完整 Unity 项目，编译未执行。"
+          : "- Unity compilation check: the workspace contains Unity source and lacks a complete project. Compilation did not run.";
       case "passed":
         return zh
           ? "- Unity 编译检查：C# 编译通过。"
@@ -301,6 +302,10 @@ function formatUnityCheckLine(
       return zh
         ? "- Unity Shader 导入检查：当前目录不适用 Unity 编译检查。"
         : "- Unity shader import check: Unity compilation check not applicable to this directory.";
+    case "project_fragment":
+      return zh
+        ? "- Unity Shader 导入检查：缺少完整 Unity 项目，导入未执行。"
+        : "- Unity shader import check: the workspace lacks a complete project. Import did not run.";
     case "passed":
       return zh
         ? "- Unity Shader 导入检查：Shader 导入通过。"

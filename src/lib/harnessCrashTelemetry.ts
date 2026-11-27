@@ -383,6 +383,15 @@ export function isExactHarnessRunGeneration(
     marker.startedAt === owner.startedAt;
 }
 
+export function matchesHarnessTerminalNotice(current: HarnessRunMarker, requested: HarnessRunMarker): boolean {
+  return current.status === requested.status && (
+    current.closeReason === requested.closeReason ||
+    (current.status === "completed" && current.closeReason === "runtime_v2_terminal" &&
+      current.terminalResultKind === "canceled" && requested.terminalResultKind === "canceled" &&
+      Boolean(requested.closeReason))
+  );
+}
+
 /**
  * Settle one exact Harness generation. A retry of the same terminal meaning is
  * idempotent, while a marker from another process generation is never touched
@@ -401,9 +410,7 @@ export function settleHarnessRunMarkerIfOwned(
   ) {
     return null;
   }
-  const hasSameTerminalMeaning = current.status === marker.status &&
-    current.closeReason === marker.closeReason;
-  if (hasSameTerminalMeaning) {
+  if (matchesHarnessTerminalNotice(current, marker)) {
     const currentResultKind = current.terminalResultKind || null;
     const requestedResultKind = marker.terminalResultKind || null;
     if (
@@ -413,6 +420,7 @@ export function settleHarnessRunMarkerIfOwned(
     ) return null;
     const effectiveResultKind = requestedResultKind || currentResultKind;
     const resultKindNeedsRepair = !currentResultKind && !!requestedResultKind;
+    const reasonNeedsRepair = current.closeReason !== marker.closeReason;
     const sameAuthorityWithoutRepairableResult = hasSameHarnessLeaseIdentity(current, marker) &&
       current.status === marker.status &&
       current.activeRunId === marker.activeRunId &&
@@ -424,6 +432,7 @@ export function settleHarnessRunMarkerIfOwned(
     if (!sameAuthorityWithoutRepairableResult) return null;
     if (
       !resultKindNeedsRepair &&
+      !reasonNeedsRepair &&
       current.planStage === marker.planStage &&
       current.isPlanApproved === marker.isPlanApproved
     ) {
@@ -432,6 +441,7 @@ export function settleHarnessRunMarkerIfOwned(
     const repairMarker = {
       ...current,
       ...(effectiveResultKind ? { terminalResultKind: effectiveResultKind } : {}),
+      closeReason: marker.closeReason,
       planStage: marker.planStage,
       isPlanApproved: marker.isPlanApproved,
       updatedAt: Math.max(current.updatedAt, marker.updatedAt),

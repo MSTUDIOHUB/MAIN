@@ -52,6 +52,16 @@ const runtime = loadTs(
 const { createRuntimeV2CheckpointPort } = loadTs(
   path.join(workspaceRoot, "src/store/runtimeV2/checkpointPort.ts"),
 );
+const { createRuntimeV2ProjectionPort } = loadTs(
+  path.join(workspaceRoot, "src/store/runtimeV2/projectionPort.ts"),
+);
+const { PlanCheckpointTerminalReserveError, PlanLedger } = loadTs(
+  path.join(workspaceRoot, "src/store/runtimeV2/planLedger.ts"),
+);
+const { recoverRuntimeV2PlanCheckpointBoundary, restoreRuntimeV2PlanEmergencyTerminal } = loadTs(
+  path.join(workspaceRoot, "src/store/runtimeV2/planCheckpointRecovery.ts"),
+);
+const { beginSessionCancellation } = loadTs(path.join(workspaceRoot, "src/store/sessionCancellationBarrier.ts"));
 
 const owner = {
   workspaceKey: "/fixture",
@@ -81,12 +91,12 @@ function nextEvent(state, type, fields = {}) {
   };
 }
 
-function activeAggregate() {
+function activeAggregate(strategy = "execute") {
   let aggregate = runtime.transition(
     null,
     nextEvent(null, "turn.admitted", {
       turn: owner,
-      strategy: "execute",
+      strategy,
       objective: "Repair the fixture",
       constraints: [],
       acceptanceCriteria: ["The fixture works"],
@@ -98,7 +108,7 @@ function activeAggregate() {
     aggregate,
     nextEvent(aggregate, "run.started", {
       run,
-      phase: "observing",
+      phase: strategy === "plan" ? "planning" : "observing",
     }),
   );
   return aggregate;
@@ -131,7 +141,8 @@ function adapterHarness(input = {}) {
     }),
     persistSessionRecord: async (_scope, patch) => {
       persisted.push(patch);
-      if (persistFailure) throw persistFailure;
+      const failure = typeof persistFailure === "function" ? persistFailure(patch) : persistFailure;
+      if (failure) throw failure;
       return { ...patch, storageRevision: 2 };
     },
     publishOwnerScopedRuntimeProjection: ({
@@ -148,11 +159,173 @@ function adapterHarness(input = {}) {
     persisted,
     logs,
     getState: () => state,
+    setState: update => { state = { ...state, ...(typeof update === "function" ? update(state) : update) }; },
     allowPersistence: () => {
       persistFailure = null;
     },
   };
 }
+
+function planBoundaryHarness({ checkpoint = checkpointFor(activeAggregate("plan")), persistFailure, language = "zh", markerRun = run, abortCtrl = new AbortController(), envelope } = {}) {
+  const initial = recordedState(checkpoint);
+  initial.config = { ...initial.config, activeProfile: "local", local: { provider: "fixture", model: "fixture" } };
+  initial.harnessRunMarker = { ...markerRun, status: "running" };
+  initial.runtimeEvents = [];
+  initial.conversationTurns = [];
+  initial.isGenerating = true;
+  initial.agentStatus = "running";
+  if (envelope) initial.runtimeV2EmergencyTerminalEnvelopes[owner.turnId] = envelope;
+  const harness = adapterHarness({ state: initial, persistFailure });
+  let taskId = 0;
+  const runner = {
+    get: harness.getState,
+    context: { phaseLanguage: language, abortCtrl, runSessionKey: owner.sessionKey, turnId: owner.turnId, harnessRunId: run.runId },
+    logStoreEvent: (event, data) => harness.logs.push({ event, data }),
+  };
+  const projection = createRuntimeV2ProjectionPort({
+    get: harness.getState, set: harness.setState,
+    language, nextTaskId: () => ++taskId, logStoreEvent: runner.logStoreEvent,
+  });
+  const ledger = new PlanLedger(owner, harness.port, projection, checkpoint, runner.logStoreEvent);
+  return { ...harness, runner, ledger, run };
+}
+
+function assertOnePlanFinal(harness, resultKind, reason) {
+  const state = harness.getState();
+  const finals = state.taskFlow.filter(block => block.visibility === "assistant_final" && block.turnId === owner.turnId);
+  assert.equal(finals.length, 1, JSON.stringify(harness.logs));
+  assert.match(finals[0].content, reason);
+  assert.equal(state.isGenerating, false);
+  assert.equal(state.harnessRunMarker.terminalResultKind, resultKind);
+  assert.equal(state.runtimeEvents.filter(event => event.type === "run.completed" && event.runId === run.runId).length, 1);
+  assert.equal(state.runtimeEvents.filter(event => event.type === "turn.completed" && event.turnId === owner.turnId).length, 1);
+}
+
+test("Plan event saturation closes through the exact envelope once and resumes without ledger writes", async () => {
+  let aggregate = activeAggregate("plan");
+  while (aggregate.events.length < runtime.MAX_RUNTIME_V2_CHECKPOINT_EVENTS) {
+    const id = `plan-fill-${aggregate.nextSequence}`;
+    aggregate = runtime.transition(aggregate, nextEvent(aggregate, "projection.published", { run, audience: "timeline", projectionId: id,
+      projection: { id, audience: "timeline", markdown: id, kind: "timeline", dedupeKey: id } }));
+  }
+  const checkpoint = checkpointFor(aggregate);
+  const harness = planBoundaryHarness({ checkpoint });
+  const error = await harness.ledger.append({ type: "soft_signal.observed", run, signal: "protocol_drift" }).then(
+    () => assert.fail("A saturated checkpoint must reject an append"), error => error,
+  );
+  assert.equal(error.reasonCode, "checkpoint_event_budget_exceeded");
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...harness, error });
+  assert.equal(settlement.disposition, "projected", JSON.stringify(harness.logs));
+  assert.equal(settlement.outcome.resultKind, "error");
+  assert.equal(harness.persisted.length, 1);
+  assert.deepEqual(Object.keys(harness.persisted[0].runtimeSnapshot), ["runtimeV2EmergencyTerminalEnvelopes"]);
+  const envelope = harness.getState().runtimeV2EmergencyTerminalEnvelopes[owner.turnId];
+  assert.equal(envelope.lastRevision, checkpoint.revision);
+  assert.equal(envelope.hasMutation, false);
+  assert.deepEqual(runtime.normalizeRuntimeV2EmergencyTerminalEnvelope(JSON.parse(JSON.stringify(envelope)), owner), envelope);
+  assertOnePlanFinal(harness, "error", /已达到安全容量边界.*未生成可交付的计划/u);
+  await restoreRuntimeV2PlanEmergencyTerminal(harness);
+  assert.equal(harness.persisted.length, 1);
+  assertOnePlanFinal(harness, "error", /未生成可交付的计划/u);
+  const restored = planBoundaryHarness({ checkpoint, envelope: JSON.parse(JSON.stringify(envelope)) });
+  await restoreRuntimeV2PlanEmergencyTerminal(restored);
+  assert.equal(restored.persisted.length, 0);
+  assertOnePlanFinal(restored, "error", /未生成可交付的计划/u);
+});
+
+test("Plan persistence failure uses bounded text and preserves a user abort as canceled", async () => {
+  const abortCtrl = new AbortController();
+  abortCtrl.abort();
+  const harness = planBoundaryHarness({ language: "en", abortCtrl, persistFailure: patch =>
+    Object.hasOwn(patch.runtimeSnapshot || {}, "runtimeV2EmergencyTerminalEnvelopes") ? null : new Error("PRIVATE_SOURCE_TEXT") });
+  const error = await harness.ledger.append({ type: "soft_signal.observed", run, signal: "protocol_drift" }).then(
+    () => assert.fail("The ordinary write must fail"), error => error,
+  );
+  assert.equal(error.reasonCode, "checkpoint_persist_failed");
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...harness, error });
+  assert.equal(settlement.outcome.status, "aborted");
+  assertOnePlanFinal(harness, "canceled", /could not be persisted.*user stopped plan generation/u);
+  const terminalEvent = harness.logs.find(entry => entry.event === "runtime_v2_plan_checkpoint_terminal");
+  assert.doesNotMatch(JSON.stringify(terminalEvent), /PRIVATE_SOURCE_TEXT/u);
+  assert.equal(terminalEvent.data.checkpointEventCount, 2);
+  const runtimeTypes = harness.getState().runtimeEvents.map(event => event.type);
+  assert.ok(runtimeTypes.indexOf("run.aborted") < runtimeTypes.indexOf("run.completed"));
+});
+
+test("Plan checkpoint recovery defers to an in-flight Stop terminal transaction", async () => {
+  const abortCtrl = new AbortController();
+  const harness = planBoundaryHarness({ abortCtrl });
+  abortCtrl.abort();
+  const message = "Stop committed the original cancellation.";
+  const { cancellation } = beginSessionCancellation(owner.sessionKey, owner.turnId, async () => {
+    await harness.ledger.finishTerminal({ run, resultKind: "canceled", reason: message, finalMarkdown: message });
+    return { terminalSettled: true, queueDisposition: "dispatch", disposition: "committed" };
+  });
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({
+    ...harness, error: new runtime.RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed"),
+  });
+  await cancellation.promise;
+  assert.equal(settlement.reason, message);
+  assert.equal(settlement.outcome.status, "aborted");
+  assertOnePlanFinal(harness, "canceled", /Stop committed/u);
+  assert.deepEqual(harness.getState().runtimeV2EmergencyTerminalEnvelopes, {});
+});
+
+test("Plan emergency recovery presents an already committed canonical result after a later write fails", async () => {
+  const harness = planBoundaryHarness({ persistFailure: patch => {
+    const checkpoint = patch.runtimeSnapshot?.runtimeV2Checkpoints?.[owner.turnId];
+    return checkpoint?.events.some(event => event.type === "projection.published" && event.audience === "final")
+      ? new Error("later checkpoint write failure")
+      : null;
+  } });
+  const originalFinal = "The saved plan document is ready.";
+  const error = await harness.ledger.finishTerminal({ run, resultKind: "success", reason: originalFinal, finalMarkdown: originalFinal }).then(
+    () => assert.fail("The final acknowledgment write must fail"), error => error,
+  );
+  assert.equal(error.reasonCode, "checkpoint_persist_failed");
+  assert.equal(harness.getState().runtimeV2Checkpoints[owner.turnId].aggregate.terminalOutcome.resultKind, "success");
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...harness, error });
+  assert.equal(settlement.outcome.resultKind, "success");
+  assertOnePlanFinal(harness, "success", /saved plan document is ready/u);
+  assert.deepEqual(harness.getState().runtimeV2EmergencyTerminalEnvelopes, {});
+});
+
+test("a Plan checkpoint fence never closes a newer harness owner", async () => {
+  const harness = planBoundaryHarness({ markerRun: { ...run, runId: "newer-run" } });
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({
+    ...harness, error: new runtime.RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed"),
+  });
+  assert.equal(settlement.disposition, "superseded");
+  assert.equal(settlement.currentOwner.harnessRunId, "newer-run");
+  assert.equal(harness.getState().isGenerating, true);
+  assert.equal(harness.getState().taskFlow.length, 0);
+  assert.equal(harness.persisted.length, 0);
+});
+
+test("Plan reports projection failure if both ordinary and emergency storage remain unavailable", async () => {
+  const harness = planBoundaryHarness({ persistFailure: new Error("DISK_ERROR_DETAILS") });
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({
+    ...harness, error: new runtime.RuntimeV2CheckpointWriteBoundaryError("checkpoint_persist_failed"),
+  });
+  assert.equal(settlement.disposition, "projection_failed");
+  assert.equal(harness.getState().taskFlow.length, 0);
+  assert.deepEqual(harness.getState().runtimeV2EmergencyTerminalEnvelopes, {});
+  assert.equal(harness.persisted.length, 2);
+  const diagnostic = harness.logs.find(entry => entry.event === "runtime_v2_plan_checkpoint_terminal_failed");
+  assert.equal(diagnostic.data.checkpointEventCount, 2);
+  assert.doesNotMatch(JSON.stringify(diagnostic), /DISK_ERROR_DETAILS/u);
+});
+
+test("Plan checkpoint reservation closes canonically and keeps the emergency slot unused", async () => {
+  const harness = planBoundaryHarness();
+  const settlement = await recoverRuntimeV2PlanCheckpointBoundary({
+    ...harness, canUseReservedTerminal: true, error: new PlanCheckpointTerminalReserveError(),
+  });
+  assert.equal(settlement.disposition, "projected");
+  assertOnePlanFinal(harness, "error", /接近容量上限/u);
+  assert.equal(runtime.isRuntimeV2TurnTerminallyClosed(harness.getState().runtimeV2Checkpoints[owner.turnId].aggregate), true);
+  assert.deepEqual(harness.getState().runtimeV2EmergencyTerminalEnvelopes, {});
+});
 
 function recordedState(checkpoint) {
   const state = {

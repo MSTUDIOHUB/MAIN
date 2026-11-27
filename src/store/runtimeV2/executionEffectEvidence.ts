@@ -2,11 +2,12 @@ import {
   BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES,
   resolveWorkspaceMutationTargets,
 } from "../../lib/workspaceMutationTools";
-import { getFileMetadata, readFileWindow } from "../../lib/ipc";
+import { getFileMetadata, observeWorktreeAbsence, readFileWindow } from "../../lib/ipc";
 import { getMcpToolOrigin } from "../../lib/mcpClient";
 import { normalizeMcpWorkspace } from "../../lib/workspaceMcp";
 import { normalizeValidationWorkspaceCwd } from "../../lib/validationContract";
 import type { RuntimeV2ToolEffectKind } from "../../lib/runtime-v2";
+import { deriveRuntimeV2WorkspaceNetChanges } from "../../lib/runtime-v2/validationReceipt";
 import { RUNTIME_V2_SOURCE_READ_TOOL_NAMES, isRuntimeV2ReadOnlyToolName } from "../../lib/runtime-v2/workspaceReadPolicy";
 import {
   authorizationFor,
@@ -19,6 +20,24 @@ import {
   runtimeV2ToolRiskForCall,
 } from "./executionAuthorizationContext";
 import type { RuntimeV2ExecutionPortsInput } from "./executionTypes";
+import { aggregateForCurrentTurn } from "./executionAggregate";
+
+export async function observeRuntimeV2CreatedPathRemovals(ports: RuntimeV2ExecutionPortsInput) {
+  const workspace = ports.context.runWorkspace;
+  const aggregate = aggregateForCurrentTurn(ports);
+  if (!workspace || !aggregate || runtimeV2ToolCapabilityRestriction(ports, "read_file") ||
+      runtimeV2ToolApprovalCapability(ports, "read_file")) return [];
+  const candidates = deriveRuntimeV2WorkspaceNetChanges(aggregate)
+    .filter(change => change.status === "created" && change.version).slice(0, 32);
+  if (!candidates.length) return [];
+  try {
+    const absent = new Set(await observeWorktreeAbsence(workspace, candidates.map(change => change.target)));
+    return candidates.flatMap(({ target, version }) => absent.has(target) && version
+      ? [{ target, priorMutationVersion: version }] : []);
+  } catch {
+    return [];
+  }
+}
 
 export async function boundUnityWorkspaceWriteVersions(ports: RuntimeV2ExecutionPortsInput, name: string, args: Record<string, unknown>, target: string) {
   const entry = authorizationFor(ports).toolCatalog.lookup(name);
@@ -47,7 +66,8 @@ export async function boundUnityWorkspaceWriteVersions(ports: RuntimeV2Execution
     const current = await Promise.all(paths.map(sample));
     return paths.flatMap((path, index) => {
       const version = current[index];
-      return version && previous[index] && version !== previous[index] ? [{ target: path, version }] : [];
+      const previousVersion = previous[index];
+      return version && previousVersion && version !== previousVersion ? [{ target: path, version, previousVersion }] : [];
     });
   };
 }
@@ -59,7 +79,7 @@ export function runtimeV2ToolEvidenceProjection(input: {
   readonly target: string;
   readonly result: Record<string, unknown> | null;
 }): {
-  readonly targets: readonly { target: string; version?: string }[];
+  readonly targets: readonly { target: string; version?: string; previousVersion?: string | null }[];
   readonly kind: "source" | "mutation" | "tool";
   readonly effectKind?: RuntimeV2ToolEffectKind;
   readonly operationName?: string;
@@ -69,13 +89,16 @@ export function runtimeV2ToolEvidenceProjection(input: {
   const builtIn = tool.status === "resolved" && tool.entry.source === "built_in";
   if (builtIn && BUILTIN_WORKSPACE_MUTATION_TOOL_NAMES.has(tool.entry.executionName) && input.result?.success === true) {
     const entries = tool.entry.executionName === "unity_create_scene"
-      ? [{ path: input.result.path || input.target, version: input.result.version }]
+      ? [{ path: input.result.path || input.target, version: input.result.version, previousVersion: "deleted" }]
       : input.result.mutationVersions;
     const targets = Array.isArray(entries) ? entries.flatMap(entry => {
       const target = normalizeValidationWorkspaceCwd(entry?.path, input.ports.context.runWorkspace);
       const version = entry?.version;
+      const previousVersion = entry?.previousVersion;
       return target && target !== "." && typeof version === "string" && /^(?:sha256-[a-f0-9]{64}|deleted)$/.test(version)
-        ? [{ target, version }] : [];
+        ? [{ target, version, ...(previousVersion === null || typeof previousVersion === "string" &&
+            /^(?:sha256-[a-f0-9]{64}|deleted|present)$/.test(previousVersion) ? { previousVersion } : {}) }]
+        : [];
     }) : [];
     return targets.length ? { targets, kind: "mutation", effectKind: "workspace_change" }
       : { targets: [], kind: "tool", effectKind: "observation" };

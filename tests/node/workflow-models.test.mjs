@@ -363,6 +363,24 @@ test("response language mismatch detection ignores code-heavy text and catches r
     targetLanguage: "zh",
   });
   assert.equal(mixedCodeTerms.mismatch, false);
+
+  const englishWithShortZhTerm = detectResponseLanguageMismatch({
+    text: "I reviewed all 23 source files and prepared 整改方案.",
+    targetLanguage: "zh",
+  });
+  assert.equal(englishWithShortZhTerm.mismatch, true);
+
+  const englishCommentaryWithZhTerm = detectResponseLanguageMismatch({
+    text: "I'll start by exploring the framework structure to understand 整改方案.",
+    targetLanguage: "zh",
+  });
+  assert.equal(englishCommentaryWithZhTerm.mismatch, true);
+
+  const zhWithPascalCaseSymbols = detectResponseLanguageMismatch({
+    text: "定位到 ObjectPoolManager.cs 的 Get<T> 异常。",
+    targetLanguage: "zh",
+  });
+  assert.equal(zhWithPascalCaseSymbols.mismatch, false);
 });
 
 test("normalizeConversationDisplayTitle strips speaker timestamps from transcript-style prompts", () => {

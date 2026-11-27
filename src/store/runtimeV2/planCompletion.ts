@@ -1,10 +1,11 @@
 import type { RuntimeRunSettlement } from "../../lib/runtimeRunSettlement";
 import { awaitCanceledTurnTerminalProjection, getPendingSessionCancellation } from "../sessionCancellationBarrier";
-import type {
-  RuntimeV2RunIdentity,
-  RuntimeV2TurnIdentity,
-  SealedWorkPlanV1,
-  WorkPlanRuntimeEvidence,
+import {
+  runtimeV2CheckpointWriteFailureReason,
+  type RuntimeV2RunIdentity,
+  type RuntimeV2TurnIdentity,
+  type SealedWorkPlanV1,
+  type WorkPlanRuntimeEvidence,
 } from "../../lib/runtime-v2";
 import type { RuntimeV2PlanCollaboration } from "./planCollaboration";
 import { PlanLedger } from "./planLedger";
@@ -26,6 +27,7 @@ import {
   resolveRuntimeV2PlanReviewFromAggregate,
 } from "./workPlanAdapter";
 import { recoverRuntimeV2PlanDraft } from "./planDraftRunner";
+import { recoverRuntimeV2PlanCheckpointBoundary } from "./planCheckpointRecovery";
 
 type RuntimeV2PlanCompletion =
   | {
@@ -37,12 +39,17 @@ type RuntimeV2PlanCompletion =
     readonly terminal: Parameters<typeof finishPlanTerminal>[0];
   };
 
-export function settleRuntimeV2PlanCompletion(
+export async function settleRuntimeV2PlanCompletion(
   completion: RuntimeV2PlanCompletion,
-): RuntimeRunSettlement | Promise<RuntimeRunSettlement> {
-  return completion.kind === "terminal"
-    ? finishPlanTerminal(completion.terminal)
-    : completion.settlement;
+): Promise<RuntimeRunSettlement> {
+  if (completion.kind === "settled") return completion.settlement;
+  try {
+    return await finishPlanTerminal(completion.terminal);
+  } catch (error) {
+    const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...completion.terminal, error });
+    if (settlement) return settlement;
+    throw error;
+  }
 }
 
 export async function completeRuntimeV2Plan(input: {
@@ -131,13 +138,29 @@ export async function completeRuntimeV2Plan(input: {
   };
 }
 
-export async function recoverRuntimeV2PlanFailure(input: {
+interface PlanFailureInput {
   readonly error: unknown;
   readonly runner: RuntimeV2PlanRunnerInput;
   readonly ledger: PlanLedger;
   readonly run: RuntimeV2RunIdentity;
   readonly collaboration: RuntimeV2PlanCollaboration;
-}): Promise<RuntimeV2PlanCompletion> {
+}
+
+export async function recoverRuntimeV2PlanFailure(input: PlanFailureInput): Promise<RuntimeV2PlanCompletion> {
+  try {
+    return await recoverPlanFailure(input);
+  } catch (error) {
+    if (!runtimeV2CheckpointWriteFailureReason(error)) throw error;
+    const canUseReservedTerminal = input.collaboration.activeChildCount() === 0;
+    input.collaboration.abortChildren("runtime_v2_plan_checkpoint_boundary");
+    const settlement = await recoverRuntimeV2PlanCheckpointBoundary({ ...input, error, canUseReservedTerminal });
+    if (settlement) return { kind: "settled", settlement };
+    throw error;
+  }
+}
+
+async function recoverPlanFailure(input: PlanFailureInput): Promise<RuntimeV2PlanCompletion> {
+  if (runtimeV2CheckpointWriteFailureReason(input.error)) throw input.error;
   const aggregate = input.ledger.snapshot();
   if (!aggregate?.run || aggregate.phase === "acting") throw input.error;
   if (

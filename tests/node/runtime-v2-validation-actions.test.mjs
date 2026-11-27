@@ -128,3 +128,33 @@ test("ordinary validation-phase commands remain tool effects and cannot clear a 
   state = response(state, { visibleText: "The change and validation succeeded." });
   assert.equal(outcomes.runtimeV2ExecuteTerminalDecision({ aggregate: state, signal: new AbortController().signal })?.resultKind, "success");
 });
+
+test("technical writes and authorized scratch removal preserve the actual delivery on cancel", () => {
+  let state = append(null, "turn.admitted", { turn, strategy: "execute", objective: "Repair the game", constraints: [], acceptanceCriteria: [] });
+  state = append(state, "run.started", { run, phase: "acting" });
+  const version = ch => `sha256-${ch.repeat(64)}`;
+  const effect = (key, operation, target, before, after) => {
+    const command = { idempotencyKey: key, kind: "execute_tool", phase: "acting", run, payload: { toolName: operation, arguments: { path: target } } };
+    state = append(state, "command.scheduled", { run, command });
+    state = append(state, "tool.completed", { run, idempotencyKey: key, status: "succeeded", effectKind: "workspace_change", evidence: [{ id: key, kind: "mutation", target, version: after, previousVersion: before }] });
+  };
+  effect("repair", "replace_in_file", "Assets/ServiceBase.cs", version("a"), version("b"));
+  effect("create-helper", "write_file", "Assets/_validate.py", "deleted", version("c"));
+  effect("temp-edit", "replace_in_file", "Assets/Other.cs", version("d"), version("e"));
+  effect("restore-temp", "replace_in_file", "Assets/Other.cs", version("e"), version("d"));
+  effect("create-scratch", "write_file", "Assets/Scratch.cs", "deleted", version("f"));
+  effect("delete-scratch", "delete_workspace_path", "Assets/Scratch.cs", version("f"), "deleted");
+  state = append(state, "phase.changed", { run, phase: "validating", reason: "file changes committed" });
+  const cleanup = { idempotencyKey: "cleanup", kind: "execute_tool", phase: "validating", run, payload: { toolName: "run_command", arguments: { command: "rm Assets/_validate.py" } } };
+  state = append(state, "command.scheduled", { run, command: cleanup });
+  state = append(state, "tool.completed", { run, idempotencyKey: "cleanup", status: "succeeded", effectKind: "external_operation", evidence: [], presentation: { toolName: "run_command", target: "rm Assets/_validate.py" }, observedWorkspaceRemovals: [{ target: "Assets/_validate.py", priorMutationVersion: version("c") }] });
+  assert.equal(runtime.runtimeV2WorkspaceChangeReceipts(state).length, 6);
+  assert.deepEqual(runtime.runtimeV2DeliveredWorkspacePaths(state), ["Assets/ServiceBase.cs"]);
+  assert.deepEqual(runtime.runtimeV2DirectExecuteMutationTargets(state), ["Assets/ServiceBase.cs"]);
+  const outcome = { resultKind: "canceled", reason: "user_cancelled", completedAt: id + 2, finalProjectionId: "final" };
+  const finalProjection = runtime.buildRuntimeV2FinalProjection(state, "final", outcome.resultKind, outcome.reason);
+  state = append(state, "run.aborted", { run, reason: outcome.reason });
+  state = append(state, "run.completed", { run, outcome, finalProjection });
+  assert.deepEqual(runtime.deriveRuntimeV2TerminalAcceptanceFacts(state).deliveredFiles, ["Assets/ServiceBase.cs"]);
+  assert.equal(runtime.deriveRuntimeV2WorkspaceNetChanges(state).find(item => item.target === "Assets/_validate.py")?.status, "unchanged");
+});

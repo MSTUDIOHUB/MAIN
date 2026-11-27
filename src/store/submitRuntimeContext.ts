@@ -24,6 +24,10 @@ export interface CreateSubmitRuntimeContextInput {
   capabilityRestrictions?: readonly import("../lib/turnCapabilities").TurnCapability[];
   approvalRequiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
   requiredCapabilities?: readonly import("../lib/turnCapabilities").TurnCapability[];
+  restoredReadOnlyStrategy?: "chat" | "analyze";
+  preparedChatAnswer?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedChatAnswer;
+  preparedWorkspaceRead?: import("../lib/submissionRuntimeContracts").RuntimeV2PreparedWorkspaceRead;
+  sourceInvestigationTurnId?: string;
   semanticWorkType?: import("../lib/runIntent").SemanticTaskIntent["workType"];
   intentClarification?: import("../lib/turnClarification").TurnClarification;
 
@@ -75,6 +79,10 @@ export function createSubmitRuntimeContext(
     capabilityRestrictions: input.capabilityRestrictions,
     approvalRequiredCapabilities: input.approvalRequiredCapabilities,
     requiredCapabilities: input.requiredCapabilities,
+    restoredReadOnlyStrategy: input.restoredReadOnlyStrategy,
+    preparedChatAnswer: input.preparedChatAnswer,
+    preparedWorkspaceRead: input.preparedWorkspaceRead,
+    sourceInvestigationTurnId: input.sourceInvestigationTurnId,
     semanticWorkType: input.semanticWorkType,
     intentClarification: input.intentClarification,
 

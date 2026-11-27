@@ -232,6 +232,8 @@ test("canonical receipts settle approved permission rows and preserve success th
   ledger = append(ledger, "turn.completed", { turn: ledger.turn, runId: runIdentity.runId, outcome });
   await harness.port.publish({ aggregate: ledger, audience: "final", projection: final });
 
+  assert.equal(harness.getState().harnessRunMarker.closeReason, "user_cancelled");
+  assert.equal(harness.getState().harnessRunMarker.terminalResultKind, "canceled");
   const rows = harness.getState().taskFlow.filter((block) => block.type === "tool");
   assert.equal(rows.some((block) => block.status === "running" || block.toolStatus === "running" || block.toolStatus === "pending"), false);
   assert.equal(rows.find((block) => block.toolCallId === successful.idempotencyKey)?.toolStatus, "executed");
@@ -469,6 +471,7 @@ test("V2 Capsule keeps V1 Run Status title and summary roles distinct", async ()
   const phaseProgress = progressEvents.at(-1).progress;
   assert.equal(phaseProgress.title, "正在实施修改");
   assert.equal(phaseProgress.summary, undefined);
+  assert.deepEqual(harness.logs, []);
 });
 
 test("V2 timeline records an unmet acceptance check without presenting the task as paused", async () => {
@@ -660,6 +663,18 @@ test("V2 provider commentary remains a durable assistant update rather than time
     ).length,
     0,
   );
+});
+
+test("publishing the same commentary projection twice is idempotent and another attempt can report the same words", async () => {
+  const harness = createHarness();
+  const original = projection("milestone", "我已经完成了文件校验。", "turn-a:provider-commentary:attempt-a", "milestone-a");
+  const next = projection("milestone", original.markdown, "turn-a:provider-commentary:attempt-b", "milestone-b");
+  await harness.port.publish({ aggregate: aggregate(), audience: "chat_milestone", projection: original });
+  await harness.port.publish({ aggregate: aggregate(), audience: "chat_milestone", projection: original });
+  await harness.port.publish({ aggregate: aggregate({ run: { identity: { ...runIdentity, attemptId: "attempt-b" }, status: "running" } }),
+    audience: "chat_milestone", projection: next });
+  const updates = harness.getState().taskFlow.filter((block) => block.visibility === "assistant_update");
+  assert.deepEqual(updates.map((block) => block.runtimeProjectionKey), [original.dedupeKey, next.dedupeKey]);
 });
 
 test("an identical milestone never suppresses the terminal Turn projection", async () => {
@@ -880,6 +895,7 @@ test("V2 child ledger reconciles into ChatArea and Subagents panel lifecycle rec
     state.runtimeEvents.filter((event) => event.type === "subagent.closed").length,
     2,
   );
+  assert.equal(harness.logs.length, 1);
   assert.equal(harness.logs.at(-1)?.data?.subagentRecordCount, 2);
 });
 
@@ -1015,10 +1031,7 @@ test("V2 keeps runtime-owned Plan artifact writes out of the user timeline", asy
     ).length,
     0,
   );
-  assert.equal(
-    harness.logs.at(-1)?.data?.storeDisposition,
-    "suppressed_internal",
-  );
+  assert.deepEqual(harness.logs, []);
 });
 
 test("V2 keeps provider and plan control-plane commands out of the user timeline", async () => {
@@ -1068,9 +1081,7 @@ test("V2 keeps provider and plan control-plane commands out of the user timeline
     ).length,
     0,
   );
-  assert.ok(harness.logs.every((entry) =>
-    entry.data?.storeDisposition === "suppressed_internal"
-  ));
+  assert.deepEqual(harness.logs, []);
 });
 
 test("V2 projection logs distinguish a stale Store owner from publication", async () => {
@@ -1085,9 +1096,9 @@ test("V2 projection logs distinguish a stale Store owner from publication", asyn
   });
   await harness.port.publish({
     aggregate: staleAggregate,
-    audience: "chat_milestone",
+    audience: "capsule_live",
     projection: projection(
-      "milestone",
+      "live_action",
       "### 不应进入当前会话",
       "turn-a:stale",
     ),
@@ -1096,6 +1107,7 @@ test("V2 projection logs distinguish a stale Store owner from publication", asyn
   assert.equal(harness.getState().taskFlow.length, 1);
   assert.equal(harness.logs.at(-1)?.event, "runtime_v2_projection_skipped");
   assert.equal(harness.logs.at(-1)?.data?.storeDisposition, "owner_mismatch");
+  assert.doesNotMatch(JSON.stringify(harness.logs), /不应进入当前会话/);
 });
 
 test("V2 canceled final projection preserves the canonical abort-complete-turn order", async () => {
@@ -1155,6 +1167,10 @@ test("V2 canceled final projection preserves the canonical abort-complete-turn o
   assert.equal(state.agentMessages[0].role, "assistant");
   assert.equal(state.agentMessages[0].runtimeTurnId, "turn-a");
   assert.match(state.agentMessages[0].content, /已取消/);
+  assert.equal(harness.logs.at(-1)?.data?.audience, "final");
+  assert.equal(harness.logs.at(-1)?.data?.resultKind, "canceled");
+  assert.equal(harness.logs.at(-1)?.data?.finalProjectionId, "final-canceled");
+  assert.doesNotMatch(JSON.stringify(harness.logs), /已取消|本轮已按用户请求停止/);
   assert.equal(
     state.conversationTurns[0].durableContext.finalAssistantAnswer,
     "### 已取消\n\n本轮已按用户请求停止。",

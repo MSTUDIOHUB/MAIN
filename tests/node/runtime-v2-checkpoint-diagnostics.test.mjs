@@ -4,6 +4,8 @@ import { createTsModuleLoader } from './tsModuleLoader.mjs';
 
 const load = createTsModuleLoader();
 const runtime = load('src/lib/runtime-v2/index.ts');
+const { createRuntimeV2CheckpointPort } = load('src/store/runtimeV2/checkpointPort.ts');
+const { resolveStoreEventLogLevel, RUNTIME_V2_SLOW_CHECKPOINT_MS } = load('src/lib/storeLogLevel.ts');
 const turn = { workspaceKey: '/fixture', sessionKey: 'session', sessionEpoch: 'epoch', clientSubmissionId: 'submission', turnId: 'turn' };
 function checkpoint() {
   const aggregate = runtime.transition(null, { schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION, type: 'turn.admitted', sequence: 0,
@@ -41,6 +43,77 @@ test('owner fencing still filters unrelated historical ledgers with an explicit 
   const value = persisted(); const diagnostics = [];
   assert.deepEqual(runtime.serializeRuntimeV2CheckpointMap({ turn: value }, { sessionEpoch: 'replacement' }, { onRejected: diagnostic => diagnostics.push(diagnostic) }), {});
   assert.equal(diagnostics[0].code, 'owner_mismatch');
+});
+
+test('checkpoint filter log identifies the expected owner without recording event contents', (t) => {
+  const log = t.mock.method(console, 'warn', () => {});
+  const expectedOwner = { workspaceKey: '/other', sessionKey: 'other-session', sessionEpoch: 'replacement' };
+  assert.deepEqual(runtime.normalizeRuntimeV2CheckpointMap({ turn: persisted() }, expectedOwner), {});
+  assert.equal(log.mock.callCount(), 1);
+  const [label, payload] = log.mock.calls[0].arguments;
+  assert.equal(label, '[runtime_v2_checkpoint_filtered]');
+  const parsed = JSON.parse(payload);
+  assert.deepEqual(parsed.expectedOwner, expectedOwner);
+  assert.equal(parsed.diagnostics[0].sessionKey, 'session');
+  assert.equal(parsed.diagnostics[0].expectedTurnId, 'turn');
+  assert.doesNotMatch(payload, /PRIVATE_PLAN_BODY/);
+});
+
+test('durable checkpoint telemetry retains slow projections, tool fences, and terminal receipts', async (t) => {
+  let now = 100;
+  t.mock.method(Date, 'now', () => now);
+  const logs = [];
+  const run = { sessionKey: turn.sessionKey, sessionEpoch: turn.sessionEpoch, turnId: turn.turnId,
+    runId: 'run', parentRunId: null, attemptId: 'attempt' };
+  let state = { runtimeV2Checkpoints: { turn: checkpoint() },
+    sessionsByWorkspace: { '/fixture': [{ id: 1 }] }, config: { sessionRecordingEnabled: true } };
+  let persistElapsedMs = 0;
+  const port = createRuntimeV2CheckpointPort({
+    get: () => state, set() {}, scopeKey: '/fixture', sessionId: 1,
+    getSessionRevisionToken: () => state, sanitizeTaskBlocksForPersist: blocks => blocks,
+    buildSessionRuntimeSnapshot: () => ({}),
+    persistSessionRecord: async () => { now += persistElapsedMs; },
+    publishOwnerScopedRuntimeProjection: ({ projectedState }) => {
+      state = projectedState;
+      return { published: true };
+    },
+    logStoreEvent: (name, data) => logs.push({ name, data, level: resolveStoreEventLogLevel(name, data) }),
+  });
+  async function append(type, fields) {
+    const base = state.runtimeV2Checkpoints.turn;
+    const event = { type, run, schemaVersion: runtime.RUNTIME_V2_EVENT_SCHEMA_VERSION,
+      sequence: base.aggregate.nextSequence, eventId: `event-${base.revision}`, at: ++now, ...fields };
+    const result = await port.append({ owner: turn, expectedRevision: base.revision, event });
+    assert.equal(result.disposition, 'committed');
+    assert.equal(state.runtimeV2Checkpoints.turn.events.at(-1).eventId, event.eventId);
+  }
+  function publish(audience, id, kind) {
+    return append('projection.published', { audience, projectionId: id,
+      projection: { id, audience, kind, dedupeKey: id, markdown: 'PRIVATE_PLAN_BODY' } });
+  }
+
+  await append('run.started', { phase: 'planning' });
+  await publish('capsule_live', 'capsule', 'live_action');
+  assert.equal(logs.length, 1);
+  persistElapsedMs = RUNTIME_V2_SLOW_CHECKPOINT_MS;
+  await publish('timeline', 'slow-timeline', 'timeline');
+  assert.equal(logs.at(-1).data.eventType, 'projection.published');
+  assert.equal(logs.at(-1).level, 'warn');
+  persistElapsedMs = 0;
+  await append('command.scheduled', { command: { kind: 'execute_tool', run, phase: 'planning',
+    idempotencyKey: 'read', payload: { toolName: 'read_file', toolCallId: 'read-1' } } });
+  assert.equal(logs.at(-1).data.sideEffectFence, true);
+  assert.equal(logs.at(-1).data.commandKind, 'execute_tool');
+  await append('tool.completed', { status: 'succeeded', evidence: [], idempotencyKey: 'read' });
+  const outcome = { resultKind: 'partial', reason: 'fixture', completedAt: now, finalProjectionId: 'final' };
+  await append('run.completed', { outcome });
+  await publish('final', 'final', 'final');
+  await append('turn.completed', { turn, runId: run.runId, outcome });
+  assert.deepEqual(logs.map(entry => entry.data.eventType), ['run.started', 'projection.published',
+    'command.scheduled', 'tool.completed', 'run.completed', 'projection.published', 'turn.completed']);
+  assert.equal(logs.at(-1).data.runId, run.runId);
+  assert.equal(logs.at(-1).data.resultKind, 'partial');
+  assert.doesNotMatch(JSON.stringify(logs), /PRIVATE_PLAN_BODY/);
 });
 
 test('a same-session ledger under the wrong Turn key is a save error, not unrelated history', () => {

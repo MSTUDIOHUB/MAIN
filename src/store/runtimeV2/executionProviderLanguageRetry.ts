@@ -1,5 +1,6 @@
 import type { beginCapsuleModelActivity } from "../../lib/capsuleLiveActivity";
 import { compactDebugString } from "../../lib/debugLog";
+import { buildCommentaryLanguageAnchor, shouldPublishPublicCommentary } from "../../lib/languageContract";
 import type { RuntimeContextBudget } from "../../lib/runtimeContextBudget";
 import type { RuntimeV2Command } from "../../lib/runtime-v2";
 import {
@@ -13,6 +14,7 @@ import {
   aggregateForCurrentTurn,
   appendRuntimeV2ProviderFeedbackHistory,
   materializedRuntimeV2SourceCoverage,
+  upsertRuntimeV2ContextAnchor,
   type RuntimeV2ExecutionPortsInput,
   type RuntimeV2LiveExecutionState,
 } from "./executionContext";
@@ -30,6 +32,8 @@ export function createRuntimeV2WireCallbacks(input: {
   activity: ReturnType<typeof beginCapsuleModelActivity>;
   logRequestTiming: (stage: string, data?: Record<string, unknown>) => void;
   appendStreamedText: (token: string) => void;
+  allowPublicText?: boolean;
+  phaseLanguage?: "zh" | "en";
 }) {
   return (
     attempt: "initial" | "reasoning_retry" | "language_retry",
@@ -37,6 +41,7 @@ export function createRuntimeV2WireCallbacks(input: {
     let dispatchAt = 0;
     let dispatchCount = 0;
     let modelProgressSeen = false;
+    let publicTextSeen = false;
     const onModelProgress = () => {
       input.lane.markFirstToken();
       if (modelProgressSeen) return;
@@ -52,12 +57,30 @@ export function createRuntimeV2WireCallbacks(input: {
         onModelProgress();
         input.appendStreamedText(token);
       },
+      ...(input.allowPublicText
+        ? {
+            onPublicText: (text: string) => {
+              if (!input.phaseLanguage || shouldPublishPublicCommentary(text, input.phaseLanguage).allow) {
+                input.activity.reportPublicCommentary(text);
+                if (!publicTextSeen && text.trim()) {
+                  publicTextSeen = true;
+                  input.logRequestTiming("first_public_text", {
+                    attempt,
+                    dispatchCount,
+                    elapsedMs: dispatchAt ? Date.now() - dispatchAt : null,
+                  });
+                }
+              }
+            },
+          }
+        : {}),
       onDone: () => undefined,
       onError: () => undefined,
       onRequestDispatched() {
         dispatchAt = Date.now();
         dispatchCount += 1;
         modelProgressSeen = false;
+        publicTextSeen = false;
         input.logRequestTiming("dispatched", { attempt, dispatchCount });
         return input.activity.requestDispatched();
       },
@@ -233,4 +256,42 @@ export async function retryRuntimeV2ProviderLanguageMismatch(input: {
   } finally {
     input.live.messages.splice(languageRetryHistoryStart);
   }
+}
+
+export function suppressMismatchedToolCommentary(input: {
+  readonly visibleText: string;
+  readonly toolCallCount: number;
+  readonly targetLanguage: "zh" | "en";
+  readonly live: RuntimeV2LiveExecutionState;
+  readonly ports: RuntimeV2ExecutionPortsInput;
+  readonly command: RuntimeV2Command;
+  readonly mode: string;
+}): string {
+  if (input.toolCallCount === 0 || !input.visibleText.trim()) {
+    return input.visibleText;
+  }
+  const check = shouldPublishPublicCommentary(
+    input.visibleText,
+    input.targetLanguage,
+  );
+  if (check.allow || check.reason !== "language_mismatch") {
+    return input.visibleText;
+  }
+  input.ports.logStoreEvent("runtime_v2_commentary_language_suppressed", {
+    turnId: input.command.run.turnId,
+    runId: input.command.run.runId,
+    commandKey: input.command.idempotencyKey,
+    phase: input.command.phase,
+    mode: input.mode,
+    targetLanguage: input.targetLanguage,
+    detectedLanguage: check.detectedLanguage,
+    hanCount: check.hanCount,
+    latinWords: check.latinWords,
+    toolCount: input.toolCallCount,
+  });
+  upsertRuntimeV2ContextAnchor(input.live, {
+    key: "language-contract",
+    content: buildCommentaryLanguageAnchor(input.targetLanguage),
+  });
+  return input.visibleText;
 }

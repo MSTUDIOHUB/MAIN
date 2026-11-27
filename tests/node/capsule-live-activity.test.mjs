@@ -98,3 +98,20 @@ test("stale finishes and aborts cannot clear the replacement request or another 
   unrelatedController.abort();
   assert.deepEqual(getCapsuleLiveActivitySnapshot(), []);
 });
+
+test("provider public commentary is temporary and scoped to the current Run and transport", (t) => {
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const activity = beginCapsuleModelActivity(run, "public-output", controller.signal);
+  activity.reportPublicCommentary("before dispatch");
+  assert.equal(getCapsuleLiveActivitySnapshot()[0].publicCommentary, undefined);
+  const receiving = activity.requestDispatched();
+  receiving();
+  activity.reportPublicCommentary("I will verify the save flow.");
+  assert.equal(getCapsuleLiveActivitySnapshot()[0].publicCommentary, "I will verify the save flow.");
+  activity.requestDispatched();
+  assert.equal(getCapsuleLiveActivitySnapshot()[0].publicCommentary, undefined);
+  controller.abort();
+  activity.reportPublicCommentary("late output");
+  assert.deepEqual(getCapsuleLiveActivitySnapshot(), []);
+});

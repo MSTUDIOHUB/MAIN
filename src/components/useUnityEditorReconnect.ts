@@ -35,7 +35,7 @@ export function useUnityEditorReconnect() {
     const probe = async () => {
       if (!current()) return;
       if (document.visibilityState === "visible") {
-        const observation = await runUnityEditorOperation("unity_probe_editor", { workspace }, abort.signal, Date.now() + 4_000)
+        const observation = await runUnityEditorOperation("unity_probe_editor", { workspace, projectRoot: check.result.projectRoot }, abort.signal, Date.now() + 4_000)
           .catch(() => null);
         if (!current()) return;
         const ready = readyUnityEditorRoute(check.result, observation);

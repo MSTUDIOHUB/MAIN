@@ -2,18 +2,20 @@ import { normalizeValidationWorkspaceCwd, unityValidationInvocations } from "../
 import type { TurnAggregateV1 } from "./aggregate";
 import { approvedRuntimeV2PlanContinuation } from "./planContinuationBaseline";
 import { runtimeV2EditorDiagnosticScope, isRuntimeV2EditorDiagnosticRepair } from "./editorConsoleEvidence";
-import { runtimeV2DirectExecuteMutationTargets, runtimeV2WorkspaceChangeReceipts } from "./validationReceipt";
+import { runtimeV2DirectExecuteMutationTargets, runtimeV2ValidationBoundaryMatchesCurrent, runtimeV2WorkspaceChangeReceipts } from "./validationReceipt";
 import { extractExactReadFileWindow } from "../readFileWindow";
+import { deriveRuntimeV2ExecutionContract } from "./executionContract";
 
 export const UNITY_COMPILE_PROJECT_TOOL = "unity_compile_project";
 export type UnityEditorCheckKind = "csharp" | "shader_import";
 
 export interface UnityCompilationResult {
-  readonly status: "passed" | "failed" | "unavailable" | "deferred_closed" | "not_unity_project";
+  readonly status: "passed" | "failed" | "unavailable" | "deferred_closed" | "not_unity_project" | "project_fragment";
   readonly editor?: "connected" | "closed";
   readonly editorPid?: number | null;
   readonly editorInstanceId?: string;
   readonly editorVersion?: string;
+  readonly projectRoot?: string;
   readonly kind?: UnityEditorCheckKind;
   readonly targets?: readonly { readonly path: string; readonly version: string | null }[];
   readonly importedPaths?: readonly string[];
@@ -46,7 +48,15 @@ export function approvedPlanExecutionRepair(aggregate: TurnAggregateV1 | null): 
 
 export function unityCompilationTarget(path: string, workspace: string): string | null {
   const relative = normalizeValidationWorkspaceCwd(path, workspace);
-  return relative && /^(?:Assets|Packages)\/.*\.(?:cs|asmdef|asmref)$/i.test(relative) ? relative : null;
+  if (!relative || !/\.(?:cs|asmdef|asmref)$/i.test(relative)) return null;
+  const windows = /^(?:[a-z]:[\\/]|\\\\|\/\/)/i.test(workspace);
+  const assets = windows ? /(?:^|\/)(?:assets|packages)\//i : /(?:^|\/)(?:Assets|Packages)\//;
+  return assets.test(relative) ? relative : null;
+}
+
+export function unityCheckTargetInProject(path: string, projectRoot: string = "."): boolean {
+  const prefix = projectRoot === "." ? "" : `${projectRoot}/`;
+  return path.startsWith(prefix) && /^(?:Assets|Packages)\//i.test(path.slice(prefix.length));
 }
 
 export function unityShaderImportTarget(path: string, workspace: string): string | null {
@@ -114,7 +124,7 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
     if (
       changed.some((item) => {
         const relative = normalizeValidationWorkspaceCwd(item.target, workspace);
-        return relative?.toLowerCase() === "projectsettings/projectversion.txt";
+        return !!relative && /(?:^|\/)projectsettings\/projectversion\.txt$/i.test(relative);
       })
     ) {
       notUnityProjectReceipt = undefined;
@@ -161,7 +171,7 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
       } catch { /* Invalid receipt remains unavailable. */ }
     }
     receipt = { boundary: boundary.sequence, sequence: event.sequence, result, hasImportTargets: boundary.hasImportTargets };
-    if (result.status === "not_unity_project") {
+    if (result.status === "not_unity_project" || result.status === "project_fragment") {
       notUnityProjectReceipt = {
         sequence: event.sequence,
         result,
@@ -189,7 +199,7 @@ function computeUnityEditorCheck(aggregate: TurnAggregateV1, kind: UnityEditorCh
     !receipt?.result.targets?.some(item => item.path === path))) receipt = undefined;
   const effectiveReceipt = receipt?.boundary === sequence
     ? receipt
-    : notUnityProjectReceipt
+    : notUnityProjectReceipt && targets.every(path => unityCheckTargetInProject(path, notUnityProjectReceipt.result.projectRoot))
       ? { boundary: sequence, ...notUnityProjectReceipt }
       : undefined;
   return { kind, sequence, targets, expectedVersions, importTargets, receipt: effectiveReceipt };
@@ -259,21 +269,49 @@ export function unityCompilationMessage(result: UnityCompilationResult): string 
   return [result.message, ...diagnostics].filter(Boolean).join("\n");
 }
 
-/** A verified compiler/test command can settle an unavailable compiler
+export function runtimeV2RequiresUnityCompilerEvidence(aggregate: TurnAggregateV1): boolean {
+  const requiredPlanChecks = aggregate.workPlan?.status === "approved"
+    ? aggregate.sealedWorkPlan?.draft.validations.filter(check => check.required) ?? []
+    : [];
+  const directChecks = deriveRuntimeV2ExecutionContract(aggregate)?.validations ?? [];
+  return isRuntimeV2EditorDiagnosticRepair(aggregate) || [...requiredPlanChecks, ...directChecks].some(check =>
+    check.kind === "finite_command" && unityValidationInvocations(check.command || "").length > 0);
+}
+
+/** A verified project-scoped compiler or Editor test can settle the compiler
  * operation after the same edit boundary. Generic shell success cannot. */
 export function unresolvedUnityCompilation(aggregate: TurnAggregateV1 | null) {
   const compilation = deriveUnityCompilation(aggregate);
   const receipt = compilation?.receipt;
+  if (aggregate && receipt?.result.status === "project_fragment") {
+    return runtimeV2RequiresUnityCompilerEvidence(aggregate) ? receipt : null;
+  }
   if (!aggregate || !compilation || !receipt ||
       (receipt.result.status !== "failed" && receipt.result.status !== "unavailable")) return null;
-  const verified = aggregate.events.some(event => event.type === "validation.completed" && event.passed &&
-    event.sequence > receipt.sequence && event.run.runId === aggregate.run?.identity.runId &&
-    unityValidationInvocations(event.presentation?.target || "").length > 0);
+  const verified = aggregate.events.some(event => {
+    if (event.type !== "validation.completed" || !event.passed || !event.authority ||
+        event.sequence <= receipt.sequence || event.run.runId !== aggregate.run?.identity.runId) return false;
+    const command = aggregate.scheduledCommands.find(command => command.idempotencyKey === event.idempotencyKey);
+    const args = command?.payload.arguments as Readonly<Record<string, unknown>> | undefined;
+    if (command?.kind !== "execute_validation" || command.payload.toolName !== "run_command") return false;
+    const invocations = unityValidationInvocations(String(args?.command || ""));
+    const cwd = normalizeValidationWorkspaceCwd(args?.cwd ?? args?.workdir, aggregate.turn.workspaceKey);
+    const projectRoot = receipt.result.projectRoot || ".";
+    const projectBound = cwd === projectRoot && invocations.length === 1 &&
+      (invocations[0]?.kind !== "batch" || event.authority.useProjectEditor === true && projectRoot === ".");
+    return projectBound &&
+      runtimeV2ValidationBoundaryMatchesCurrent({ aggregate, targetPaths: event.authority.targetPaths,
+        mutationBoundarySequence: event.mutationBoundarySequence, validatedMutationVersions: event.validatedMutationVersions }) &&
+      compilation.targets.every(path => !(path in compilation.expectedVersions) || event.authority!.targetPaths.includes(path));
+  });
   return verified ? null : receipt;
 }
 
 export function unresolvedUnityShaderImport(aggregate: TurnAggregateV1 | null) {
   const receipt = deriveUnityShaderImport(aggregate)?.receipt;
+  if (aggregate && receipt?.result.status === "project_fragment") {
+    return runtimeV2RequiresUnityCompilerEvidence(aggregate) ? receipt : null;
+  }
   return receipt && ["failed", "unavailable", "deferred_closed"].includes(receipt.result.status) ? receipt : null;
 }
 

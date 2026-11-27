@@ -14,7 +14,7 @@ import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
 import { isRuntimeV2ReadOnlyToolName, RUNTIME_V2_WORKSPACE_NETWORK_READ_TOOL_NAMES } from "./workspaceReadPolicy";
 import { analyzeValidationCommand } from "../validationContract";
 import { isRuntimeV2ValidationAttempt } from "./validationAttempt";
-import { runtimeV2WorkspaceChangeReceipts } from "./validationReceipt";
+import { runtimeV2DeliveredWorkspacePaths } from "./validationReceipt";
 import { effectiveRuntimeV2CompletionRequirement } from "./completionRequirement";
 import { normalizedEvidenceUrl } from "./readOnlyProgress";
 
@@ -195,7 +195,7 @@ export function exhaustedRuntimeV2ResultKind(
       aggregate.workPlan?.status === "approved"
     );
   if (mutationRequired) {
-    return runtimeV2WorkspaceChangeReceipts(aggregate).length > 0
+    return runtimeV2DeliveredWorkspacePaths(aggregate).length > 0
       ? "partial"
       : "error";
   }

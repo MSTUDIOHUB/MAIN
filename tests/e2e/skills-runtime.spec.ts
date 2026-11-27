@@ -51,6 +51,7 @@ test.beforeEach(async ({ page }) => {
     };
 
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_all_session_snapshots" || cmd === "list_legacy_session_files") return [];
       if (cmd === "plugin:event|listen") {
         return Number(args?.handler ?? callbackId++);
       }

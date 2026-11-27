@@ -640,7 +640,7 @@ for (const fixture of [
   { suffix: "analyze-then-repair", text: "First analyze the defect, then fix src/app.ts and run the relevant test. Explain the change afterwards.",
     result: semanticResult("implement", ["workspace_read", "workspace_write", "command"], "analysis"), intent: "execute" },
   { suffix: "analysis-only", text: "先分析修复方案，不要修改文件或执行命令；给我一个计划。",
-    result: semanticResult("plan", ["workspace_read"], "plan", ["workspace_write", "command"]), intent: "plan" },
+    result: { ...semanticResult("plan", ["workspace_read"], "plan", ["workspace_write", "command"]), planRequestExcerpt: "给我一个计划" }, intent: "plan" },
   { suffix: "live-report", text: "Inspect the live Editor with the CLI and give me a report. Do not modify project files.",
     result: semanticResult("operate", ["command", "external_interaction"], "report", ["workspace_write"]), intent: "execute" },
 ]) {
